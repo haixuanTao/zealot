@@ -9,7 +9,7 @@ pub use vortx_shaders as shaders;
 use khal::re_exports::include_dir::{Dir, include_dir};
 
 /// Embedded SPIR-V shader directory.
-pub static SPIRV_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/shaders-spirv");
+pub static SPIRV_DIR: Dir<'static> = include_dir!("$OUT_DIR/shaders-spirv");
 
 pub use linalg::*;
 

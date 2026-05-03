@@ -1,16 +1,18 @@
+use std::path::PathBuf;
+
 use khal_builder::KhalBuilder;
 
 fn main() {
-    let shader_crate = "./vortx-shaders";
-    let output_dir = "shaders-spirv";
+    let output_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR not set by cargo"))
+        .join("shaders-spirv");
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PUSH_CONSTANTS");
 
     #[allow(unused_mut)]
-    let mut builder = KhalBuilder::new(shader_crate, true);
+    let mut builder = KhalBuilder::from_dependency("vortx-shaders", true);
     #[cfg(feature = "push_constants")]
     {
         builder = builder.feature("push_constants");
     }
-    builder.build(output_dir);
+    builder.build(&output_dir);
 }

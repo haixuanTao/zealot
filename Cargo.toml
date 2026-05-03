@@ -3,9 +3,10 @@ name = "vortx"
 authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
 description = "Cross-platform GPU tensor library with Rust."
 repository = "https://github.com/dimforge/vortx"
-version = "0.1.0"
+version = { workspace = true }
 edition = "2024"
 license = "Apache-2.0"
+exclude = ["assets/vortx-logo.png", "assets/vortx-logo2.png"]
 
 [workspace]
 members = [
@@ -22,6 +23,9 @@ cuda = ["khal/cuda", "khal-builder/cuda", "vortx-shaders/cuda"]
 push_constants = ["khal/push_constants", "vortx-shaders/push_constants"]
 subgroup_ops = ["khal/subgroup_ops", "vortx-shaders/subgroup_ops"]
 
+[workspace.package]
+version = "0.1.1"
+
 [workspace.dependencies]
 khal-std = "0.1"
 khal = { version = "0.1", features = ["derive"]}
@@ -33,7 +37,7 @@ nalgebra = "0.34"
 khal = { workspace = true }
 khal-std = { workspace = true }
 # Shader crate provides both GPU shader code and generated ShaderArgs via spirv_bindgen
-vortx-shaders = { path = "vortx-shaders" }
+vortx-shaders = { version = "0.1", path = "vortx-shaders" }
 
 [dev-dependencies]
 nalgebra = { version = "0.34", features = ["rand"] }
@@ -47,7 +51,9 @@ anyhow = "1"
 wgpu = "29"
 
 [build-dependencies]
-khal-builder = "0.1"
+khal-builder = "0.1.1"
+# To build the shader from the dependency instead of local path.
+vortx-shaders = { version = "0.1.1", path = "./vortx-shaders" }
 
 #[patch.crates-io]
 #khal-builder = { path = "../khal/crates/khal-builder" }

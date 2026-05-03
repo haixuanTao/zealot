@@ -1,7 +1,12 @@
 [package]
 name = "vortx-shaders"
-version = "0.1.0"
+authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
+description = "Cross-platform GPU kernels for linear algebra."
+version = { workspace = true }
 edition = "2021"
+license = "Apache-2.0"
+links = "vortx-shaders"
+build = "build.rs"
 
 [features]
 unsafe_remove_boundchecks = ["khal-std/unsafe_remove_boundchecks"]
@@ -14,9 +19,9 @@ push_constants = []
 # When enabled, shaders will use subgroup operations for reductions.
 # When disabled, shaders will use manual reduction via shared memory.
 subgroup_ops = []
-cpu = ["khal-std/cpu"]
-cpu-parallel = ["khal-std/cpu-parallel"]
-cuda = ["khal-std/cuda"]
+cpu = ["khal-std/cpu", "khal/cpu"]
+cpu-parallel = ["cpu", "khal-std/cpu-parallel"]
+cuda = ["khal-std/cuda", "khal/cuda"]
 
 [dependencies]
 khal-std = { workspace = true }
