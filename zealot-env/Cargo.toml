@@ -1,0 +1,11 @@
+[package]
+name = "zealot-env"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# TODO: wire in nexus once we start the env loop. Target dependency:
+#   nexus3d = { path = "../../nexus-rustgpu/crates/nexus3d", features = ["rbd", "from_rapier"] }
+# Building nexus requires `cargo install cargo-gpu` (compiles Rust-GPU shaders to SPIR-V).
+# `from_rapier` also pulls in rapier3d 0.32 for CPU-side scene construction.

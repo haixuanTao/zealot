@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["zealot-env", "zealot-rl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+zealot-env = { path = "zealot-env" }
+zealot-rl = { path = "zealot-rl" }
