@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#
+# Pre-push hook: run the test suite before code reaches the remote.
+#
+# Lives alongside the pre-commit hook; both are enabled per-clone with:
+#   git config core.hooksPath .githooks
+#
+# Tests run here rather than in pre-commit so individual commits stay fast as
+# the suite grows. Scope mirrors the pre-commit checks: default features only
+# (the `gpu` feature needs the cargo-gpu toolchain and pulls in ../vortx), and
+# warnings are still treated as errors.
+#
+set -euo pipefail
+
+echo "pre-push: running tests (cargo test)..."
+if ! RUSTFLAGS="-D warnings" cargo test --workspace; then
+    echo
+    echo "✗ Tests failed. Push aborted — fix the failures above and try again."
+    echo "  (To bypass in an emergency: git push --no-verify)"
+    exit 1
+fi
+
+echo "pre-push: ok"

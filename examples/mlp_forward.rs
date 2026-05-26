@@ -47,7 +47,11 @@ async fn main() -> anyhow::Result<()> {
     let gw2 = Tensor::matrix_from_na(&backend, &w2, BufferUsages::STORAGE)?;
     let gb2 = Tensor::matrix_from_na(&backend, &b2, BufferUsages::STORAGE)?;
     let gx = Tensor::matrix_from_na(&backend, &x, BufferUsages::STORAGE)?;
-    let mut z1 = Tensor::matrix_from_na(&backend, &DMatrix::<f32>::zeros(HID, 1), BufferUsages::STORAGE)?;
+    let mut z1 = Tensor::matrix_from_na(
+        &backend,
+        &DMatrix::<f32>::zeros(HID, 1),
+        BufferUsages::STORAGE,
+    )?;
     let mut z2 = Tensor::matrix_from_na(
         &backend,
         &DMatrix::<f32>::zeros(OUT, 1),
@@ -62,7 +66,14 @@ async fn main() -> anyhow::Result<()> {
     }
     {
         let mut pass = encoder.begin_pass("bias1", None);
-        op.launch(&backend, &mut shapes, &mut pass, OpAssignVariant::Add, &mut z1, &gb1)?; // z1 += b1
+        op.launch(
+            &backend,
+            &mut shapes,
+            &mut pass,
+            OpAssignVariant::Add,
+            &mut z1,
+            &gb1,
+        )?; // z1 += b1
     }
     {
         let mut pass = encoder.begin_pass("tanh1", None);
@@ -74,7 +85,14 @@ async fn main() -> anyhow::Result<()> {
     }
     {
         let mut pass = encoder.begin_pass("bias2", None);
-        op.launch(&backend, &mut shapes, &mut pass, OpAssignVariant::Add, &mut z2, &gb2)?; // z2 += b2
+        op.launch(
+            &backend,
+            &mut shapes,
+            &mut pass,
+            OpAssignVariant::Add,
+            &mut z2,
+            &gb2,
+        )?; // z2 += b2
     }
     backend.submit(encoder)?;
     backend.synchronize()?;
@@ -88,7 +106,10 @@ async fn main() -> anyhow::Result<()> {
 
     println!("MLP forward ({IN}->{HID}->{OUT})");
     println!("  gpu out = {:?}", &z2_gpu[..OUT]);
-    println!("  cpu out = {:?}", (0..OUT).map(|r| z2c[(r, 0)]).collect::<Vec<_>>());
+    println!(
+        "  cpu out = {:?}",
+        (0..OUT).map(|r| z2c[(r, 0)]).collect::<Vec<_>>()
+    );
     println!("  max|gpu - cpu| = {max_err:.3e}");
     anyhow::ensure!(max_err < 1e-4, "MLP GPU output diverged from CPU reference");
     println!("OK — GPU MLP (Linear + bias + tanh) matches CPU. tanh kernel verified.");

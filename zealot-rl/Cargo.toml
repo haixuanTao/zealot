@@ -4,41 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# vortx (dimforge's GPU tensor lib) is the chosen stack — unified WebGPU stack
-# shared with nexus; hand-rolled MLP backprop + Adam (vortx has no autograd).
-# It is gated behind the `gpu` feature (off by default) because building vortx
-# compiles rust-gpu shaders via cargo-gpu, which needs a special toolchain. This
-# keeps `cargo check --workspace` green for anyone without that toolchain.
-#
-# vortx 0.1.1 (local clone) — when integrating with nexus/zealot-env later, the
-# vortx version must match whatever nexus settles on (its `cuda` branch uses 0.1).
-[features]
-default = []
-gpu = ["dep:vortx", "dep:khal"]
-
+# The vortx + khal GPU learning stack lives behind the root package's `gpu`
+# feature, where the example programs that exercise it now live. zealot-rl's own
+# src is still a scaffold (just `version()`), so it has no deps yet.
 [dependencies]
-vortx = { path = "../../vortx", optional = true }
-khal = { version = "0.1", features = ["derive", "webgpu"], optional = true }
-
-[dev-dependencies]
-nalgebra = "0.34"
-wgpu = "29"
-async-std = { version = "1", features = ["attributes"] }
-anyhow = "1"
-
-# GPU examples — only built with `--features gpu` (needs the cargo-gpu toolchain).
-[[example]]
-name = "linear_forward"
-required-features = ["gpu"]
-
-[[example]]
-name = "mlp_forward"
-required-features = ["gpu"]
-
-[[example]]
-name = "mlp_backward"
-required-features = ["gpu"]
-
-[[example]]
-name = "train_regression"
-required-features = ["gpu"]

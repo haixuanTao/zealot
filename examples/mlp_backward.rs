@@ -76,17 +76,89 @@ async fn main() -> anyhow::Result<()> {
 
     let mut enc = backend.begin_encoding();
     // forward
-    { let mut p = enc.begin_pass("gemm1", None); gemm.dispatch_naive(&backend, &mut sh, &mut p, &mut z1, &gw1, &gx)?; }
-    { let mut p = enc.begin_pass("bias1", None); op.launch(&backend, &mut sh, &mut p, OpAssignVariant::Add, &mut z1, &gb1)?; }
-    { let mut p = enc.begin_pass("tanh1", None); act.tanh(&backend, &mut sh, &mut p, &mut z1)?; }
-    { let mut p = enc.begin_pass("gemm2", None); gemm.dispatch_naive(&backend, &mut sh, &mut p, &mut z2, &gw2, &z1)?; }
-    { let mut p = enc.begin_pass("bias2", None); op.launch(&backend, &mut sh, &mut p, OpAssignVariant::Add, &mut z2, &gb2)?; }
+    {
+        let mut p = enc.begin_pass("gemm1", None);
+        gemm.dispatch_naive(&backend, &mut sh, &mut p, &mut z1, &gw1, &gx)?;
+    }
+    {
+        let mut p = enc.begin_pass("bias1", None);
+        op.launch(
+            &backend,
+            &mut sh,
+            &mut p,
+            OpAssignVariant::Add,
+            &mut z1,
+            &gb1,
+        )?;
+    }
+    {
+        let mut p = enc.begin_pass("tanh1", None);
+        act.tanh(&backend, &mut sh, &mut p, &mut z1)?;
+    }
+    {
+        let mut p = enc.begin_pass("gemm2", None);
+        gemm.dispatch_naive(&backend, &mut sh, &mut p, &mut z2, &gw2, &z1)?;
+    }
+    {
+        let mut p = enc.begin_pass("bias2", None);
+        op.launch(
+            &backend,
+            &mut sh,
+            &mut p,
+            OpAssignVariant::Add,
+            &mut z2,
+            &gb2,
+        )?;
+    }
     // backward
-    { let mut p = enc.begin_pass("dz2", None); op.launch(&backend, &mut sh, &mut p, OpAssignVariant::Sub, &mut z2, &gt)?; } // z2 = dz2
-    { let mut p = enc.begin_pass("dW2", None); gemm.dispatch_naive(&backend, &mut sh, &mut p, &mut gdw2, &z2, z1.transpose_last_dims())?; } // dz2·a1ᵀ
-    { let mut p = enc.begin_pass("da1", None); gemm.dispatch_naive(&backend, &mut sh, &mut p, &mut gda1, gw2.transpose_last_dims(), &z2)?; } // W2ᵀ·dz2
-    { let mut p = enc.begin_pass("dz1", None); act.tanh_backward(&backend, &mut sh, &mut p, &mut gda1, &z1)?; } // *= 1 - a1²
-    { let mut p = enc.begin_pass("dW1", None); gemm.dispatch_naive(&backend, &mut sh, &mut p, &mut gdw1, &gda1, gx.transpose_last_dims())?; } // dz1·xᵀ
+    {
+        let mut p = enc.begin_pass("dz2", None);
+        op.launch(
+            &backend,
+            &mut sh,
+            &mut p,
+            OpAssignVariant::Sub,
+            &mut z2,
+            &gt,
+        )?;
+    } // z2 = dz2
+    {
+        let mut p = enc.begin_pass("dW2", None);
+        gemm.dispatch_naive(
+            &backend,
+            &mut sh,
+            &mut p,
+            &mut gdw2,
+            &z2,
+            z1.transpose_last_dims(),
+        )?;
+    } // dz2·a1ᵀ
+    {
+        let mut p = enc.begin_pass("da1", None);
+        gemm.dispatch_naive(
+            &backend,
+            &mut sh,
+            &mut p,
+            &mut gda1,
+            gw2.transpose_last_dims(),
+            &z2,
+        )?;
+    } // W2ᵀ·dz2
+    {
+        let mut p = enc.begin_pass("dz1", None);
+        act.tanh_backward(&backend, &mut sh, &mut p, &mut gda1, &z1)?;
+    } // *= 1 - a1²
+    {
+        let mut p = enc.begin_pass("dW1", None);
+        gemm.dispatch_naive(
+            &backend,
+            &mut sh,
+            &mut p,
+            &mut gdw1,
+            &gda1,
+            gx.transpose_last_dims(),
+        )?;
+    } // dz1·xᵀ
     backend.submit(enc)?;
     backend.synchronize()?;
 
@@ -102,7 +174,12 @@ async fn main() -> anyhow::Result<()> {
     println!("MLP backward gradient errors (gpu vs cpu analytic):");
     println!("  dW1 {e_dw1:.3e}   db1 {e_db1:.3e}   dW2 {e_dw2:.3e}   db2 {e_db2:.3e}");
     let worst = e_dw1.max(e_db1).max(e_dw2).max(e_db2);
-    anyhow::ensure!(worst < 1e-4, "GPU gradients diverged from CPU (worst {worst:.3e})");
-    println!("OK — hand-rolled GPU backward matches CPU analytic gradients. Autodiff path verified.");
+    anyhow::ensure!(
+        worst < 1e-4,
+        "GPU gradients diverged from CPU (worst {worst:.3e})"
+    );
+    println!(
+        "OK — hand-rolled GPU backward matches CPU analytic gradients. Autodiff path verified."
+    );
     Ok(())
 }

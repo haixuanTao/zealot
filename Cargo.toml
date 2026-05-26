@@ -10,3 +10,122 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 zealot-env = { path = "zealot-env" }
 zealot-rl = { path = "zealot-rl" }
+
+# The workspace root is also a package: it hosts the runnable examples that
+# exercise the GPU learning stack (vortx + khal). The examples don't depend on
+# zealot-rl yet — they validate the vortx forward/backward/Adam primitives that
+# zealot-rl's policy + PPO will be built on.
+[package]
+name = "zealot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Everything that touches the GPU is gated behind a feature (all off by default)
+# because the dimforge stack — vortx and nexus3d — compiles rust-gpu shaders via
+# cargo-gpu, which needs a special toolchain. Keeping it optional lets
+# `cargo check --workspace` stay green for anyone without that toolchain.
+#
+#   gpu      — vortx (dimforge's GPU tensor lib): hand-rolled MLP forward/backward
+#              + Adam (vortx has no autograd). Used by the tensor examples.
+#   pendulum — nexus3d GPU rigid-body physics + rapier3d (CPU-side scene build).
+#              Used by the pendulum examples under examples/pendulum/.
+#
+# vortx/khal/rapier3d are taken from crates.io but redirected to local dimforge
+# forks by [patch.crates-io] below — the same forks nexus3d is built against.
+[features]
+default = []
+gpu = ["dep:vortx", "dep:khal"]
+pendulum = ["dep:nexus3d", "dep:rapier3d", "dep:pollster", "dep:khal"]
+
+[dependencies]
+vortx = { version = "0.1", optional = true }
+khal = { version = "0.1", features = ["derive", "webgpu"], optional = true }
+nexus3d = { path = "../nexus-cuda/crates/nexus3d", features = ["rbd", "from_rapier"], optional = true }
+rapier3d = { version = "0.32", optional = true }
+pollster = { version = "0.4", optional = true }
+
+[dev-dependencies]
+nalgebra = "0.34"
+wgpu = "29"
+async-std = { version = "1", features = ["attributes"] }
+anyhow = "1"
+
+# Tensor examples — vortx forward/backward/Adam primitives (`--features gpu`).
+[[example]]
+name = "linear_forward"
+required-features = ["gpu"]
+
+[[example]]
+name = "mlp_forward"
+required-features = ["gpu"]
+
+[[example]]
+name = "mlp_backward"
+required-features = ["gpu"]
+
+[[example]]
+name = "train_regression"
+required-features = ["gpu"]
+
+# Pendulum examples — nexus3d GPU rigid-body env (`--features pendulum`). Ported
+# verbatim from nexus-rl's `pendulum_headless` crate; they drive nexus3d directly
+# (not via zealot-env/zealot-rl yet). pendulum_gpu_policy also needs `gpu` (vortx).
+[[example]]
+name = "pendulum_smoke"
+path = "examples/pendulum/pendulum_smoke.rs"
+required-features = ["pendulum"]
+
+[[example]]
+name = "inverted_pendulum"
+path = "examples/pendulum/inverted_pendulum.rs"
+required-features = ["pendulum"]
+
+[[example]]
+name = "pendulum2dof"
+path = "examples/pendulum/pendulum2dof.rs"
+required-features = ["pendulum"]
+
+[[example]]
+name = "pendulum_batch"
+path = "examples/pendulum/pendulum_batch.rs"
+required-features = ["pendulum"]
+
+[[example]]
+name = "pendulum_reset"
+path = "examples/pendulum/pendulum_reset.rs"
+required-features = ["pendulum"]
+
+[[example]]
+name = "pendulum_learn"
+path = "examples/pendulum/pendulum_learn.rs"
+required-features = ["pendulum"]
+
+[[example]]
+name = "pendulum_pg"
+path = "examples/pendulum/pendulum_pg.rs"
+required-features = ["pendulum"]
+
+[[example]]
+name = "pendulum_ppo"
+path = "examples/pendulum/pendulum_ppo.rs"
+required-features = ["pendulum"]
+
+[[example]]
+name = "pendulum_gpu_policy"
+path = "examples/pendulum/pendulum_gpu_policy.rs"
+required-features = ["pendulum", "gpu"]
+
+# Local dimforge forks — mirrors nexus-rl's workspace patch table so nexus3d
+# (and vortx) resolve to the exact sources they're built against there. zealot
+# and nexus-rl are sibling checkouts under the same parent dir, so the relative
+# paths match. Only consulted when a GPU feature pulls these crates into the graph.
+[patch.crates-io]
+khal = { path = "../khal/crates/khal" }
+khal-derive = { path = "../khal/crates/khal-derive" }
+khal-std = { path = "../khal/crates/khal-std" }
+khal-builder = { path = "../khal/crates/khal-builder" }
+vortx = { path = "../vortx" }
+vortx-shaders = { path = "../vortx/vortx-shaders" }
+parry3d = { path = "../parry/crates/parry3d" }
+rapier3d = { path = "../rapier/crates/rapier3d" }

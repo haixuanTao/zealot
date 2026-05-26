@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: reject badly formatted code and compiler warnings.
+#
+# Enabled per-clone with:  git config core.hooksPath .githooks
+#
+# Scope notes:
+#   * fmt is run with explicit -p flags for the workspace members only.
+#     `cargo fmt --all` would also reach into the ../vortx path dependency
+#     (an external clone), which we must not touch.
+#   * check runs with default features. The `gpu` feature is intentionally
+#     off — it needs the cargo-gpu toolchain and pulls in vortx. The
+#     gpu-gated examples are skipped automatically via required-features.
+#   * RUSTFLAGS="-D warnings" turns every warning into a hard error.
+#
+set -euo pipefail
+
+# Workspace packages to format-check (keep in sync with Cargo.toml members).
+PKGS=(-p zealot -p zealot-env -p zealot-rl)
+
+echo "pre-commit: checking formatting (rustfmt)..."
+if ! cargo fmt --check "${PKGS[@]}"; then
+    echo
+    echo "✗ Formatting check failed. Fix it with:"
+    echo "    cargo fmt ${PKGS[*]}"
+    exit 1
+fi
+
+echo "pre-commit: checking for warnings (cargo check)..."
+if ! RUSTFLAGS="-D warnings" cargo check --workspace --all-targets; then
+    echo
+    echo "✗ cargo check failed (warnings are treated as errors)."
+    echo "  Fix the warnings/errors above, then commit again."
+    exit 1
+fi
+
+echo "pre-commit: ok"

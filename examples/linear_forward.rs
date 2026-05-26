@@ -8,8 +8,8 @@
 //! the nonlinearity (tanh) is the next step and needs a small custom rust-gpu kernel,
 //! because vortx 0.1 has no activation ops.
 
-use khal::Shader;
 use khal::BufferUsages;
+use khal::Shader;
 use khal::backend::{Backend, Encoder, GpuBackend, WebGpu};
 use nalgebra::DMatrix;
 use vortx::linalg::Gemm;
