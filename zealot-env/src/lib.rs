@@ -7,16 +7,25 @@
 //! ~10-line nexus patch).
 //!
 //! Modules:
-//! - `config` — the [`EnvConfig`] task interface (the MDP contract). **Implemented.**
+//! - `config` — the generic [`EnvConfig`] task interface (the MDP contract).
+//! - `math`   — dependency-free vec/quat helpers used by the MDP.
+//! - `rng`    — a small deterministic LCG for command / domain sampling.
+//! - `robots` — robot asset specs (pure data); currently the LeRobot bipedal.
+//! - `tasks`  — concrete task MDPs; currently flat velocity tracking.
 //!
 //! Planned (built incrementally):
 //! - `env`     — vectorized runtime: `reset()`, `step(actions) -> (obs, reward, done)`,
 //!               driving nexus's batched pipeline across all parallel environments.
-//! - `command` — command sampling (e.g. target base velocities).
 
 pub mod config;
+pub mod math;
+pub mod rng;
+pub mod robots;
+pub mod tasks;
 
 pub use config::{BodyState, EnvConfig};
+pub use robots::LeRobotBipedal;
+pub use tasks::VelocityFlatTask;
 
 /// Crate version — used to sanity-check that the workspace links.
 pub fn version() -> &'static str {

@@ -37,13 +37,27 @@ license.workspace = true
 default = []
 gpu = ["dep:vortx", "dep:khal"]
 pendulum = ["dep:nexus3d", "dep:rapier3d", "dep:pollster", "dep:khal"]
+# biped — the LeRobot bipedal on nexus GPU physics + the URDF loader
+# (rapier3d-urdf, stl meshes → cheap Obb colliders). Used by the GPU biped examples.
+biped = ["pendulum", "dep:rapier3d-urdf", "dep:zealot-env"]
+# cpu — the LeRobot bipedal on rapier's CPU multibody (mature floating-base +
+# contacts). No nexus / cargo-gpu needed, so it builds and runs on any machine.
+# Includes the MuJoCo-XML model loader (roxmltree) — the curated standing model.
+cpu = ["dep:rapier3d", "dep:rapier3d-urdf", "dep:zealot-env", "dep:zealot-rl", "dep:roxmltree", "dep:rayon"]
+# biped_gpu — retry the biped on nexus GPU physics, built from the MJCF model.
+biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env"]
 
 [dependencies]
 vortx = { version = "0.1", optional = true }
 khal = { version = "0.1", features = ["derive", "webgpu"], optional = true }
 nexus3d = { path = "../nexus-cuda/crates/nexus3d", features = ["rbd", "from_rapier"], optional = true }
 rapier3d = { version = "0.32", optional = true }
+rapier3d-urdf = { path = "../rapier/crates/rapier3d-urdf", features = ["stl"], optional = true }
+roxmltree = { version = "0.20", optional = true }
+rayon = { version = "1", optional = true }
 pollster = { version = "0.4", optional = true }
+zealot-env = { workspace = true, optional = true }
+zealot-rl = { workspace = true, optional = true }
 
 [dev-dependencies]
 nalgebra = "0.34"
@@ -116,6 +130,42 @@ name = "pendulum_gpu_policy"
 path = "examples/pendulum/pendulum_gpu_policy.rs"
 required-features = ["pendulum", "gpu"]
 
+# Biped examples — the LeRobot bipedal on nexus (`--features biped`).
+[[example]]
+name = "biped_smoke"
+path = "examples/biped/biped_smoke.rs"
+required-features = ["biped"]
+
+# CPU biped — rapier multibody, no GPU toolchain (`--features cpu`).
+[[example]]
+name = "biped_smoke_cpu"
+path = "examples/biped/biped_smoke_cpu.rs"
+required-features = ["cpu"]
+
+# CPU biped from the curated MuJoCo XML model (`--features cpu`).
+[[example]]
+name = "biped_mjcf"
+path = "examples/biped/biped_mjcf.rs"
+required-features = ["cpu"]
+
+# Train flat velocity tracking on the CPU MJCF biped (`--features cpu`).
+[[example]]
+name = "biped_train"
+path = "examples/biped/biped_train.rs"
+required-features = ["cpu"]
+
+# Record a deterministic rollout to JSON for rendering (`--features cpu`).
+[[example]]
+name = "biped_render"
+path = "examples/biped/biped_render.rs"
+required-features = ["cpu"]
+
+# Retry: biped on nexus GPU physics from the MJCF model (`--features biped_gpu`).
+[[example]]
+name = "biped_nexus"
+path = "examples/biped/biped_nexus.rs"
+required-features = ["biped_gpu"]
+
 # Local dimforge forks — mirrors nexus-rl's workspace patch table so nexus3d
 # (and vortx) resolve to the exact sources they're built against there. zealot
 # and nexus-rl are sibling checkouts under the same parent dir, so the relative
@@ -129,3 +179,16 @@ vortx = { path = "../vortx" }
 vortx-shaders = { path = "../vortx/vortx-shaders" }
 parry3d = { path = "../parry/crates/parry3d" }
 rapier3d = { path = "../rapier/crates/rapier3d" }
+
+# Probe rapier foot–ground contact (`--features cpu`).
+[[example]]
+name = "biped_footcheck"
+path = "examples/biped/biped_footcheck.rs"
+required-features = ["cpu"]
+
+# Minimal physics-only repro for dimforge/rapier#934 — drop a foot-shaped box at
+# various edge/corner tilts and observe whether it tips flat under gravity.
+[[example]]
+name = "foot_tip_stability"
+path = "examples/biped/foot_tip_stability.rs"
+required-features = ["cpu"]

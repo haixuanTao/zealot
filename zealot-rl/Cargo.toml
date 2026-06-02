@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The vortx + khal GPU learning stack lives behind the root package's `gpu`
-# feature, where the example programs that exercise it now live. zealot-rl's own
-# src is still a scaffold (just `version()`), so it has no deps yet.
 [dependencies]
+# Data-parallel PPO minibatch gradient accumulation (the CPU update bottleneck).
+rayon = "1"
