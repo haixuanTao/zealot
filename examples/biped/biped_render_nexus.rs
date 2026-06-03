@@ -176,17 +176,22 @@ fn main() {
                 println!("resuming from existing checkpoint {policy_path}...");
                 ActorCritic::load(&policy_path).expect("load checkpoint")
             } else {
-                // Wider net + extra hidden — closer to the deployed rsl_rl preset.
+                // Matches WBC-AGILE T1 velocity policy exactly: asymmetric net
+                // (actor smaller, privileged critic wider), `init_noise_std=1.0`,
+                // lr 1e-3 with adaptive-KL schedule.
                 ActorCritic::new(
-                    &[obs_dim, 512, 256, 128, act_dim],
+                    &[obs_dim, 256, 256, 128, act_dim],
                     &[critic_dim, 512, 256, 128, 1],
-                    0.5,
-                    5e-4,
+                    1.0,
+                    1e-3,
                     &mut rng,
                 )
             };
-            // rsl_rl-style: adaptive-KL LR, real entropy bonus.
-            let cfg = PpoConfig::default();
+            // rsl_rl-style: adaptive-KL LR, entropy bonus at WBC-AGILE's 0.005.
+            let cfg = PpoConfig {
+                entropy_coef: 0.005,
+                ..PpoConfig::default()
+            };
             println!("training for {train_iters} iters on nexus GPU...");
             train(
                 &mut ac,
@@ -229,13 +234,15 @@ fn main() {
 
         for step in 0..rollout_steps {
             // Snapshot BEFORE stepping so we record the current pose, then act.
-            // Body positions come from body_poses (correct at step 0); joint
-            // angles come from ws.coords (integrated by the previous step's FK).
-            let (ws, poses) = env.snapshot().await;
+            // Both body positions and joint angles come from `body_poses` now
+            // — `joint_angles_for` derives them via parent⇄child relative
+            // rotation (the heavy `links_workspace` readback was removed when
+            // the step path was switched to the same poses-only path).
+            let poses = env.snapshot().await;
             frames.push(env.body_positions_for(0, &poses));
             let (p, q) = env.base_pose_for(0, &poses);
             bases.push([p[0], p[1], p[2], q[0], q[1], q[2], q[3]]);
-            joints.push(env.joint_angles_for(0, &ws));
+            joints.push(env.joint_angles_for(0, &poses));
 
             // Mean (noise-free) action for env 0.
             let mean = ac.mean(&cur[0]);
