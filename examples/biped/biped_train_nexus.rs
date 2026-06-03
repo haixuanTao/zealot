@@ -32,6 +32,11 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
+    // 3rd arg: where to save the trained policy (safetensors). Pass an empty
+    // string to skip saving.
+    let policy_path = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "/tmp/biped_policy_nexus.safetensors".to_string());
 
     let xml = std::fs::read_to_string(default_mjcf_path()).expect("read mjcf");
     println!("building {num_envs} envs (batched on one GpuPhysicsState)...");
@@ -44,18 +49,16 @@ fn main() {
         println!("obs={obs_dim} critic_obs={critic_dim} action={act_dim}");
 
         let mut rng = Lcg::new(7);
+        // Wider net + extra hidden — closer to the deployed rsl_rl preset.
         let mut ac = ActorCritic::new(
-            &[obs_dim, 256, 128, act_dim],
-            &[critic_dim, 256, 128, 1],
+            &[obs_dim, 512, 256, 128, act_dim],
+            &[critic_dim, 512, 256, 128, 1],
             0.5,
             5e-4,
             &mut rng,
         );
-        let cfg = PpoConfig {
-            adaptive_lr: false,
-            entropy_coef: 0.005,
-            ..PpoConfig::default()
-        };
+        // rsl_rl-style: adaptive-KL LR, real entropy bonus.
+        let cfg = PpoConfig::default();
 
         let (mut cur, mut cur_c) = env.initial_obs().await;
 
@@ -152,6 +155,12 @@ fn main() {
                     torso_sum / num_envs as f32,
                 );
             }
+        }
+        // Persist the trained policy so it can be replayed later (CPU rollout,
+        // multi-pose eval, Python analysis via the safetensors lib, etc.).
+        if !policy_path.is_empty() {
+            ac.save(&policy_path).expect("save policy");
+            println!("saved policy → {policy_path}");
         }
     });
 }

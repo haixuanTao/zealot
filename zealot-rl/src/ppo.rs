@@ -122,6 +122,16 @@ impl Normalizer {
         }
     }
 
+    /// Rebuild a normalizer directly from saved Welford state (used by `load`).
+    pub fn from_state(mean: Vec<f32>, m2: Vec<f32>, count: f32) -> Self {
+        Self { mean, m2, count }
+    }
+
+    /// Immutable view of the Welford state (used by `save`).
+    pub fn state(&self) -> (&[f32], &[f32], f32) {
+        (&self.mean, &self.m2, self.count)
+    }
+
     /// Fold one observation into the running statistics.
     pub fn update(&mut self, x: &[f32]) {
         self.count += 1.0;
@@ -446,6 +456,165 @@ impl ActorCritic {
             self.log_std[k] = (self.log_std[k] - step).clamp(-1.6f32, 1.0);
         }
     }
+
+    /// Serialise the policy to a `.safetensors` file — HuggingFace's standard
+    /// model-weights format. Loadable cross-language from Python via the
+    /// `safetensors` package, with type+shape metadata in the JSON header.
+    /// Saves actor + critic networks, `log_std`, both Welford normalizers, and
+    /// `lr`. Adam optimizer state is NOT saved (re-initialised on load), so the
+    /// file is evaluation-ready but resuming training loses adaptive momentum.
+    ///
+    /// Tensor layout (all `f32`):
+    /// - `actor.w_{l}`  shape `[out, in]`, row-major (per-layer, l = 0..L-1)
+    /// - `actor.b_{l}`  shape `[out]`
+    /// - `critic.w_{l}` / `critic.b_{l}` — same pattern
+    /// - `log_std`            shape `[act_dim]`
+    /// - `obs_norm.mean`      shape `[obs_dim]`
+    /// - `obs_norm.m2`        shape `[obs_dim]`
+    /// - `obs_norm.count`     shape `[1]`
+    /// - `critic_norm.mean` / `.m2` / `.count` — same pattern
+    /// - `lr`                  shape `[1]`
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        use safetensors::tensor::{Dtype, TensorView};
+        // Scalars need to live until after `serialize` so the views' borrows
+        // stay valid — bind them up-front.
+        let (obs_mean, obs_m2, obs_count) = self.obs_norm.state();
+        let (crit_mean, crit_m2, crit_count) = self.critic_norm.state();
+        let obs_count_arr = [obs_count];
+        let crit_count_arr = [crit_count];
+        let lr_arr = [self.lr];
+
+        let mut tensors: Vec<(String, TensorView)> = Vec::new();
+        // Actor + critic layers.
+        for (prefix, mlp) in [("actor", &self.actor), ("critic", &self.critic)] {
+            for l in 0..mlp.dims.len() - 1 {
+                let (in_d, out_d) = (mlp.dims[l], mlp.dims[l + 1]);
+                tensors.push((
+                    format!("{prefix}.w_{l}"),
+                    TensorView::new(Dtype::F32, vec![out_d, in_d], f32_bytes(&mlp.w[l]))
+                        .map_err(io_err)?,
+                ));
+                tensors.push((
+                    format!("{prefix}.b_{l}"),
+                    TensorView::new(Dtype::F32, vec![out_d], f32_bytes(&mlp.b[l]))
+                        .map_err(io_err)?,
+                ));
+            }
+        }
+        // 1-D tensors.
+        for (name, slice) in [
+            ("log_std", self.log_std.as_slice()),
+            ("obs_norm.mean", obs_mean),
+            ("obs_norm.m2", obs_m2),
+            ("obs_norm.count", obs_count_arr.as_slice()),
+            ("critic_norm.mean", crit_mean),
+            ("critic_norm.m2", crit_m2),
+            ("critic_norm.count", crit_count_arr.as_slice()),
+            ("lr", lr_arr.as_slice()),
+        ] {
+            tensors.push((
+                name.into(),
+                TensorView::new(Dtype::F32, vec![slice.len()], f32_bytes(slice)).map_err(io_err)?,
+            ));
+        }
+
+        let bytes = safetensors::serialize(tensors, &None).map_err(io_err)?;
+        std::fs::write(path, &bytes)
+    }
+
+    /// Load a policy previously written by [`save`]. Adam state is reinitialised.
+    pub fn load(path: &str) -> std::io::Result<Self> {
+        use safetensors::SafeTensors;
+        let bytes = std::fs::read(path)?;
+        let st = SafeTensors::deserialize(&bytes).map_err(io_err)?;
+        // Read an Mlp by scanning `<prefix>.w_{l}` and `<prefix>.b_{l}` for
+        // contiguous l starting at 0. `dims` is reconstructed from the shapes.
+        let read_mlp = |prefix: &str| -> std::io::Result<Mlp> {
+            let mut w = Vec::new();
+            let mut b = Vec::new();
+            let mut dims: Vec<usize> = Vec::new();
+            for l in 0usize.. {
+                let wn = format!("{prefix}.w_{l}");
+                let bn = format!("{prefix}.b_{l}");
+                let Ok(tw) = st.tensor(&wn) else { break };
+                let tb = st.tensor(&bn).map_err(io_err)?;
+                let sh = tw.shape();
+                if sh.len() != 2 {
+                    return Err(io_err_msg(format!("{wn}: expected 2D, got {sh:?}")));
+                }
+                if l == 0 {
+                    dims.push(sh[1]);
+                }
+                dims.push(sh[0]);
+                w.push(bytes_to_f32(tw.data()));
+                b.push(bytes_to_f32(tb.data()));
+            }
+            if w.is_empty() {
+                return Err(io_err_msg(format!("no layers under prefix `{prefix}`")));
+            }
+            Ok(Mlp { dims, w, b })
+        };
+        let actor = read_mlp("actor")?;
+        let critic = read_mlp("critic")?;
+        let read_vec = |name: &str| -> std::io::Result<Vec<f32>> {
+            Ok(bytes_to_f32(st.tensor(name).map_err(io_err)?.data()))
+        };
+        let read_scalar = |name: &str| -> std::io::Result<f32> { Ok(read_vec(name)?[0]) };
+        let log_std = read_vec("log_std")?;
+        let obs_norm = Normalizer::from_state(
+            read_vec("obs_norm.mean")?,
+            read_vec("obs_norm.m2")?,
+            read_scalar("obs_norm.count")?,
+        );
+        let critic_norm = Normalizer::from_state(
+            read_vec("critic_norm.mean")?,
+            read_vec("critic_norm.m2")?,
+            read_scalar("critic_norm.count")?,
+        );
+        let lr = read_scalar("lr")?;
+        let opt_actor = Adam::new(&actor);
+        let opt_critic = Adam::new(&critic);
+        let m_logstd = vec![0.0; log_std.len()];
+        let v_logstd = vec![0.0; log_std.len()];
+        Ok(Self {
+            actor,
+            critic,
+            log_std,
+            obs_norm,
+            critic_norm,
+            opt_actor,
+            opt_critic,
+            m_logstd,
+            v_logstd,
+            t_logstd: 0,
+            lr,
+        })
+    }
+}
+
+// --- safetensors helpers used only by ActorCritic::save / load. ---
+
+/// Reinterpret an `f32` slice as the equivalent little-endian byte slice. Safe
+/// on every platform Rust targets in practice (`f32` has fixed 4-byte layout).
+fn f32_bytes(v: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// Inverse of [`f32_bytes`]: decode a little-endian byte slice into `f32`s.
+fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(b.len() / 4);
+    for chunk in b.chunks_exact(4) {
+        out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    out
+}
+
+fn io_err<E: std::fmt::Debug>(e: E) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
+}
+
+fn io_err_msg(s: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, s)
 }
 
 /// GAE(λ) advantages and returns for one trajectory (`rewards`, `values`,
@@ -491,6 +660,43 @@ mod tests {
         assert!((ret[0] - 3.0).abs() < 1e-6);
         assert!((adv[0] - 3.0).abs() < 1e-6);
         assert!((adv[1] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn actor_critic_save_load_roundtrips() {
+        // Build a small actor-critic, feed in some normalizer updates, then save +
+        // load and verify the loaded policy produces bit-identical actions and the
+        // loaded normalizer produces bit-identical normalize() output.
+        let mut rng = Lcg::new(7);
+        let mut ac = ActorCritic::new(&[4, 8, 8, 2], &[6, 8, 1], 0.3, 1e-3, &mut rng);
+        // Push some data through the normalizers so their state isn't trivial.
+        for k in 0..20 {
+            let obs: Vec<f32> = (0..4).map(|j| ((k + j) as f32).sin()).collect();
+            let cobs: Vec<f32> = (0..6).map(|j| ((k * 3 + j) as f32).cos()).collect();
+            ac.record_obs(&obs, &cobs);
+        }
+        // Capture reference outputs at a few inputs.
+        let probes: Vec<Vec<f32>> = (0..3)
+            .map(|k| (0..4).map(|j| ((k * 7 + j) as f32).tanh()).collect())
+            .collect();
+        let before: Vec<Vec<f32>> = probes.iter().map(|p| ac.mean(p)).collect();
+        // Save → load.
+        let path = format!("/tmp/zealot_rl_roundtrip_{}.bin", std::process::id());
+        ac.save(&path).expect("save");
+        let ac2 = ActorCritic::load(&path).expect("load");
+        std::fs::remove_file(&path).ok();
+        // Loaded policy should produce IDENTICAL outputs (no numeric drift —
+        // weights are byte-for-byte the same).
+        for (probe, ref_out) in probes.iter().zip(before.iter()) {
+            let after = ac2.mean(probe);
+            assert_eq!(after.len(), ref_out.len());
+            for (a, b) in after.iter().zip(ref_out.iter()) {
+                assert!((a - b).abs() < 1e-9, "actor mean diverged after load");
+            }
+        }
+        // log_std and lr survive.
+        assert_eq!(ac.log_std, ac2.log_std);
+        assert_eq!(ac.lr, ac2.lr);
     }
 
     #[test]

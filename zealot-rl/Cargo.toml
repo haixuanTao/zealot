@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 # Data-parallel PPO minibatch gradient accumulation (the CPU update bottleneck).
 rayon = "1"
+# Standard model-weights format (HuggingFace-maintained, JSON header + raw bytes).
+# Used for ActorCritic::save / load — cross-language readable from Python via
+# `safetensors`/`torch`, type+shape metadata is in the header.
+safetensors = "0.4"

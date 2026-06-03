@@ -131,6 +131,11 @@ fn main() {
     let out = std::env::args()
         .nth(3)
         .unwrap_or_else(|| "/tmp/biped_rollout_nexus.json".to_string());
+    // 4th arg: policy safetensors path. If `train_iters > 0`, train and save
+    // here. If `train_iters == 0`, load and skip training (fast re-rollouts).
+    let policy_path = std::env::args()
+        .nth(4)
+        .unwrap_or_else(|| "/tmp/biped_policy_nexus.safetensors".to_string());
 
     let xml = std::fs::read_to_string(default_mjcf_path()).expect("read mjcf");
     let mut rng = Lcg::new(7);
@@ -148,21 +153,28 @@ fn main() {
 
         let (obs_dim, critic_dim, act_dim) =
             (env.obs_dim(), env.critic_obs_dim(), env.action_dim());
-        let mut ac = ActorCritic::new(
-            &[obs_dim, 256, 128, act_dim],
-            &[critic_dim, 256, 128, 1],
-            0.5,
-            5e-4,
-            &mut rng,
-        );
-        let cfg = PpoConfig {
-            adaptive_lr: false,
-            entropy_coef: 0.005,
-            ..PpoConfig::default()
+        let mut ac = if train_iters > 0 {
+            // Wider net + extra hidden — closer to the deployed rsl_rl preset.
+            let mut ac = ActorCritic::new(
+                &[obs_dim, 512, 256, 128, act_dim],
+                &[critic_dim, 512, 256, 128, 1],
+                0.5,
+                5e-4,
+                &mut rng,
+            );
+            // rsl_rl-style: adaptive-KL LR, real entropy bonus.
+            let cfg = PpoConfig::default();
+            println!("training for {train_iters} iters on nexus GPU...");
+            train(&mut ac, &mut env, &cfg, &mut rng, train_iters).await;
+            ac.save(&policy_path).expect("save policy");
+            println!("saved policy → {policy_path}");
+            ac
+        } else {
+            println!("loading policy from {policy_path}...");
+            ActorCritic::load(&policy_path).expect("load policy")
         };
-
-        println!("training for {train_iters} iters on nexus GPU...");
-        train(&mut ac, &mut env, &cfg, &mut rng, train_iters).await;
+        // Suppress the now-unused `act_dim` / `obs_dim` warning when train_iters=0.
+        let _ = (obs_dim, critic_dim, act_dim);
 
         // Recording rollout: reset env 0 to the DR-OFF template + pin command
         // forward, then step deterministically (mean action) and record state.
