@@ -25,20 +25,23 @@ HOME = os.path.expanduser("~")
 XML = f"{HOME}/Documents/work/lerobot-humanoid-design/to_real_robot/RL_policy/robot.xml"
 ASSETS = f"{HOME}/Documents/work/lerobot-humanoid-design/urdf/bipedal_plateform/urdf/assets"
 
-# Rapier-side PD gains (per zealot-env/src/robots/lerobot_bipedal.rs JOINT_GAINS table).
+# Rapier-side PD gains + per-joint effort limits (rapier caps PD output via
+# `set_motor_max_force`, see biped_env.rs:257). We MUST mirror this cap in
+# MuJoCo's actuator `forcerange`, otherwise MuJoCo's PD can apply unbounded
+# torque the rapier-trained policy never had to deal with.
 GAINS = {
-    "hipz": (30, 3),
-    "hipx": (40, 3),
-    "hipy": (60, 4),
-    "knee": (60, 4),
-    "ankley": (20, 1.5),
-    "anklex": (20, 1.5),
+    "hipz":   (30, 3,   88),
+    "hipx":   (40, 3,   88),
+    "hipy":   (60, 4,   88),
+    "knee":   (60, 4,   88),
+    "ankley": (20, 1.5, 44),
+    "anklex": (20, 1.5, 44),
 }
 
 def pick_gain(joint_name: str):
-    for prefix, kd in GAINS.items():
+    for prefix, gains in GAINS.items():
         if joint_name.startswith(prefix):
-            return kd
+            return gains
     raise ValueError(f"no gain for {joint_name}")
 
 
@@ -61,8 +64,12 @@ def build_model_with_actuators(joint_names):
     # Insert a position actuator per joint with the matching PD gains.
     actuator_xml = "<actuator>\n"
     for jn in joint_names:
-        kp, kd = pick_gain(jn)
-        actuator_xml += f'    <position name="act_{jn}" joint="{jn}" kp="{kp}" kv="{kd}"/>\n'
+        kp, kd, eff = pick_gain(jn)
+        # `forcerange` enforces the same per-joint torque cap rapier applies.
+        actuator_xml += (
+            f'    <position name="act_{jn}" joint="{jn}" kp="{kp}" kv="{kd}" '
+            f'forcerange="-{eff} {eff}"/>\n'
+        )
     actuator_xml += "  </actuator>\n"
     xml = xml.replace("</mujoco>", f"  {actuator_xml}</mujoco>")
     return mujoco.MjModel.from_xml_string(xml)
@@ -105,8 +112,25 @@ def main():
     mj_base[0] = base[0]
     mj_joints[0] = joints[0]
 
+    # Mirror rapier's resets in MuJoCo too — at each reset step, re-initialise
+    # MuJoCo's qpos/qvel to the rapier post-reset standing pose. This gives four
+    # independent "attempts" of MuJoCo following the rapier joint trajectory from
+    # the same starting conditions the rapier env had, instead of one continuous
+    # 8-second run that decays into a fallen-robot playback after the first fall.
+    resets_set = set(roll.get("resets", []))
+    print(f"  rapier resets at steps: {sorted(resets_set)} (will mirror in MuJoCo)")
     fell_at = None
     for t in range(1, T):
+        # Re-init MuJoCo when rapier reset — use rapier's post-reset pose.
+        if (t - 1) in resets_set:
+            p = base[t, :3]
+            qx, qy, qz, qw = base[t, 3:7]
+            data.qpos[free_adr : free_adr + 3] = p
+            data.qpos[free_adr + 3 : free_adr + 7] = [qw, qx, qy, qz]
+            for k, n in enumerate(jnames):
+                data.qpos[hinge_adr[n]] = joints[t, k]
+            data.qvel[:] = 0.0
+            mujoco.mj_forward(model, data)
         for k, n in enumerate(jnames):
             data.ctrl[actuator_id[n]] = joints[t, k]
         # Step physics `decim` times per control step (matching rapier).
@@ -117,7 +141,7 @@ def main():
         mj_base[t] = [pos[0], pos[1], pos[2], quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
         for k, n in enumerate(jnames):
             mj_joints[t, k] = data.qpos[hinge_adr[n]]
-        # Track when MuJoCo's torso drops below 0.40 m (= "fell" in our rapier env).
+        # Track first MuJoCo fall (regardless of subsequent resets).
         if fell_at is None and pos[2] < 0.40:
             fell_at = t * dt_ctrl
 

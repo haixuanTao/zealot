@@ -65,20 +65,17 @@ data = mujoco.MjData(model)
 free_adr = model.joint("torso_subassembly_freejoint").qposadr[0]
 hinge_adr = {n: int(model.joint(n).qposadr[0]) for n in jnames}
 
-# STATIC, FLAT tripod camera (optional azimuth override in deg). It does NOT move
-# and does NOT tilt — fixed lookat framing the whole walk path, elevation 0
-# (horizontal / eye-level), so the robot simply walks across a still frame.
+# STATIC, FLAT tripod camera with HARD-CODED framing so two rollouts rendered with
+# this script (e.g. rapier vs MuJoCo) are directly comparable frame-for-frame —
+# the camera does not adapt to the trajectory of each rollout. Optional 3rd arg
+# overrides the azimuth in degrees.
 AZIMUTH = float(sys.argv[3]) if len(sys.argv) > 3 else 90.0
-cx = float((base[:, 0].min() + base[:, 0].max()) / 2)
-cy = float((base[:, 1].min() + base[:, 1].max()) / 2)
-span = float(max(np.ptp(base[:, 0]), np.ptp(base[:, 1])))
-
 renderer = mujoco.Renderer(model, height=H, width=W)
 cam = mujoco.MjvCamera()
-cam.distance = max(3.0, span * 1.4 + 2.0)  # far enough to frame the whole walk
-cam.elevation = 0.0  # absolutely flat (horizontal)
+cam.distance = 3.0      # fixed for both rollouts
+cam.elevation = 0.0     # absolutely flat (horizontal)
 cam.azimuth = AZIMUTH
-cam.lookat[:] = [cx, cy, 0.45]  # fixed — does not follow the robot
+cam.lookat[:] = [0.0, 0.0, 0.45]  # fixed at origin — does not follow the robot
 
 frames_dir = os.path.join(tmp, "frames")
 os.makedirs(frames_dir)

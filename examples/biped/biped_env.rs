@@ -345,6 +345,14 @@ pub struct BipedEnv {
     foot_sole_local: [Vec3; NUM_FEET],
     /// Domain randomization config (applied at every reset + every step).
     randomization: Randomization,
+    /// If `Some(yaw)`, every reset (including in-rollout restarts after a fall)
+    /// spawns at this exact yaw, overriding `randomization.spawn_yaw_range`. Used
+    /// for reproducible multi-pose rollouts.
+    pinned_yaw: Option<f32>,
+    /// If `Some`, these per-joint angle offsets are applied after every reset,
+    /// so post-fall restarts return to the SAME perturbed pose. Free root joint
+    /// is left untouched. Used for multi-pose rollouts.
+    pinned_joint_offsets: Option<[f32; NUM_JOINTS]>,
     /// Step at which the next random push impulse fires (`u32::MAX` = none queued).
     push_at: u32,
     gravity: Vec3,
@@ -450,6 +458,8 @@ impl BipedEnv {
             air_time: [0.0; NUM_FEET],
             foot_sole_local,
             randomization: Randomization::default(),
+            pinned_yaw: None,
+            pinned_joint_offsets: None,
             push_at: u32::MAX,
             gravity: Vec3::new(0.0, 0.0, -9.81),
             ip,
@@ -485,6 +495,52 @@ impl BipedEnv {
         &self.randomization
     }
 
+    /// Pin the spawn yaw to a specific value (rad). Every subsequent `reset_full`
+    /// uses this exact yaw, ignoring `randomization.spawn_yaw_range`. Pass `None`
+    /// (via [`unpin_yaw`]) to return to the DR-driven yaw.
+    pub fn pin_yaw(&mut self, yaw: f32) {
+        self.pinned_yaw = Some(yaw);
+    }
+
+    /// Clear the pinned yaw (restore DR-driven yaw sampling at reset).
+    pub fn unpin_yaw(&mut self) {
+        self.pinned_yaw = None;
+    }
+
+    /// Pin per-joint initial angle offsets — applied after every reset (incl.
+    /// post-fall restarts) so multi-pose rollouts stay at the chosen pose.
+    pub fn pin_joint_offsets(&mut self, offsets: [f32; NUM_JOINTS]) {
+        self.pinned_joint_offsets = Some(offsets);
+    }
+
+    /// Clear the pinned joint offsets (reset returns to MJCF default pose).
+    pub fn unpin_joint_offsets(&mut self) {
+        self.pinned_joint_offsets = None;
+    }
+
+    /// Add per-joint angle offsets (rad) to the multibody's current pose, then
+    /// re-run forward kinematics so the link rigid-body world transforms match.
+    /// Call after [`reset_full`] to start the rollout from a non-default joint
+    /// configuration. The free root joint is left untouched.
+    pub fn perturb_initial_joints(&mut self, offsets: &[f32; NUM_JOINTS]) {
+        let world = &mut self.world;
+        let torso = world.torso;
+        let Some(link) = world.multibody.rigid_body_link(torso).copied() else {
+            return;
+        };
+        if let Some(mb) = world.multibody.get_multibody_mut(link.multibody) {
+            // Displacement vector: 6 free-joint DOFs (zero) + NUM_JOINTS hinge offsets,
+            // in the same canonical joint order the env's `joints` field uses.
+            let mut disp = vec![0.0_f32; mb.ndofs()];
+            for k in 0..NUM_JOINTS {
+                disp[6 + k] = offsets[k];
+            }
+            mb.apply_displacements(&disp);
+            mb.forward_kinematics(&world.bodies, true);
+            mb.update_rigid_bodies(&mut world.bodies, true);
+        }
+    }
+
     /// Pin the velocity command (e.g. for a clean straight-walk demo): every
     /// resample/reset returns exactly `(vx, vy, yaw)`, no standing, no turning.
     pub fn pin_command(&mut self, vx: f32, vy: f32, yaw: f32) {
@@ -516,8 +572,10 @@ impl BipedEnv {
     /// Like [`reset`](Self::reset) but returns both the policy and critic obs.
     pub fn reset_full(&mut self) -> (Vec<f32>, Vec<f32>) {
         let dr = self.randomization;
-        // Spawn yaw — uniformly sampled in [-range, +range].
-        let yaw = if dr.spawn_yaw_range > 0.0 {
+        // Spawn yaw — pinned value wins; otherwise uniformly sampled in [-range, +range].
+        let yaw = if let Some(y) = self.pinned_yaw {
+            y
+        } else if dr.spawn_yaw_range > 0.0 {
             self.rng.range(-dr.spawn_yaw_range, dr.spawn_yaw_range)
         } else {
             0.0
@@ -564,6 +622,10 @@ impl BipedEnv {
         self.last_action = [0.0; NUM_JOINTS];
         self.prev_action = [0.0; NUM_JOINTS];
         self.air_time = [0.0; NUM_FEET];
+        // Apply pinned joint offsets (multi-pose rollout) before observing.
+        if let Some(offsets) = self.pinned_joint_offsets {
+            self.perturb_initial_joints(&offsets);
+        }
         let mut state = self.read_state();
         state.feet = self.update_feet();
         let mut obs = vec![0.0; OBS_DIM];

@@ -678,7 +678,8 @@ impl BipedNexusBatchEnv {
         let prev_joint_pos = vec![[0.0f32; NUM_JOINTS]; num_envs];
         let has_prev_joint_pos = vec![false; num_envs];
         // One pose entry per collider per env (matches `body_poses` layout).
-        let prev_body_poses = vec![NexusPose::default(); num_envs * idx.colliders_per_batch as usize];
+        let prev_body_poses =
+            vec![NexusPose::default(); num_envs * idx.colliders_per_batch as usize];
         let has_prev_pose = vec![false; num_envs];
         let rng: Vec<Lcg> = (0..num_envs)
             .map(|e| Lcg::new(seed ^ ((e as u64).wrapping_mul(2654435761))))
@@ -1061,8 +1062,7 @@ impl BipedNexusBatchEnv {
                 let (feet, new_air) = self.compute_feet_from_poses(e, &poses);
                 let (mut state, new_joint_pos) = self.read_state_from_poses(e, &poses);
                 state.feet = feet;
-                let fell =
-                    self.task.fell_over(&state.base) || !state.base.height.is_finite();
+                let fell = self.task.fell_over(&state.base) || !state.base.height.is_finite();
                 let mut reward = self.task.reward(&state, &self.cmd[e]).total();
                 if fell {
                     reward += self.task.weights.termination;

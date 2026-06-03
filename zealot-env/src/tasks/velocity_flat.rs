@@ -197,8 +197,11 @@ impl Default for CommandSampler {
     fn default() -> Self {
         // From the deployed Mjlab-Velocity-Flat-LeRobot config.
         Self {
-            lin_vel_x: (-0.8, 0.8),
-            lin_vel_y: (-0.4, 0.4),
+            // Reachable at our budget: 0.5 m/s is achievable, 0.8 is not. With an
+            // unreachable max command the curriculum forces the policy into a
+            // regime where tracking reward is uniformly tiny → it gives up.
+            lin_vel_x: (-0.5, 0.5),
+            lin_vel_y: (-0.3, 0.3),
             ang_vel_z: (-0.2, 0.2),
             standing_prob: 0.1,
             resample_s: (3.0, 8.0),
@@ -359,8 +362,12 @@ impl Default for RewardStds {
         //   track_ang_vel_z_exp     std = 0.2
         //   base_height_exp         std = 0.1
         //   flat_body_orientation   std = 10° = 0.1745 rad
+        // WBC's std=0.2 is too tight at our reachable command range — at cmd=1.0
+        // tracking reward is ~0 anywhere the policy can actually move, so there's
+        // no useful gradient. Widen to 0.3 so a 0.3 m/s walk vs standing gives a
+        // ~6× reward difference at the rollout's pinned cmd=0.4.
         Self {
-            lin_vel: 0.2,
+            lin_vel: 0.3,
             ang_vel: 0.2,
             upright: 10_f32.to_radians(),
             base_height: 0.1,
