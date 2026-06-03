@@ -49,16 +49,24 @@ fn main() {
         println!("obs={obs_dim} critic_obs={critic_dim} action={act_dim}");
 
         let mut rng = Lcg::new(7);
-        // Wider net + extra hidden — closer to the deployed rsl_rl preset.
-        let mut ac = ActorCritic::new(
-            &[obs_dim, 512, 256, 128, act_dim],
-            &[critic_dim, 512, 256, 128, 1],
-            0.5,
-            5e-4,
-            &mut rng,
-        );
+        // Auto-resume: if a checkpoint already exists at `policy_path`, load
+        // it and continue training from there. Otherwise build a fresh net.
+        let mut ac = if !policy_path.is_empty() && std::path::Path::new(&policy_path).exists() {
+            println!("resuming from existing checkpoint {policy_path}...");
+            ActorCritic::load(&policy_path).expect("load checkpoint")
+        } else {
+            // Wider net + extra hidden — closer to the deployed rsl_rl preset.
+            ActorCritic::new(
+                &[obs_dim, 512, 256, 128, act_dim],
+                &[critic_dim, 512, 256, 128, 1],
+                0.5,
+                5e-4,
+                &mut rng,
+            )
+        };
         // rsl_rl-style: adaptive-KL LR, real entropy bonus.
         let cfg = PpoConfig::default();
+        const CHECKPOINT_EVERY: usize = 50;
 
         let (mut cur, mut cur_c) = env.initial_obs().await;
 
@@ -155,12 +163,23 @@ fn main() {
                     torso_sum / num_envs as f32,
                 );
             }
+            // Periodic checkpoint so a killed run leaves a resumable state.
+            // Skip iter 0 so we don't overwrite a resumed checkpoint with the
+            // un-trained starting net.
+            if !policy_path.is_empty() && it > 0 && (it % CHECKPOINT_EVERY == 0 || it == iters - 1)
+            {
+                if let Err(e) = ac.save(&policy_path) {
+                    eprintln!("warning: checkpoint save failed at iter {it}: {e}");
+                } else {
+                    println!("  checkpoint → {policy_path}");
+                }
+            }
         }
-        // Persist the trained policy so it can be replayed later (CPU rollout,
-        // multi-pose eval, Python analysis via the safetensors lib, etc.).
+        // Final save (belt-and-braces — the periodic write above already
+        // handled iters-1, but a no-op extra write is cheap).
         if !policy_path.is_empty() {
             ac.save(&policy_path).expect("save policy");
-            println!("saved policy → {policy_path}");
+            println!("saved final policy → {policy_path}");
         }
     });
 }

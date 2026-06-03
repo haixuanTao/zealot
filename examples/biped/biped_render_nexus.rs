@@ -27,13 +27,18 @@ fn to_action(v: &[f32]) -> [f32; NUM_JOINTS] {
     a
 }
 
-/// Train on the batched nexus env for `iters` PPO iterations.
+/// Train on the batched nexus env for `iters` PPO iterations. Writes a
+/// checkpoint to `checkpoint_path` every `checkpoint_every` iters (and once
+/// more at the end) so a killed run leaves a resumable state. Set
+/// `checkpoint_every = 0` to disable mid-training saves.
 async fn train(
     ac: &mut ActorCritic,
     env: &mut BipedNexusBatchEnv,
     cfg: &PpoConfig,
     rng: &mut Lcg,
     iters: usize,
+    checkpoint_path: &str,
+    checkpoint_every: usize,
 ) {
     let n = env.obs_dim();
     let _ = n;
@@ -116,6 +121,17 @@ async fn train(
                 total_reward / steps
             );
         }
+        // Periodic checkpoint. Writes the FULL policy via safetensors —
+        // weights, log_std, both Normalizer states. Atomic enough for our
+        // purposes (single fs::write call). Skip iter 0 so we don't overwrite
+        // a resumed checkpoint with the un-trained starting state.
+        if checkpoint_every > 0 && it > 0 && (it % checkpoint_every == 0 || it == iters - 1) {
+            if let Err(e) = ac.save(checkpoint_path) {
+                eprintln!("warning: checkpoint save failed at iter {it}: {e}");
+            } else {
+                println!("  checkpoint → {checkpoint_path}");
+            }
+        }
     }
 }
 
@@ -154,20 +170,38 @@ fn main() {
         let (obs_dim, critic_dim, act_dim) =
             (env.obs_dim(), env.critic_obs_dim(), env.action_dim());
         let mut ac = if train_iters > 0 {
-            // Wider net + extra hidden — closer to the deployed rsl_rl preset.
-            let mut ac = ActorCritic::new(
-                &[obs_dim, 512, 256, 128, act_dim],
-                &[critic_dim, 512, 256, 128, 1],
-                0.5,
-                5e-4,
-                &mut rng,
-            );
+            // Auto-resume: if a checkpoint already exists at `policy_path`,
+            // pick up from there. Otherwise build a fresh net.
+            let mut ac = if std::path::Path::new(&policy_path).exists() {
+                println!("resuming from existing checkpoint {policy_path}...");
+                ActorCritic::load(&policy_path).expect("load checkpoint")
+            } else {
+                // Wider net + extra hidden — closer to the deployed rsl_rl preset.
+                ActorCritic::new(
+                    &[obs_dim, 512, 256, 128, act_dim],
+                    &[critic_dim, 512, 256, 128, 1],
+                    0.5,
+                    5e-4,
+                    &mut rng,
+                )
+            };
             // rsl_rl-style: adaptive-KL LR, real entropy bonus.
             let cfg = PpoConfig::default();
             println!("training for {train_iters} iters on nexus GPU...");
-            train(&mut ac, &mut env, &cfg, &mut rng, train_iters).await;
+            train(
+                &mut ac,
+                &mut env,
+                &cfg,
+                &mut rng,
+                train_iters,
+                &policy_path,
+                50, // checkpoint every 50 iters
+            )
+            .await;
+            // Final write — `train` writes one at iters-1 too, this is the
+            // belt-and-braces.
             ac.save(&policy_path).expect("save policy");
-            println!("saved policy → {policy_path}");
+            println!("saved final policy → {policy_path}");
             ac
         } else {
             println!("loading policy from {policy_path}...");
