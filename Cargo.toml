@@ -44,8 +44,10 @@ biped = ["pendulum", "dep:rapier3d-urdf", "dep:zealot-env"]
 # contacts). No nexus / cargo-gpu needed, so it builds and runs on any machine.
 # Includes the MuJoCo-XML model loader (roxmltree) — the curated standing model.
 cpu = ["dep:rapier3d", "dep:rapier3d-urdf", "dep:zealot-env", "dep:zealot-rl", "dep:roxmltree", "dep:rayon"]
-# biped_gpu — retry the biped on nexus GPU physics, built from the MJCF model.
-biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env"]
+# biped_gpu — biped on nexus GPU physics, MJCF model. Pulls zealot-rl so the
+# nexus trainer can build (the smoke example doesn't need it, but it's a
+# negligible link-time addition).
+biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl"]
 
 [dependencies]
 vortx = { version = "0.1", optional = true }
@@ -164,6 +166,19 @@ required-features = ["cpu"]
 [[example]]
 name = "biped_nexus"
 path = "examples/biped/biped_nexus.rs"
+required-features = ["biped_gpu"]
+
+# Train flat velocity tracking on the nexus GPU biped (vectorized N-env batch).
+[[example]]
+name = "biped_train_nexus"
+path = "examples/biped/biped_train_nexus.rs"
+required-features = ["biped_gpu"]
+
+# Train briefly on nexus then record a deterministic env-0 rollout to JSON.
+# Render with `python3 examples/biped/render_biped.py <out.json> <out.mp4>`.
+[[example]]
+name = "biped_render_nexus"
+path = "examples/biped/biped_render_nexus.rs"
 required-features = ["biped_gpu"]
 
 # Local dimforge forks — mirrors nexus-rl's workspace patch table so nexus3d
