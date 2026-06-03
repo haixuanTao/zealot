@@ -55,17 +55,22 @@ fn main() {
             println!("resuming from existing checkpoint {policy_path}...");
             ActorCritic::load(&policy_path).expect("load checkpoint")
         } else {
-            // Wider net + extra hidden — closer to the deployed rsl_rl preset.
+            // Matches WBC-AGILE T1 velocity policy exactly: asymmetric net
+            // (actor smaller, privileged critic wider), `init_noise_std=1.0`,
+            // lr 1e-3 with adaptive-KL schedule.
             ActorCritic::new(
-                &[obs_dim, 512, 256, 128, act_dim],
+                &[obs_dim, 256, 256, 128, act_dim],
                 &[critic_dim, 512, 256, 128, 1],
-                0.5,
-                5e-4,
+                1.0,
+                1e-3,
                 &mut rng,
             )
         };
-        // rsl_rl-style: adaptive-KL LR, real entropy bonus.
-        let cfg = PpoConfig::default();
+        // rsl_rl-style: adaptive-KL LR, entropy bonus at WBC-AGILE's 0.005.
+        let cfg = PpoConfig {
+            entropy_coef: 0.005,
+            ..PpoConfig::default()
+        };
         const CHECKPOINT_EVERY: usize = 50;
 
         let (mut cur, mut cur_c) = env.initial_obs().await;
