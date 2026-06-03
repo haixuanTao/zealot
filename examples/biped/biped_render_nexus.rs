@@ -229,13 +229,15 @@ fn main() {
 
         for step in 0..rollout_steps {
             // Snapshot BEFORE stepping so we record the current pose, then act.
-            // Body positions come from body_poses (correct at step 0); joint
-            // angles come from ws.coords (integrated by the previous step's FK).
-            let (ws, poses) = env.snapshot().await;
+            // Both body positions and joint angles come from `body_poses` now
+            // — `joint_angles_for` derives them via parent⇄child relative
+            // rotation (the heavy `links_workspace` readback was removed when
+            // the step path was switched to the same poses-only path).
+            let poses = env.snapshot().await;
             frames.push(env.body_positions_for(0, &poses));
             let (p, q) = env.base_pose_for(0, &poses);
             bases.push([p[0], p[1], p[2], q[0], q[1], q[2], q[3]]);
-            joints.push(env.joint_angles_for(0, &ws));
+            joints.push(env.joint_angles_for(0, &poses));
 
             // Mean (noise-free) action for env 0.
             let mean = ac.mean(&cur[0]);

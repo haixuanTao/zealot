@@ -47,7 +47,7 @@ cpu = ["dep:rapier3d", "dep:rapier3d-urdf", "dep:zealot-env", "dep:zealot-rl", "
 # biped_gpu — biped on nexus GPU physics, MJCF model. Pulls zealot-rl so the
 # nexus trainer can build (the smoke example doesn't need it, but it's a
 # negligible link-time addition).
-biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl"]
+biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "dep:rayon"]
 
 [dependencies]
 vortx = { version = "0.1", optional = true }
@@ -200,6 +200,12 @@ rapier3d = { path = "../rapier/crates/rapier3d" }
 name = "biped_footcheck"
 path = "examples/biped/biped_footcheck.rs"
 required-features = ["cpu"]
+
+# FPS benchmark: rapier CPU multibody vs nexus GPU physics (same N envs).
+[[example]]
+name = "biped_fps"
+path = "examples/biped/biped_fps.rs"
+required-features = ["cpu", "biped_gpu"]
 
 # Minimal physics-only repro for dimforge/rapier#934 — drop a foot-shaped box at
 # various edge/corner tilts and observe whether it tips flat under gravity.

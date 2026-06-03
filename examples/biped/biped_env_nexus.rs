@@ -27,8 +27,10 @@ use nexus3d::rbd::math::Pose as NexusPose;
 use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
 use nexus3d::rbd::shaders::dynamics::MultibodyLinkWorkspace;
 use rapier3d::prelude::*;
+use rayon::prelude::*;
 use roxmltree::Node;
 use std::collections::HashMap;
+use std::time::Instant;
 use zealot_env::rng::Lcg;
 use zealot_env::robots::LeRobotBipedal;
 use zealot_env::robots::lerobot_bipedal::{JOINT_NAMES, NUM_JOINTS};
@@ -42,6 +44,61 @@ const SPAWN_Z: f32 = 0.72;
 // the inner solver loop doubles the per-step kernel work for marginal stability
 // gain at our timescales.
 const SOLVER_ITERS: u32 = 8;
+
+/// Per-phase wall-time accumulators populated by `BipedNexusBatchEnv::step`.
+/// Use `take_step_timings` to read + reset. `Instant::now()` is cheap (~50 ns
+/// per call, ~10 calls per step → ~0.5 µs/step overhead) so the
+/// instrumentation is always on. Lets us answer "where does the per-step
+/// time actually go?" without external profilers.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct StepTimings {
+    /// Number of `step()` calls accumulated into this struct.
+    pub steps: u64,
+    /// Host loop staging motor targets into `links_static_mirror`.
+    pub stage_motors_ns: u64,
+    /// `flush_links_static` — single `write_buffer` for the whole mirror.
+    pub flush_static_ns: u64,
+    /// `decimation × pipeline.step.await` — encoder build + queue submit
+    /// (host-side; GPU work is fire-and-forget here, waited on later).
+    pub pipeline_step_ns: u64,
+    /// `auto_resize_buffers` (only fires every `AUTO_RESIZE_PERIOD` steps).
+    pub auto_resize_ns: u64,
+    /// Explicit `gpu.synchronize()` between the pipeline step and the
+    /// readback — this is where the host actually blocks waiting for the
+    /// physics dispatches we enqueued above to finish. So this is "true
+    /// GPU compute time per ctrl step", separated from the byte transfer.
+    pub gpu_wait_ns: u64,
+    /// `slurp_poses` — `slow_read_buffer` of body_poses (the only readback
+    /// remaining after Tier 1). After the explicit sync above, this should
+    /// be just the staging copy + map_async + memcpy.
+    pub readback_ns: u64,
+    /// Serial pre-pass: `step_count++` + occasional command resample.
+    pub serial_pre_ns: u64,
+    /// Parallel rayon block (feet/state/obs/reward across N envs).
+    pub par_compute_ns: u64,
+    /// Serial commit pass: per-env state writes + StepOut assembly.
+    pub serial_commit_ns: u64,
+}
+
+impl StepTimings {
+    /// Total wall time accounted for across all phases (ns).
+    pub fn total_ns(&self) -> u64 {
+        self.stage_motors_ns
+            + self.flush_static_ns
+            + self.pipeline_step_ns
+            + self.auto_resize_ns
+            + self.gpu_wait_ns
+            + self.readback_ns
+            + self.serial_pre_ns
+            + self.par_compute_ns
+            + self.serial_commit_ns
+    }
+}
+// `pipeline.auto_resize_buffers` only needs to fire when nexus's internal
+// buffers (contacts mostly) grow. Once the scene settles after a few warmup
+// steps, sizes stop changing — calling it every step adds dispatch latency
+// for no work. 32 control steps ≈ 0.64 s of sim time, plenty fast to react.
+const AUTO_RESIZE_PERIOD: u32 = 32;
 
 // --- MJCF parsing (duplicated from biped_env.rs — small, self-contained) ----
 
@@ -231,6 +288,18 @@ pub struct LinkIndices {
     /// same order the CPU env's `body_positions()` returns and the python
     /// renderer (`render_biped.py`) expects.
     pub mjcf_to_link: Vec<u32>,
+
+    /// Parent multibody link index for each actuated joint (in `JOINT_NAMES`
+    /// order). Used to compute joint angles from `body_poses` alone — the
+    /// parent's world rotation, the joint's rest local quat, and the child's
+    /// world rotation suffice (no `links_workspace` readback needed).
+    pub actuated_parent_links: [u32; NUM_JOINTS],
+    /// Rest orientation of each actuated joint in its parent's local frame
+    /// (i.e. the body's `local_frame1.rotation` at zero joint angle). With
+    /// this, `q_child = q_parent · rest_quat · R_z(θ)`, so the current angle
+    /// is `θ = 2·atan2(rel.z, rel.w)` where
+    /// `rel = rest_quat⁻¹ · q_parent⁻¹ · q_child`.
+    pub actuated_rest_quat: [Rotation; NUM_JOINTS],
 }
 
 /// Build one env's rapier scene + sim params with the given DR sample.
@@ -401,6 +470,26 @@ fn build_env_scene(
         .map(|i| *mb_link_of_mjcf.get(&i).unwrap_or(&0))
         .collect();
 
+    // Per-joint parent link + rest quat, used by the ws-free joint-angle
+    // extraction (`q_child = q_parent · rest_quat · R_z(θ)`).
+    let mut actuated_parent_links = [0u32; NUM_JOINTS];
+    let mut actuated_rest_quat = [Rotation::IDENTITY; NUM_JOINTS];
+    for (k, &name) in JOINT_NAMES.iter().enumerate() {
+        let mjcf_idx = mjcf
+            .iter()
+            .position(|b| b.joint.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("missing joint {name} in MJCF"));
+        let parent_mjcf_idx = mjcf[mjcf_idx]
+            .parent
+            .expect("actuated joint's body must have a parent");
+        actuated_parent_links[k] = *mb_link_of_mjcf
+            .get(&parent_mjcf_idx)
+            .expect("joint parent not in multibody");
+        // The joint's local_frame1.rotation is the body's MJCF `local_quat`
+        // (set above in the GenericJointBuilder call).
+        actuated_rest_quat[k] = mjcf[mjcf_idx].local_quat;
+    }
+
     let idx = LinkIndices {
         links_per_batch: next_mb_link, // 1 (torso) + 12 (legs) = 13
         dofs_per_batch: 6 + NUM_JOINTS as u32,
@@ -411,6 +500,8 @@ fn build_env_scene(
         joint_dof_offset,
         foot_sole_local,
         mjcf_to_link,
+        actuated_parent_links,
+        actuated_rest_quat,
     };
 
     let _ = torso_handle;
@@ -466,6 +557,15 @@ pub struct BipedNexusBatchEnv {
     /// Initialised lazily to the first-step coords so step 1's vel is 0.
     prev_joint_pos: Vec<[f32; NUM_JOINTS]>,
     has_prev_joint_pos: Vec<bool>,
+    /// Previous control-step `body_poses` slice per env (one `NexusPose` per
+    /// collider in this env's slot). Used to finite-diff base linear /
+    /// angular velocity and per-foot linear velocity at the control rate
+    /// (20 ms) instead of reading `links_workspace.rb_vels` back from the
+    /// GPU — kills the dominant per-step readback. Layout matches the body
+    /// poses returned by `slurp_poses`: `colliders_per_batch` poses per env,
+    /// concatenated in env-index order.
+    prev_body_poses: Vec<NexusPose>,
+    has_prev_pose: Vec<bool>,
     /// Per-env foot-local sole-normal (depends on the spawn template that
     /// seeded the env — we keep one copy per env, updated on reset).
     foot_sole_local: Vec<[Vec3; NUM_FEET]>,
@@ -481,6 +581,13 @@ pub struct BipedNexusBatchEnv {
     // Pre-built spawn templates for reset_env_from (different DR samples).
     templates: Vec<GpuPhysicsState>,
     template_dr: Vec<DrParams>,
+
+    /// Counter for the periodic `pipeline.auto_resize_buffers` call (see
+    /// `AUTO_RESIZE_PERIOD`). Resets to 0 after each resize.
+    tick_since_resize: u32,
+
+    /// Phase-level timing accumulators — read + reset via `take_step_timings`.
+    timings: StepTimings,
 }
 
 impl BipedNexusBatchEnv {
@@ -570,6 +677,9 @@ impl BipedNexusBatchEnv {
         let air_time = vec![[0.0f32; NUM_FEET]; num_envs];
         let prev_joint_pos = vec![[0.0f32; NUM_JOINTS]; num_envs];
         let has_prev_joint_pos = vec![false; num_envs];
+        // One pose entry per collider per env (matches `body_poses` layout).
+        let prev_body_poses = vec![NexusPose::default(); num_envs * idx.colliders_per_batch as usize];
+        let has_prev_pose = vec![false; num_envs];
         let rng: Vec<Lcg> = (0..num_envs)
             .map(|e| Lcg::new(seed ^ ((e as u64).wrapping_mul(2654435761))))
             .collect();
@@ -592,6 +702,8 @@ impl BipedNexusBatchEnv {
             air_time,
             prev_joint_pos,
             has_prev_joint_pos,
+            prev_body_poses,
+            has_prev_pose,
             foot_sole_local,
             sampler_default,
             gpu,
@@ -599,6 +711,8 @@ impl BipedNexusBatchEnv {
             state,
             templates,
             template_dr,
+            tick_since_resize: 0,
+            timings: StepTimings::default(),
         };
         // Seed every env's command and resample schedule (mirrors `reset_full`
         // on the CPU side without an actual GPU reset — the GPU state is
@@ -671,30 +785,69 @@ impl BipedNexusBatchEnv {
         (ws, poses)
     }
 
-    /// Build the per-env `RobotState` from a workspace + body_poses slurp.
-    /// Joint angles from `ws.coords[5]` (AngZ revolute); joint velocities by
-    /// finite-diff against the cached previous joint angles (zero velocity on
-    /// first step). Base pose from `body_poses` (always correct, including at
-    /// step 0); base linear/angular velocity from `ws.rb_vels` (zero before any
-    /// pipeline.step runs — fine, the biped starts at rest).
-    fn read_state(
-        &mut self,
+    /// Hot-path readback: ONLY `body_poses` (no `links_workspace`). The fast
+    /// step path uses parent⇄child relative rotation off `body_poses` to derive
+    /// joint angles, and finite-diffs the previous step's poses for base /
+    /// foot velocities — eliminating the ~13 MB-per-step `links_workspace`
+    /// readback that dominated the host loop.
+    async fn slurp_poses(&mut self) -> Vec<NexusPose> {
+        let mut poses: Vec<NexusPose> =
+            vec![NexusPose::default(); self.state.body_poses().buffer().len()];
+        self.gpu
+            .slow_read_buffer(self.state.body_poses().buffer(), &mut poses)
+            .await
+            .expect("body_poses readback");
+        poses
+    }
+
+    /// Build the per-env `RobotState` from a `body_poses` slurp ONLY (no
+    /// `links_workspace`). Pure with respect to `&self` — the parallel post-
+    /// step loop calls this read-only and the caller commits the returned
+    /// `new_joint_pos` into `self.prev_joint_pos[env]` afterwards.
+    ///
+    /// Joint angles come from `q_child = q_parent · rest_quat · R_z(θ)`,
+    /// inverted to `θ = 2·atan2(rel.z, rel.w)` with
+    /// `rel = rest_quat⁻¹ · q_parent⁻¹ · q_child` (see `LinkIndices`).
+    /// Joint velocities, base linear/angular velocity, and base height are
+    /// finite-diffed at the control rate (20 ms) against the cached previous
+    /// poses — first step gets zero velocity (mirrors the existing
+    /// `has_prev_joint_pos` semantics).
+    fn read_state_from_poses(
+        &self,
         env: usize,
-        ws: &[MultibodyLinkWorkspace],
         poses: &[NexusPose],
-    ) -> RobotState {
-        let lpb = self.idx.links_per_batch as usize;
+    ) -> (RobotState, [f32; NUM_JOINTS]) {
         let cpb = self.idx.colliders_per_batch as usize;
-        let env_base_ws = env * lpb;
-        let env_base_pose = env * cpb;
+        let env_base = env * cpb;
         let control_dt = self.task.control_dt();
 
-        let torso_pose = &poses[env_base_pose + self.idx.torso_link as usize];
+        let torso_pose = &poses[env_base + self.idx.torso_link as usize];
         let t = torso_pose.translation;
         let r = torso_pose.rotation;
-        let root_ws = &ws[env_base_ws + self.idx.torso_link as usize];
-        let lv = root_ws.rb_vels.linear;
-        let av = root_ws.rb_vels.angular;
+
+        // Base linear / angular velocity by finite-diff vs last step's torso
+        // pose. ω from the small-rotation approximation
+        // `ω ≈ 2 · (Δq.xyz)/dt` with hemisphere correction so antipodal
+        // quaternions don't blow it up. Zero on the first step (no prev).
+        let (lv, av) = if self.has_prev_pose[env] {
+            let prev = &self.prev_body_poses[env_base + self.idx.torso_link as usize];
+            let pt = prev.translation;
+            let lv = Vec3::new(
+                (t.x - pt.x) / control_dt,
+                (t.y - pt.y) / control_dt,
+                (t.z - pt.z) / control_dt,
+            );
+            let dq_raw = r * prev.rotation.conjugate();
+            let s = if dq_raw.w >= 0.0 { 1.0 } else { -1.0 };
+            let av = Vec3::new(
+                2.0 * s * dq_raw.x / control_dt,
+                2.0 * s * dq_raw.y / control_dt,
+                2.0 * s * dq_raw.z / control_dt,
+            );
+            (lv, av)
+        } else {
+            (Vec3::ZERO, Vec3::ZERO)
+        };
         let base = BaseState {
             orientation: [r.x, r.y, r.z, r.w],
             lin_vel_world: [lv.x, lv.y, lv.z],
@@ -702,58 +855,71 @@ impl BipedNexusBatchEnv {
             height: t.z,
         };
 
+        // Joint angles from parent⇄child relative rotation (see doc comment).
         let mut joint_pos = [0.0f32; NUM_JOINTS];
-        let mut joint_vel = [0.0f32; NUM_JOINTS];
         for k in 0..NUM_JOINTS {
-            let link = self.idx.actuated[k].0 as usize;
-            joint_pos[k] = ws[env_base_ws + link].coords[5];
+            let parent_link = self.idx.actuated_parent_links[k] as usize;
+            let child_link = self.idx.actuated[k].0 as usize;
+            let qp = poses[env_base + parent_link].rotation;
+            let qc = poses[env_base + child_link].rotation;
+            let rest = self.idx.actuated_rest_quat[k];
+            let rel = rest.conjugate() * qp.conjugate() * qc;
+            joint_pos[k] = 2.0 * rel.z.atan2(rel.w);
         }
+        let mut joint_vel = [0.0f32; NUM_JOINTS];
         if self.has_prev_joint_pos[env] {
             for k in 0..NUM_JOINTS {
                 joint_vel[k] = (joint_pos[k] - self.prev_joint_pos[env][k]) / control_dt;
             }
         }
-        self.prev_joint_pos[env] = joint_pos;
-        self.has_prev_joint_pos[env] = true;
 
-        RobotState {
-            base,
+        (
+            RobotState {
+                base,
+                joint_pos,
+                joint_vel,
+                last_action: self.last_action[env],
+                prev_action: self.prev_action[env],
+                feet: [FootObs::default(); NUM_FEET],
+            },
             joint_pos,
-            joint_vel,
-            last_action: self.last_action[env],
-            prev_action: self.prev_action[env],
-            feet: [FootObs::default(); NUM_FEET],
-        }
+        )
     }
 
-    /// Compute per-foot observation for one env from the slurp + advance the
-    /// per-foot air-time counter. Positions come from `body_poses` (always
-    /// correct), velocities from `ws.rb_vels` (zero before first step — fine,
-    /// biped starts at rest). Contact is synthesised: foot below a small Z
-    /// threshold (nexus doesn't expose narrow-phase pairs).
-    fn update_feet(
-        &mut self,
+    /// Per-foot observation for one env from `body_poses` ONLY.
+    /// Pure with respect to `&self` — returns the new air-time array alongside
+    /// the `FootObs` row; the caller commits it into `self.air_time[env]`.
+    /// Foot linear velocity is finite-diffed against the previous step's foot
+    /// pose (so we don't need `ws.rb_vels`); contact is still synthesised by
+    /// foot Z < threshold (nexus doesn't expose narrow-phase pairs).
+    fn compute_feet_from_poses(
+        &self,
         env: usize,
-        ws: &[MultibodyLinkWorkspace],
         poses: &[NexusPose],
-    ) -> [FootObs; NUM_FEET] {
+    ) -> ([FootObs; NUM_FEET], [f32; NUM_FEET]) {
         const CONTACT_Z: f32 = 0.025;
         let dt = self.task.control_dt();
-        let lpb = self.idx.links_per_batch as usize;
         let cpb = self.idx.colliders_per_batch as usize;
-        let env_base_ws = env * lpb;
-        let env_base_pose = env * cpb;
+        let env_base = env * cpb;
 
-        let base_rot = poses[env_base_pose + self.idx.torso_link as usize].rotation;
+        let base_rot = poses[env_base + self.idx.torso_link as usize].rotation;
         let base_rot_inv = base_rot.conjugate();
         let sole_local = self.foot_sole_local[env];
+        let has_prev = self.has_prev_pose[env];
         let mut out = [FootObs::default(); NUM_FEET];
+        let mut new_air = [0.0f32; NUM_FEET];
         for i in 0..NUM_FEET {
             let link = self.idx.foot_links[i] as usize;
-            let foot_pose = &poses[env_base_pose + link];
-            let foot_ws = &ws[env_base_ws + link];
+            let foot_pose = &poses[env_base + link];
             let pos = foot_pose.translation;
-            let lv = foot_ws.rb_vels.linear;
+            let planar_speed = if has_prev {
+                let prev_pos = self.prev_body_poses[env_base + link].translation;
+                let dx = (pos.x - prev_pos.x) / dt;
+                let dy = (pos.y - prev_pos.y) / dt;
+                (dx * dx + dy * dy).sqrt()
+            } else {
+                0.0
+            };
             let world_normal = foot_pose.rotation * sole_local[i];
             let tilt = world_normal.z.abs().clamp(0.0, 1.0).acos();
             let foot_x_in_base = (base_rot_inv * foot_pose.rotation) * Vec3::X;
@@ -761,34 +927,43 @@ impl BipedNexusBatchEnv {
             let contact = pos.z < CONTACT_Z;
             let prev_air = self.air_time[env][i];
             let first_contact = contact && prev_air > 0.0;
-            self.air_time[env][i] = if contact { 0.0 } else { prev_air + dt };
+            new_air[i] = if contact { 0.0 } else { prev_air + dt };
             out[i] = FootObs {
                 contact,
                 first_contact,
-                air_time: if contact {
-                    prev_air
-                } else {
-                    self.air_time[env][i]
-                },
+                air_time: if contact { prev_air } else { new_air[i] },
                 height: pos.z,
-                planar_speed: (lv.x * lv.x + lv.y * lv.y).sqrt(),
+                planar_speed,
                 tilt,
                 yaw_rel_base,
                 pos_xy: [pos.x, pos.y],
             };
         }
-        out
+        (out, new_air)
     }
 
     /// Step every env one control tick. Returns per-env `StepOut`s in
     /// env-index order. Async because both pipeline.step and the readback are
     /// async on the WebGPU backend.
+    ///
+    /// Hot-path layout (after the Tier-1 perf rework):
+    /// 1. Stage motor targets + flush → `pipeline.step × decimation`.
+    /// 2. ONE readback: `body_poses` only (was `body_poses + links_workspace`
+    ///    every step; the latter dominated host time at large N).
+    /// 3. Serial pre-pass: bump `step_count`, resample commands on schedule.
+    /// 4. **Parallel** rayon block: derive joint angles from parent⇄child
+    ///    relative rotation, finite-diff base + foot velocities, build obs /
+    ///    critic_obs / reward. All read-only against `&self`, so envs run
+    ///    independently across worker threads.
+    /// 5. Serial post-pass: commit per-env mutable state (air_time, prev_*,
+    ///    action history), assemble `StepOut`s.
     pub async fn step(&mut self, actions: &[[f32; NUM_JOINTS]]) -> Vec<StepOut> {
         assert_eq!(actions.len(), self.n);
 
-        // Stage every env's motor targets host-side in the mirror, then push
-        // the whole `links_static` buffer in ONE write_buffer call. Replaces
-        // `num_envs * NUM_JOINTS` per-step write_buffer calls.
+        // (1) Stage every env's motor targets host-side in the mirror, then
+        // push the whole `links_static` buffer in ONE write_buffer call.
+        // Replaces `num_envs * NUM_JOINTS` per-step write_buffer calls.
+        let t = Instant::now();
         for e in 0..self.n {
             let targets = self.task.joint_targets(&actions[e]);
             for k in 0..NUM_JOINTS {
@@ -801,28 +976,59 @@ impl BipedNexusBatchEnv {
                 );
             }
         }
+        self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
+
+        let t = Instant::now();
         self.state
             .multibodies_mut()
             .flush_links_static(&self.gpu)
             .expect("flush motor targets");
-        // Advance physics at the control decimation.
+        self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
+
+        // (2) Advance physics at the control decimation. Each `pipeline.step`
+        // is async — the await may include queue submit + any implicit GPU
+        // sync the backend needs between sub-steps.
+        let t = Instant::now();
         for _ in 0..self.task.decimation {
             let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
         }
+        self.timings.pipeline_step_ns += t.elapsed().as_nanos() as u64;
+
+        // Explicit `gpu.synchronize()` so the timing buckets cleanly split
+        // "wait for GPU compute to finish" from "transfer bytes back". In
+        // production this sync isn't needed — the next `slow_read_buffer`
+        // syncs implicitly — but for profiling it lets us see how much of
+        // the per-step budget is actual GPU work vs host-side transfer.
+        let t = Instant::now();
         self.gpu.synchronize().expect("sync");
-        self.pipeline
-            .auto_resize_buffers(&self.gpu, &mut self.state)
-            .await;
+        self.timings.gpu_wait_ns += t.elapsed().as_nanos() as u64;
 
-        let (ws, poses) = self.slurp_state().await;
+        // `auto_resize_buffers` runs only every `AUTO_RESIZE_PERIOD` steps;
+        // for a static scene it stabilises after warmup and per-step calls
+        // just add dispatch latency for no work.
+        self.tick_since_resize += 1;
+        if self.tick_since_resize >= AUTO_RESIZE_PERIOD {
+            let t = Instant::now();
+            self.pipeline
+                .auto_resize_buffers(&self.gpu, &mut self.state)
+                .await;
+            self.timings.auto_resize_ns += t.elapsed().as_nanos() as u64;
+            self.tick_since_resize = 0;
+        }
 
-        let mut outs = Vec::with_capacity(self.n);
+        // (3) Single readback: body_poses (the only one left post-Tier-1).
+        // After the explicit sync above, this should be just staging copy +
+        // map_async + memcpy — the time *attributed* to the readback now is
+        // close to its real cost, not the GPU compute that piggybacks on the
+        // implicit drain.
+        let t = Instant::now();
+        let poses = self.slurp_poses().await;
+        self.timings.readback_ns += t.elapsed().as_nanos() as u64;
+
+        // (4) Serial pre-pass: step_count + command resample. Cheap; can't
+        // easily live in the parallel block (needs `&mut self.rng[e]`).
+        let t = Instant::now();
         for e in 0..self.n {
-            let feet = self.update_feet(e, &ws, &poses);
-            let mut state = self.read_state(e, &ws, &poses);
-            state.feet = feet;
-
-            // Resample command on schedule.
             self.step_count[e] += 1;
             if self.step_count[e] >= self.resample_at[e] {
                 self.cmd[e] = self.sampler.sample(&mut self.rng[e]);
@@ -831,32 +1037,88 @@ impl BipedNexusBatchEnv {
                         .sampler
                         .resample_steps(&mut self.rng[e], self.task.control_dt());
             }
+        }
+        self.timings.serial_pre_ns += t.elapsed().as_nanos() as u64;
 
-            let fell = self.task.fell_over(&state.base) || !state.base.height.is_finite();
-            let timeout = self.step_count[e] >= self.task.max_steps();
-            let mut reward = self.task.reward(&state, &self.cmd[e]).total();
-            if fell {
-                reward += self.task.weights.termination;
-            }
+        // (4) Parallel heavy compute. Inputs: read-only `&self` slices indexed
+        // by env. Output: per-env tuple of obs/critic/reward/fell + the new
+        // air-time + new joint-pos snapshot (committed serially below).
+        // `with_min_len(64)` chunks the work so rayon's per-task overhead
+        // (~µs) amortises across many envs.
+        struct PerEnv {
+            obs: Vec<f32>,
+            critic_obs: Vec<f32>,
+            reward: f32,
+            fell: bool,
+            new_air: [f32; NUM_FEET],
+            new_joint_pos: [f32; NUM_JOINTS],
+        }
+        let t = Instant::now();
+        let computed: Vec<PerEnv> = (0..self.n)
+            .into_par_iter()
+            .with_min_len(64)
+            .map(|e| {
+                let (feet, new_air) = self.compute_feet_from_poses(e, &poses);
+                let (mut state, new_joint_pos) = self.read_state_from_poses(e, &poses);
+                state.feet = feet;
+                let fell =
+                    self.task.fell_over(&state.base) || !state.base.height.is_finite();
+                let mut reward = self.task.reward(&state, &self.cmd[e]).total();
+                if fell {
+                    reward += self.task.weights.termination;
+                }
+                let mut obs = vec![0.0; OBS_DIM];
+                self.task.observe(&state, &self.cmd[e], &mut obs);
+                let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
+                self.task
+                    .observe_critic(&state, &self.cmd[e], &mut critic_obs);
+                PerEnv {
+                    obs,
+                    critic_obs,
+                    reward,
+                    fell,
+                    new_air,
+                    new_joint_pos,
+                }
+            })
+            .collect();
+        self.timings.par_compute_ns += t.elapsed().as_nanos() as u64;
 
-            let mut obs = vec![0.0; OBS_DIM];
-            self.task.observe(&state, &self.cmd[e], &mut obs);
-            let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
-            self.task
-                .observe_critic(&state, &self.cmd[e], &mut critic_obs);
-
+        // (5) Serial commit: per-env mutable state + StepOut assembly.
+        let t = Instant::now();
+        let cpb = self.idx.colliders_per_batch as usize;
+        let mut outs = Vec::with_capacity(self.n);
+        for (e, c) in computed.into_iter().enumerate() {
+            self.air_time[e] = c.new_air;
+            self.prev_joint_pos[e] = c.new_joint_pos;
+            self.has_prev_joint_pos[e] = true;
+            // Snapshot poses for this env into prev_body_poses for the next
+            // step's finite-diff base / foot velocities.
+            let env_base = e * cpb;
+            self.prev_body_poses[env_base..env_base + cpb]
+                .copy_from_slice(&poses[env_base..env_base + cpb]);
+            self.has_prev_pose[e] = true;
             self.prev_action[e] = self.last_action[e];
             self.last_action[e] = actions[e];
-
+            let timeout = self.step_count[e] >= self.task.max_steps();
             outs.push(StepOut {
-                obs,
-                critic_obs,
-                reward,
-                done: fell || timeout,
-                fell,
+                obs: c.obs,
+                critic_obs: c.critic_obs,
+                reward: c.reward,
+                done: c.fell || timeout,
+                fell: c.fell,
             });
         }
+        self.timings.serial_commit_ns += t.elapsed().as_nanos() as u64;
+        self.timings.steps += 1;
         outs
+    }
+
+    /// Read the accumulated per-phase timings and reset the counters.
+    /// Pair with the timed loop in `biped_fps.rs` to get a breakdown of
+    /// where the per-step budget went.
+    pub fn take_step_timings(&mut self) -> StepTimings {
+        std::mem::take(&mut self.timings)
     }
 
     /// Reset one env by copying a randomly-chosen spawn template into its slot.
@@ -884,13 +1146,14 @@ impl BipedNexusBatchEnv {
         self.prev_action[env] = [0.0; NUM_JOINTS];
         self.air_time[env] = [0.0; NUM_FEET];
 
-        // Cached prev joint angles are stale across a reset; clear so the next
-        // step seeds them again with zero velocity.
+        // Cached prev joint angles + poses are stale across a reset; clear so
+        // the next step seeds them again with zero velocity.
         self.has_prev_joint_pos[env] = false;
+        self.has_prev_pose[env] = false;
         // Build the initial obs from the freshly-copied state.
-        let (ws, poses) = self.slurp_state().await;
-        let feet = self.update_feet(env, &ws, &poses);
-        let mut state = self.read_state(env, &ws, &poses);
+        let poses = self.slurp_poses().await;
+        let (feet, _) = self.compute_feet_from_poses(env, &poses);
+        let (mut state, _) = self.read_state_from_poses(env, &poses);
         state.feet = feet;
         let mut obs = vec![0.0; OBS_DIM];
         self.task.observe(&state, &self.cmd[env], &mut obs);
@@ -903,12 +1166,12 @@ impl BipedNexusBatchEnv {
     /// Bulk fresh-reset: rebuild every env's obs (no GPU reset — caller uses
     /// this once after construction to seed the policy loop).
     pub async fn initial_obs(&mut self) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
-        let (ws, poses) = self.slurp_state().await;
+        let poses = self.slurp_poses().await;
         let mut obs = Vec::with_capacity(self.n);
         let mut critic_obs = Vec::with_capacity(self.n);
         for e in 0..self.n {
-            let feet = self.update_feet(e, &ws, &poses);
-            let mut state = self.read_state(e, &ws, &poses);
+            let (feet, _) = self.compute_feet_from_poses(e, &poses);
+            let (mut state, _) = self.read_state_from_poses(e, &poses);
             state.feet = feet;
             let mut o = vec![0.0; OBS_DIM];
             self.task.observe(&state, &self.cmd[e], &mut o);
@@ -941,9 +1204,10 @@ impl BipedNexusBatchEnv {
         self.prev_action[e] = [0.0; NUM_JOINTS];
         self.air_time[e] = [0.0; NUM_FEET];
         self.has_prev_joint_pos[e] = false;
-        let (ws, poses) = self.slurp_state().await;
-        let feet = self.update_feet(e, &ws, &poses);
-        let mut state = self.read_state(e, &ws, &poses);
+        self.has_prev_pose[e] = false;
+        let poses = self.slurp_poses().await;
+        let (feet, _) = self.compute_feet_from_poses(e, &poses);
+        let (mut state, _) = self.read_state_from_poses(e, &poses);
         state.feet = feet;
         let mut obs = vec![0.0; OBS_DIM];
         self.task.observe(&state, &self.cmd[e], &mut obs);
@@ -992,15 +1256,21 @@ impl BipedNexusBatchEnv {
         ([t.x, t.y, t.z], [r.x, r.y, r.z, r.w])
     }
 
-    /// Joint angles (rad) in `JOINT_NAMES` order for env `e`. Read straight
-    /// from `ws.coords[5]` — the integrated coord for an AngZ-free revolute.
-    pub fn joint_angles_for(&self, e: usize, ws: &[MultibodyLinkWorkspace]) -> [f32; NUM_JOINTS] {
-        let lpb = self.idx.links_per_batch as usize;
-        let base = e * lpb;
+    /// Joint angles (rad) in `JOINT_NAMES` order for env `e`. Derived from
+    /// `body_poses` via the same parent⇄child relative-rotation formula the
+    /// step path uses — no `links_workspace` readback needed.
+    pub fn joint_angles_for(&self, e: usize, poses: &[NexusPose]) -> [f32; NUM_JOINTS] {
+        let cpb = self.idx.colliders_per_batch as usize;
+        let base = e * cpb;
         let mut q = [0.0f32; NUM_JOINTS];
         for k in 0..NUM_JOINTS {
-            let link = self.idx.actuated[k].0 as usize;
-            q[k] = ws[base + link].coords[5];
+            let parent_link = self.idx.actuated_parent_links[k] as usize;
+            let child_link = self.idx.actuated[k].0 as usize;
+            let qp = poses[base + parent_link].rotation;
+            let qc = poses[base + child_link].rotation;
+            let rest = self.idx.actuated_rest_quat[k];
+            let rel = rest.conjugate() * qp.conjugate() * qc;
+            q[k] = 2.0 * rel.z.atan2(rel.w);
         }
         q
     }
@@ -1025,16 +1295,18 @@ impl BipedNexusBatchEnv {
         (names, edges, feet)
     }
 
-    /// One slurped snapshot for rendering — returns `(ws, body_poses)`. Use
-    /// `body_positions_for` / `base_pose_for` with `body_poses` (correct at all
-    /// times); use `joint_angles_for` with `ws` for the integrated joint coords.
-    pub async fn snapshot(&mut self) -> (Vec<MultibodyLinkWorkspace>, Vec<NexusPose>) {
-        self.slurp_state().await
+    /// One slurped snapshot for rendering — returns only `body_poses` now.
+    /// `body_positions_for` / `base_pose_for` / `joint_angles_for` all consume
+    /// it directly; the `links_workspace` readback was only needed for
+    /// joint-angle extraction, which now goes through parent⇄child relative
+    /// rotation off `body_poses` (same as the step path).
+    pub async fn snapshot(&mut self) -> Vec<NexusPose> {
+        self.slurp_poses().await
     }
 
     /// Telemetry: torso heights across all envs.
     pub async fn torso_heights(&mut self) -> Vec<f32> {
-        let (_, poses) = self.slurp_state().await;
+        let poses = self.slurp_poses().await;
         (0..self.n)
             .map(|e| {
                 let i = e * self.idx.colliders_per_batch as usize + self.idx.torso_link as usize;
