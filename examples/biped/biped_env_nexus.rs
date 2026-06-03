@@ -153,6 +153,11 @@ pub fn default_mjcf_path() -> String {
 
 /// Domain randomization knobs the GPU side CAN honour. Push-perturbation and
 /// contact-pair readback are dropped vs the CPU `Randomization` struct.
+///
+/// Initial-pose fields (`joint_pos_noise`, `base_z_noise`, `base_tilt_noise`)
+/// perturb each spawn template's starting configuration so the policy sees a
+/// distribution of starts rather than the same neutral pose every episode.
+/// Crucial for PPO to explore the relevant state space.
 #[derive(Clone, Copy, Debug)]
 pub struct DrParams {
     pub friction: f32,
@@ -160,7 +165,13 @@ pub struct DrParams {
     pub pd_scale: f32,
     pub contact_natural_frequency: f32,
     pub contact_damping_ratio: f32,
+    /// Sampled base orientation at spawn — separate axes so a single template
+    /// can mix yaw / roll / pitch. Each in rad.
     pub spawn_yaw: f32,
+    pub spawn_roll: f32,
+    pub spawn_pitch: f32,
+    /// Sampled additive jitter on `SPAWN_Z`, m. May be negative.
+    pub spawn_z_offset: f32,
 }
 
 impl Default for DrParams {
@@ -172,6 +183,9 @@ impl Default for DrParams {
             contact_natural_frequency: 30.0,
             contact_damping_ratio: 5.0,
             spawn_yaw: 0.0,
+            spawn_roll: 0.0,
+            spawn_pitch: 0.0,
+            spawn_z_offset: 0.0,
         }
     }
 }
@@ -233,14 +247,19 @@ fn build_env_scene(
     let impulse = ImpulseJointSet::new();
     let mut multibody = MultibodyJointSet::new();
 
-    // FK world poses (root at SPAWN_Z, with spawn-yaw rotation).
+    // FK world poses with initial-pose jitter on the root: yaw + roll + pitch
+    // + height. Joint angles stay at neutral (the multibody rest pose).
+    // Composing intrinsic ZYX so yaw is the outermost rotation (the typical
+    // RL convention — yaw randomises heading, roll/pitch perturb upright).
+    let root_rot = Rotation::from_rotation_z(dr.spawn_yaw)
+        * Rotation::from_rotation_y(dr.spawn_pitch)
+        * Rotation::from_rotation_x(dr.spawn_roll);
+    let root_pos = Vec3::new(0.0, 0.0, SPAWN_Z + dr.spawn_z_offset);
+    let root_pose = Pose::from_parts(root_pos, root_rot);
     let mut world: Vec<Pose> = Vec::with_capacity(mjcf.len());
     for b in mjcf {
         let w = match b.parent {
-            None => Pose::from_parts(
-                Vec3::new(0.0, 0.0, SPAWN_Z),
-                Rotation::from_rotation_z(dr.spawn_yaw),
-            ),
+            None => root_pose,
             Some(p) => world[p] * Pose::from_parts(b.local_pos, b.local_quat),
         };
         world.push(w);
@@ -1044,6 +1063,8 @@ async fn webgpu_backend() -> KhalGpuBackend {
 
 /// Sample one DR point. Ranges mirror `Randomization::default()` from the CPU
 /// env (minus push perturbations, which nexus can't apply at runtime).
+/// Initial-pose jitter ranges are conservative — wider tilts make every
+/// episode start mid-fall, which the policy can't recover from at small T.
 fn sample_dr(rng: &mut Lcg) -> DrParams {
     DrParams {
         friction: rng.range(0.5, 1.5),
@@ -1051,6 +1072,9 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
         pd_scale: rng.range(0.85, 1.15),
         contact_natural_frequency: rng.range(10.0, 50.0),
         contact_damping_ratio: rng.range(2.0, 8.0),
-        spawn_yaw: 0.0,
+        spawn_yaw: rng.range(-std::f32::consts::PI, std::f32::consts::PI),
+        spawn_roll: rng.range(-0.10, 0.10),     // ±~6°
+        spawn_pitch: rng.range(-0.10, 0.10),    // ±~6°
+        spawn_z_offset: rng.range(-0.03, 0.03), // ±3 cm
     }
 }

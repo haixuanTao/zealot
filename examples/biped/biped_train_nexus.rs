@@ -37,7 +37,7 @@ fn main() {
     println!("building {num_envs} envs (batched on one GpuPhysicsState)...");
 
     pollster::block_on(async {
-        let mut env = BipedNexusBatchEnv::new(&xml, num_envs, 16, 0xC0FFEE).await;
+        let mut env = BipedNexusBatchEnv::new(&xml, num_envs, 32, 0xC0FFEE).await;
 
         let (obs_dim, critic_dim, act_dim) =
             (env.obs_dim(), env.critic_obs_dim(), env.action_dim());

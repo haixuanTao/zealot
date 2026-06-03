@@ -139,10 +139,10 @@ fn main() {
         // After the bulk-motor + single-readback wins, 32 envs is the sweet
         // spot — N×12 motor updates collapse into one buffer write, so the
         // marginal cost per env at this scale is the per-link workspace
-        // readback, ~constant. 8 templates give enough DR variety to avoid
-        // overfitting to one contact-stiffness sample.
+        // readback, ~constant. 32 templates give enough initial-pose variety
+        // (yaw + roll/pitch + height noise) that PPO actually explores.
         let num_envs = 32;
-        let num_templates = 8;
+        let num_templates = 32;
         println!("building {num_envs} envs on nexus...");
         let mut env = BipedNexusBatchEnv::new(&xml, num_envs, num_templates, 0xC0FFEE).await;
 
