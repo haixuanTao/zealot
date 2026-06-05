@@ -40,6 +40,14 @@ toolchain). Two groups:
 - **Tensor primitives** (`--features gpu`): vortx forward/backward/Adam demos —
   `linear_forward`, `mlp_forward`, `mlp_backward`, `train_regression`.
   e.g. `cargo run --example train_regression --features gpu`.
+- **GPU policy port** (the vortx PPO actor/critic — verified piece by piece
+  against the CPU `zealot-rl` reference, each to float epsilon): `elu_check`
+  (ELU fwd/bwd kernels), `mlp_backward_batch` (multi-layer batched ELU backward,
+  `--features "gpu biped_gpu"`), `ppo_grad_check` (clipped-surrogate + value-loss
+  gradient kernels), and `policy_forward_bench` (CPU vs GPU batched forward,
+  `--features "gpu biped_gpu"`). The batched forward is wired into
+  `biped_render_nexus` so the rollout runs the policy on the same backend as the
+  physics. See the policy-forward benchmark below.
 - **Pendulum** (`--features pendulum`, in `examples/pendulum/`): a GPU rigid-body
   inverted pendulum and RL trainers on it, from `pendulum_smoke` (a physics smoke
   test) up through `pendulum_pg` (REINFORCE), `pendulum_ppo` (PPO swing-up), and
@@ -62,52 +70,140 @@ that logic into the crates is the next step, gated on:
    browser/dora story). Both are confirmed viable on nexus — `pendulum_gpu_policy`
    already trains a vortx policy on-GPU.
 
-## Benchmark — rapier CPU vs nexus GPU
+## Benchmark — full CPU vs full GPU rollout
 
-`examples/biped/biped_fps.rs` steps the LeRobot bipedal on both engines under
-identical control settings (50 Hz control, physics decimation 4, neutral
-actions) and reports wall-clock throughput. Same MJCF model, same MDP, same N
-envs; only the physics engine differs — CPU runs independent rapier multibodies
-stepped in parallel via rayon, GPU runs one batched `GpuPhysicsState` advanced
-per dispatch.
+`examples/biped/rollout_e2e_bench.rs` runs the full rollout control step —
+**policy forward** (an action per env) **+ physics step** — and reports
+wall-clock throughput. **Full CPU** = rapier multibody physics (rayon) + the CPU
+MLP policy (serial per-env `actor.mean`/`critic.value`). **Full GPU** = one
+batched nexus `GpuPhysicsState` + the vortx GPU policy (batched GEMM forward).
+Same MJCF model, same MDP, same N envs, same net shapes (actor
+`[43,256,256,128,12]`, critic `[49,512,256,128,1]`). No PPO update — this is
+rollout throughput, like `biped_fps`.
 
-Numbers are **env-control-steps / second** (multiply by 4 for raw physics
-sub-steps/s). Bold = winner of that row. Measured on a M-series mac + WebGPU
-and on a 24-core x86 box with an RTX 5090 (wgpu Vulkan).
+Numbers are **env-control-steps / second**. Bold = winner of each CPU/GPU pair.
+Measured on a M-series mac + WebGPU and a 24-core x86 box with an RTX 5090. The
+**Isaac** column is NVIDIA Isaac Lab + PhysX 5 on the same 5090, same task
+(`Velocity-LeRobot-NoArms-v0`), measured the same way — rsl_rl *collection*
+throughput (`num_envs · 24 / collection_time`, i.e. physics + policy inference,
+no learning step) — as the production reference for "how fast this *should* go".
 
-| N envs | mac CPU (rapier) | mac GPU (nexus, WebGPU) | linux CPU (24-core rapier) | linux GPU (nexus, RTX 5090) |
-|-------:|------------------:|-------------------------:|---------------------------:|----------------------------:|
-| 32     | **6.2 k**         | 503                      | **13.9 k**                 | 758                         |
-| 128    | **12.5 k**        | 2.0 k                    | **17.8 k**                 | 3.0 k                       |
-| 512    | **11.2 k**        | 5.9 k                    | **23.0 k**                 | 11.3 k                      |
-| 2 048  | **12.0 k**        | 10.0 k                   | 24.7 k                     | **34.7 k**                  |
-| 4 096  | **12.0 k**        | 11.7 k                   | 24.9 k                     | **41.0 k**                  |
-| 8 192  | 9.5 k             | **11.8 k**               | 25.0 k                     | **49.2 k**                  |
-| 16 384 | —                 | —                        | 25.1 k                     | **56.9 k**                  |
-| 32 768 | —                 | —                        | 25.2 k                     | **59.6 k**                  |
+| N envs | mac CPU (rapier + MLP) | mac GPU (nexus + vortx) | linux CPU (24-core) | linux GPU (RTX 5090) | Isaac/PhysX 5 (5090) |
+|-------:|-----------------------:|-------------------------:|--------------------:|---------------------:|---------------------:|
+| 32     | **3.7 k**              | 0.5 k                    | **5.0 k**           | 0.7 k                | —                    |
+| 128    | **4.1 k**              | 1.7 k                    | **6.0 k**           | 2.4 k                | —                    |
+| 512    | 4.1 k                  | **4.7 k**                | 6.4 k               | **8.7 k**            | —                    |
+| 1 024  | 4.1 k                  | **6.5 k**                | 6.5 k               | **15.9 k**           | —                    |
+| 2 048  | 4.0 k                  | **8.6 k**                | 6.5 k               | **27.0 k**           | 73.8 k               |
+| 4 096  | 3.9 k                  | **10.4 k**               | 6.6 k               | **35.1 k**           | 139 k                |
+| 8 192  | 3.9 k                  | **10.8 k**               | 6.5 k               | **44.5 k**           | 220 k                |
 
 | machine                          | peak CPU | peak GPU | GPU > CPU at N ≈ | best GPU/CPU ratio |
 |----------------------------------|---------:|---------:|-----------------:|-------------------:|
-| mac (M-series + WebGPU)          | 12.5 k   | 11.8 k   | ~6 000           | 1.24×              |
-| linux (24-core + RTX 5090)       | 25.2 k   | 59.6 k   | ~1 800           | 2.36×              |
+| mac (M-series + WebGPU)          | 4.1 k    | 10.8 k   | ~500             | 2.77×              |
+| linux (24-core + RTX 5090)       | 6.6 k    | 44.5 k   | ~450             | 6.80×              |
 
 What this says in practice:
 
-- On the mac, CPU rapier wins almost everywhere; nexus only edges ahead past
-  N ≈ 8 000, and that's because per-step WebGPU readback (`slow_read_buffer`
-  on `links_workspace` + `body_poses`) dominates the host loop.
-- On the 5090 box, nexus crosses CPU at ~2 000 envs and runs ~2× CPU at
-  N = 8 192. GPU utilisation sits at 86–98% during the bench — real GPU
-  compute is the bottleneck there, not host plumbing.
-- The CPU plateau (~25 k env/s on 24 cores, ~12 k on the mac) is core-count
-  bound. The GPU plateau is bounded by the per-env Rust post-step loop
-  (`update_feet` + `task.observe` + the `Vec<f32>` obs/critic_obs allocs);
-  moving obs/reward into a compute shader would push it further.
+- Below N ≈ 450–500 the full-CPU path wins on both machines: rapier physics is
+  cheap at small batch and the GPU path pays a fixed per-step physics + policy
+  readback (~70 ms on the mac, ~50 ms on the 5090) that doesn't amortize yet.
+- Past the crossover the full-GPU path pulls ahead — ~2.8× by N = 8 192 on the
+  mac, **~6.8× on the 5090** (44.5 k vs 6.5 k env/s). The full-CPU throughput is
+  flat (~4 k mac, ~6.5 k 24-core) — bottlenecked by the **serial** per-env CPU
+  MLP forward, not the physics.
+- The PPO *update* still runs on the CPU and isn't in this measurement — moving
+  it to the GPU (Stage B) is what makes a full training iteration scale, not just
+  the rollout.
+- Versus the **Isaac/PhysX 5** reference, nexus+vortx is ~2.7× behind at N = 2 048
+  and ~5× at N = 8 192 (44.5 k vs 220 k). That gap is the all-Rust/WebGPU tax —
+  PhysX is the ceiling to chase, and it scales harder with batch (the nexus GPU
+  curve is flattening past 4 k while PhysX keeps climbing).
 
 Reproduce:
 
 ```sh
-cargo run --release --example biped_fps --features "cpu biped_gpu" -- <num_envs> <control_steps>
+cargo run --release --example rollout_e2e_bench --features "gpu biped_gpu" -- <num_envs> <steps>
+```
+
+### Benchmark — full training iteration (rollout + PPO update)
+
+The rollout table above is only half a training step; the other half is the
+**PPO update**. `examples/biped/iter_e2e_bench.rs` times one whole iteration each
+way — **full CPU** = rapier rollout (CPU MLP + rayon physics) + CPU PPO update;
+**full GPU** = nexus rollout (vortx policy) + GPU PPO update (the Stage-B path
+verified in `gpu_update_check`) — over a T=32 rollout and a 5-epoch × 16-minibatch
+update. Throughput is `N·T / iteration_time`, same env-control-steps/s unit, and
+the **Isaac** column is PhysX 5's total `Computation` (collection + learning):
+
+The GPU update is **GPU-resident** (the batch is normalized + uploaded once, each
+minibatch is an on-GPU column gather), uses a **tiled GEMM**, and the GEMM inner
+loop is **vec4** (4-wide FMA) — all verified bit-exact against the CPU update
+(`gpu_update_check`):
+
+| N envs | mac CPU | mac GPU | linux CPU (24-core) | linux GPU (RTX 5090) | Isaac/PhysX 5 (5090) |
+|-------:|--------:|--------:|--------------------:|---------------------:|---------------------:|
+| 512    | 2.0 k   | **3.8 k** | 2.1 k             | **6.4 k**            | —                    |
+| 1 024  | 2.0 k   | **5.3 k** | 2.3 k             | **10.6 k**           | —                    |
+| 2 048  | 2.1 k   | **6.5 k** | 2.7 k             | **15.5 k**           | 67 k                 |
+| 4 096  | 2.1 k   | **7.7 k** | 3.1 k             | **19.9 k**           | 126 k                |
+| 8 192  | 2.1 k   | **8.0 k** | 3.6 k             | **23.1 k**           | 201 k                |
+
+Full GPU beats full CPU by ~**6.5×** on the 5090 (~3.5× on the mac). The
+optimizations (GPU-resident batch + tiled GEMM + vec4) lifted the 5090 iteration
+from 12.7 k → **23.1 k env/s** at N = 8 192. **The Isaac gap is now ~6–9× (was
+~16×).** Two hardware notes worth recording. (1) The vec4 **inner-loop FMA** is a ~12%
+win on the 5090 but **flat on the mac** — Metal auto-vectorizes the inner loop;
+rust-gpu → SPIR-V → NVIDIA does not, so the explicit `Vec4` FMA matters there.
+(2) vec4 **global loads** (a `gemm_tiled_vec4` with 128-bit loads, verified
+bit-exact) add **0%** — because a *tiled* GEMM already amortizes global memory
+(each element is loaded once into shared memory and reused), so it isn't
+global-bandwidth-bound; the win was compute, not bandwidth. The remaining gap is
+the rollout (~5× off PhysX) plus the update vs Isaac's fused-CUDA learning step
+(~0.09 s) — the next lever is fewer dispatches, not vec4. None of it is new math.
+
+Reproduce:
+
+```sh
+cargo run --release --example iter_e2e_bench --features "gpu biped_gpu" -- <num_envs> 32 5 16
+```
+
+### Benchmark — policy forward, CPU vs GPU (vortx)
+
+The bench above measures *physics*. The other half of the rollout is the
+**policy forward**: the original trainer ran the actor and critic as
+`for e in 0..N { actor.mean(); critic.value() }` — N serial CPU MLP passes. The
+vortx GPU policy replaces that with one batched GEMM-stack per net (GEMM → bias
+→ ELU, linear output) on the same backend as the physics. Net shapes are the
+deployed biped (actor `[43,256,256,128,12]`, critic `[49,512,256,128,1]`).
+
+Two measurements (mac M-series, WebGPU, naïve GEMM). `policy_forward_bench`
+times *just the compute*, tensors resident. `rollout_bench` times the **real
+rollout path** as `biped_render_nexus` runs it — including the per-step GPU→CPU
+`slow_read_vec` readback of means/values for CPU sampling — so it's the honest
+end-to-end-of-the-forward number:
+
+| N envs | CPU serial loop | GPU compute only | GPU + per-step readback (real) |
+|-------:|----------------:|-----------------:|-------------------------------:|
+| 1 024  | 183 ms/step     | —                | 11 ms/step — **16×**           |
+| 4 096  | 727 ms/step     | 23 ms/step (32×) | 28 ms/step — **26×**           |
+
+So the readback is real but modest — it knocks the isolated 32× down to ~26× at
+deployed scale, **not** a regression. GPU output matches the CPU net to 4e-7.
+
+Caveat on *training* throughput: this speeds up the **rollout**, but a full PPO
+iteration is currently dominated by the **CPU update** (`ActorCritic::update`
+over ~131 k samples/iter — unchanged by this work), so end-to-end iters/s won't
+move ~26× until that update also moves to the GPU. The update path is built and
+unit-verified but not yet wired (every new kernel matches the CPU `zealot-rl`
+reference to ~1e-6 — ELU `elu_check`, batched backward `mlp_backward_batch`, PPO
+gradients `ppo_grad_check`). The 5090 figures are TBD.
+
+Reproduce:
+
+```sh
+cargo run --release --example policy_forward_bench --features "gpu biped_gpu"
+cargo run --release --example rollout_bench --features "gpu biped_gpu" -- 4096 32
 ```
 
 ### Cross-engine reference — Isaac Lab + PhysX 5
