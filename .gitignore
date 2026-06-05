@@ -1,1 +1,13 @@
 /target
+
+# Rendered rollout videos (produced by render_biped.py)
+*.mp4
+
+# Python bytecode cache (render/plot helper scripts)
+__pycache__/
+
+# MuJoCo solver log dropped in the cwd
+MUJOCO_LOG.TXT
+
+# Curriculum-resume sidecars written next to checkpoints
+*.iter
