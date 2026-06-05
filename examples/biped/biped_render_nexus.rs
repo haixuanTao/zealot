@@ -11,8 +11,11 @@
 
 #[path = "biped_env_nexus.rs"]
 mod biped_env_nexus;
+#[path = "gpu_policy.rs"]
+mod gpu_policy;
 
 use biped_env_nexus::{BipedNexusBatchEnv, StepOut, default_mjcf_path};
+use gpu_policy::GpuPolicy;
 use std::fmt::Write as _;
 use zealot_env::robots::lerobot_bipedal::{JOINT_NAMES, NUM_JOINTS};
 use zealot_rl::ppo::{Sample, gae};
@@ -52,8 +55,27 @@ async fn train(
     let (mut cur, mut cur_c) = env.initial_obs().await;
     let n = cur.len();
 
+    // GPU-resident actor/critic for the batched rollout forward, on the env's
+    // own backend. Re-synced from `ac` after every PPO update below.
+    let mut gpu = GpuPolicy::new(env.backend(), ac, n).expect("build gpu policy");
+
+    // Curriculum/resume position: persist the iteration index alongside the
+    // weight checkpoint so a killed-and-resumed run continues the command
+    // curriculum instead of restarting the scale ramp from 0. The safetensors
+    // checkpoint stores weights + normalizers but not this loop counter, so
+    // without the sidecar a resume silently rewinds `scale` to 0.
+    let progress_path = format!("{checkpoint_path}.iter");
+    let start_iter = std::fs::read_to_string(&progress_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&i| i < iters)
+        .unwrap_or(0);
+    if start_iter > 0 {
+        println!("resuming curriculum at iter {start_iter}/{iters}");
+    }
+
     let warmup = (iters as f32 * 0.4).max(1.0);
-    for it in 0..iters {
+    for it in start_iter..iters {
         let scale = (it as f32 / warmup).min(1.0);
         env.set_command_scale(scale);
 
@@ -64,11 +86,28 @@ async fn train(
         let (mut total_reward, mut falls) = (0.0f32, 0u32);
 
         for _ in 0..T {
-            let mut actions: Vec<[f32; NUM_JOINTS]> = Vec::with_capacity(n);
+            // Fold this step's obs into the running normalizers, then run ONE
+            // batched GPU forward for all envs (the old per-env CPU actor/critic
+            // forward loop was the rollout bottleneck — see gpu_policy.rs).
             for e in 0..n {
                 ac.record_obs(&cur[e], &cur_c[e]);
-                let (action, logp, mean) = ac.sample(&cur[e], rng);
-                let value = ac.value(&cur_c[e]);
+            }
+            let (means, values) = gpu
+                .forward(env.backend(), ac, &cur, &cur_c)
+                .await
+                .expect("gpu policy forward");
+
+            let mut actions: Vec<[f32; NUM_JOINTS]> = Vec::with_capacity(n);
+            for e in 0..n {
+                // Sample a = mean + std·ε and its log-prob — cheap CPU work
+                // (std-only diagonal Gaussian), matching `ActorCritic::sample`.
+                let mean = means[e].to_vec();
+                let mut action = vec![0.0f32; NUM_JOINTS];
+                for k in 0..NUM_JOINTS {
+                    action[k] = mean[k] + ac.log_std[k].exp() * rng.gauss();
+                }
+                let logp = ac.logp(&action, &mean);
+                let value = values[e];
                 actions.push(to_action(&action));
                 samples[e].push(Sample {
                     obs: cur[e].clone(),
@@ -113,6 +152,8 @@ async fn train(
             }
         }
         let _stats = ac.update(&mut batch, cfg);
+        // Weights changed — push them to the GPU policy for next iter's rollout.
+        gpu.sync_weights(env.backend(), ac);
 
         if it % 10 == 0 || it == iters - 1 {
             let steps = (n * T) as f32;
@@ -129,6 +170,10 @@ async fn train(
             if let Err(e) = ac.save(checkpoint_path) {
                 eprintln!("warning: checkpoint save failed at iter {it}: {e}");
             } else {
+                // Record the next iter to resume at, so the curriculum scale
+                // continues across a kill/restart. Written after the weights so
+                // the two stay consistent on resume.
+                let _ = std::fs::write(&progress_path, (it + 1).to_string());
                 println!("  checkpoint → {checkpoint_path}");
             }
         }
@@ -162,9 +207,16 @@ fn main() {
         // marginal cost per env at this scale is the per-link workspace
         // readback, ~constant. 32 templates give enough initial-pose variety
         // (yaw + roll/pitch + height noise) that PPO actually explores.
-        let num_envs = 32;
+        // Train at the deployed-scale batch size — 4096 envs is where the
+        // nexus GPU path actually beats CPU rapier on a 5090 (~40k env/s,
+        // see README "Cross-engine reference" table). Templates stay at 32:
+        // each template defines one DR scene (friction / restitution / PD
+        // scale / contact softness / spawn pose) and N_envs/N_templates =
+        // 128 envs share each template at construction time, then mix
+        // freely as `reset_env` cycles them.
+        let num_envs = 4096;
         let num_templates = 32;
-        println!("building {num_envs} envs on nexus...");
+        println!("building {num_envs} envs on nexus ({num_templates} DR templates)...");
         let mut env = BipedNexusBatchEnv::new(&xml, num_envs, num_templates, 0xC0FFEE).await;
 
         let (obs_dim, critic_dim, act_dim) =
@@ -176,6 +228,9 @@ fn main() {
                 println!("resuming from existing checkpoint {policy_path}...");
                 ActorCritic::load(&policy_path).expect("load checkpoint")
             } else {
+                // Fresh run — clear any stale curriculum-progress sidecar so the
+                // scale ramp starts at iter 0.
+                let _ = std::fs::remove_file(format!("{policy_path}.iter"));
                 // Matches WBC-AGILE T1 velocity policy exactly: asymmetric net
                 // (actor smaller, privileged critic wider), `init_noise_std=1.0`,
                 // lr 1e-3 with adaptive-KL schedule.
