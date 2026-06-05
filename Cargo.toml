@@ -84,6 +84,36 @@ required-features = ["gpu"]
 name = "train_regression"
 required-features = ["gpu"]
 
+# GPU PPO-update + verification examples: each new vortx primitive checked
+# bit-exact vs its zealot-rl CPU reference, plus the GPU PPO-update benchmark.
+[[example]]
+name = "elu_check"
+required-features = ["gpu"]
+
+[[example]]
+name = "gemm_vec4_check"
+required-features = ["gpu"]
+
+[[example]]
+name = "ppo_grad_check"
+required-features = ["gpu"]
+
+[[example]]
+name = "policy_forward_bench"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "mlp_backward_batch"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "gpu_update_check"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "gpu_update_bench"
+required-features = ["gpu", "biped_gpu"]
+
 # Pendulum examples — nexus3d GPU rigid-body env (`--features pendulum`). Ported
 # verbatim from nexus-rl's `pendulum_headless` crate; they drive nexus3d directly
 # (not via zealot-env/zealot-rl yet). pendulum_gpu_policy also needs `gpu` (vortx).
