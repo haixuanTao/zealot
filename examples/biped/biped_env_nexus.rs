@@ -732,6 +732,13 @@ impl BipedNexusBatchEnv {
         self.n
     }
 
+    /// The shared GPU backend driving the physics. Exposed so a vortx GPU policy
+    /// can run its batched forward on the *same* device (no second backend, and a
+    /// future on-device obs path can skip the CPU round-trip).
+    pub fn backend(&self) -> &KhalGpuBackend {
+        &self.gpu
+    }
+
     pub fn obs_dim(&self) -> usize {
         OBS_DIM
     }
@@ -1344,9 +1351,16 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
         pd_scale: rng.range(0.85, 1.15),
         contact_natural_frequency: rng.range(10.0, 50.0),
         contact_damping_ratio: rng.range(2.0, 8.0),
+        // Initial-pose DR — aggressive ranges so the policy sees a wide
+        // distribution of starts and learns to recover from non-trivial
+        // perturbations. Comparable to WBC-AGILE / Isaac Lab humanoid
+        // defaults (±15–25° on tilts, a few cm on height). Wider than this
+        // (e.g. ±30° tilts) makes most episodes start mid-fall and PPO
+        // can't get a useful gradient with the curriculum's early
+        // command-velocity scale.
         spawn_yaw: rng.range(-std::f32::consts::PI, std::f32::consts::PI),
-        spawn_roll: rng.range(-0.10, 0.10),     // ±~6°
-        spawn_pitch: rng.range(-0.10, 0.10),    // ±~6°
-        spawn_z_offset: rng.range(-0.03, 0.03), // ±3 cm
+        spawn_roll: rng.range(-0.35, 0.35),     // ±~20°
+        spawn_pitch: rng.range(-0.35, 0.35),    // ±~20°
+        spawn_z_offset: rng.range(-0.08, 0.08), // ±8 cm (~10% of torso height)
     }
 }

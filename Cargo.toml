@@ -77,6 +77,49 @@ name = "mlp_forward"
 required-features = ["gpu"]
 
 [[example]]
+name = "elu_check"
+required-features = ["gpu"]
+
+[[example]]
+name = "policy_forward_bench"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "mlp_backward_batch"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "gemm_vec4_check"
+required-features = ["gpu"]
+
+[[example]]
+name = "ppo_grad_check"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_update_check"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "gpu_update_bench"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "rollout_bench"
+path = "examples/biped/rollout_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "rollout_e2e_bench"
+path = "examples/biped/rollout_e2e_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "iter_e2e_bench"
+path = "examples/biped/iter_e2e_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
 name = "mlp_backward"
 required-features = ["gpu"]
 
@@ -179,7 +222,7 @@ required-features = ["biped_gpu"]
 [[example]]
 name = "biped_render_nexus"
 path = "examples/biped/biped_render_nexus.rs"
-required-features = ["biped_gpu"]
+required-features = ["biped_gpu", "gpu"]
 
 # Local dimforge forks — mirrors nexus-rl's workspace patch table so nexus3d
 # (and vortx) resolve to the exact sources they're built against there. zealot

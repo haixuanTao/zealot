@@ -1,1 +1,5 @@
 /target
+*.mp4
+*.tgz
+MUJOCO_LOG.TXT
+__pycache__/
