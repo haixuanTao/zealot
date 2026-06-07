@@ -996,6 +996,7 @@ name = "khal-std"
 version = "0.1.1"
 dependencies = [
  "cuda_std",
+ "glam 0.32.1",
  "glamx",
  "khal-derive",
  "spirv-std",
