@@ -48,6 +48,11 @@ cpu = ["dep:rapier3d", "dep:rapier3d-urdf", "dep:zealot-env", "dep:zealot-rl", "
 # nexus trainer can build (the smoke example doesn't need it, but it's a
 # negligible link-time addition).
 biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "dep:rayon"]
+# cuda_backend — additively enables the native-CUDA (cuda-oxide) khal backend on
+# the vortx + nexus3d stack, alongside WebGPU. Selected at runtime via BIPED_CUDA=1.
+# Used for the all-native end-to-end benchmark (iter_e2e_bench). The cubins are
+# embedded at build time via CUDA_OXIDE_SHADERS_PTX_{NEXUS_RBD_SHADERS3D,VORTX_SHADERS}.
+cuda_backend = ["gpu", "biped_gpu", "khal/cuda", "nexus3d/cuda", "vortx/cuda"]
 
 [dependencies]
 vortx = { version = "0.1", optional = true }
@@ -117,6 +122,15 @@ required-features = ["gpu", "biped_gpu"]
 [[example]]
 name = "iter_e2e_bench"
 path = "examples/biped/iter_e2e_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "cuda_gather_check"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "iter_e2e_boxes_bench"
+path = "examples/biped/iter_e2e_boxes_bench.rs"
 required-features = ["gpu", "biped_gpu"]
 
 [[example]]

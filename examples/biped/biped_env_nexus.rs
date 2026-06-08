@@ -599,7 +599,7 @@ impl BipedNexusBatchEnv {
         let robot = LeRobotBipedal::new();
         let task = VelocityFlatTask::new();
 
-        let gpu = webgpu_backend().await;
+        let gpu = make_backend().await;
         let pipeline = GpuPhysicsPipeline::from_backend(&gpu);
 
         // Sample DR for the templates first (each defines one rapier scene).
@@ -1324,6 +1324,23 @@ impl BipedNexusBatchEnv {
 }
 
 // --- Helpers -----------------------------------------------------------------
+
+/// Pick the GPU backend for the batched physics. Defaults to WebGPU; when the
+/// `cuda_backend` feature is compiled in AND `BIPED_CUDA=1`, runs the native
+/// CUDA (cuda-oxide) backend instead — used by the all-native e2e benchmark.
+/// The nexus + vortx cubins are embedded at build time via the per-crate
+/// `CUDA_OXIDE_SHADERS_PTX_*` env vars (see khal-builder `build_ptx`).
+async fn make_backend() -> KhalGpuBackend {
+    #[cfg(feature = "cuda_backend")]
+    {
+        if std::env::var("BIPED_CUDA").as_deref() == Ok("1") {
+            use khal::backend::Cuda;
+            eprintln!("[biped] backend = native CUDA (cuda-oxide)");
+            return KhalGpuBackend::Cuda(Cuda::new(0).expect("init CUDA backend"));
+        }
+    }
+    webgpu_backend().await
+}
 
 async fn webgpu_backend() -> KhalGpuBackend {
     let limits = wgpu::Limits {
