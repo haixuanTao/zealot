@@ -9,32 +9,37 @@ lower *absolute* env/s but the *relative* wins and bit-exactness should hold.
 ## Branches / getting the code
 
 - `zealot` → branch **`feat/native-cuda-e2e-bench`** (pushed to origin).
-- `nexus-cuda` → the changes are **NOT pushed**: the `nexus-cuda` GitHub remote is
-  **archived (read-only)**, so the commits couldn't be pushed. Instead the diff is
-  bundled here as patch files in `zealot/docs/nexus-cuda-patches/` (they apply on
-  top of nexus-cuda `master` = `29fac1e`). On the box:
+- nexus physics = the **`nexus-rl`** repo (`git@github.com:haixuanTao/nexus-rl.git`).
+  The changes are pushed there as branch **`feat/per-env-parallelism`**, based off
+  **`cuda-oxide`** (the local dir may be named `nexus-cuda`, but the live remote is
+  `nexus-rl`; the old `nexus-cuda` GitHub remote is archived). On the box:
   ```sh
-  cd nexus-cuda
-  git checkout master && git rev-parse HEAD   # expect 29fac1e...; if not, fetch
-  git am ../zealot/docs/nexus-cuda-patches/*.patch
-  # (if git am conflicts on a divergent master, use:
-  #   git apply --reject ../zealot/docs/nexus-cuda-patches/*.patch  and resolve)
+  cd <nexus-rl checkout>          # the dir cloned from haixuanTao/nexus-rl
+  git fetch origin                # or whatever remote points at nexus-rl
+  git checkout feat/per-env-parallelism
   ```
-  (Alternatively, if you can un-archive the GitHub repo, ask baguette to push
-  branch `feat/dispatch-and-per-env-parallelism` and just check it out.)
+  Note it's based off `cuda-oxide`, **not** the default `cuda-build` (which has
+  extra motor-staging work) — so this branch doesn't include those. If you need
+  both, rebase onto `cuda-build` and resolve the `solver.rs` / `multibody/mod.rs`
+  overlap.
+  - Fallback (if the box's nexus checkout is the *archived* `nexus-cuda` at base
+    `29fac1e`, not `nexus-rl`): apply the bundled patches instead —
+    `git am ../zealot/docs/nexus-cuda-patches/*.patch`.
 
 `khal` and `vortx` are **local dimforge forks, not under git** — the box must
-already have them as sibling dirs (same parent as `zealot`/`nexus-cuda`, e.g.
-`~/Documents/work/`). One small khal edit is needed — see "khal caveat" below.
+already have them as sibling dirs (same parent, e.g. `~/Documents/work/`). One
+small khal edit is needed — see "khal caveat" below.
 
 ## Prereqs on the box
 
 The native-CUDA path compiles the `#[spirv]` shaders to PTX via **cuda-oxide**
 (rust-gpu → LLVM → ptxas), so it needs that toolchain. The build scripts in
-`nexus-cuda/build_cuda/` reference machine-specific paths (LLVM tools from a
-nightly rustup toolchain, `ptxas`, `libdevice.10.bc`, `librustc_codegen_cuda.so`,
-libNVVM). **These paths are baguette's machine** — fix them up for this box first
-(the scripts are short; the vars are all at the top).
+`build_cuda/` are `$HOME`-relative on `nexus-rl` (a "portable across boxes"
+commit already landed there), but they still assume the cuda-oxide toolchain +
+the NVVM/ptxas/libdevice wheels live at the expected `$HOME` locations (LLVM
+tools from a nightly rustup toolchain, `ptxas`, `libdevice.10.bc`,
+`librustc_codegen_cuda.so`, libNVVM). **Verify the vars at the top of each script
+match this box** before running.
 
 ## ⚠️ The #1 gotcha: arch is `sm_120` (5090) → use `sm_89` (4090)
 
