@@ -180,13 +180,16 @@ The **native-CUDA** column is the *same* Rust stack compiled to PTX via
 at all, both the vortx tensor ops and the `nexus3d` physics, straight from the
 *verbatim* `#[spirv]` shader source, bit-exact vs WebGPU (boxes-physics pose
 fingerprint identical; full biped iteration gather err 0.0 — the contact-path
-codegen crash is fixed, nexus-cuda `29fac1e`). It's **~1.4× over WebGPU across
-the sweep** (up to ~1.47× on the smallest batch): the lever is the GEMM-heavy PPO update (~3× via
-`cuLaunchKernel` — no per-dispatch bind groups, higher GEMM throughput), diluted
-by the heavier articulated-multibody physics. Getting there took ~12 general
-cuda-oxide codegen fixes plus two khal↔cuda-oxide ABI fixes (push element-count not
-byte-length for slice kernel args; pass a shader's `&0` offset by value to dodge a
-null-deref that DCE'd a whole kernel).
+codegen crash is fixed, nexus-cuda `29fac1e`). It's now **~1.8–2× over WebGPU
+across the sweep** (up to ~2× on the smaller batches; was ~1.4× before the
+2026-06 per-env-parallelism work). Two levers compound: (1) the GEMM-heavy PPO
+update (~3× via `cuLaunchKernel` — no per-dispatch bind groups, higher GEMM
+throughput), and (2) the per-env optimizations land harder on CUDA — CUDA-graph
+capture (effective only on CUDA) lets the cooperative-kernel physics wins show,
+and fixed-grid dispatch is CUDA-only (WebGPU keeps its native indirect dispatch).
+Getting there took ~12 general cuda-oxide codegen fixes plus two khal↔cuda-oxide
+ABI fixes (push element-count not byte-length for slice kernel args; pass a
+shader's `&0` offset by value to dodge a null-deref that DCE'd a whole kernel).
 
 Full GPU beats full CPU by ~**16.7×** on the 5090 (native CUDA; ~9.5× on WebGPU,
 ~3.8× on the mac). The optimizations (GPU-resident batch + tiled GEMM + vec4)
