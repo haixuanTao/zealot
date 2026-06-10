@@ -276,6 +276,16 @@ position-iters = 4 + explicit Coriolis; **†** columns are the previous
 | 4 096  | 3.9 k                  | **10.4 k**               | 7.5 k               | **76.1 k**           | 139 k                |
 | 8 192  | 3.9 k                  | **10.8 k**               | 7.5 k               | **95.7 k**           | 220 k                |
 
+> ⚠️ The **GPU rollout** numbers above predate the 2026-06 per-env-parallelism
+> work and have **not** been refreshed: a re-measure showed much higher values
+> (WebGPU ~238 k @ N=8 192) but they're confounded by `rollout_e2e_bench`'s
+> per-step policy-forward + obs readback + CPU sampling — wall-clock there is
+> dominated by backend-dependent readback/sync, not physics (native CUDA even
+> measures *slower* than WebGPU at large N because of per-step `synchronize` +
+> `clone_dtoh`). Treat this column as a *rough* physics+inference reference, not a
+> clean rollout-throughput comparison. The iteration table above (full train step)
+> is the reliable, refreshed measurement.
+
 | machine                          | peak CPU | peak GPU | GPU > CPU at N ≈ | best GPU/CPU ratio |
 |----------------------------------|---------:|---------:|-----------------:|-------------------:|
 | mac (M-series + WebGPU)†         | 4.1 k    | 10.8 k   | ~500             | 2.77×              |
