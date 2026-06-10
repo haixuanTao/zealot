@@ -26,9 +26,16 @@ lower *absolute* env/s but the *relative* wins and bit-exactness should hold.
     `29fac1e`, not `nexus-rl`): apply the bundled patches instead —
     `git am ../zealot/docs/nexus-cuda-patches/*.patch`.
 
-`khal` and `vortx` are **local dimforge forks, not under git** — the box must
-already have them as sibling dirs (same parent, e.g. `~/Documents/work/`). One
-small khal edit is needed — see "khal caveat" below.
+- `khal` → now pushed to **`haixuanTao/khal`** branch **`feat/cuda-oxide-profiling`**
+  (the local cuda-oxide working state + the `KHAL_CUDA_PROFILE` timer).
+- `vortx` → now pushed to **`haixuanTao/vortx`** branch **`feat/gpu-mdp-kernels`**
+  (the GPU MDP kernels + integrated gemm/activation).
+
+All four are **sibling dirs under the same parent** (e.g. `~/Documents/work/`):
+`zealot`, the nexus-rl checkout, `khal`, `vortx`. Fetch + checkout the branch
+above in each. (These khal/vortx branches are the exact working trees the
+5090 build uses; they're new branches off `feat/cuda-oxide-backend` /
+`feat/gpu-policy-shaders` respectively — review before merging into your mains.)
 
 ## Prereqs on the box
 
@@ -54,20 +61,19 @@ The cubin build scripts hardcode Blackwell `sm_120`. For Ada (4090) change every
 (If a kernel uses an sm_120-only feature it'll fail at ptxas; none should here —
 it's plain FP32 SIMT.)
 
-## khal caveat (un-versioned)
+## khal note
 
-The bench calls `khal::backend::cuda::dump_kernel_profile()` — a local profiling
-helper added to `khal/crates/khal/src/backend/cuda.rs` that is **not in the
-dimforge fork** and can't be pushed (khal isn't a git repo). Two options:
-
-- **Simplest (skip profiling):** in `zealot/examples/biped/iter_e2e_bench.rs`,
-  delete the two lines
-  ```rust
-  #[cfg(feature = "cuda_backend")]
-  khal::backend::cuda::dump_kernel_profile();
-  ```
-  The bench then builds + runs fine; you just lose `KHAL_CUDA_PROFILE`.
-- **Keep profiling:** apply the patch in Appendix A to the box's `khal`.
+The bench calls `khal::backend::cuda::dump_kernel_profile()` — that helper now
+lives on the `haixuanTao/khal` `feat/cuda-oxide-profiling` branch, so as long as
+the box's `khal` is on that branch the bench builds as-is. If your `khal` is on a
+branch without it, either check out `feat/cuda-oxide-profiling` or delete the two
+lines in `zealot/examples/biped/iter_e2e_bench.rs`:
+```rust
+#[cfg(feature = "cuda_backend")]
+khal::backend::cuda::dump_kernel_profile();
+```
+(builds + runs fine, you just lose `KHAL_CUDA_PROFILE`). Appendix A still has the
+raw patch as a last resort.
 
 ## Build
 
