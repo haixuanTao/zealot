@@ -102,6 +102,18 @@ name = "ppo_grad_check"
 required-features = ["gpu"]
 
 [[example]]
+name = "sample_check"
+required-features = ["gpu"]
+
+[[example]]
+name = "obs_check"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "reward_check"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
 name = "gpu_update_check"
 required-features = ["gpu", "biped_gpu"]
 

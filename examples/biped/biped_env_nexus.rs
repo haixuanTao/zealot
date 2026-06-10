@@ -20,7 +20,7 @@
 //! Joint angles / velocities, base linear / angular velocity all come from
 //! `links_workspace[k].{coords, joint_rot, rb_vels}` (rb_vels is world-space).
 
-use khal::backend::{Backend, Buffer, GpuBackend as KhalGpuBackend, WebGpu};
+use khal::backend::{Backend, Buffer, Encoder, GpuBackend as KhalGpuBackend, WebGpu};
 use khal::re_exports::wgpu;
 use nexus3d::rbd::dynamics::GpuSimParams;
 use nexus3d::rbd::math::Pose as NexusPose;
@@ -39,11 +39,36 @@ use zealot_env::tasks::velocity_flat::{
     VelocityCommand, VelocityFlatTask,
 };
 
+// GPU-resident MDP path (Stage 3c). Gated on `gpu` (vortx) — `biped_train_nexus`
+// / `biped_fps` compile this module WITHOUT vortx, so it must be optional.
+#[cfg(feature = "gpu")]
+use khal::{AsGpuSlice, BufferUsages, Shader};
+#[cfg(feature = "gpu")]
+use vortx::linalg::{
+    JointObsCfg, Obs, ObsParams, Reward, RewardJointCfg, RewardParams,
+};
+#[cfg(feature = "gpu")]
+use vortx::tensor::Tensor as VxTensor;
+
+/// `Sync` newtype over the captured physics graph. The graph holds raw CUDA
+/// pointers (not `Sync`), but it's only ever captured/launched on the main
+/// thread — never inside the rayon `par_iter` obs/reward block — so giving the
+/// env a `Sync` field here is sound and keeps `&self: Sync` for rayon.
+#[cfg(feature = "cuda_backend")]
+struct SyncGraph(khal::backend::cuda::CapturedGraph);
+#[cfg(feature = "cuda_backend")]
+unsafe impl Send for SyncGraph {}
+#[cfg(feature = "cuda_backend")]
+unsafe impl Sync for SyncGraph {}
+
 const SPAWN_Z: f32 = 0.72;
-// Match the CPU env's `IntegrationParameters::num_solver_iterations = 8` — at 16
-// the inner solver loop doubles the per-step kernel work for marginal stability
-// gain at our timescales.
-const SOLVER_ITERS: u32 = 8;
+// Match Isaac Lab / PhysX 5 (our benchmark reference): its articulation solver
+// runs `solver_position_iteration_count = 4` (velocity iters = 0) for velocity
+// locomotion. nexus's `num_solver_iterations` is the direct analog of PhysX's
+// position-iteration count, so 4 mirrors Isaac. (Was 8 to match the CPU rapier
+// env; the CPU side at `biped_env.rs` still uses 8.) Override via
+// BIPED_SOLVER_ITERS — e.g. =8 for the old higher-fidelity setting.
+const SOLVER_ITERS: u32 = 4;
 
 /// Per-phase wall-time accumulators populated by `BipedNexusBatchEnv::step`.
 /// Use `take_step_timings` to read + reset. `Instant::now()` is cheap (~50 ns
@@ -439,7 +464,13 @@ fn build_env_scene(
     // Sim params: per-env contact softness via DR.
     let mut sp = GpuSimParams::default();
     sp.dt = task_dt;
-    sp.num_solver_iterations = SOLVER_ITERS;
+    // Solver substeps per control step — the master cost multiplier (every
+    // per-substep kernel chain runs this many times). Default SOLVER_ITERS=8;
+    // override with BIPED_SOLVER_ITERS to trade physics fidelity for speed.
+    sp.num_solver_iterations = std::env::var("BIPED_SOLVER_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SOLVER_ITERS);
     sp.contact_natural_frequency = dr.contact_natural_frequency;
     sp.contact_damping_ratio = dr.contact_damping_ratio;
 
@@ -588,6 +619,16 @@ pub struct BipedNexusBatchEnv {
 
     /// Phase-level timing accumulators — read + reset via `take_step_timings`.
     timings: StepTimings,
+
+    /// CUDA-graph capture of the physics decimation loop (`BIPED_CAPTURE=1`).
+    /// Captured once after warmup, then replayed each step with one
+    /// `cuGraphLaunch` — skips the ~600 per-launch host encodes/gaps. Requires
+    /// `BIPED_FIXED_GRID=1` (no indirect-dispatch syncs to break capture).
+    #[cfg(feature = "cuda_backend")]
+    phys_graph: Option<SyncGraph>,
+    /// Eager steps run before capturing (let auto_resize / buffers stabilise).
+    #[cfg(feature = "cuda_backend")]
+    capture_warmup: u32,
 }
 
 impl BipedNexusBatchEnv {
@@ -641,6 +682,30 @@ impl BipedNexusBatchEnv {
             .collect();
         let mut state = GpuPhysicsState::from_rapier(&gpu, &envs_refs);
         state.multibodies_mut().set_gravity(&gpu, [0.0, 0.0, -9.81]);
+        // Coriolis handling. Match Isaac/PhysX: its Featherstone articulation
+        // solver computes Coriolis/centrifugal bias forces EXPLICITLY each step,
+        // not via an implicitly-integrated mass-matrix recompute. So default to
+        // explicit (implicit_coriolis = false) — also the cheaper path (no
+        // per-non-last-substep mass-matrix rebuild). Set BIPED_IMPLICIT_CORIOLIS=1
+        // to restore nexus's implicit handling.
+        let implicit_coriolis = std::env::var("BIPED_IMPLICIT_CORIOLIS").as_deref() == Ok("1");
+        state
+            .multibodies_mut()
+            .set_implicit_coriolis(implicit_coriolis);
+
+        // The contact solver loops `for _ in 0..(max_colors+1)` PER color-sweep
+        // (×3 sweeps ×substeps ×decimation) — the dominant per-step dispatch
+        // source. nexus defaults max_colors=8 ⇒ 9 sweeps, but the biped has only
+        // a few feet-ground contacts so most sweeps process zero constraints yet
+        // still launch. Tightening to 4 measured ~12% off the step (bit-identical
+        // physics, fully-converged — it doesn't grow), with auto-resize still
+        // growing it on the rare step that needs more (e.g. a fall with knees/
+        // torso contacting), so it's safe. `BIPED_MAX_COLORS` overrides.
+        let max_colors = std::env::var("BIPED_MAX_COLORS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4);
+        state.set_max_colors(max_colors);
 
         // Spawn templates: one single-env GPU state per DR sample.
         let mut templates: Vec<GpuPhysicsState> = Vec::with_capacity(num_templates);
@@ -714,6 +779,10 @@ impl BipedNexusBatchEnv {
             template_dr,
             tick_since_resize: 0,
             timings: StepTimings::default(),
+            #[cfg(feature = "cuda_backend")]
+            phys_graph: None,
+            #[cfg(feature = "cuda_backend")]
+            capture_warmup: 0,
         };
         // Seed every env's command and resample schedule (mirrors `reset_full`
         // on the CPU side without an actual GPU reset — the GPU state is
@@ -968,37 +1037,92 @@ impl BipedNexusBatchEnv {
     pub async fn step(&mut self, actions: &[[f32; NUM_JOINTS]]) -> Vec<StepOut> {
         assert_eq!(actions.len(), self.n);
 
-        // (1) Stage every env's motor targets host-side in the mirror, then
-        // push the whole `links_static` buffer in ONE write_buffer call.
-        // Replaces `num_envs * NUM_JOINTS` per-step write_buffer calls.
+        // (1) Apply motor targets. Default: stage host-side mirror + one
+        // write_buffer flush. With BIPED_SCATTER=1: a GPU scatter kernel writes
+        // the targets into links_static directly (Stage 1 of the CUDA-graph
+        // rollout — applies actions without the per-step mirror flush). Both
+        // paths set the same motors[AngZ].target_pos + motor_axes bit.
         let t = Instant::now();
-        for e in 0..self.n {
-            let targets = self.task.joint_targets(&actions[e]);
+        if std::env::var("BIPED_SCATTER").as_deref() == Ok("1") {
+            let mut targets_flat = vec![0.0f32; NUM_JOINTS * self.n];
+            let mut actuated_link_ids = [0u32; NUM_JOINTS];
             for k in 0..NUM_JOINTS {
-                let link = self.idx.actuated[k].0;
-                self.state.multibodies_mut().stage_motor_position(
-                    e as u32,
-                    link,
-                    JointAxis::AngZ,
-                    targets[k],
-                );
+                actuated_link_ids[k] = self.idx.actuated[k].0;
             }
+            for e in 0..self.n {
+                let targets = self.task.joint_targets(&actions[e]);
+                for k in 0..NUM_JOINTS {
+                    targets_flat[k * self.n + e] = targets[k];
+                }
+            }
+            self.state
+                .multibodies_mut()
+                .scatter_motor_targets(
+                    &self.gpu,
+                    &targets_flat,
+                    &actuated_link_ids,
+                    JointAxis::AngZ as u32,
+                )
+                .expect("scatter motor targets");
+            self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
+        } else {
+            for e in 0..self.n {
+                let targets = self.task.joint_targets(&actions[e]);
+                for k in 0..NUM_JOINTS {
+                    let link = self.idx.actuated[k].0;
+                    self.state.multibodies_mut().stage_motor_position(
+                        e as u32,
+                        link,
+                        JointAxis::AngZ,
+                        targets[k],
+                    );
+                }
+            }
+            self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
+            let t2 = Instant::now();
+            self.state
+                .multibodies_mut()
+                .flush_links_static(&self.gpu)
+                .expect("flush motor targets");
+            self.timings.flush_static_ns += t2.elapsed().as_nanos() as u64;
         }
-        self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
-
-        let t = Instant::now();
-        self.state
-            .multibodies_mut()
-            .flush_links_static(&self.gpu)
-            .expect("flush motor targets");
-        self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
 
         // (2) Advance physics at the control decimation. Each `pipeline.step`
         // is async — the await may include queue submit + any implicit GPU
         // sync the backend needs between sub-steps.
+        let decimation = self.task.decimation;
         let t = Instant::now();
-        for _ in 0..self.task.decimation {
-            let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+        let mut advanced = false;
+        // CUDA-graph capture/replay (BIPED_CAPTURE=1, requires BIPED_FIXED_GRID=1
+        // so there are no indirect-dispatch syncs to break capture). Capture the
+        // whole decimation loop ONCE after warmup, then replay it with a single
+        // cuGraphLaunch each step — eliminating the ~600 per-launch host encodes.
+        #[cfg(feature = "cuda_backend")]
+        if std::env::var("BIPED_CAPTURE").as_deref() == Ok("1") {
+            const CAPTURE_WARMUP: u32 = 16;
+            if let Some(graph) = self.phys_graph.as_ref() {
+                graph.0.launch().expect("physics graph replay");
+                advanced = true;
+            } else if self.capture_warmup >= CAPTURE_WARMUP {
+                if let Some(cuda) = self.gpu.as_cuda() {
+                    cuda.begin_capture().expect("begin_capture");
+                    for _ in 0..decimation {
+                        let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+                    }
+                    let graph = cuda.end_capture().expect("end_capture");
+                    // Capture records but doesn't execute; launch once to advance.
+                    graph.launch().expect("physics graph first launch");
+                    self.phys_graph = Some(SyncGraph(graph));
+                    advanced = true;
+                }
+            } else {
+                self.capture_warmup += 1;
+            }
+        }
+        if !advanced {
+            for _ in 0..decimation {
+                let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+            }
         }
         self.timings.pipeline_step_ns += t.elapsed().as_nanos() as u64;
 
@@ -1014,8 +1138,25 @@ impl BipedNexusBatchEnv {
         // `auto_resize_buffers` runs only every `AUTO_RESIZE_PERIOD` steps;
         // for a static scene it stabilises after warmup and per-step calls
         // just add dispatch latency for no work.
+        // Skip auto-resize once a physics graph is captured — a realloc would
+        // dangle the graph's baked-in buffer addresses. (Static scene: buffers
+        // are stable post-warmup, so this is a no-op anyway.)
+        let graph_active = {
+            #[cfg(feature = "cuda_backend")]
+            {
+                self.phys_graph.is_some()
+            }
+            #[cfg(not(feature = "cuda_backend"))]
+            {
+                false
+            }
+        };
+        // BIPED_PIN_COLORS=1 disables auto-resize (and thus the max_colors grow)
+        // so a chosen BIPED_MAX_COLORS stays fixed — for measuring the color-loop
+        // dispatch cost cleanly.
+        let pin_colors = std::env::var("BIPED_PIN_COLORS").as_deref() == Ok("1");
         self.tick_since_resize += 1;
-        if self.tick_since_resize >= AUTO_RESIZE_PERIOD {
+        if self.tick_since_resize >= AUTO_RESIZE_PERIOD && !graph_active && !pin_colors {
             let t = Instant::now();
             self.pipeline
                 .auto_resize_buffers(&self.gpu, &mut self.state)
@@ -1090,6 +1231,33 @@ impl BipedNexusBatchEnv {
             })
             .collect();
         self.timings.par_compute_ns += t.elapsed().as_nanos() as u64;
+
+        // (4b) Optional GPU-MDP A/B (Stage 3c): run gpu_obs + gpu_reward on the
+        // SAME poses + pre-commit per-env state the rayon block just used, and
+        // report max divergence from the CPU result. Diagnostic only (behind
+        // BIPED_GPU_MDP=1); reads `self` immutably before the commit mutates it.
+        #[cfg(feature = "gpu")]
+        if std::env::var("BIPED_GPU_MDP").as_deref() == Ok("1") {
+            let (obs_g, critic_g, reward_g, fell_g) = self.gpu_mdp(&poses).await;
+            let n = self.n;
+            let (mut e_obs, mut e_crit, mut e_rew) = (0f32, 0f32, 0f32);
+            let mut fell_mm = 0usize;
+            for (e, c) in computed.iter().enumerate() {
+                for d in 0..OBS_DIM {
+                    e_obs = e_obs.max((obs_g[d * n + e] - c.obs[d]).abs());
+                }
+                for d in 0..CRITIC_OBS_DIM {
+                    e_crit = e_crit.max((critic_g[d * n + e] - c.critic_obs[d]).abs());
+                }
+                e_rew = e_rew.max((reward_g[e] - c.reward).abs());
+                if (fell_g[e] != 0) != c.fell {
+                    fell_mm += 1;
+                }
+            }
+            eprintln!(
+                "[gpu-mdp A/B] obs {e_obs:.2e}  critic {e_crit:.2e}  reward {e_rew:.2e}  fell_mismatch {fell_mm}/{n}"
+            );
+        }
 
         // (5) Serial commit: per-env mutable state + StepOut assembly.
         let t = Instant::now();
@@ -1321,6 +1489,310 @@ impl BipedNexusBatchEnv {
             })
             .collect()
     }
+}
+
+/// GPU-resident MDP path (Stage 3c). Runs the `gpu_obs` + `gpu_reward` kernels
+/// on the same `body_poses` + per-env state the CPU rayon block uses, returning
+/// the GPU observations / reward / fall flags so the step loop can A/B them
+/// against the CPU results. (Gated on `gpu`: vortx isn't linked into the
+/// trainer / fps examples.)
+#[cfg(feature = "gpu")]
+impl BipedNexusBatchEnv {
+    /// Symmetry config for one joint, mirroring `VelocityFlatTask::symmetry_error`:
+    /// `(sym_active, sym_partner, sym_sign)`.
+    fn sym_for(&self, name: &str) -> (u32, u32, f32) {
+        if let Some(stem) = name.strip_suffix("_left") {
+            let right = alloc_right(stem);
+            if let Some(jr) = self.robot.joints.iter().position(|j| j.name == right) {
+                let sign = if stem == "hipy" || stem == "knee" || stem == "ankley" {
+                    1.0
+                } else {
+                    -1.0
+                };
+                return (1, jr as u32, sign);
+            }
+        }
+        (0, 0, 1.0)
+    }
+
+    /// Evaluate the full observation + reward on-GPU. The CURRENT poses are read
+    /// straight from the GPU-resident `body_poses` buffer (no upload — the
+    /// readback-elimination unlock: nexus's `Tensor<Pose>` buffer is reinterpreted
+    /// as the kernels' `[f32]` input, 8 f32/pose), so the only host data crossing
+    /// is the small per-env state + config (still uploaded per call here; a full
+    /// capture-clean rollout keeps those GPU-resident too). `poses` is the host
+    /// slurp, used only for a length sanity-check. Returns `(obs[OBS_DIM·n],
+    /// critic[CRITIC·n], reward[n], fell[n])`, row-major `[dim x n]`.
+    pub async fn gpu_mdp(
+        &self,
+        poses: &[NexusPose],
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) {
+        let bk = &self.gpu;
+        let n = self.n;
+        let jn = NUM_JOINTS;
+        let nf = NUM_FEET;
+        let cpb = self.idx.colliders_per_batch as usize;
+        let dt = self.task.control_dt();
+
+        // CURRENT poses come straight off the GPU (body_poses) below; `poses` is
+        // only a sanity check that the slurp the CPU path used matches the buffer.
+        debug_assert_eq!(poses.len(), self.state.body_poses().buffer().len());
+        // prev poses are still host-side (maintained from the prior slurp); a
+        // fully GPU-resident rollout would double-buffer body_poses on-GPU.
+        let prev_f: &[f32] = unsafe {
+            std::slice::from_raw_parts(
+                self.prev_body_poses.as_ptr() as *const f32,
+                self.prev_body_poses.len() * 8,
+            )
+        };
+
+        // Per-joint config (obs + reward variants).
+        let mut obs_cfg = Vec::with_capacity(jn);
+        let mut rew_cfg = Vec::with_capacity(jn);
+        for k in 0..jn {
+            let parent = self.idx.actuated_parent_links[k];
+            let child = self.idx.actuated[k].0;
+            let rq = self.idx.actuated_rest_quat[k];
+            let dp = self.robot.joints[k].default_pos;
+            obs_cfg.push(JointObsCfg {
+                parent_link: parent,
+                child_link: child,
+                default_pos: dp,
+                pad: 0.0,
+                rest_quat: [rq.x, rq.y, rq.z, rq.w],
+            });
+            let (lo, hi) = self.robot.joints[k].pos_limit;
+            let name = self.robot.joints[k].name;
+            let (sym_active, sym_partner, sym_sign) = self.sym_for(name);
+            let is_hip = u32::from(name.starts_with("hipz") || name.starts_with("hipx"));
+            rew_cfg.push(RewardJointCfg {
+                parent_link: parent,
+                child_link: child,
+                default_pos: dp,
+                pos_lo: lo,
+                pos_hi: hi,
+                sym_partner,
+                sym_sign,
+                sym_active,
+                is_hip,
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
+                rest_quat: [rq.x, rq.y, rq.z, rq.w],
+            });
+        }
+
+        // Per-env dynamic state, packed row-major `[dim x n]`.
+        let mut cmd = vec![0f32; 3 * n];
+        let mut last_a = vec![0f32; jn * n];
+        let mut action2 = vec![0f32; 2 * jn * n];
+        let mut prev_jp = vec![0f32; jn * n];
+        let mut air = vec![0f32; nf * n];
+        let mut sole = vec![0f32; nf * 3 * n];
+        let mut flags = vec![0u32; n];
+        for e in 0..n {
+            cmd[e] = self.cmd[e].vx;
+            cmd[n + e] = self.cmd[e].vy;
+            cmd[2 * n + e] = self.cmd[e].yaw_rate;
+            for k in 0..jn {
+                last_a[k * n + e] = self.last_action[e][k];
+                action2[k * n + e] = self.last_action[e][k];
+                action2[(jn + k) * n + e] = self.prev_action[e][k];
+                prev_jp[k * n + e] = self.prev_joint_pos[e][k];
+            }
+            for i in 0..nf {
+                air[i * n + e] = self.air_time[e][i];
+                let s = self.foot_sole_local[e][i];
+                sole[(i * 3) * n + e] = s.x;
+                sole[(i * 3 + 1) * n + e] = s.y;
+                sole[(i * 3 + 2) * n + e] = s.z;
+            }
+            let mut fl = 0u32;
+            if self.has_prev_pose[e] {
+                fl |= 1;
+            }
+            if self.has_prev_joint_pos[e] {
+                fl |= 2;
+            }
+            flags[e] = fl;
+        }
+
+        let obs_op = Obs::from_backend(bk).expect("obs op");
+        let rew_op = Reward::from_backend(bk).expect("reward op");
+        let st = BufferUsages::STORAGE;
+        let rw = BufferUsages::STORAGE | BufferUsages::COPY_SRC;
+        let uni = BufferUsages::UNIFORM;
+        let vec_t = |data: &[f32]| VxTensor::vector(bk, data, st).expect("vec");
+        let u_t = |data: &[u32]| VxTensor::vector(bk, data, st).expect("uvec");
+
+        let obs_params = VxTensor::scalar(
+            bk,
+            ObsParams {
+                num_envs: n as u32,
+                num_joints: jn as u32,
+                colliders_per_batch: cpb as u32,
+                torso_link: self.idx.torso_link,
+                obs_dim: OBS_DIM as u32,
+                critic_obs_dim: CRITIC_OBS_DIM as u32,
+                fwd: 0,
+                lat: 1,
+                up: 2,
+                control_dt: dt,
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
+                pad3: 0,
+                pad4: 0,
+                pad5: 0,
+            },
+            uni,
+        )
+        .expect("obs params");
+        let w = &self.task.weights;
+        let s = &self.task.stds;
+        let rew_params = VxTensor::scalar(
+            bk,
+            RewardParams {
+                num_envs: n as u32,
+                num_joints: jn as u32,
+                num_feet: nf as u32,
+                colliders_per_batch: cpb as u32,
+                torso_link: self.idx.torso_link,
+                fwd: 0,
+                lat: 1,
+                up: 2,
+                foot_link0: self.idx.foot_links[0],
+                foot_link1: self.idx.foot_links[1],
+                pad_u0: 0,
+                pad_u1: 0,
+                control_dt: dt,
+                w_track_lin: w.track_lin_vel,
+                w_track_ang: w.track_ang_vel,
+                w_upright: w.upright,
+                w_base_height: w.base_height,
+                base_height_target: w.base_height_target,
+                w_pose: w.pose,
+                w_bilateral: w.bilateral_symmetry,
+                w_action_rate: w.action_rate,
+                w_action_rate_hip: w.action_rate_hipz_hipx,
+                w_body_ang_vel: w.body_ang_vel,
+                w_lin_vel_z: w.lin_vel_z,
+                w_dof_pos_limits: w.dof_pos_limits,
+                w_dof_vel: w.dof_vel,
+                w_termination: w.termination,
+                w_air_time: w.air_time,
+                w_flight: w.flight,
+                w_single_support: w.single_support,
+                w_foot_slip: w.foot_slip,
+                w_foot_clearance: w.foot_clearance,
+                foot_clearance_target: w.foot_clearance_target,
+                w_foot_orientation: w.foot_orientation,
+                w_feet_yaw_mean: w.feet_yaw_mean,
+                w_feet_distance: w.feet_distance,
+                feet_distance_ref: w.feet_distance_ref,
+                std_lin_vel: s.lin_vel,
+                std_ang_vel: s.ang_vel,
+                std_upright: s.upright,
+                std_base_height: s.base_height,
+                std_pose: s.pose,
+                contact_z: 0.025,
+                min_base_height: self.task.min_base_height,
+                tilt_cos: self.task.tilt_limit.cos(),
+                standing_speed: 0.1,
+                air_cap: 0.4,
+                limit_scale: 0.9,
+                pad_f0: 0.0,
+                pad_f1: 0.0,
+            },
+            uni,
+        )
+        .expect("reward params");
+
+        let prev_t = vec_t(prev_f);
+        let obscfg_t = VxTensor::vector(bk, &obs_cfg, st).expect("obscfg");
+        let rewcfg_t = VxTensor::vector(bk, &rew_cfg, st).expect("rewcfg");
+        let cmd_t = vec_t(&cmd);
+        let la_t = vec_t(&last_a);
+        let a2_t = vec_t(&action2);
+        let pjp_t = vec_t(&prev_jp);
+        let air_t = vec_t(&air);
+        let sole_t = vec_t(&sole);
+        let flags_t = u_t(&flags);
+        let mut obs_t = vec_t(&vec![0f32; OBS_DIM * n]);
+        let mut critic_t = vec_t(&vec![0f32; CRITIC_OBS_DIM * n]);
+        let mut jpout_t = vec_t(&vec![0f32; jn * n]);
+        let mut reward_t = vec_t(&vec![0f32; n]);
+        let mut fell_t = u_t(&vec![0u32; n]);
+        let mut newair_t = vec_t(&vec![0f32; nf * n]);
+
+        // THE UNLOCK: bind the live GPU `body_poses` (Tensor<Pose>) as the kernels'
+        // `[f32]` input by reinterpreting its buffer slice (8 f32/pose). No D2H/H2D
+        // for the current poses — the kernels read physics output in place.
+        let poses_buf = self.state.body_poses().buffer();
+        let poses_slice = poses_buf.as_gpu_slice().reinterpret::<f32>();
+
+        let mut enc = bk.begin_encoding();
+        {
+            let mut p = enc.begin_pass("gpu_obs", None);
+            obs_op
+                .obs
+                .call(
+                    &mut p,
+                    n as u32,
+                    obs_params.buffer(),
+                    &poses_slice,
+                    prev_t.buffer(),
+                    obscfg_t.buffer(),
+                    cmd_t.buffer(),
+                    la_t.buffer(),
+                    pjp_t.buffer(),
+                    flags_t.buffer(),
+                    obs_t.buffer_mut(),
+                    critic_t.buffer_mut(),
+                    jpout_t.buffer_mut(),
+                )
+                .expect("obs call");
+        }
+        {
+            let mut p = enc.begin_pass("gpu_reward", None);
+            rew_op
+                .reward
+                .call(
+                    &mut p,
+                    n as u32,
+                    rew_params.buffer(),
+                    &poses_slice,
+                    prev_t.buffer(),
+                    rewcfg_t.buffer(),
+                    cmd_t.buffer(),
+                    a2_t.buffer(),
+                    air_t.buffer(),
+                    sole_t.buffer(),
+                    flags_t.buffer(),
+                    reward_t.buffer_mut(),
+                    fell_t.buffer_mut(),
+                    newair_t.buffer_mut(),
+                )
+                .expect("reward call");
+        }
+        bk.submit(enc).expect("submit gpu mdp");
+        bk.synchronize().expect("sync gpu mdp");
+
+        let obs_g = bk.slow_read_vec(obs_t.buffer()).await.expect("obs read");
+        let critic_g = bk.slow_read_vec(critic_t.buffer()).await.expect("critic read");
+        let reward_g = bk.slow_read_vec(reward_t.buffer()).await.expect("reward read");
+        let fell_g: Vec<u32> = bk.slow_read_vec(fell_t.buffer()).await.expect("fell read");
+        (obs_g, critic_g, reward_g, fell_g)
+    }
+}
+
+/// `"{stem}_right"` without pulling in `format!` machinery at the call site.
+#[cfg(feature = "gpu")]
+fn alloc_right(stem: &str) -> String {
+    let mut s = String::with_capacity(stem.len() + 6);
+    s.push_str(stem);
+    s.push_str("_right");
+    s
 }
 
 // --- Helpers -----------------------------------------------------------------

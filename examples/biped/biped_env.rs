@@ -432,7 +432,10 @@ impl BipedEnv {
         let task = VelocityFlatTask::new();
         let mut ip = IntegrationParameters::default();
         ip.dt = task.sim_dt;
-        ip.num_solver_iterations = 8;
+        // Match the nexus GPU env + Isaac/PhysX reference (position iterations =
+        // 4). Was 8; lowered for parity so CPU-vs-GPU benchmarks compare like
+        // fidelity. See biped_env_nexus.rs `SOLVER_ITERS`.
+        ip.num_solver_iterations = 4;
         let world = build_world(&mjcf, &robot, 0.0);
         // At the freshly-built default pose the feet are flat (world sole-normal =
         // +Z), so each foot's local sole-normal is R_spawn⁻¹·Z. Tilt is then the

@@ -96,8 +96,8 @@ collection + learning, the same unit as the tables below):
 
 ```
 full iteration — 8192 envs, T=32, 5e x 16mb
-  FULL CPU (rapier + CPU MLP + CPU update) :  72511 ms =   3.6 k env/s
-  FULL GPU (nexus + vortx + GPU update)    :  11916 ms =  22.0 k env/s
+  FULL CPU (rapier + CPU MLP + CPU update) :  68319 ms =   3.8 k env/s
+  FULL GPU (nexus + vortx + GPU update)    :   8792 ms =  29.8 k env/s
 ```
 
 Sweep N by re-running with `2048` / `4096` / `8192`. For **rollout-only**
@@ -119,47 +119,115 @@ minibatch is an on-GPU column gather), uses a **tiled GEMM**, and the GEMM inner
 loop is **vec4** (4-wide FMA) — all verified bit-exact against the CPU update
 (`gpu_update_check`):
 
-| N envs | mac CPU | mac GPU | linux CPU (24-core) | linux GPU (RTX 5090, WebGPU) | linux GPU (RTX 5090, native CUDA) | Isaac/PhysX 5 (5090) |
+> **Solver config (2026-06):** position-iterations = **4** + **explicit Coriolis**,
+> matching Isaac Lab / PhysX 5. The **linux CPU**, **linux GPU (WebGPU)** and
+> **linux GPU (native CUDA)** columns were all re-measured at this config — the
+> native-CUDA biped now runs end-to-end (the contact-path codegen crash is fixed,
+> nexus-cuda `29fac1e`), gather bit-exact (err 0.0).
+>
+> **Dispatch optimizations (2026-06):** the **native-CUDA** column now also
+> includes a set of dispatch-overhead reductions, all bit-identical physics:
+> (1) **CUDA-graph capture** of the physics rollout (`BIPED_CAPTURE=1`) — the
+> radix-sort capture wall was a `ThreadCount`-vs-`Grid` one-liner; replay = one
+> `cuGraphLaunch`, encode 80 ms→0.5 ms; (2) **fixed-grid dispatch** — now the
+> **default on CUDA** (was `BIPED_FIXED_GRID=1`): replaces CUDA indirect dispatch
+> (which does a full GPU drain — `synchronize()`+device→host read — per launch);
+> measured as the *entire* host-encode cost, `physics_encode` **1114 ms→25 ms** at
+> N=8192, leaving the step cleanly GPU-compute-bound. WebGPU keeps indirect (it's
+> native there); `BIPED_FIXED_GRID=0/1` overrides; (3) **`max_colors` 8→4**;
+> (4) **color-counter fusion** (~80 fewer `inc_color`/`reset_color` launches/step).
+>
+> **Per-env parallelism (2026-06):** profiling (a `KHAL_CUDA_PROFILE` per-kernel
+> timer — Nsight is too old for Blackwell) found ~50% of GPU time in **three
+> `threads(1)` "dispatch-arg" kernels** that each *serially scanned all N batches
+> in one thread* to compute an indirect grid size (an O(N) anti-scaling term) —
+> replaced with single-workgroup parallel reductions (**155× per call**,
+> bit-identical). Then **`gpu_mb_finalize_contact_constraints`** (the per-contact
+> LU back-solve) was made block-per-articulation (`threads(32)`, lane-split over
+> the independent back-solves): **~11.6× on the kernel, +11% e2e @ N=8192**. The
+> dominant kernel `gpu_mb_init_solve_joint_with_bias` (~37%) was then split into a
+> serial metadata-discovery walk → a **parallel back-solve phase** (the back-solves
+> are what's expensive; gating them inside the serial walk doesn't parallelize —
+> SIMT lockstep runs one active lane per slot — so they're hoisted into a separate
+> finalize-style `s += lanes` loop): **~4.5× on the kernel** (37%→12%). These
+> per-env wins lifted the native-CUDA column to **60.8 k @ N=8 192 / 59.2 k @
+> N=2 048** (~+35–41% over the dispatch-only column). The remaining gap to Isaac
+> at large N is the fused-megakernel / per-articulation-FK gap (the solver lacks
+> cooperative-launch / grid-sync — only workgroup barriers).
+> The **†** column (**mac**) is
+> the previous `position-iters = 8` setting and awaits re-measurement on that
+> hardware. The **Isaac** column is PhysX's own solver and is config-independent.
+
+| N envs | mac CPU† | mac GPU† | linux CPU (24-core) | linux GPU (RTX 5090, WebGPU) | linux GPU (RTX 5090, native CUDA) | Isaac/PhysX 5 (5090) |
 |-------:|--------:|--------:|--------------------:|-----------------------------:|----------------------------------:|---------------------:|
-| 512    | 2.0 k   | 3.8 k   | 2.1 k               | 6.4 k                        | **12.0 k**                        | —                    |
-| 1 024  | 2.0 k   | 5.3 k   | 2.3 k               | 10.6 k                       | **19.1 k**                        | —                    |
-| 2 048  | 2.1 k   | 6.5 k   | 2.7 k               | 15.5 k                       | **26.2 k**                        | 67 k                 |
-| 4 096  | 2.1 k   | 7.7 k   | 3.1 k               | 19.9 k                       | **30.1 k**                        | 126 k                |
-| 8 192  | 2.1 k   | 8.0 k   | 3.6 k               | 23.1 k                       | **32.6 k**                        | 201 k                |
+| 512    | 2.0 k   | 3.8 k   | 2.2 k               | 11.7 k                       | **32.5 k**                        | —                    |
+| 1 024  | 2.0 k   | 5.3 k   | 2.5 k               | 18.1 k                       | **47.1 k**                        | —                    |
+| 2 048  | 2.1 k   | 6.5 k   | 2.9 k               | 24.2 k                       | **59.2 k**                        | 67 k                 |
+| 4 096  | 2.1 k   | 7.7 k   | 3.4 k               | 27.4 k                       | **61.0 k**                        | 126 k                |
+| 8 192  | 2.1 k   | 8.0 k   | 3.8 k               | 29.8 k                       | **60.8 k**                        | 201 k                |
 
 The **native-CUDA** column is the *same* Rust stack compiled to PTX via
 [cuda-oxide](https://github.com/NVlabs/cuda-oxide) (Rust→PTX, LLVM 21) — no WebGPU
 at all, both the vortx tensor ops and the `nexus3d` physics, straight from the
 *verbatim* `#[spirv]` shader source, bit-exact vs WebGPU (boxes-physics pose
-fingerprint identical; biped obs-gather err 0.0). It's **~1.4× over WebGPU at
-N = 8 192 and up to ~1.9× on the small batches** (where WebGPU's per-dispatch
-overhead bites hardest): the lever is the GEMM-heavy PPO update (~3× via
+fingerprint identical; full biped iteration gather err 0.0 — the contact-path
+codegen crash is fixed, nexus-cuda `29fac1e`). It's **~1.4× over WebGPU across
+the sweep** (up to ~1.47× on the smallest batch): the lever is the GEMM-heavy PPO update (~3× via
 `cuLaunchKernel` — no per-dispatch bind groups, higher GEMM throughput), diluted
 by the heavier articulated-multibody physics. Getting there took ~12 general
 cuda-oxide codegen fixes plus two khal↔cuda-oxide ABI fixes (push element-count not
 byte-length for slice kernel args; pass a shader's `&0` offset by value to dodge a
 null-deref that DCE'd a whole kernel).
 
-Full GPU beats full CPU by ~**6.5×** on the 5090 (~3.5× on the mac). The
-optimizations (GPU-resident batch + tiled GEMM + vec4) lifted the 5090 WebGPU
-iteration from 12.7 k → **23.1 k env/s** at N = 8 192. **The Isaac gap is now ~6–9×
-(was ~16×).** Two hardware notes worth recording. (1) The vec4 **inner-loop FMA** is a ~12%
+Full GPU beats full CPU by ~**10.9×** on the 5090 (native CUDA; ~7.8× on WebGPU,
+~3.8× on the mac). The optimizations (GPU-resident batch + tiled GEMM + vec4)
+lifted the 5090 WebGPU iteration from 12.7 k → 23.1 k env/s at N = 8 192, and the
+Isaac-matching solver config (position-iters 8 → 4 + explicit Coriolis) lifted it
+further to **29.8 k** (WebGPU) / **41.5 k** (native CUDA), and the dispatch +
+per-env-parallelism optimizations above lifted native CUDA again to **60.8 k @
+N=8 192 / 59.2 k @ N=2 048** (32.5 k @ N=512). **The Isaac gap (native CUDA) is now
+~3.3× at N = 8 192 (was 4.8×) and ~1.1× at N = 2 048 (was 1.9×)** — the dispatch
+and per-env wins close it substantially, but the large-N gap is the fused-solver
+(megakernel) / per-articulation-FK architecture, not dispatches. Two hardware notes worth recording. (1) The vec4 **inner-loop FMA** is a ~12%
 win on the 5090 but **flat on the mac** — Metal auto-vectorizes the inner loop;
 rust-gpu → SPIR-V → NVIDIA does not, so the explicit `Vec4` FMA matters there.
 (2) vec4 **global loads** (a `gemm_tiled_vec4` with 128-bit loads, verified
 bit-exact) add **0%** — because a *tiled* GEMM already amortizes global memory
 (each element is loaded once into shared memory and reused), so it isn't
 global-bandwidth-bound; the win was compute, not bandwidth. The remaining gap is
-the rollout (~5× off PhysX) plus the update vs Isaac's fused-CUDA learning step
+the rollout (~2.3× off PhysX) plus the update vs Isaac's fused-CUDA learning step
 (~0.09 s) — the next lever is fewer dispatches, not vec4. None of it is new math.
+
+> **Next levers (2026-06, in priority order).** After the dispatch + per-env-parallelism
+> wins above, the GPU profile (via `KHAL_CUDA_PROFILE=1`) has shifted — physics is no
+> longer the single dominant cost:
+> 1. **`gemm_tiled` (PPO policy/value matmuls) is now the top GPU kernel (~22%).** The
+>    next lever is the *learning* side: higher GEMM throughput and/or fusing the PPO
+>    update, not more physics work.
+> 2. **Block-per-articulation resident-state substep megakernel** — fuse FK → mass-matrix
+>    → LU → constraint solve → integrate into one workgroup-scoped kernel that loads the
+>    articulation's `M`/jacobians/velocities into **shared memory once**, killing both
+>    the ~10–15 inter-kernel launches/substep and the repeated global round-trips of `M`.
+>    This is workgroup-scoped (only workgroup barriers — *not* the grid-sync the stack
+>    lacks), so it's feasible, and it's what closes most of the remaining large-N Isaac gap.
+> 3. **Remaining `threads(1)` multibody kernels** — `gpu_mb_gravity_and_lu` (mass-matrix
+>    LU decompose), `compute_dynamics_pre`, and the per-substep contact solve/remove
+>    kernels. Apply the now-proven patterns: lane-split where work is independent
+>    (finalize-style `s += lanes`), serial-walk → parallel-back-solve phase-split where a
+>    serial discovery loop is involved (init_solve-style). **Do not** gate expensive work
+>    inside a serial SIMT-lockstep loop — it won't parallelize.
+> 4. **Stage `M` in shared memory** for the finalize/init back-solves (each lane currently
+>    re-reads `M` from global) — folds into lever 2.
 
 Reproduce:
 
 ```sh
 # WebGPU
 cargo run --release --example iter_e2e_bench --features "gpu biped_gpu" -- <num_envs> 32 5 16
-# native CUDA (needs the cuda-oxide toolchain + embedded cubins)
+# native CUDA (needs the cuda-oxide toolchain + embedded cubins; fixed-grid is the CUDA default)
 BIPED_CUDA=1 cargo run --release --example iter_e2e_bench --features "gpu biped_gpu cuda_backend" -- <num_envs> 32 5 16
+# with CUDA-graph capture of the rollout (the updated native-CUDA column):
+BIPED_CAPTURE=1 BIPED_CUDA=1 cargo run --release --example iter_e2e_bench --features "gpu biped_gpu cuda_backend" -- <num_envs> 32 5 16
 ```
 
 ## Benchmark — full CPU vs full GPU rollout
@@ -180,37 +248,43 @@ Measured on a M-series mac + WebGPU and a 24-core x86 box with an RTX 5090. The
 throughput (`num_envs · 24 / collection_time`, i.e. physics + policy inference,
 no learning step) — as the production reference for "how fast this *should* go".
 
-| N envs | mac CPU (rapier + MLP) | mac GPU (nexus + vortx) | linux CPU (24-core) | linux GPU (RTX 5090) | Isaac/PhysX 5 (5090) |
+Same config note as the iteration table: **linux** columns re-measured at
+position-iters = 4 + explicit Coriolis; **†** columns are the previous
+`position-iters = 8` config; **Isaac** is config-independent.
+
+| N envs | mac CPU (rapier + MLP)† | mac GPU (nexus + vortx)† | linux CPU (24-core) | linux GPU (RTX 5090) | Isaac/PhysX 5 (5090) |
 |-------:|-----------------------:|-------------------------:|--------------------:|---------------------:|---------------------:|
-| 32     | **3.7 k**              | 0.5 k                    | **5.0 k**           | 0.7 k                | —                    |
-| 128    | **4.1 k**              | 1.7 k                    | **6.0 k**           | 2.4 k                | —                    |
-| 512    | 4.1 k                  | **4.7 k**                | 6.4 k               | **8.7 k**            | —                    |
-| 1 024  | 4.1 k                  | **6.5 k**                | 6.5 k               | **15.9 k**           | —                    |
-| 2 048  | 4.0 k                  | **8.6 k**                | 6.5 k               | **27.0 k**           | 73.8 k               |
-| 4 096  | 3.9 k                  | **10.4 k**               | 6.6 k               | **35.1 k**           | 139 k                |
-| 8 192  | 3.9 k                  | **10.8 k**               | 6.5 k               | **44.5 k**           | 220 k                |
+| 32     | **3.7 k**              | 0.5 k                    | **5.6 k**           | 1.6 k                | —                    |
+| 128    | **4.1 k**              | 1.7 k                    | **6.9 k**           | 5.6 k                | —                    |
+| 512    | 4.1 k                  | **4.7 k**                | 7.3 k               | **19.6 k**           | —                    |
+| 1 024  | 4.1 k                  | **6.5 k**                | 7.5 k               | **34.5 k**           | —                    |
+| 2 048  | 4.0 k                  | **8.6 k**                | 7.6 k               | **57.1 k**           | 73.8 k               |
+| 4 096  | 3.9 k                  | **10.4 k**               | 7.5 k               | **76.1 k**           | 139 k                |
+| 8 192  | 3.9 k                  | **10.8 k**               | 7.5 k               | **95.7 k**           | 220 k                |
 
 | machine                          | peak CPU | peak GPU | GPU > CPU at N ≈ | best GPU/CPU ratio |
 |----------------------------------|---------:|---------:|-----------------:|-------------------:|
-| mac (M-series + WebGPU)          | 4.1 k    | 10.8 k   | ~500             | 2.77×              |
-| linux (24-core + RTX 5090)       | 6.6 k    | 44.5 k   | ~450             | 6.80×              |
+| mac (M-series + WebGPU)†         | 4.1 k    | 10.8 k   | ~500             | 2.77×              |
+| linux (24-core + RTX 5090)       | 7.6 k    | 95.7 k   | ~200             | 12.8×              |
 
 What this says in practice:
 
-- Below N ≈ 450–500 the full-CPU path wins on both machines: rapier physics is
-  cheap at small batch and the GPU path pays a fixed per-step physics + policy
-  readback (~70 ms on the mac, ~50 ms on the 5090) that doesn't amortize yet.
+- Below the crossover (N ≈ 500 on the mac, **N ≈ 200 on the 5090**) the full-CPU
+  path wins: rapier physics is cheap at small batch and the GPU path pays a fixed
+  per-step physics + policy cost (~70 ms on the mac, **~20 ms on the 5090** at the
+  new solver config) that doesn't amortize yet.
 - Past the crossover the full-GPU path pulls ahead — ~2.8× by N = 8 192 on the
-  mac, **~6.8× on the 5090** (44.5 k vs 6.5 k env/s). The full-CPU throughput is
-  flat (~4 k mac, ~6.5 k 24-core) — bottlenecked by the **serial** per-env CPU
+  mac, **~12.8× on the 5090** (95.7 k vs 7.5 k env/s). The full-CPU throughput is
+  flat (~4 k mac, ~7.5 k 24-core) — bottlenecked by the **serial** per-env CPU
   MLP forward, not the physics.
 - The PPO *update* still runs on the CPU and isn't in this measurement — moving
   it to the GPU (Stage B) is what makes a full training iteration scale, not just
   the rollout.
-- Versus the **Isaac/PhysX 5** reference, nexus+vortx is ~2.7× behind at N = 2 048
-  and ~5× at N = 8 192 (44.5 k vs 220 k). That gap is the all-Rust/WebGPU tax —
-  PhysX is the ceiling to chase, and it scales harder with batch (the nexus GPU
-  curve is flattening past 4 k while PhysX keeps climbing).
+- Versus the **Isaac/PhysX 5** reference, nexus+vortx is now ~1.3× behind at
+  N = 2 048 and ~2.3× at N = 8 192 (95.7 k vs 220 k) — closed from ~2.7× / ~5×
+  once the solver config matched Isaac's (position-iters 4 + explicit Coriolis).
+  PhysX is still the ceiling and scales harder with batch (its curve keeps
+  climbing past 4 k while nexus softens).
 
 Reproduce:
 
