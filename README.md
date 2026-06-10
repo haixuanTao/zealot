@@ -97,7 +97,7 @@ collection + learning, the same unit as the tables below):
 ```
 full iteration — 8192 envs, T=32, 5e x 16mb
   FULL CPU (rapier + CPU MLP + CPU update) :  68319 ms =   3.8 k env/s
-  FULL GPU (nexus + vortx + GPU update)    :   8792 ms =  29.8 k env/s
+  FULL GPU (nexus + vortx + GPU update)    :   7242 ms =  36.2 k env/s
 ```
 
 Sweep N by re-running with `2048` / `4096` / `8192`. For **rollout-only**
@@ -169,11 +169,11 @@ loop is **vec4** (4-wide FMA) — all verified bit-exact against the CPU update
 
 | N envs | mac CPU† | mac GPU† | linux CPU (24-core) | linux GPU (RTX 5090, WebGPU) | linux GPU (RTX 5090, native CUDA) | Isaac/PhysX 5 (5090) |
 |-------:|--------:|--------:|--------------------:|-----------------------------:|----------------------------------:|---------------------:|
-| 512    | 2.0 k   | 3.8 k   | 2.2 k               | 11.7 k                       | **34.7 k**                        | —                    |
-| 1 024  | 2.0 k   | 5.3 k   | 2.5 k               | 18.1 k                       | **49.7 k**                        | —                    |
-| 2 048  | 2.1 k   | 6.5 k   | 2.9 k               | 24.2 k                       | **61.0 k**                        | 67 k                 |
-| 4 096  | 2.1 k   | 7.7 k   | 3.4 k               | 27.4 k                       | **63.0 k**                        | 126 k                |
-| 8 192  | 2.1 k   | 8.0 k   | 3.8 k               | 29.8 k                       | **63.6 k**                        | 201 k                |
+| 512    | 2.0 k   | 3.8 k   | 2.2 k               | 17.2 k                       | **34.7 k**                        | —                    |
+| 1 024  | 2.0 k   | 5.3 k   | 2.5 k               | 24.9 k                       | **49.7 k**                        | —                    |
+| 2 048  | 2.1 k   | 6.5 k   | 2.9 k               | 31.8 k                       | **61.0 k**                        | 67 k                 |
+| 4 096  | 2.1 k   | 7.7 k   | 3.4 k               | 34.7 k                       | **63.0 k**                        | 126 k                |
+| 8 192  | 2.1 k   | 8.0 k   | 3.8 k               | 36.2 k                       | **63.6 k**                        | 201 k                |
 
 The **native-CUDA** column is the *same* Rust stack compiled to PTX via
 [cuda-oxide](https://github.com/NVlabs/cuda-oxide) (Rust→PTX, LLVM 21) — no WebGPU
@@ -188,16 +188,20 @@ cuda-oxide codegen fixes plus two khal↔cuda-oxide ABI fixes (push element-coun
 byte-length for slice kernel args; pass a shader's `&0` offset by value to dodge a
 null-deref that DCE'd a whole kernel).
 
-Full GPU beats full CPU by ~**10.9×** on the 5090 (native CUDA; ~7.8× on WebGPU,
+Full GPU beats full CPU by ~**16.7×** on the 5090 (native CUDA; ~9.5× on WebGPU,
 ~3.8× on the mac). The optimizations (GPU-resident batch + tiled GEMM + vec4)
 lifted the 5090 WebGPU iteration from 12.7 k → 23.1 k env/s at N = 8 192, and the
 Isaac-matching solver config (position-iters 8 → 4 + explicit Coriolis) lifted it
-further to **29.8 k** (WebGPU) / **41.5 k** (native CUDA), and the dispatch +
-per-env-parallelism optimizations above lifted native CUDA again to **63.6 k @
-N=8 192 / 61.0 k @ N=2 048** (34.7 k @ N=512). **The Isaac gap (native CUDA) is now
-~3.2× at N = 8 192 (was 4.8×) and ~1.1× at N = 2 048 (was 1.9×)** — the dispatch
-and per-env wins close it substantially, but the large-N gap is the fused-solver
-(megakernel) / per-articulation-FK architecture, not dispatches. Two hardware notes worth recording. (1) The vec4 **inner-loop FMA** is a ~12%
+further to **29.8 k** (WebGPU) / **41.5 k** (native CUDA). The dispatch +
+per-env-parallelism optimizations above are mostly **backend-shared** (the
+cooperative kernels live in the verbatim `#[spirv]` source, so they compile for
+both SPIR-V and PTX), so they lifted **both** columns again: native CUDA to
+**63.6 k @ N=8 192 / 61.0 k @ N=2 048** (34.7 k @ N=512) and WebGPU to **36.2 k @
+N=8 192 / 31.8 k @ N=2 048** (17.2 k @ N=512, +22–47% across the sweep; the
+fixed-grid default is CUDA-only, the rest is shared). **The Isaac gap (native
+CUDA) is now ~3.2× at N = 8 192 (was 4.8×) and ~1.1× at N = 2 048 (was 1.9×)** —
+the dispatch and per-env wins close it substantially, but the large-N gap is the
+fused-solver (megakernel) / per-articulation-FK architecture, not dispatches. Two hardware notes worth recording. (1) The vec4 **inner-loop FMA** is a ~12%
 win on the 5090 but **flat on the mac** — Metal auto-vectorizes the inner loop;
 rust-gpu → SPIR-V → NVIDIA does not, so the explicit `Vec4` FMA matters there.
 (2) vec4 **global loads** (a `gemm_tiled_vec4` with 128-bit loads, verified
