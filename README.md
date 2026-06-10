@@ -149,22 +149,31 @@ loop is **vec4** (4-wide FMA) — all verified bit-exact against the CPU update
 > serial metadata-discovery walk → a **parallel back-solve phase** (the back-solves
 > are what's expensive; gating them inside the serial walk doesn't parallelize —
 > SIMT lockstep runs one active lane per slot — so they're hoisted into a separate
-> finalize-style `s += lanes` loop): **~4.5× on the kernel** (37%→12%). These
-> per-env wins lifted the native-CUDA column to **60.8 k @ N=8 192 / 59.2 k @
-> N=2 048** (~+35–41% over the dispatch-only column). The remaining gap to Isaac
-> at large N is the fused-megakernel / per-articulation-FK gap (the solver lacks
-> cooperative-launch / grid-sync — only workgroup barriers).
+> finalize-style `s += lanes` loop): **~4.5× on the kernel** (37%→12%). The same
+> two patterns were then applied to the rest of the `threads(1)` multibody set:
+> the **joint + contact PGS sweeps** (`remove_solve_joint`, `solve_contact`,
+> `remove_solve_contact`) are now cooperative `threads(32)` — Gauss-Seidel across
+> constraints stays serial, but each constraint's `J·v` reduction + DOF-apply is
+> split across lanes with a `delta` broadcast + per-constraint barrier (joint PGS
+> **~3.4×**; contact PGS ~1.3×, limited by reduction-barrier overhead at the
+> biped's small contact count), and **`gpu_mb_integrate`** is lane-split over
+> links (~1.9×). All bit-identical. These per-env wins lifted the native-CUDA
+> column to **63.6 k @ N=8 192 / 61.0 k @ N=2 048** (~+41–45% over the
+> dispatch-only column). The remaining gap to Isaac at large N is the
+> fused-megakernel / per-articulation-FK gap (the solver lacks cooperative-launch /
+> grid-sync — only workgroup barriers), and the now-largest single GPU kernel is
+> the PPO `gemm_tiled` (~22%), not physics.
 > The **†** column (**mac**) is
 > the previous `position-iters = 8` setting and awaits re-measurement on that
 > hardware. The **Isaac** column is PhysX's own solver and is config-independent.
 
 | N envs | mac CPU† | mac GPU† | linux CPU (24-core) | linux GPU (RTX 5090, WebGPU) | linux GPU (RTX 5090, native CUDA) | Isaac/PhysX 5 (5090) |
 |-------:|--------:|--------:|--------------------:|-----------------------------:|----------------------------------:|---------------------:|
-| 512    | 2.0 k   | 3.8 k   | 2.2 k               | 11.7 k                       | **32.5 k**                        | —                    |
-| 1 024  | 2.0 k   | 5.3 k   | 2.5 k               | 18.1 k                       | **47.1 k**                        | —                    |
-| 2 048  | 2.1 k   | 6.5 k   | 2.9 k               | 24.2 k                       | **59.2 k**                        | 67 k                 |
-| 4 096  | 2.1 k   | 7.7 k   | 3.4 k               | 27.4 k                       | **61.0 k**                        | 126 k                |
-| 8 192  | 2.1 k   | 8.0 k   | 3.8 k               | 29.8 k                       | **60.8 k**                        | 201 k                |
+| 512    | 2.0 k   | 3.8 k   | 2.2 k               | 11.7 k                       | **34.7 k**                        | —                    |
+| 1 024  | 2.0 k   | 5.3 k   | 2.5 k               | 18.1 k                       | **49.7 k**                        | —                    |
+| 2 048  | 2.1 k   | 6.5 k   | 2.9 k               | 24.2 k                       | **61.0 k**                        | 67 k                 |
+| 4 096  | 2.1 k   | 7.7 k   | 3.4 k               | 27.4 k                       | **63.0 k**                        | 126 k                |
+| 8 192  | 2.1 k   | 8.0 k   | 3.8 k               | 29.8 k                       | **63.6 k**                        | 201 k                |
 
 The **native-CUDA** column is the *same* Rust stack compiled to PTX via
 [cuda-oxide](https://github.com/NVlabs/cuda-oxide) (Rust→PTX, LLVM 21) — no WebGPU
@@ -184,9 +193,9 @@ Full GPU beats full CPU by ~**10.9×** on the 5090 (native CUDA; ~7.8× on WebGP
 lifted the 5090 WebGPU iteration from 12.7 k → 23.1 k env/s at N = 8 192, and the
 Isaac-matching solver config (position-iters 8 → 4 + explicit Coriolis) lifted it
 further to **29.8 k** (WebGPU) / **41.5 k** (native CUDA), and the dispatch +
-per-env-parallelism optimizations above lifted native CUDA again to **60.8 k @
-N=8 192 / 59.2 k @ N=2 048** (32.5 k @ N=512). **The Isaac gap (native CUDA) is now
-~3.3× at N = 8 192 (was 4.8×) and ~1.1× at N = 2 048 (was 1.9×)** — the dispatch
+per-env-parallelism optimizations above lifted native CUDA again to **63.6 k @
+N=8 192 / 61.0 k @ N=2 048** (34.7 k @ N=512). **The Isaac gap (native CUDA) is now
+~3.2× at N = 8 192 (was 4.8×) and ~1.1× at N = 2 048 (was 1.9×)** — the dispatch
 and per-env wins close it substantially, but the large-N gap is the fused-solver
 (megakernel) / per-articulation-FK architecture, not dispatches. Two hardware notes worth recording. (1) The vec4 **inner-loop FMA** is a ~12%
 win on the 5090 but **flat on the mac** — Metal auto-vectorizes the inner loop;
@@ -210,12 +219,13 @@ the rollout (~2.3× off PhysX) plus the update vs Isaac's fused-CUDA learning st
 >    the ~10–15 inter-kernel launches/substep and the repeated global round-trips of `M`.
 >    This is workgroup-scoped (only workgroup barriers — *not* the grid-sync the stack
 >    lacks), so it's feasible, and it's what closes most of the remaining large-N Isaac gap.
-> 3. **Remaining `threads(1)` multibody kernels** — `gpu_mb_gravity_and_lu` (mass-matrix
->    LU decompose), `compute_dynamics_pre`, and the per-substep contact solve/remove
->    kernels. Apply the now-proven patterns: lane-split where work is independent
->    (finalize-style `s += lanes`), serial-walk → parallel-back-solve phase-split where a
->    serial discovery loop is involved (init_solve-style). **Do not** gate expensive work
->    inside a serial SIMT-lockstep loop — it won't parallelize.
+> 3. ~~Remaining `threads(1)` multibody kernels~~ **(mostly done)** — the joint + contact
+>    PGS sweeps and `gpu_mb_integrate` are now cooperative `threads(32)` (see the per-env
+>    note above); `gpu_mb_gravity_and_lu` / `compute_dynamics_pre` turned out to be
+>    *already* cooperative (the heavy mass-matrix/ABA/LU work, not a `threads(1)` problem).
+>    The one remaining `threads(1)` builder is **`gpu_mb_init_contact_constraints`** (~6 %):
+>    its per-constraint jacobian fill needs the walk's per-contact geometry, so the
+>    init_solve-style phase-split needs that geometry stored/recomputed — left as a TODO.
 > 4. **Stage `M` in shared memory** for the finalize/init back-solves (each lane currently
 >    re-reads `M` from global) — folds into lever 2.
 
