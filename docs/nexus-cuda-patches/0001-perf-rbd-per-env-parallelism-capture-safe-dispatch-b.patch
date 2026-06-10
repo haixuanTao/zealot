@@ -1,0 +1,1716 @@
+From ad856b9efdc8396e2f2c3056c83062ac2c8c3958 Mon Sep 17 00:00:00 2001
+From: CarolinePascal <caroline8.pascal@gmail.com>
+Date: Wed, 10 Jun 2026 14:52:29 +0200
+Subject: [PATCH 1/2] perf(rbd): per-env parallelism + capture-safe dispatch
+ (bit-identical)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+GPU-side optimizations for the batched multibody rollout, all verified
+bit-identical (biped gather err 0.0). Lifts the native-CUDA biped from
+45k -> 60.8k env/s @ N=8192 (Isaac gap 4.8x -> 3.3x).
+
+Per-env parallelism (the plateau was per-env serial work, not dispatch):
+- broad_phase/{lbvh,narrow_phase}: the three threads(1) "*_init_dispatch"
+  kernels serially scanned all N batches in ONE thread to compute an indirect
+  grid size (O(N) anti-scaling). Replaced with single-workgroup threads(256)
+  parallel max-reductions (shared helper highest_len_over_batches): 155x/call.
+- multibody/contact_constraints: gpu_mb_finalize_contact_constraints made
+  cooperative threads(32) — lane-split over the independent per-constraint LU
+  back-solves (no barriers, disjoint writes): ~11.6x/call.
+- multibody/joint_constraints: gpu_mb_init_solve_joint_with_bias split into a
+  serial metadata-discovery walk (defer_column) -> barrier -> parallel
+  back-solve phase (compute_joint_columns_par, finalize-style s += lanes) ->
+  barrier -> lane-0 Gauss-Seidel PGS: ~4.5x/call. (Gating the back-solve inside
+  the serial walk does NOT parallelize: SIMT lockstep runs one lane per slot.)
+
+Dispatch / capture (lib.rs, solver.rs, pipeline.rs, radix_sort, coloring,
+warmstart, joint, multibody): fixed-grid dispatch is now the backend-aware
+default (ON for CUDA — kills the indirect host round-trip / GPU drain,
+physics_encode 1114->25ms; OFF for WebGPU; BIPED_FIXED_GRID overrides) via
+set_fixed_dispatch_grid_default(is_cuda) in pipeline from_rapier. Plus the
+radix-sort ThreadCount-vs-Grid capture fix, color-counter fusion, and
+max_colors plumbing from the capture-enablement work.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ build_cuda/README.md                          |   7 +-
+ build_cuda/build_cubin_unroll.sh              |  62 ++++++
+ build_cuda/build_libnvvm_unroll_both.sh       |  38 ++++
+ build_cuda/build_vortx_cubin_only.sh          |  36 +++
+ src_rbd/broad_phase/narrow_phase.rs           |  14 +-
+ src_rbd/dynamics/coloring.rs                  |  17 +-
+ src_rbd/dynamics/joint.rs                     |  12 +-
+ src_rbd/dynamics/multibody.rs                 |  90 +++++++-
+ src_rbd/dynamics/solver.rs                    |  77 +++++--
+ src_rbd/dynamics/warmstart.rs                 |  10 +-
+ src_rbd/lib.rs                                |  60 +++++
+ src_rbd/pipeline.rs                           |  20 ++
+ src_rbd/utils/radix_sort/mod.rs               | 120 ++++++----
+ src_rbd_shaders/broad_phase/lbvh.rs           |  73 +++++-
+ src_rbd_shaders/broad_phase/narrow_phase.rs   |  48 ++--
+ .../dynamics/multibody/contact_constraints.rs |  24 +-
+ .../dynamics/multibody/joint_constraints.rs   | 210 ++++++++++++++----
+ src_rbd_shaders/dynamics/multibody/mod.rs     |   2 +
+ .../dynamics/multibody/scatter_motor.rs       |  44 ++++
+ 19 files changed, 793 insertions(+), 171 deletions(-)
+ create mode 100755 build_cuda/build_cubin_unroll.sh
+ create mode 100644 build_cuda/build_libnvvm_unroll_both.sh
+ create mode 100644 build_cuda/build_vortx_cubin_only.sh
+ create mode 100644 src_rbd_shaders/dynamics/multibody/scatter_motor.rs
+
+diff --git a/build_cuda/README.md b/build_cuda/README.md
+index 154632e..397c6f0 100644
+--- a/build_cuda/README.md
++++ b/build_cuda/README.md
+@@ -21,6 +21,7 @@ nexus_rbd3d build.rs (CUDA_OXIDE_SHADERS_PTX).
+ - build_nexus_cubin.sh         : same but llc+ptxas cubin path
+ 
+ ## Status
+-- Builds + runs on the 5090; steps 1-22 bit-exact vs WebGPU.
+-- KNOWN REMAINING: step-23 crash in gpu_solver_init_constraints (contact path,
+-  CUDA_ERROR_ILLEGAL_ADDRESS) once contacts form -- separate codegen bug.
++- Builds + runs on the 5090; bit-exact vs WebGPU.
++- FIXED (29fac1e): the step-23 ILLEGAL_ADDRESS in gpu_solver_init_constraints
++  (contact path) is resolved. The contact-heavy biped (zealot iter_e2e_bench)
++  now runs end-to-end on native CUDA, gather bit-exact (err 0.0).
+diff --git a/build_cuda/build_cubin_unroll.sh b/build_cuda/build_cubin_unroll.sh
+new file mode 100755
+index 0000000..9d6f204
+--- /dev/null
++++ b/build_cuda/build_cubin_unroll.sh
+@@ -0,0 +1,62 @@
++#!/bin/bash
++# Build a shader-crate cubin with the cuda-oxide loop-unroll win (HANDOFF_5090).
++# Usage: build_cubin_unroll.sh <crate> <features> <crate_dir> <src_touch> <ll_name> <verify_sym>
++set -eo pipefail
++CRATE=$1; FEATURES=$2; CRATE_DIR=$3; SRC_TOUCH=$4; LL_NAME=$5; VSYM=$6
++
++# LLVM 21 tools — MUST match the LLVM the cuda-oxide backend links (LLVM 21).
++# (The old build_nexus_cubin.sh used the rust-nightly LLVM-20 tools, which silently
++# ignore the LLVM-21-emitted !llvm.loop.unroll.full hint → unroll no-op.)
++TOOL=${LLVM21_BIN:-/home/baguette/llvm21/bin}
++LIBDEV=/home/baguette/nvvm-wheel/extracted/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc
++PTXAS=/home/baguette/.local/lib/python3.12/site-packages/triton/backends/nvidia/bin/ptxas
++BACKEND=/home/baguette/cuda-oxide-src/crates/rustc-codegen-cuda/target/debug/librustc_codegen_cuda.so
++export CUDA_OXIDE_PTX_DIR=${CUDA_OXIDE_PTX_DIR:-$HOME/nexus_ptx}
++export PATH=$HOME/.cargo/bin:$PATH
++DO_UNROLL=${DO_UNROLL:-1}                 # 0 = same toolchain, unroll pass OFF (control)
++[ "$DO_UNROLL" = "1" ] && export CUDA_OXIDE_UNROLL_LOOPS=1   # emit !llvm.loop.unroll.full hints
++mkdir -p $CUDA_OXIDE_PTX_DIR
++cd "$CRATE_DIR"
++
++echo "=== [$CRATE 1/6] cuda-oxide build -> .ll (unroll ON) ==="
++cargo clean -p "$CRATE" 2>/dev/null || true
++touch "$SRC_TOUCH"        # GOTCHA: clean -p doesn't clear nvptx64 artifact; force recompile
++CARGO_INCREMENTAL=0 RUSTFLAGS="-Z codegen-backend=$BACKEND -Zalways-encode-mir -Zmir-enable-passes=-JumpThreading" \
++  cargo +nightly-2026-04-03 build -p "$CRATE" --release \
++  --no-default-features --features "$FEATURES" \
++  --target nvptx64-nvidia-cuda -Z build-std=core
++LL=$CUDA_OXIDE_PTX_DIR/$LL_NAME.ll
++UNROLL_MD=$(grep -cE 'llvm\.loop\.unroll\.full|!llvm\.loop' "$LL" || true)
++echo "ll: $(grep -c '^define' "$LL") defines; unroll-metadata lines = $UNROLL_MD (DO_UNROLL=$DO_UNROLL)"
++if [ "$DO_UNROLL" = "1" ] && [ "$UNROLL_MD" -eq 0 ]; then echo "!!! no unroll metadata in .ll — backend not emitting hint"; exit 1; fi
++
++echo "=== [$CRATE 2/6] assemble + link libdevice ==="
++$TOOL/llvm-as "$LL" -o /tmp/u.bc
++$TOOL/llvm-link /tmp/u.bc "$LIBDEV" -o /tmp/u_linked.bc
++
++echo "=== [$CRATE 3/6] value-only prune + inline (NO -O3: avoids barrier-dup deadlock) ==="
++$TOOL/opt -passes="internalize,globaldce,inline,sroa,early-cse,instcombine<no-verify-fixpoint>,gvn" \
++  /tmp/u_linked.bc -o /tmp/u1.bc
++
++echo "=== [$CRATE 4/6] canonicalize loops + UNROLL ==="
++$TOOL/opt -passes="loop-simplify,loop(loop-rotate,indvars),loop-unroll,sroa,instcombine<no-verify-fixpoint>,gvn,adce" \
++  /tmp/u1.bc -o /tmp/u2.bc
++$TOOL/opt -passes="globaldce" /tmp/u2.bc -o /tmp/u3.bc
++
++echo "=== [$CRATE 5/6] llc -> ptx -> cubin ==="
++$TOOL/llc -mcpu=sm_120 -O3 --fp-contract=fast /tmp/u3.bc -o /tmp/u.ptx
++OUT=$CUDA_OXIDE_PTX_DIR/$LL_NAME.cubin
++rm -f "$OUT"
++$PTXAS -arch=sm_120 -O3 /tmp/u.ptx -o "$OUT"
++ls -la "$OUT"
++
++echo "=== [$CRATE 6/6] SASS density (FFMA share) — non-fatal ==="
++set +e
++CUOBJDUMP=$(dirname "$PTXAS")/cuobjdump
++SASS=$("$CUOBJDUMP" -sass "$OUT" 2>/dev/null)
++FFMA=$(echo "$SASS" | grep -cE '\bFFMA\b')
++IMAD=$(echo "$SASS" | grep -cE '\bIMAD\b')
++TOTAL=$(echo "$SASS" | grep -cE '/\*[0-9a-f]+\*/')
++echo "$CRATE: FFMA=$FFMA  IMAD=$IMAD  total-insns≈$TOTAL"
++echo "DONE $CRATE -> $OUT"
++exit 0
+diff --git a/build_cuda/build_libnvvm_unroll_both.sh b/build_cuda/build_libnvvm_unroll_both.sh
+new file mode 100644
+index 0000000..96cdf14
+--- /dev/null
++++ b/build_cuda/build_libnvvm_unroll_both.sh
+@@ -0,0 +1,38 @@
++#!/bin/bash
++# libNVVM + unroll for BOTH cubins (the synthesis): cuda-oxide .ll (unroll hint) -> make_cubin (libNVVM).
++set -eo pipefail
++BACKEND=/home/baguette/cuda-oxide-src/crates/rustc-codegen-cuda/target/debug/librustc_codegen_cuda.so
++export CUDA_OXIDE_PTX_DIR=$HOME/nexus_ptx
++export PATH=$HOME/.cargo/bin:$PATH
++export CUDA_OXIDE_LIBDEVICE=/home/baguette/nvvm-wheel/extracted/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc
++export LIBNVVM_PATH=/home/baguette/nvvm-wheel/extracted/nvidia/cuda_nvcc/nvvm/lib64/libnvvm.so
++export LIBNVJITLINK_PATH=/home/baguette/nvjit-wheel/extracted/nvidia/nvjitlink/lib/libnvJitLink.so.12
++export CUDA_OXIDE_UNROLL_LOOPS=1   # emit the hint; libNVVM decides whether to honor it
++
++# --- nexus: reuse the authored libNVVM script (inherits CUDA_OXIDE_UNROLL_LOOPS) ---
++touch ~/Documents/work/nexus-cuda/src_rbd_shaders/lib.rs   # force nvptx64 recompile (clean -p won't)
++echo "########## NEXUS (libNVVM + unroll) ##########"
++bash ~/Documents/work/nexus-cuda/build_cuda/build_nexus_cubin_libnvvm.sh
++
++# --- vortx: cuda-oxide build -> .ll -> make_cubin ---
++echo "########## VORTX (libNVVM + unroll) ##########"
++cd ~/Documents/work/vortx
++cargo clean -p vortx-shaders 2>/dev/null || true
++touch vortx-shaders/src/lib.rs
++CARGO_INCREMENTAL=0 RUSTFLAGS="-Z codegen-backend=$BACKEND -Zalways-encode-mir -Zmir-enable-passes=-JumpThreading" \
++  cargo +nightly-2026-04-03 build -p vortx-shaders --release \
++  --no-default-features --features "cuda-oxide unsafe_remove_boundchecks" \
++  --target nvptx64-nvidia-cuda -Z build-std=core
++VLL=$CUDA_OXIDE_PTX_DIR/vortx_shaders.ll
++echo "vortx ll: $(grep -c '^define' $VLL) defines; unroll-md $(grep -cE '!llvm.loop' $VLL)"
++rm -f $CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin
++cd ~/make_cubin
++OUT=$(cargo +nightly-2026-04-03 run --release -- $VLL sm_120 2>/tmp/mkcubin_v.err | grep "^CUBIN=" | cut -d= -f2)
++tail -3 /tmp/mkcubin_v.err
++[ -s "$CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin" ] || { [ -n "$OUT" ] && cp "$OUT" $CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin; }
++ls -la $CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin
++
++CUOBJ=/home/baguette/.local/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump
++NAME=$("$CUOBJ" -sass $CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin 2>/dev/null | grep -oE 'gemm_tiled_cuda_entry_[0-9a-f]+' | head -1)
++echo "libNVVM vortx gemm_tiled FP mix:"; "$CUOBJ" -sass -fun "$NAME" $CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin 2>/dev/null | grep -E '/\*[0-9a-f]+\*/' | grep -oE '\b(FFMA|FMUL|FADD)\b' | sort | uniq -c
++echo "LIBNVVM_BOTH_DONE"
+diff --git a/build_cuda/build_vortx_cubin_only.sh b/build_cuda/build_vortx_cubin_only.sh
+new file mode 100644
+index 0000000..e8c3b8f
+--- /dev/null
++++ b/build_cuda/build_vortx_cubin_only.sh
+@@ -0,0 +1,36 @@
++#!/bin/bash
++# Rebuild ONLY the vortx-shaders cubin via the libNVVM path (the production-best
++# path per native-cuda-loop-unroll memory). Used after adding a vortx kernel
++# (e.g. gpu_sample_targets) so the native-CUDA backend embeds it. nexus cubin is
++# untouched.
++set -eo pipefail
++BACKEND=/home/baguette/cuda-oxide-src/crates/rustc-codegen-cuda/target/debug/librustc_codegen_cuda.so
++export CUDA_OXIDE_PTX_DIR=$HOME/nexus_ptx
++export PATH=$HOME/.cargo/bin:$PATH
++export CUDA_OXIDE_LIBDEVICE=/home/baguette/nvvm-wheel/extracted/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc
++export LIBNVVM_PATH=/home/baguette/nvvm-wheel/extracted/nvidia/cuda_nvcc/nvvm/lib64/libnvvm.so
++export LIBNVJITLINK_PATH=/home/baguette/nvjit-wheel/extracted/nvidia/nvjitlink/lib/libnvJitLink.so.12
++export CUDA_OXIDE_UNROLL_LOOPS=1
++
++echo "########## VORTX (libNVVM + unroll) ##########"
++cd ~/Documents/work/vortx
++cargo clean -p vortx-shaders 2>/dev/null || true
++touch vortx-shaders/src/lib.rs
++CARGO_INCREMENTAL=0 RUSTFLAGS="-Z codegen-backend=$BACKEND -Zalways-encode-mir -Zmir-enable-passes=-JumpThreading" \
++  cargo +nightly-2026-04-03 build -p vortx-shaders --release \
++  --no-default-features --features "cuda-oxide unsafe_remove_boundchecks" \
++  --target nvptx64-nvidia-cuda -Z build-std=core
++VLL=$CUDA_OXIDE_PTX_DIR/vortx_shaders.ll
++echo "vortx ll: $(grep -c '^define' $VLL) defines; unroll-md $(grep -cE '!llvm.loop' $VLL)"
++echo "sample kernel present in .ll: $(grep -c 'gpu_sample_targets' $VLL)"
++rm -f $CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin
++cd ~/make_cubin
++OUT=$(cargo +nightly-2026-04-03 run --release -- $VLL sm_120 2>/tmp/mkcubin_v.err | grep "^CUBIN=" | cut -d= -f2)
++tail -3 /tmp/mkcubin_v.err
++[ -s "$CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin" ] || { [ -n "$OUT" ] && cp "$OUT" $CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin; }
++ls -la $CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin
++
++CUOBJ=/home/baguette/.local/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump
++echo "sample kernel symbol in cubin:"
++"$CUOBJ" -sass $CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin 2>/dev/null | grep -oE 'gpu_sample_targets_cuda_entry_[0-9a-f]+' | head -1
++echo "VORTX_CUBIN_DONE"
+diff --git a/src_rbd/broad_phase/narrow_phase.rs b/src_rbd/broad_phase/narrow_phase.rs
+index 9410806..eea0172 100644
+--- a/src_rbd/broad_phase/narrow_phase.rs
++++ b/src_rbd/broad_phase/narrow_phase.rs
+@@ -44,12 +44,22 @@ impl GpuNarrowPhase {
+         batch_indices: &Tensor<crate::shaders::utils::BatchIndices>,
+     ) -> Result<(), GpuBackendError> {
+         let num_batches = contacts_len.len() as u32;
++        // Fixed capacity-based grids (BIPED_FIXED_GRID) — both kernels grid-stride
++        // over the true per-batch count, so `[ceil(cap/64), num_batches, 1]` is
++        // correct and avoids the per-dispatch GPU-drain of indirect dispatch.
++        let nb = num_batches.max(1);
++        let pairs_grid = [
++            (collision_pairs.len() as u32 / nb).max(1).div_ceil(64),
++            num_batches,
++            1,
++        ];
++        let pfm_grid = [(pfm_pairs.len() as u32 / nb).max(1).div_ceil(64), num_batches, 1];
+         self.reset_narrow_phase
+             .call(pass, [1u32, num_batches, 1], contacts_len, pfm_pairs_len)?;
+ 
+         self.narrow_phase.call(
+             pass,
+-            collision_pairs_indirect,
++            crate::dispatch_grid(collision_pairs_indirect, pairs_grid),
+             collision_pairs,
+             collision_pairs_len,
+             poses,
+@@ -67,7 +77,7 @@ impl GpuNarrowPhase {
+             .call(pass, 1u32, pfm_pairs_len, pfm_pairs_indirect)?;
+         self.narrow_phase_pfm_pfm.call(
+             pass,
+-            &*pfm_pairs_indirect,
++            crate::dispatch_grid(&*pfm_pairs_indirect, pfm_grid),
+             contacts,
+             contacts_len,
+             pfm_pairs,
+diff --git a/src_rbd/dynamics/coloring.rs b/src_rbd/dynamics/coloring.rs
+index 7db6628..43e854d 100644
+--- a/src_rbd/dynamics/coloring.rs
++++ b/src_rbd/dynamics/coloring.rs
+@@ -97,6 +97,13 @@ pub struct ColoringArgs<'a> {
+     pub body_group: &'a Tensor<u32>,
+ }
+ 
++/// Fixed capacity-based grid for the (grid-stride) coloring kernels —
++/// `BIPED_FIXED_GRID` path (see `crate::dispatch_grid`).
++fn coloring_grid(args: &ColoringArgs) -> [u32; 3] {
++    let nb = (args.contacts_len.len() as u32).max(1);
++    [(args.constraints.len() as u32 / nb).max(1).div_ceil(64), nb, 1]
++}
++
+ impl GpuColoring {
+     /// Dispatches the reset_luby kernel.
+     fn dispatch_reset_luby(
+@@ -106,7 +113,7 @@ impl GpuColoring {
+     ) -> Result<(), GpuBackendError> {
+         self.reset_luby_kernel.call(
+             pass,
+-            args.contacts_len_indirect,
++            crate::dispatch_grid(args.contacts_len_indirect, coloring_grid(args)),
+             args.constraints_colors,
+             args.constraints_rands,
+             args.contacts_len,
+@@ -123,7 +130,7 @@ impl GpuColoring {
+     ) -> Result<(), GpuBackendError> {
+         self.step_graph_coloring_luby_kernel.call(
+             pass,
+-            args.contacts_len_indirect,
++            crate::dispatch_grid(args.contacts_len_indirect, coloring_grid(args)),
+             args.body_constraint_counts,
+             args.body_constraint_ids,
+             args.constraints,
+@@ -146,7 +153,7 @@ impl GpuColoring {
+     ) -> Result<(), GpuBackendError> {
+         self.reset_topo_gc_kernel.call(
+             pass,
+-            args.contacts_len_indirect,
++            crate::dispatch_grid(args.contacts_len_indirect, coloring_grid(args)),
+             args.constraints_colors,
+             args.colored,
+             args.contacts_len,
+@@ -163,7 +170,7 @@ impl GpuColoring {
+     ) -> Result<(), GpuBackendError> {
+         self.step_graph_coloring_topo_gc_kernel.call(
+             pass,
+-            args.contacts_len_indirect,
++            crate::dispatch_grid(args.contacts_len_indirect, coloring_grid(args)),
+             args.body_constraint_counts,
+             args.body_constraint_ids,
+             args.constraints,
+@@ -185,7 +192,7 @@ impl GpuColoring {
+     ) -> Result<(), GpuBackendError> {
+         self.fix_conflicts_topo_gc_kernel.call(
+             pass,
+-            args.contacts_len_indirect,
++            crate::dispatch_grid(args.contacts_len_indirect, coloring_grid(args)),
+             args.body_constraint_counts,
+             args.body_constraint_ids,
+             args.constraints,
+diff --git a/src_rbd/dynamics/joint.rs b/src_rbd/dynamics/joint.rs
+index 20f9cd4..fe95475 100644
+--- a/src_rbd/dynamics/joint.rs
++++ b/src_rbd/dynamics/joint.rs
+@@ -366,6 +366,9 @@ pub struct JointSolverArgs<'a> {
+     pub local_mprops: &'a Tensor<LocalMassProperties>,
+     /// Shared per-batch capacity / section-offset uniform.
+     pub batch_indices: &'a Tensor<crate::shaders::utils::BatchIndices>,
++    /// Constant per-color uniforms `[1,2,…]` — bound per joint-color sweep
++    /// instead of bumping `joints.curr_color` via reset/inc kernels.
++    pub color_uniforms: &'a [Tensor<u32>],
+ }
+ 
+ impl GpuJointSolver {
+@@ -439,10 +442,7 @@ impl GpuJointSolver {
+             )?;
+         }
+ 
+-        self.reset_joint_color
+-            .call(pass, 1u32, &mut args.joints.curr_color)?;
+-
+-        for _ in 0..args.joints.num_colors {
++        for c in 0..args.joints.num_colors as usize {
+             // TODO PERF: figure out a way to dispatch a number of threads that fits
+             //            more tightly the size of the current color.
+             self.solve_joint_constraints.call(
+@@ -451,11 +451,9 @@ impl GpuJointSolver {
+                 &mut args.joints.constraints,
+                 solver_vels,
+                 &args.joints.color_groups,
+-                &args.joints.curr_color,
++                &args.color_uniforms[c],
+                 args.batch_indices,
+             )?;
+-            self.inc_joint_color
+-                .call(pass, 1u32, &mut args.joints.curr_color)?;
+         }
+ 
+         Ok(())
+diff --git a/src_rbd/dynamics/multibody.rs b/src_rbd/dynamics/multibody.rs
+index cfaf64a..7a07bdb 100644
+--- a/src_rbd/dynamics/multibody.rs
++++ b/src_rbd/dynamics/multibody.rs
+@@ -33,7 +33,7 @@ use crate::shaders::dynamics::{
+     GpuMbTransposeGenForcesToPacked,
+     GpuMbRemoveContactConstraintBias, GpuMbRemoveImpulseJointConstraintBias,
+     GpuMbRemoveSolveJointNoBias, GpuMbSolveContactConstraints, GpuMbSolveImpulseJointConstraints,
+-    GpuMbUpdateImpulseJointConstraints, LocalMassProperties, MAX_AXIS_CONSTRAINTS,
++    GpuMbUpdateImpulseJointConstraints, GpuScatterMotorTargets, LocalMassProperties, MAX_AXIS_CONSTRAINTS,
+     MAX_MB_CONTACT_CONSTRAINTS_PER_MB, MbImpulseJointBuilder, MbImpulseJointConstraint,
+     MultibodyContactConstraint, MultibodyInfo, MultibodyJointConstraint, MultibodyLinkStatic,
+     MultibodyLinkWorkspace, SIDE_KIND_BODY, SIDE_KIND_FIXED, SIDE_KIND_MB, Velocity,
+@@ -306,6 +306,65 @@ impl GpuMultibodySet {
+         &self.links_workspace
+     }
+ 
++    /// Per-link static descriptors (mutable). Exposed so a GPU motor-scatter
++    /// kernel can write `motors[axis].target_pos` directly (the on-GPU analogue
++    /// of `stage_motor_position` + `flush_links_static`). Layout is flat
++    /// `[num_batches * links_per_batch]`, index = `batch * links_per_batch + link_id`.
++    pub fn links_static_mut(&mut self) -> &mut Tensor<MultibodyLinkStatic> {
++        &mut self.links_static
++    }
++
++    /// Per-batch link stride (rows of `links_static` per env).
++    pub fn links_per_batch(&self) -> u32 {
++        self.links_per_batch
++    }
++
++    /// Scatter per-(actuated-joint, env) motor target positions into
++    /// `links_static` on the GPU — the on-device equivalent of
++    /// `stage_motor_position` + `flush_links_static`. `targets` is row-major
++    /// `[num_actuated x num_batches]` (element `(j, env)` at `j*num_batches+env`);
++    /// `actuated_link_ids[j]` is the link index of actuated joint `j`. Writes
++    /// `motors[axis].target_pos` and sets the `motor_axes` bit, matching
++    /// `stage_motor_position`. Prerequisite for applying RL actions without a
++    /// host round-trip (CUDA-graph-capturable rollout).
++    pub fn scatter_motor_targets(
++        &mut self,
++        backend: &GpuBackend,
++        targets: &[f32],
++        actuated_link_ids: &[u32],
++        axis: u32,
++    ) -> Result<(), GpuBackendError> {
++        use khal::backend::Encoder;
++        use khal::shader::Shader;
++        let num_actuated = actuated_link_ids.len() as u32;
++        let uu = BufferUsages::STORAGE | BufferUsages::UNIFORM;
++        let t_targets =
++            Tensor::vector(backend, targets, BufferUsages::STORAGE | BufferUsages::COPY_DST)?;
++        let t_links = Tensor::vector(backend, actuated_link_ids, BufferUsages::STORAGE)?;
++        let u_na = Tensor::scalar(backend, num_actuated, uu)?;
++        let u_ne = Tensor::scalar(backend, self.num_batches, uu)?;
++        let u_lpb = Tensor::scalar(backend, self.links_per_batch, uu)?;
++        let u_ax = Tensor::scalar(backend, axis, uu)?;
++        let bundle = MotorScatterBundle::from_backend(backend)?;
++        let mut enc = backend.begin_encoding();
++        {
++            let mut pass = enc.begin_pass("scatter_motor_targets", None);
++            bundle.scatter.call(
++                &mut pass,
++                [num_actuated, self.num_batches, 1],
++                &t_targets,
++                &mut self.links_static,
++                &t_links,
++                &u_na,
++                &u_ne,
++                &u_lpb,
++                &u_ax,
++            )?;
++        }
++        backend.submit(enc)?;
++        Ok(())
++    }
++
+     /// Per-link local mass properties (inv_mass / inv_inertia / com /
+     /// inertia_ref_frame). Exposed for diagnostic readback while debugging
+     /// dimforge/nexus-rustgpu#1; not part of the stable API.
+@@ -1502,6 +1561,14 @@ fn make_workspace_init() -> MultibodyLinkWorkspace {
+     w
+ }
+ 
++/// Standalone shader bundle for the motor-target scatter (used outside the
++/// solver, e.g. to apply RL actions on-GPU). `#[derive(Shader)]` supplies
++/// `from_backend`, which loads the embedded `gpu_scatter_motor_targets` entry.
++#[derive(Shader)]
++struct MotorScatterBundle {
++    scatter: GpuScatterMotorTargets,
++}
++
+ /// GPU shader bundle for multibody dynamics.
+ #[derive(Shader)]
+ pub struct GpuMultibodySolver {
+@@ -1725,13 +1792,16 @@ impl GpuMultibodySolver {
+         // 2+3. Build limit / motor constraints AND apply one PGS sweep WITH
+         // bias.
+         if mb.has_joint_constraints {
+-            // TODO(PERF): consider splitting in two kernels so we can
+-            //             have parallelism for the init part (one workgroup per joint)
+-            //             even in we can’t have parallelism on the solve since they
+-            //             necessarily all touch the same multibody?
++            // Cooperative (threads(32)): one workgroup per articulation. The
++            // independent per-constraint init back-solves split across
++            // `MB_LU_LANES` lanes (the cheap link walk runs redundantly); the
++            // Gauss-Seidel PGS solve then runs serially on lane 0. ThreadCount =
++            // multibodies_per_batch · lanes → multibodies_per_batch workgroups.
++            let init_solve_dispatch =
++                [mb.multibodies_per_batch * MB_LU_LANES, mb.num_batches, 1];
+             self.init_solve_joint_with_bias.call(
+                 pass,
+-                dispatch,
++                init_solve_dispatch,
+                 &mb.multibody_info,
+                 &mb.links_static,
+                 &mb.links_workspace,
+@@ -1766,9 +1836,15 @@ impl GpuMultibodySolver {
+             args.contacts_len,
+         )?;
+ 
++        // `finalize_contact_constraints` is cooperative (threads(32)): one
++        // workgroup per articulation, the independent per-constraint LU
++        // back-solves split across `MB_LU_LANES` lanes. ThreadCount =
++        // multibodies_per_batch · lanes → multibodies_per_batch workgroups.
++        let finalize_contact_dispatch =
++            [mb.multibodies_per_batch * MB_LU_LANES, mb.num_batches, 1];
+         self.finalize_contact_constraints.call(
+             pass,
+-            dispatch,
++            finalize_contact_dispatch,
+             &mb.multibody_info,
+             &mb.mass_matrices,
+             &mb.lu_pivots,
+diff --git a/src_rbd/dynamics/solver.rs b/src_rbd/dynamics/solver.rs
+index 796a5f9..bb0be22 100644
+--- a/src_rbd/dynamics/solver.rs
++++ b/src_rbd/dynamics/solver.rs
+@@ -27,7 +27,7 @@ use crate::shaders::dynamics::{
+ };
+ use crate::utils::{GpuPrefixSum, PrefixSumWorkspace};
+ use khal::Shader;
+-use khal::backend::{GpuBackend, GpuBackendError, GpuPass};
++use khal::backend::{DispatchGrid, GpuBackend, GpuBackendError, GpuPass};
+ use vortx::tensor::Tensor;
+ 
+ /// GPU shader bundle for the constraint solver.
+@@ -138,6 +138,9 @@ pub struct SolverArgs<'a> {
+     pub constraints_colors: &'a Tensor<u32>,
+     /// Current color being processed.
+     pub curr_color: &'a mut Tensor<u32>,
++    /// Constant per-color uniforms `[1,2,…]` — bound per sweep instead of
++    /// bumping `curr_color` via reset/inc kernels. Empty ⇒ use the old path.
++    pub color_uniforms: &'a [Tensor<u32>],
+     /// Prefix sum shader for building constraint ranges.
+     pub prefix_sum: &'a GpuPrefixSum,
+     /// Number of solver iterations (max across all environments).
+@@ -187,12 +190,21 @@ impl GpuSolver {
+             args.batch_indices,
+         )?;
+ 
++        // Fixed capacity-based grid (BIPED_FIXED_GRID) — these contact kernels
++        // grid-stride over the true count, so this avoids the per-dispatch GPU
++        // drain of indirect dispatch (which would drain the pending broad/narrow
++        // GPU work mid-step). See `crate::dispatch_grid`.
++        let contacts_grid = [
++            (args.contacts.len() as u32 / args.num_batches.max(1)).max(1).div_ceil(64),
++            args.num_batches,
++            1,
++        ];
+         self.init_constraints.call(
+-            pass, args.contacts_len_indirect, args.contacts, args.constraints, args.constraint_builders,
++            pass, crate::dispatch_grid(args.contacts_len_indirect, contacts_grid), args.contacts, args.constraints, args.constraint_builders,
+             args.collider_world_poses, args.solver_body_poses, args.vels, args.mprops, args.sim_params, args.batch_indices,
+         )?;
+         self.count_body_constraints.call(
+-            pass, args.contacts_len_indirect, args.contacts, args.body_constraint_counts,
++            pass, crate::dispatch_grid(args.contacts_len_indirect, contacts_grid), args.contacts, args.body_constraint_counts,
+             args.body_group, args.mprops, args.batch_indices,
+         )?;
+ 
+@@ -206,7 +218,7 @@ impl GpuSolver {
+ 
+         self.sort_constraints.call(
+             pass,
+-            args.contacts_len_indirect,
++            crate::dispatch_grid(args.contacts_len_indirect, contacts_grid),
+             args.body_constraint_counts,
+             args.mprops,
+             args.contacts,
+@@ -234,6 +246,35 @@ impl GpuSolver {
+         #[cfg(feature = "dim3")] multibody: Option<(&GpuMultibodySolver, &mut GpuMultibodySet)>,
+     ) -> Result<(), GpuBackendError> {
+         let num_substeps = args.num_solver_iterations;
++        assert!(
++            args.color_uniforms.len() >= args.num_colors as usize,
++            "color_uniforms ({}) < num_colors ({}) — bump the pre-allocated count",
++            args.color_uniforms.len(),
++            args.num_colors
++        );
++
++        // EXPERIMENT (BIPED_FIXED_GRID=1): replace the per-contact-kernel INDIRECT
++        // dispatch with a fixed capacity-based grid. khal's CUDA indirect dispatch
++        // does `stream.synchronize()` + device→host count read PER dispatch (a full
++        // GPU drain); the solver issues ~3·colors·substeps of them, which dominates
++        // the step (measured ~94%). These kernels grid-stride over the real count
++        // read from `contacts_len` (stride = num_workgroups.x·WORKGROUP_SIZE), so
++        // ANY grid is correct — a fixed `[ceil(capacity/64), num_batches, 1]` (both
++        // host-known, no readback) removes the drain. `None` = exact prior behavior.
++        let fixed_grid: Option<[u32; 3]> = if crate::fixed_dispatch_grid_enabled() {
++            let cap = (args.contacts.len() as u32 / args.num_batches.max(1)).max(1);
++            Some([cap.div_ceil(64), args.num_batches, 1])
++        } else {
++            None
++        };
++        let idr = args.contacts_len_indirect;
++        let cgrid = || -> DispatchGrid<'a, GpuBackend> {
++            match fixed_grid {
++                Some(a) => DispatchGrid::Grid(a),
++                None => DispatchGrid::Indirect(idr.buffer()),
++            }
++        };
++
+         #[cfg(feature = "dim3")]
+         let (mb_solver, mut mb_state) = match multibody {
+             Some((s, st)) => (Some(s), Some(st)),
+@@ -298,7 +339,7 @@ impl GpuSolver {
+              */
+             self.update_constraints.call(
+                 pass,
+-                args.contacts_len_indirect,
++                cgrid(),
+                 args.constraints,
+                 args.constraint_builders,
+                 args.contacts_len,
+@@ -312,38 +353,34 @@ impl GpuSolver {
+             /*
+              * Warmstart.
+              */
+-            self.reset_color.call(pass, 1u32, args.curr_color)?;
+-            for _ in 0..args.num_colors {
++            for c in 0..args.num_colors as usize {
+                 self.warmstart.call(
+                     pass,
+-                    args.contacts_len_indirect,
++                    cgrid(),
+                     args.constraints,
+                     args.solver_vels,
+                     args.constraints_colors,
+                     args.contacts_len,
+-                    args.curr_color,
++                    &args.color_uniforms[c],
+                     args.batch_indices,
+                 )?;
+-                self.inc_color.call(pass, 1u32, args.curr_color)?
+             }
+ 
+             /*
+              * Solve with bias.
+              */
+             joint_solver.solve(pass, &mut joint_args, args.solver_vels, true)?;
+-            self.reset_color.call(pass, 1u32, args.curr_color)?;
+-            for _ in 0..args.num_colors {
++            for c in 0..args.num_colors as usize {
+                 self.step_gauss_seidel.call(
+                     pass,
+-                    args.contacts_len_indirect,
++                    cgrid(),
+                     args.constraints,
+                     args.solver_vels,
+                     args.constraints_colors,
+                     args.contacts_len,
+-                    args.curr_color,
++                    &args.color_uniforms[c],
+                     args.batch_indices,
+                 )?;
+-                self.inc_color.call(pass, 1u32, args.curr_color)?
+             }
+ 
+             /*
+@@ -366,25 +403,23 @@ impl GpuSolver {
+ 
+             self.remove_cfm_and_bias_kernel.call(
+                 pass,
+-                args.contacts_len_indirect,
++                cgrid(),
+                 args.constraints,
+                 args.contacts_len,
+                 args.batch_indices,
+             )?;
+ 
+-            self.reset_color.call(pass, 1u32, args.curr_color)?;
+-            for _ in 0..args.num_colors {
++            for c in 0..args.num_colors as usize {
+                 self.step_gauss_seidel.call(
+                     pass,
+-                    args.contacts_len_indirect,
++                    cgrid(),
+                     args.constraints,
+                     args.solver_vels,
+                     args.constraints_colors,
+                     args.contacts_len,
+-                    args.curr_color,
++                    &args.color_uniforms[c],
+                     args.batch_indices,
+                 )?;
+-                self.inc_color.call(pass, 1u32, args.curr_color)?
+             }
+         }
+ 
+diff --git a/src_rbd/dynamics/warmstart.rs b/src_rbd/dynamics/warmstart.rs
+index 00c1e2e..f4e9cb1 100644
+--- a/src_rbd/dynamics/warmstart.rs
++++ b/src_rbd/dynamics/warmstart.rs
+@@ -49,9 +49,17 @@ impl GpuWarmstart {
+         pass: &mut GpuPass,
+         args: WarmstartArgs<'a>,
+     ) -> Result<(), GpuBackendError> {
++        // Fixed capacity-based grid (BIPED_FIXED_GRID) — grid-strides over the
++        // true count; avoids the per-dispatch GPU drain. See `crate::dispatch_grid`.
++        let nb = (args.contacts_len.len() as u32).max(1);
++        let ws_grid = [
++            (args.new_constraints.len() as u32 / nb).max(1).div_ceil(64),
++            nb,
++            1,
++        ];
+         self.transfer_warmstart_impulses_kernel.call(
+             pass,
+-            args.contacts_len_indirect,
++            crate::dispatch_grid(args.contacts_len_indirect, ws_grid),
+             args.old_body_constraint_counts,
+             args.old_body_constraint_ids,
+             args.old_constraints,
+diff --git a/src_rbd/lib.rs b/src_rbd/lib.rs
+index 4a0ddab..0f3dd88 100644
+--- a/src_rbd/lib.rs
++++ b/src_rbd/lib.rs
+@@ -37,6 +37,66 @@ pub use glamx;
+ 
+ const VALIDATE_LBVH_TOPOLOGY: bool = false;
+ 
++/// Fixed-grid dispatch state: `0` = off, `1` = on, `2` = not-yet-initialized.
++///
++/// Replaces per-dispatch CUDA INDIRECT grids — which each force a
++/// `stream.synchronize()` + device→host count read (a full GPU drain) in khal's
++/// CUDA backend — with a fixed capacity-based grid. Measured: the indirect
++/// round-trip is ~1100 ms / rollout (the entire `physics_encode` cost) at
++/// N=8192; fixed-grid drops it to ~25 ms, leaving the step cleanly
++/// GPU-compute-bound (and capturable). The affected kernels grid-stride over the
++/// real count read from a buffer, so over-launch is always correct.
++///
++/// Default is backend-aware (set once at [`pipeline::GpuPhysicsState`] init via
++/// [`set_fixed_dispatch_grid_default`]): ON for CUDA (the indirect drain is
++/// catastrophic there), OFF for WebGPU (indirect dispatch is native/cheap, so a
++/// fixed worst-case grid would only waste idle workgroups). `BIPED_FIXED_GRID=1`
++/// / `=0` overrides either way.
++static FIXED_GRID_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
++
++fn fixed_grid_env_override() -> Option<bool> {
++    match std::env::var("BIPED_FIXED_GRID").as_deref() {
++        Ok("1") => Some(true),
++        Ok("0") => Some(false),
++        _ => None,
++    }
++}
++
++/// Set the fixed-grid default from the active backend. The `BIPED_FIXED_GRID`
++/// env var, if set, always wins. Called once when the physics state is built.
++pub fn set_fixed_dispatch_grid_default(is_cuda: bool) {
++    use std::sync::atomic::Ordering;
++    let enabled = fixed_grid_env_override().unwrap_or(is_cuda);
++    FIXED_GRID_STATE.store(enabled as u8, Ordering::Relaxed);
++}
++
++pub(crate) fn fixed_dispatch_grid_enabled() -> bool {
++    use std::sync::atomic::Ordering;
++    match FIXED_GRID_STATE.load(Ordering::Relaxed) {
++        0 => false,
++        1 => true,
++        // Not yet initialized (no physics state built): honor an explicit env
++        // var, else default off (conservative).
++        _ => fixed_grid_env_override().unwrap_or(false),
++    }
++}
++
++/// Pick the dispatch grid for an indirect-capable kernel: the fixed
++/// capacity-based `fixed` grid when [`fixed_dispatch_grid_enabled`], else the
++/// original `indirect` buffer. `fixed` MUST cover the kernel's max count (the
++/// kernel grid-strides over the true count internally, so over-launch is safe).
++pub(crate) fn dispatch_grid<'a>(
++    indirect: &'a vortx::tensor::Tensor<[u32; 3]>,
++    fixed: [u32; 3],
++) -> khal::backend::DispatchGrid<'a, khal::backend::GpuBackend> {
++    use khal::backend::DispatchGrid;
++    if fixed_dispatch_grid_enabled() {
++        DispatchGrid::Grid(fixed)
++    } else {
++        DispatchGrid::Indirect(indirect.buffer())
++    }
++}
++
+ pub mod dynamics;
+ pub mod pipeline;
+ 
+diff --git a/src_rbd/pipeline.rs b/src_rbd/pipeline.rs
+index 8ca1772..8cbc1db 100644
+--- a/src_rbd/pipeline.rs
++++ b/src_rbd/pipeline.rs
+@@ -159,6 +159,11 @@ pub struct GpuPhysicsState {
+     colored: Tensor<u32>,
+     constraints_rands: Tensor<u32>,
+     curr_color: Tensor<u32>,
++    /// Constant per-color uniform buffers holding `[1, 2, …, N]`. Used by the
++    /// solver's per-color sweeps INSTEAD of bumping `curr_color` via the
++    /// `reset_color`/`inc_color` kernels (which were ~28% of per-step dispatches
++    /// doing zero math). Each loop iteration binds `color_uniforms[c]`.
++    color_uniforms: Vec<Tensor<u32>>,
+     uncolored: Tensor<u32>,
+     uncolored_staging: Tensor<u32>,
+     lbvh: LbvhState,
+@@ -198,6 +203,11 @@ impl GpuPhysicsState {
+             &GpuSimParams,
+         )],
+     ) -> Self {
++        // Pick the dispatch-grid strategy from the backend: fixed-grid on CUDA
++        // (the INDIRECT host round-trip is a ~1100 ms/rollout GPU drain there),
++        // indirect on WebGPU (native/cheap). `BIPED_FIXED_GRID` overrides.
++        crate::set_fixed_dispatch_grid_default(backend.is_cuda());
++
+         let num_batches = environments.len() as u32;
+         let max_colliders = environments
+             .iter()
+@@ -731,6 +741,13 @@ impl GpuPhysicsState {
+                     | BufferUsages::COPY_SRC,
+             )
+             .unwrap(),
++            // Constant color values [1..=256] for the solver's per-color sweeps.
++            color_uniforms: (1u32..=256)
++                .map(|c| {
++                    Tensor::scalar(backend, c, BufferUsages::STORAGE | BufferUsages::UNIFORM)
++                        .unwrap()
++                })
++                .collect(),
+             uncolored: Tensor::scalar(
+                 backend,
+                 0,
+@@ -1126,6 +1143,7 @@ impl GpuPhysicsPipeline {
+                 body_constraint_ids: &mut state.new_body_constraint_ids,
+                 constraints_colors: &state.constraints_colors,
+                 curr_color: &mut state.curr_color,
++                color_uniforms: &state.color_uniforms,
+                 prefix_sum: &self.prefix_sum,
+                 num_colors: 0,
+                 num_batches: state.num_batches,
+@@ -1212,6 +1230,7 @@ impl GpuPhysicsPipeline {
+             body_constraint_ids: &mut state.new_body_constraint_ids,
+             constraints_colors: &state.constraints_colors,
+             curr_color: &mut state.curr_color,
++            color_uniforms: &state.color_uniforms,
+             prefix_sum: &self.prefix_sum,
+             num_colors,
+             num_batches: state.num_batches,
+@@ -1229,6 +1248,7 @@ impl GpuPhysicsPipeline {
+             local_mprops: &state.local_mprops,
+             joints: &mut state.joints,
+             batch_indices: &state.batch_indices,
++            color_uniforms: &state.color_uniforms,
+         };
+ 
+         {
+diff --git a/src_rbd/utils/radix_sort/mod.rs b/src_rbd/utils/radix_sort/mod.rs
+index 01c4372..0b42de0 100644
+--- a/src_rbd/utils/radix_sort/mod.rs
++++ b/src_rbd/utils/radix_sort/mod.rs
+@@ -60,6 +60,11 @@ pub struct RadixSortWorkspace {
+     batch_ids: Tensor<u32>,
+     batch_ids_pong: Tensor<u32>,
+     n_sort_flat: Tensor<u32>,
++    /// Signature `(num_passes, per_batch_max, has_aux)` the cached
++    /// `pass_uniforms` were built for. Rebuilding allocates new GPU scalars,
++    /// which is illegal during CUDA-graph capture — so we only rebuild when the
++    /// signature changes (stable post-warmup for a fixed scene).
++    uniform_sig: Option<(u32, u32, u32)>,
+ }
+ 
+ impl RadixSortWorkspace {
+@@ -93,6 +98,7 @@ impl RadixSortWorkspace {
+             batch_ids: Tensor::vector_uninit(backend, 0, BufferUsages::STORAGE).unwrap(),
+             batch_ids_pong: Tensor::vector_uninit(backend, 0, BufferUsages::STORAGE).unwrap(),
+             n_sort_flat: Tensor::scalar(backend, 0u32, BufferUsages::STORAGE).unwrap(),
++            uniform_sig: None,
+         }
+     }
+ }
+@@ -272,18 +278,23 @@ impl RadixSort {
+ 
+         let num_passes = sorting_bits.div_ceil(4);
+ 
+-        // Create uniforms (has_aux=0 for single batch).
+-        workspace.pass_uniforms.clear();
+-        for pass_id in 0..num_passes {
+-            workspace.pass_uniforms.push(Tensor::scalar(
+-                backend,
+-                SortUniforms {
+-                    shift: pass_id * 4,
+-                    max_keys_per_batch: per_batch_max,
+-                    has_aux: 0,
+-                },
+-                BufferUsages::STORAGE | BufferUsages::UNIFORM,
+-            )?);
++        // Create uniforms (has_aux=0 for single batch). Cached: rebuild only when
++        // the signature changes (allocating during CUDA-graph capture is illegal).
++        let sig = (num_passes, per_batch_max, 0u32);
++        if workspace.uniform_sig != Some(sig) {
++            workspace.pass_uniforms.clear();
++            for pass_id in 0..num_passes {
++                workspace.pass_uniforms.push(Tensor::scalar(
++                    backend,
++                    SortUniforms {
++                        shift: pass_id * 4,
++                        max_keys_per_batch: per_batch_max,
++                        has_aux: 0,
++                    },
++                    BufferUsages::STORAGE | BufferUsages::UNIFORM,
++                )?);
++            }
++            workspace.uniform_sig = Some(sig);
+         }
+ 
+         let mut output_keys = output_keys;
+@@ -420,41 +431,48 @@ impl RadixSort {
+                 Tensor::vector_uninit(backend, total_n, BufferUsages::STORAGE)?;
+         }
+ 
+-        // n_sort_flat = [total_n] for the flattened single-batch view.
+-        workspace.n_sort_flat = Tensor::scalar(backend, total_n, BufferUsages::STORAGE)?;
++        // n_sort_flat + per-pass uniforms — all derived from (total_passes,
++        // total_n, num_batches), stable post-warmup. Cache them: rebuilding
++        // allocates GPU scalars, illegal during CUDA-graph capture.
++        let init_uniform_idx = total_passes as usize;
++        let sig = (total_passes, total_n, num_batches);
++        if workspace.uniform_sig != Some(sig) {
++            // n_sort_flat = [total_n] for the flattened single-batch view.
++            workspace.n_sort_flat = Tensor::scalar(backend, total_n, BufferUsages::STORAGE)?;
++
++            // Create uniforms for all passes.
++            workspace.pass_uniforms.clear();
++            for pass_id in 0..total_passes {
++                let shift = if pass_id < key_passes {
++                    pass_id * 4
++                } else {
++                    (pass_id - key_passes) * 4
++                };
++                workspace.pass_uniforms.push(Tensor::scalar(
++                    backend,
++                    SortUniforms {
++                        shift,
++                        max_keys_per_batch: total_n,
++                        has_aux: 1,
++                    },
++                    BufferUsages::STORAGE | BufferUsages::UNIFORM,
++                )?);
++            }
+ 
+-        // Create uniforms for all passes.
+-        workspace.pass_uniforms.clear();
+-        for pass_id in 0..total_passes {
+-            let shift = if pass_id < key_passes {
+-                pass_id * 4
+-            } else {
+-                (pass_id - key_passes) * 4
+-            };
++            // Extra uniform for init_batched (max_keys_per_batch = per_batch, not total_n).
++            // shift is repurposed to carry num_batches for this kernel.
+             workspace.pass_uniforms.push(Tensor::scalar(
+                 backend,
+                 SortUniforms {
+-                    shift,
+-                    max_keys_per_batch: total_n,
+-                    has_aux: 1,
++                    shift: num_batches,
++                    max_keys_per_batch: per_batch,
++                    has_aux: 0,
+                 },
+                 BufferUsages::STORAGE | BufferUsages::UNIFORM,
+             )?);
++            workspace.uniform_sig = Some(sig);
+         }
+ 
+-        // Extra uniform for init_batched (max_keys_per_batch = per_batch, not total_n).
+-        // shift is repurposed to carry num_batches for this kernel.
+-        let init_uniform_idx = total_passes as usize;
+-        workspace.pass_uniforms.push(Tensor::scalar(
+-            backend,
+-            SortUniforms {
+-                shift: num_batches,
+-                max_keys_per_batch: per_batch,
+-                has_aux: 0,
+-            },
+-            BufferUsages::STORAGE | BufferUsages::UNIFORM,
+-        )?);
+-
+         // Init writes to output buffers. After even total_passes, data stays in output.
+         // NOTE: call() takes a thread count, not workgroup count (khal resolves internally).
+         self.init_batched.call(
+@@ -482,6 +500,16 @@ impl RadixSort {
+             &mut workspace.num_reduce_wgs,
+         )?;
+ 
++        // Capture-safe fixed grids for the flattened sort passes — host-exact
++        // match to `gpu_init_sort_dispatch` (no host count readback ⇒ CUDA-graph
++        // capturable). MUST be `DispatchGrid::Grid` (raw workgroup counts), NOT a
++        // bare `[u32;3]` (that converts to ThreadCount and divides by block size).
++        //   num_wgs    = ceil(total_n / BLOCK_SIZE)
++        //   reduce_wgs = BIN_COUNT * ceil(num_wgs / BLOCK_SIZE)
++        let nwg = total_n.div_ceil(BLOCK_SIZE);
++        let sort_grid = [nwg, 1u32, 1u32];
++        let reduce_grid = [BIN_COUNT * nwg.div_ceil(BLOCK_SIZE), 1u32, 1u32];
++
+         // Run all sort passes with 3-stream ping-pong.
+         // Stream mapping changes between key passes and batch_id passes:
+         //   Key passes:      scatter(src=keys, values=vals, aux=bids)
+@@ -498,7 +526,7 @@ impl RadixSort {
+                 // Key pass: digit extraction from keys.
+                 self.count.call(
+                     pass,
+-                    &workspace.num_wgs,
++                    khal::backend::DispatchGrid::Grid(sort_grid),
+                     uniforms,
+                     n_sort_flat,
+                     cur_keys,
+@@ -506,7 +534,7 @@ impl RadixSort {
+                 )?;
+                 self.reduce.call(
+                     pass,
+-                    &workspace.num_reduce_wgs,
++                    khal::backend::DispatchGrid::Grid(reduce_grid),
+                     uniforms,
+                     n_sort_flat,
+                     &workspace.count_buf,
+@@ -516,7 +544,7 @@ impl RadixSort {
+                     .call(pass, [1u32, 1, 1], n_sort_flat, &mut workspace.reduced_buf)?;
+                 self.scan_add.call(
+                     pass,
+-                    &workspace.num_reduce_wgs,
++                    khal::backend::DispatchGrid::Grid(reduce_grid),
+                     uniforms,
+                     n_sort_flat,
+                     &workspace.reduced_buf,
+@@ -524,7 +552,7 @@ impl RadixSort {
+                 )?;
+                 self.scatter.call(
+                     pass,
+-                    &workspace.num_wgs,
++                    khal::backend::DispatchGrid::Grid(sort_grid),
+                     uniforms,
+                     n_sort_flat,
+                     cur_keys,
+@@ -540,7 +568,7 @@ impl RadixSort {
+                 // Remap: src=batch_ids, values=keys, aux=vals.
+                 self.count.call(
+                     pass,
+-                    &workspace.num_wgs,
++                    khal::backend::DispatchGrid::Grid(sort_grid),
+                     uniforms,
+                     n_sort_flat,
+                     cur_aux,
+@@ -548,7 +576,7 @@ impl RadixSort {
+                 )?;
+                 self.reduce.call(
+                     pass,
+-                    &workspace.num_reduce_wgs,
++                    khal::backend::DispatchGrid::Grid(reduce_grid),
+                     uniforms,
+                     n_sort_flat,
+                     &workspace.count_buf,
+@@ -558,7 +586,7 @@ impl RadixSort {
+                     .call(pass, [1u32, 1, 1], n_sort_flat, &mut workspace.reduced_buf)?;
+                 self.scan_add.call(
+                     pass,
+-                    &workspace.num_reduce_wgs,
++                    khal::backend::DispatchGrid::Grid(reduce_grid),
+                     uniforms,
+                     n_sort_flat,
+                     &workspace.reduced_buf,
+@@ -568,7 +596,7 @@ impl RadixSort {
+                 //         out=next_bids, out_values=next_keys, out_aux=next_vals)
+                 self.scatter.call(
+                     pass,
+-                    &workspace.num_wgs,
++                    khal::backend::DispatchGrid::Grid(sort_grid),
+                     uniforms,
+                     n_sort_flat,
+                     cur_aux,
+diff --git a/src_rbd_shaders/broad_phase/lbvh.rs b/src_rbd_shaders/broad_phase/lbvh.rs
+index 774435c..d60f6e4 100644
+--- a/src_rbd_shaders/broad_phase/lbvh.rs
++++ b/src_rbd_shaders/broad_phase/lbvh.rs
+@@ -95,30 +95,81 @@ pub fn gpu_lbvh_reset_collision_pairs(
+     }
+ }
+ 
++/// Number of lanes in the single-workgroup `max`-over-batches reductions used
++/// by the `*_init_dispatch` kernels. 256 == WebGPU's default per-workgroup
++/// invocation cap, so this is the widest portable workgroup.
++pub const DISPATCH_REDUCE_LANES: u32 = 256;
++
+ /// Initializes indirect dispatch arguments for narrow phase.
++///
++/// Computes `max(collision_pairs_len[..])` across all `num_batches` batches.
++/// Launched as ONE workgroup of `DISPATCH_REDUCE_LANES` threads (host passes
++/// grid `1`): each lane grid-strides over the batch array, then a shared-memory
++/// tree reduction collapses the per-lane maxima. Replaces the former
++/// `threads(1)` serial scan, which cost ~3.7 ms at N=8192 (one thread looping
++/// over 8192 batches) — ~17% of total GPU time.
+ #[spirv_bindgen]
+-#[spirv(compute(threads(1)))]
++#[spirv(compute(threads(256)))]
+ pub fn gpu_lbvh_init_dispatch(
+-    // TODO: take the batch dimension as argument (instead of relying on the len of `collision_pairs_len`)?
++    #[spirv(local_invocation_id)] lid: UVec3,
+     // NOTE: the `collision_pairs_len` is mutable here even though we don’t modify it. That’s
+     //       because we access it with an atomic load otherwise it would occasionally read
+     //       stale data (on Windows+Nvidia+wgpu backend). This might be caused by:
+     //       https://github.com/gfx-rs/wgpu/issues/9221
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] collision_pairs_len: &mut [u32],
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] indirect_args: &mut [u32; 3],
++    #[spirv(workgroup)] partial: &mut [u32; DISPATCH_REDUCE_LANES as usize],
+ ) {
+-    // For indirect dispatch, get the largest length along all batch dimensions.
+     let num_batches = collision_pairs_len.len();
+-    let mut highest_pairs_len = 0;
+-    for batch_id in 0..num_batches {
+-        // NOTE: atomic_load is needed for correctness on some platforms (see comment above `collision_pairs_len`).
+-        highest_pairs_len =
+-            highest_pairs_len.max(atomic_load_u32(collision_pairs_len.at_mut(batch_id)));
++    let highest = highest_len_over_batches(lid.x, num_batches, collision_pairs_len, partial);
++    if lid.x == 0 {
++        *indirect_args.at_mut(0) = highest.div_ceil(WORKGROUP_SIZE);
++        *indirect_args.at_mut(1) = num_batches as u32;
++        *indirect_args.at_mut(2) = 1;
+     }
++}
+ 
+-    *indirect_args.at_mut(0) = highest_pairs_len.div_ceil(WORKGROUP_SIZE);
+-    *indirect_args.at_mut(1) = num_batches as u32;
+-    *indirect_args.at_mut(2) = 1;
++/// Single-workgroup parallel `max` over a per-batch length array. Lane `lane`
++/// (0..`DISPATCH_REDUCE_LANES`) grid-strides over `lens[..num_batches]`, then
++/// the partial maxima are tree-reduced through `partial`; the result is
++/// broadcast (every lane returns the same value).
++///
++/// The barrier sequence is workgroup-uniform (the `if lane < stride` guards are
++/// inside loop bodies whose barriers every lane reaches), matching the reduction
++/// idiom in `impulse_joint_constraints::side_dot_vel_par`.
++#[inline]
++pub fn highest_len_over_batches(
++    lane: u32,
++    num_batches: usize,
++    lens: &mut [u32],
++    partial: &mut impl MaybeIndexUnchecked<u32>,
++) -> u32 {
++    let mut m = 0u32;
++    let mut i = lane as usize;
++    while i < num_batches {
++        // NOTE: atomic_load is needed for correctness on some platforms (see
++        // the wgpu#9221 note at the call sites).
++        m = m.max(atomic_load_u32(lens.at_mut(i)));
++        i += DISPATCH_REDUCE_LANES as usize;
++    }
++    partial.write(lane as usize, m);
++    workgroup_memory_barrier_with_group_sync();
++    // Tree reduction over 256 lanes (2^8). Fixed trip count keeps control flow
++    // workgroup-uniform (rust-gpu/naga requirement).
++    for step in 0..8u32 {
++        let stride = 1u32 << (7 - step);
++        if lane < stride {
++            let a = partial.read(lane as usize);
++            let b = partial.read((lane + stride) as usize);
++            partial.write(lane as usize, a.max(b));
++        }
++        workgroup_memory_barrier_with_group_sync();
++    }
++    let result = partial.read(0);
++    // Trailing barrier: every lane has read `partial[0]` before any caller
++    // reuses the scratch.
++    workgroup_memory_barrier_with_group_sync();
++    result
+ }
+ 
+ /// Runs a reduction to compute the AABB of the collider positions.
+diff --git a/src_rbd_shaders/broad_phase/narrow_phase.rs b/src_rbd_shaders/broad_phase/narrow_phase.rs
+index a9cbcf2..bac5f61 100644
+--- a/src_rbd_shaders/broad_phase/narrow_phase.rs
++++ b/src_rbd_shaders/broad_phase/narrow_phase.rs
+@@ -20,6 +20,7 @@ use khal_std::{
+ 
+ use crate::utils::{BatchIndices, Slice, SliceMut};
+ use glamx::UVec2;
++use super::lbvh::DISPATCH_REDUCE_LANES;
+ 
+ const WORKGROUP_SIZE: u32 = 64;
+ 
+@@ -45,27 +46,30 @@ pub fn gpu_reset_narrow_phase(
+ }
+ 
+ /// Initializes indirect dispatch arguments for constraint solver.
++///
++/// One workgroup of `DISPATCH_REDUCE_LANES` threads computing
++/// `max(contacts_len[..])` via a shared-memory tree reduction (see
++/// `super::lbvh::highest_len_over_batches`). Replaces the former `threads(1)`
++/// serial scan over all batches (~3.7 ms at N=8192).
+ #[spirv_bindgen]
+-#[spirv(compute(threads(1)))]
++#[spirv(compute(threads(256)))]
+ pub fn gpu_narrow_phase_init_contacts_dispatch(
++    #[spirv(local_invocation_id)] lid: UVec3,
+     // NOTE: the `contacts_len` is mutable here even though we don’t modify it. That’s
+     //       because we access it with an atomic load otherwise it would occasionally read
+     //       stale data (on Windows+Nvidia+wgpu backend). This might be caused by:
+     //       https://github.com/gfx-rs/wgpu/issues/9221
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] contacts_len: &mut [u32],
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] indirect_args: &mut [u32; 3],
++    #[spirv(workgroup)] partial: &mut [u32; DISPATCH_REDUCE_LANES as usize],
+ ) {
+-    // For indirect dispatch, get the largest length along all batch dimensions.
+     let num_batches = contacts_len.len();
+-    let mut highest_contacts_len = 0;
+-    for i in 0..num_batches {
+-        // NOTE: atomic_load is needed for correctness on some platforms (see comment above `contacts_len`).
+-        highest_contacts_len = highest_contacts_len.max(atomic_load_u32(contacts_len.at_mut(i)));
++    let highest = super::lbvh::highest_len_over_batches(lid.x, num_batches, contacts_len, partial);
++    if lid.x == 0 {
++        *indirect_args.at_mut(0) = highest.div_ceil(WORKGROUP_SIZE);
++        *indirect_args.at_mut(1) = num_batches as u32;
++        *indirect_args.at_mut(2) = 1;
+     }
+-
+-    *indirect_args.at_mut(0) = highest_contacts_len.div_ceil(WORKGROUP_SIZE);
+-    *indirect_args.at_mut(1) = num_batches as u32;
+-    *indirect_args.at_mut(2) = 1;
+ }
+ 
+ const PREDICTION: f32 = 2.0e-3; // TODO: make the prediction configurable.
+@@ -426,27 +430,31 @@ pub struct NarrowPhasePfmPair {
+ }
+ 
+ /// Initializes PFM-PFM dispatch arguments for constraint solver.
++///
++/// One workgroup of `DISPATCH_REDUCE_LANES` threads computing
++/// `max(pfm_pairs_len[..])` via a shared-memory tree reduction (see
++/// `super::lbvh::highest_len_over_batches`). Replaces the former `threads(1)`
++/// serial scan over all batches (~3.7 ms at N=8192).
+ #[spirv_bindgen]
+-#[spirv(compute(threads(1)))]
++#[spirv(compute(threads(256)))]
+ pub fn gpu_init_pfm_pfm_dispatch(
++    #[spirv(local_invocation_id)] lid: UVec3,
+     // NOTE: the `pfm_pairs_len` is mutable here even though we don’t modify it. That’s
+     //       because we access it with an atomic load otherwise it would occasionally read
+     //       stale data (on Windows+Nvidia+wgpu backend). This might be caused by:
+     //       https://github.com/gfx-rs/wgpu/issues/9221
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] pfm_pairs_len: &mut [u32],
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] indirect_args: &mut [u32; 3],
++    #[spirv(workgroup)] partial: &mut [u32; DISPATCH_REDUCE_LANES as usize],
+ ) {
+     let num_batches = pfm_pairs_len.len();
+-    let mut highest_pfm_pairs_len = 0;
+-    for batch_id in 0..num_batches {
+-        // NOTE: atomic_load is needed for correctness on some platforms (see comment above `pfm_pairs_len`).
+-        highest_pfm_pairs_len =
+-            highest_pfm_pairs_len.max(atomic_load_u32(pfm_pairs_len.at_mut(batch_id)));
++    let highest = super::lbvh::highest_len_over_batches(lid.x, num_batches, pfm_pairs_len, partial);
++    if lid.x == 0 {
++        // TODO PERF: pfm_pfm is very divergent. Use a smaller workgroup size?
++        *indirect_args.at_mut(0) = highest.div_ceil(WORKGROUP_SIZE);
++        *indirect_args.at_mut(1) = num_batches as u32;
++        *indirect_args.at_mut(2) = 1;
+     }
+-    // TODO PERF: pfm_pfm is very divergent. Use a smaller workgroup size?
+-    *indirect_args.at_mut(0) = highest_pfm_pairs_len.div_ceil(WORKGROUP_SIZE);
+-    *indirect_args.at_mut(1) = num_batches as u32;
+-    *indirect_args.at_mut(2) = 1;
+ }
+ 
+ #[spirv_bindgen]
+diff --git a/src_rbd_shaders/dynamics/multibody/contact_constraints.rs b/src_rbd_shaders/dynamics/multibody/contact_constraints.rs
+index 7af492e..8531dc8 100644
+--- a/src_rbd_shaders/dynamics/multibody/contact_constraints.rs
++++ b/src_rbd_shaders/dynamics/multibody/contact_constraints.rs
+@@ -534,10 +534,17 @@ pub fn gpu_mb_init_contact_constraints(
+ /// Pass 2: for each emitted constraint, LU back-solve `M · column = Jᵀ`
+ /// (the row produced by the init kernel) and set `inv_lhs = 1 / (Jᵀ ·
+ /// column + free_body_inv_r)`.
++/// Lanes per workgroup for the cooperative `*_finalize_contact_constraints` /
++/// per-constraint kernels: one workgroup per articulation, the `count`
++/// independent constraint back-solves are split across these lanes (grid-stride,
++/// no barriers — each constraint writes its own disjoint column + slot).
++pub const MB_CONTACT_FINALIZE_LANES: u32 = 32;
++
+ #[spirv_bindgen]
+-#[spirv(compute(threads(1)))]
++#[spirv(compute(threads(32)))]
+ pub fn gpu_mb_finalize_contact_constraints(
+-    #[spirv(global_invocation_id)] invocation_id: UVec3,
++    #[spirv(workgroup_id)] wg_id: UVec3,
++    #[spirv(local_invocation_id)] lid: UVec3,
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] multibody_info: &[MultibodyInfo],
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] mass_matrices: &[f32],
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] lu_pivots: &[u32],
+@@ -550,8 +557,9 @@ pub fn gpu_mb_finalize_contact_constraints(
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] num_multibodies: &[u32],
+     #[spirv(uniform, descriptor_set = 0, binding = 8)] batch_ids: &BatchIndices,
+ ) {
+-    let batch_id = invocation_id.y;
+-    let mb_idx = invocation_id.x;
++    let batch_id = wg_id.y;
++    let mb_idx = wg_id.x;
++    let lane = lid.x;
+     let num_mb = num_multibodies.read(batch_id as usize);
+     if mb_idx >= num_mb {
+         return;
+@@ -576,7 +584,12 @@ pub fn gpu_mb_finalize_contact_constraints(
+     let m = MatSlice::dense(mb_mm_base, ndofs, ndofs);
+     let count = contact_constraint_count.read(mb_start + mb_idx as usize);
+ 
+-    for s in 0..count {
++    // Each constraint's back-solve is independent (disjoint column + slot, only
++    // read-only shared M/jacs), so split the slot loop across the workgroup's
++    // lanes with NO barriers — lane `lane` owns constraints
++    // `lane, lane+LANES, …`.
++    let mut s = lane;
++    while s < count {
+         let col_offset = col_base + (s as usize) * dofs_stride;
+         // 1) Copy J^T row into the column buffer (it'll be overwritten by the
+         //    LU solve with the M⁻¹·Jᵀ result).
+@@ -613,6 +626,7 @@ pub fn gpu_mb_finalize_contact_constraints(
+         let total = inv_r_mb + inv_r_free;
+         cons.inv_lhs = if total > 0.0 { 1.0 / total } else { 0.0 };
+         contact_constraints.write(cons_base + s as usize, cons);
++        s += MB_CONTACT_FINALIZE_LANES;
+     }
+ }
+ 
+diff --git a/src_rbd_shaders/dynamics/multibody/joint_constraints.rs b/src_rbd_shaders/dynamics/multibody/joint_constraints.rs
+index fd944a3..6a7af7d 100644
+--- a/src_rbd_shaders/dynamics/multibody/joint_constraints.rs
++++ b/src_rbd_shaders/dynamics/multibody/joint_constraints.rs
+@@ -19,6 +19,12 @@
+ use khal_std::glamx::UVec3;
+ use khal_std::index::MaybeIndexUnchecked;
+ use khal_std::macros::{spirv, spirv_bindgen};
++use khal_std::sync::workgroup_memory_barrier_with_group_sync;
++
++/// Lanes per workgroup for the cooperative fused `init_solve_joint` kernel: one
++/// workgroup per articulation, the independent per-constraint init back-solves
++/// split across these lanes (the serial PGS solve then runs on lane 0).
++pub const MB_JOINT_INIT_LANES: u32 = 32;
+ 
+ use crate::DIM;
+ use crate::dynamics::joint::SPATIAL_DIM;
+@@ -109,6 +115,7 @@ pub fn gpu_mb_init_joint_constraints(
+         mb_idx,
+         *dt_uniform,
+         batch_ids,
++        false,
+     );
+ }
+ 
+@@ -239,6 +246,12 @@ pub fn gpu_mb_solve_joint_constraints(
+ }
+ 
+ #[inline]
++/// Serial per-articulation constraint-discovery walk: emits one constraint slot
++/// per active limit/motor axis. `defer_column`: when true, the expensive LU
++/// back-solve is skipped (a later parallel phase fills `inv_lhs`/column from each
++/// slot's `dof_id`) — used by the cooperative fused kernel so the back-solves
++/// don't run serially inside this single-threaded walk. Pass `false` for the
++/// standalone single-thread kernel (back-solve inline).
+ fn init_joint_constraints_body(
+     multibody_info: &[MultibodyInfo],
+     links_static: &[MultibodyLinkStatic],
+@@ -251,6 +264,7 @@ fn init_joint_constraints_body(
+     mb_idx: u32,
+     dt: f32,
+     batch_ids: &BatchIndices,
++    defer_column: bool,
+ ) {
+     let mb = batch_ids
+         .mb_batch(batch_id, multibody_info)
+@@ -341,6 +355,7 @@ fn init_joint_constraints_body(
+                     m,
+                     lu_pivots,
+                     piv_offset,
++                    defer_column,
+                 );
+                 slot += 1;
+             }
+@@ -364,6 +379,7 @@ fn init_joint_constraints_body(
+                     m,
+                     lu_pivots,
+                     piv_offset,
++                    defer_column,
+                 );
+                 slot += 1;
+             }
+@@ -398,6 +414,7 @@ fn init_joint_constraints_body(
+                     m,
+                     lu_pivots,
+                     piv_offset,
++                    defer_column,
+                 );
+                 slot += 1;
+             }
+@@ -425,6 +442,7 @@ fn init_joint_constraints_body(
+                     m,
+                     lu_pivots,
+                     piv_offset,
++                    defer_column,
+                 );
+                 slot += 1;
+             }
+@@ -433,6 +451,62 @@ fn init_joint_constraints_body(
+     }
+ }
+ 
++/// Parallel back-solve phase (pairs with `init_joint_constraints_body(.., defer_column=true)`).
++/// Each lane owns a disjoint set of constraint slots (`s = lane, lane+num_lanes,
++/// …`) and computes that slot's `M⁻¹·e_{dof_id}` column + `inv_lhs`. The slots
++/// are independent (disjoint columns, read-only shared `M`), so this needs no
++/// barriers. Mirrors the cooperative `gpu_mb_finalize_contact_constraints`.
++#[inline]
++fn compute_joint_columns_par(
++    multibody_info: &[MultibodyInfo],
++    joint_constraints: &mut [MultibodyJointConstraint],
++    joint_constraint_columns: &mut [f32],
++    mass_matrices: &[f32],
++    lu_pivots: &[u32],
++    batch_id: u32,
++    mb_idx: u32,
++    batch_ids: &BatchIndices,
++    lane: u32,
++    num_lanes: u32,
++) {
++    let mb = batch_ids
++        .mb_batch(batch_id, multibody_info)
++        .read(mb_idx as usize);
++    let ndofs = mb.ndofs;
++    if ndofs == 0 {
++        return;
++    }
++    let mb_mm_base = batch_ids.mm_start(batch_id) + mb.mass_matrix_offset as usize;
++    let piv_offset = batch_ids.dof_start(batch_id) + mb.first_dof as usize;
++    let cons_base = batch_ids.mb_joint_constraints_start(batch_id) + mb.first_constraint as usize;
++    let dofs_stride = batch_ids.dof_batch_capacity as usize;
++    let col_base = batch_ids.mb_joint_constraint_columns_start(batch_id)
++        + (mb.first_constraint as usize) * dofs_stride;
++    let m = MatSlice::dense(mb_mm_base, ndofs, ndofs);
++
++    let mut s = lane;
++    while s < mb.max_constraints {
++        let mut cons = joint_constraints.read(cons_base + s as usize);
++        if cons.kind != 0 {
++            let inv_lhs = compute_constraint_column(
++                joint_constraint_columns,
++                col_base,
++                s,
++                dofs_stride,
++                ndofs,
++                cons.dof_id,
++                mass_matrices,
++                m,
++                lu_pivots,
++                piv_offset,
++            );
++            cons.inv_lhs = inv_lhs;
++            joint_constraints.write(cons_base + s as usize, cons);
++        }
++        s += num_lanes;
++    }
++}
++
+ /// Solve `M · column = e_{dof_id}` and pack `inv_lhs = 1 / column[dof_id]`,
+ /// matching `inv_lhs = 1 / (Jᵀ M⁻¹ J)` for J = e_{dof_id}.
+ ///
+@@ -486,6 +560,11 @@ fn emit_limit_constraint(
+     m: MatSlice,
+     lu_pivots: &[u32],
+     piv_offset: usize,
++    // When true, skip the (expensive) LU back-solve here and leave `inv_lhs = 0`;
++    // a later parallel phase recomputes the column from `dof_id`. Used by the
++    // cooperative fused kernel so the back-solves don't run serially inside the
++    // single-threaded discovery walk.
++    defer_column: bool,
+ ) {
+     // Fixed regularization values matching rapier's defaults for joint softness:
+     // erp_inv_dt = 1 / dt, cfm_coeff = 0 — full positional bias, no compliance.
+@@ -499,18 +578,22 @@ fn emit_limit_constraint(
+     let rhs_bias = (hi_excess - lo_excess) * erp_inv_dt;
+     let rhs_wo_bias = 0.0f32;
+ 
+-    let inv_lhs = compute_constraint_column(
+-        joint_constraint_columns,
+-        col_base,
+-        slot,
+-        dofs_stride,
+-        ndofs,
+-        dof_id,
+-        mass_matrices,
+-        m,
+-        lu_pivots,
+-        piv_offset,
+-    );
++    let inv_lhs = if defer_column {
++        0.0
++    } else {
++        compute_constraint_column(
++            joint_constraint_columns,
++            col_base,
++            slot,
++            dofs_stride,
++            ndofs,
++            dof_id,
++            mass_matrices,
++            m,
++            lu_pivots,
++            piv_offset,
++        )
++    };
+ 
+     let max_neg_impulse = if min_enabled { -1.0e30f32 } else { 0.0 };
+     let max_pos_impulse = if max_enabled { 1.0e30f32 } else { 0.0 };
+@@ -556,6 +639,8 @@ fn emit_motor_constraint(
+     m: MatSlice,
+     lu_pivots: &[u32],
+     piv_offset: usize,
++    // See `emit_limit_constraint`: defer the LU back-solve to a parallel phase.
++    defer_column: bool,
+ ) {
+     let (erp_inv_dt, cfm_coeff, cfm_gain, _, max_impulse) = motor_params(motor, dt);
+ 
+@@ -577,18 +662,22 @@ fn emit_motor_constraint(
+     }
+     rhs_wo_bias += -target_vel;
+ 
+-    let inv_lhs = compute_constraint_column(
+-        joint_constraint_columns,
+-        col_base,
+-        slot,
+-        dofs_stride,
+-        ndofs,
+-        dof_id,
+-        mass_matrices,
+-        m,
+-        lu_pivots,
+-        piv_offset,
+-    );
++    let inv_lhs = if defer_column {
++        0.0
++    } else {
++        compute_constraint_column(
++            joint_constraint_columns,
++            col_base,
++            slot,
++            dofs_stride,
++            ndofs,
++            dof_id,
++            mass_matrices,
++            m,
++            lu_pivots,
++            piv_offset,
++        )
++    };
+ 
+     let cons = MultibodyJointConstraint {
+         dof_id,
+@@ -613,9 +702,10 @@ fn emit_motor_constraint(
+ /// dispatches with one — at the cost of ~zero extra work, since both kernels
+ /// already iterate the same per-multibody slot loop.
+ #[spirv_bindgen]
+-#[spirv(compute(threads(1)))]
++#[spirv(compute(threads(32)))]
+ pub fn gpu_mb_init_solve_joint_with_bias(
+-    #[spirv(global_invocation_id)] invocation_id: UVec3,
++    #[spirv(workgroup_id)] wg_id: UVec3,
++    #[spirv(local_invocation_id)] lid: UVec3,
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] multibody_info: &[MultibodyInfo],
+     #[spirv(storage_buffer, descriptor_set = 0, binding = 1)]
+     links_static: &[MultibodyLinkStatic],
+@@ -632,34 +722,68 @@ pub fn gpu_mb_init_solve_joint_with_bias(
+     #[spirv(uniform, descriptor_set = 0, binding = 9)] dt_uniform: &f32,
+     #[spirv(uniform, descriptor_set = 0, binding = 10)] batch_ids: &BatchIndices,
+ ) {
+-    let batch_id = invocation_id.y;
+-    let mb_idx = invocation_id.x;
++    let batch_id = wg_id.y;
++    let mb_idx = wg_id.x;
++    let lane = lid.x;
+     let num_mb = num_multibodies.read(batch_id as usize);
++    // Uniform across the workgroup (all lanes share `mb_idx`), so every lane
++    // takes the same branch — no barrier-divergence hazard below.
+     if mb_idx >= num_mb {
+         return;
+     }
+-    init_joint_constraints_body(
+-        multibody_info,
+-        links_static,
+-        links_workspace,
+-        mass_matrices,
+-        lu_pivots,
+-        joint_constraints,
+-        joint_constraint_columns,
+-        batch_id,
+-        mb_idx,
+-        *dt_uniform,
+-        batch_ids,
+-    );
+-    solve_joint_constraints_body(
++    // Phase 1 (lane 0): serial constraint-discovery walk, writing each slot's
++    // metadata but DEFERRING the expensive LU back-solve. (Gating the back-solve
++    // inside this serial walk wouldn't parallelize it — the walk runs in SIMT
++    // lockstep, so one active lane per slot = still serial. Hence the split.)
++    if lane == 0 {
++        init_joint_constraints_body(
++            multibody_info,
++            links_static,
++            links_workspace,
++            mass_matrices,
++            lu_pivots,
++            joint_constraints,
++            joint_constraint_columns,
++            batch_id,
++            mb_idx,
++            *dt_uniform,
++            batch_ids,
++            true,
++        );
++    }
++    // Make lane 0's constraint metadata visible to all lanes.
++    workgroup_memory_barrier_with_group_sync();
++    // Phase 2 (all lanes): the independent per-slot back-solves run in parallel,
++    // each lane owning a disjoint set of slots (this is the actual win — same
++    // structure as the cooperative finalize_contact kernel).
++    compute_joint_columns_par(
+         multibody_info,
+         joint_constraints,
+         joint_constraint_columns,
+-        dof_state,
++        mass_matrices,
++        lu_pivots,
+         batch_id,
+         mb_idx,
+         batch_ids,
++        lane,
++        MB_JOINT_INIT_LANES,
+     );
++    // Make every lane's column/inv_lhs writes visible before the PGS sweep.
++    workgroup_memory_barrier_with_group_sync();
++    // Phase 3 (lane 0): the PGS solve is Gauss-Seidel (each constraint
++    // reads/writes shared `dof_state`), so it stays serial. No barriers inside
++    // `solve_joint_constraints_body`, so the divergent branch is safe.
++    if lane == 0 {
++        solve_joint_constraints_body(
++            multibody_info,
++            joint_constraints,
++            joint_constraint_columns,
++            dof_state,
++            batch_id,
++            mb_idx,
++            batch_ids,
++        );
++    }
+ }
+ 
+ /// Fused `remove_bias + solve_without_bias` for joint constraints — runs once
+diff --git a/src_rbd_shaders/dynamics/multibody/mod.rs b/src_rbd_shaders/dynamics/multibody/mod.rs
+index 09f4ea1..5723914 100644
+--- a/src_rbd_shaders/dynamics/multibody/mod.rs
++++ b/src_rbd_shaders/dynamics/multibody/mod.rs
+@@ -42,6 +42,7 @@ mod joint_constraints;
+ mod lu;
+ mod mass_matrix;
+ mod packed_dof_poc;
++mod scatter_motor;
+ mod types;
+ mod utils;
+ 
+@@ -52,5 +53,6 @@ pub use impulse_joint_constraints::*;
+ pub use integrate::*;
+ pub use joint_constraints::*;
+ pub use packed_dof_poc::*;
++pub use scatter_motor::*;
+ pub use types::*;
+ pub use utils::*;
+diff --git a/src_rbd_shaders/dynamics/multibody/scatter_motor.rs b/src_rbd_shaders/dynamics/multibody/scatter_motor.rs
+new file mode 100644
+index 0000000..522a5de
+--- /dev/null
++++ b/src_rbd_shaders/dynamics/multibody/scatter_motor.rs
+@@ -0,0 +1,44 @@
++//! GPU motor-target scatter: write per-(env, actuated-joint) target positions
++//! directly into `links_static` on the GPU, replacing the host-side
++//! `stage_motor_position` + `flush_links_static` (a per-step H2D copy). Enables
++//! applying RL policy actions without a host round-trip — a prerequisite for
++//! capturing the rollout into a CUDA graph (no per-step host writes).
++//!
++//! Layout mirrors `stage_motor_position` exactly: `links_static` is flat
++//! `[num_envs * links_per_batch]`, global index = `env * links_per_batch +
++//! link_id`. Targets are row-major `[num_actuated x num_envs]`, element
++//! `(j, env)` at `j * num_envs + env` (matches the policy action buffer).
++
++use khal_std::glamx::UVec3;
++use khal_std::macros::{spirv, spirv_bindgen};
++
++use super::types::MultibodyLinkStatic;
++
++/// One thread per (actuated-joint `x`, env `y`). Writes `target_pos` into the
++/// matching motor and sets the `motor_axes` bit, same as `stage_motor_position`.
++#[spirv_bindgen]
++#[spirv(compute(threads(1)))]
++pub fn gpu_scatter_motor_targets(
++    #[spirv(global_invocation_id)] invocation_id: UVec3,
++    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] motor_targets: &[f32],
++    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)]
++    links_static: &mut [MultibodyLinkStatic],
++    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] actuated_link_ids: &[u32],
++    #[spirv(uniform, descriptor_set = 0, binding = 3)] num_actuated: &u32,
++    #[spirv(uniform, descriptor_set = 0, binding = 4)] num_envs: &u32,
++    #[spirv(uniform, descriptor_set = 0, binding = 5)] links_per_batch: &u32,
++    #[spirv(uniform, descriptor_set = 0, binding = 6)] axis_id: &u32,
++) {
++    let j = invocation_id.x;
++    let env = invocation_id.y;
++    if j >= *num_actuated || env >= *num_envs {
++        return;
++    }
++    let link_id = actuated_link_ids[j as usize];
++    let global_idx = (env * *links_per_batch + link_id) as usize;
++    let target = motor_targets[(j * *num_envs + env) as usize];
++
++    let link = &mut links_static[global_idx];
++    link.data.motors[*axis_id as usize].target_pos = target;
++    link.data.motor_axes |= 1u32 << *axis_id;
++}
+-- 
+2.43.0
+

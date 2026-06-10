@@ -6,10 +6,22 @@ they're **bit-identical** (gather err 0.0). Numbers were developed on a 5090; th
 4090 has fewer SMs (~128 vs ~170) and less bandwidth (~1 TB/s vs ~1.7), so expect
 lower *absolute* env/s but the *relative* wins and bit-exactness should hold.
 
-## Branches (already pushed)
+## Branches / getting the code
 
-- `zealot` → branch **`feat/native-cuda-e2e-bench`**
-- `nexus-cuda` → branch **`feat/dispatch-and-per-env-parallelism`**
+- `zealot` → branch **`feat/native-cuda-e2e-bench`** (pushed to origin).
+- `nexus-cuda` → the changes are **NOT pushed**: the `nexus-cuda` GitHub remote is
+  **archived (read-only)**, so the commits couldn't be pushed. Instead the diff is
+  bundled here as patch files in `zealot/docs/nexus-cuda-patches/` (they apply on
+  top of nexus-cuda `master` = `29fac1e`). On the box:
+  ```sh
+  cd nexus-cuda
+  git checkout master && git rev-parse HEAD   # expect 29fac1e...; if not, fetch
+  git am ../zealot/docs/nexus-cuda-patches/*.patch
+  # (if git am conflicts on a divergent master, use:
+  #   git apply --reject ../zealot/docs/nexus-cuda-patches/*.patch  and resolve)
+  ```
+  (Alternatively, if you can un-archive the GitHub repo, ask baguette to push
+  branch `feat/dispatch-and-per-env-parallelism` and just check it out.)
 
 `khal` and `vortx` are **local dimforge forks, not under git** — the box must
 already have them as sibling dirs (same parent as `zealot`/`nexus-cuda`, e.g.
