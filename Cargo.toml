@@ -243,6 +243,12 @@ name = "biped_train_nexus"
 path = "examples/biped/biped_train_nexus.rs"
 required-features = ["biped_gpu"]
 
+# Fully GPU-resident trainer: GPU policy forward + GPU PPO update (vortx).
+[[example]]
+name = "biped_train_gpu"
+path = "examples/biped/biped_train_gpu.rs"
+required-features = ["gpu", "biped_gpu"]
+
 # Train briefly on nexus then record a deterministic env-0 rollout to JSON.
 # Render with `python3 examples/biped/render_biped.py <out.json> <out.mp4>`.
 [[example]]

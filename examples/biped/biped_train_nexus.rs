@@ -11,6 +11,7 @@
 mod biped_env_nexus;
 
 use biped_env_nexus::{BipedNexusBatchEnv, StepOut, default_mjcf_path};
+use std::time::Instant;
 use zealot_env::robots::lerobot_bipedal::NUM_JOINTS;
 use zealot_rl::rng::Lcg;
 use zealot_rl::{ActorCritic, PpoConfig, Sample, gae};
@@ -93,9 +94,13 @@ fn main() {
             let mut vs: Vec<Vec<f32>> = (0..num_envs).map(|_| Vec::with_capacity(T)).collect();
             let mut ds: Vec<Vec<bool>> = (0..num_envs).map(|_| Vec::with_capacity(T)).collect();
             let (mut total_reward, mut falls, mut torso_sum) = (0.0f32, 0u32, 0.0f32);
+            // [TIMING] ns accumulators: CPU policy fwd, GPU env.step, per-done
+            // env resets, CPU PPO update.
+            let (mut t_pol, mut t_step, mut t_commit, mut t_upd) = (0u128, 0u128, 0u128, 0u128);
 
             for _ in 0..T {
                 // Sample actions + values for all envs (sequential — shared policy).
+                let tp = Instant::now();
                 let mut actions: Vec<[f32; NUM_JOINTS]> = Vec::with_capacity(num_envs);
                 for e in 0..num_envs {
                     ac.record_obs(&cur[e], &cur_c[e]);
@@ -114,9 +119,13 @@ fn main() {
                     });
                     vs[e].push(value);
                 }
+                t_pol += tp.elapsed().as_nanos();
                 // ONE GPU dispatch advances every env.
+                let ts = Instant::now();
                 let outs: Vec<StepOut> = env.step(&actions).await;
+                t_step += ts.elapsed().as_nanos();
 
+                let tc = Instant::now();
                 for e in 0..num_envs {
                     let out = &outs[e];
                     total_reward += out.reward;
@@ -134,6 +143,7 @@ fn main() {
                         cur_c[e].clone_from(&out.critic_obs);
                     }
                 }
+                t_commit += tc.elapsed().as_nanos();
                 // Cheap torso-z aggregate (avoids another GPU readback — already
                 // baked into the last step's StepOut via obs[ ... ] but we don't
                 // expose that index here, so re-read once per T-block instead).
@@ -155,8 +165,17 @@ fn main() {
                     batch.push(std::mem::take(&mut samples[e][t]));
                 }
             }
+            let tu = Instant::now();
             let _stats = ac.update(&mut batch, &cfg);
+            t_upd += tu.elapsed().as_nanos();
 
+            if it % 10 == 0 || it == iters - 1 {
+                let ms = |x: u128| x as f64 / 1e6;
+                println!(
+                    "  [time] policy_cpu {:.0}ms | gpu_step {:.0}ms | resets {:.0}ms | ppo_update {:.0}ms",
+                    ms(t_pol), ms(t_step), ms(t_commit), ms(t_upd)
+                );
+            }
             if it % 10 == 0 || it == iters - 1 {
                 let steps = (num_envs * T) as f32;
                 println!(
