@@ -23,7 +23,13 @@ src = sys.argv[1] if len(sys.argv) > 1 else "/tmp/biped_rollout.json"
 out = sys.argv[2] if len(sys.argv) > 2 else "/tmp/biped_mesh.mp4"
 HOME = os.path.expanduser("~")
 XML = f"{HOME}/Documents/work/lerobot-humanoid-design/to_real_robot/RL_policy/robot.xml"
-ASSETS = f"{HOME}/Documents/work/lerobot-humanoid-design/urdf/bipedal_plateform/urdf/assets"
+# Mesh dir for the STLs robot.xml references. Override with BIPED_ASSETS — the
+# default path moved when the model repo was reorganised.
+ASSETS = os.environ.get(
+    "BIPED_ASSETS",
+    f"{HOME}/Documents/work/lerobot-humanoid-design/urdf/bipedal_plateform/urdf/assets",
+)
+XML = os.environ.get("BIPED_ROBOT_XML", XML)
 W, H = 720, 720
 
 with open(src) as f:
