@@ -54,6 +54,10 @@ pub struct JointSpec {
     pub default_pos: f32,
     /// Hard joint position limits `(lower, upper)`, rad (from the URDF).
     pub pos_limit: (f32, f32),
+    /// Rotor/reflected inertia (kg·m²), system-identified by WBC-AGILE
+    /// (`config.yaml` `joint_armature`). Added to the joint's dof inertia — what
+    /// makes stiff PD-controlled joints numerically stable in sim.
+    pub armature: f32,
 }
 
 const PI: f32 = std::f32::consts::PI;
@@ -81,18 +85,19 @@ pub const JOINT_NAMES: [&str; NUM_JOINTS] = [
 /// 44 N·m. Action scales and PD gains are from the deployed policy's `gain.md` /
 /// action config.
 const fn family(name: &'static str) -> JointSpec {
-    // (kp, kd, effort, action_scale) per joint family.
-    let (kp, kd, effort, scale) = if starts_with(name, "hipz") {
-        (30.0, 3.0, 88.0, 0.733)
+    // (kp, kd, effort, action_scale, armature) per joint family. Armature is
+    // WBC-AGILE's system-identified rotor inertia (`joint_armature` in config.yaml).
+    let (kp, kd, effort, scale, armature) = if starts_with(name, "hipz") {
+        (30.0, 3.0, 88.0, 0.733, 0.0227)
     } else if starts_with(name, "hipx") {
-        (40.0, 3.0, 88.0, 0.55)
+        (40.0, 3.0, 88.0, 0.55, 0.1333)
     } else if starts_with(name, "hipy") {
-        (60.0, 4.0, 88.0, 0.367)
+        (60.0, 4.0, 88.0, 0.367, 0.1408)
     } else if starts_with(name, "knee") {
-        (60.0, 4.0, 88.0, 0.367)
+        (60.0, 4.0, 88.0, 0.367, 0.1233)
     } else {
         // ankley / anklex
-        (20.0, 1.5, 44.0, 0.55)
+        (20.0, 1.5, 44.0, 0.55, 0.0299)
     };
     JointSpec {
         name,
@@ -103,6 +108,7 @@ const fn family(name: &'static str) -> JointSpec {
         action_scale: scale,
         default_pos: 0.0,
         pos_limit: (-PI, PI),
+        armature,
     }
 }
 
