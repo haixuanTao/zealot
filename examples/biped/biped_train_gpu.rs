@@ -1,27 +1,37 @@
-//! Train flat velocity tracking on the LeRobot bipedal — **fully GPU-resident**.
+//! GPU-resident PPO trainer for the nexus biped — the real-training version of
+//! the machinery `iter_e2e_bench` benchmarks one-shot. Both the rollout policy
+//! forward (`GpuPolicy`) AND the PPO update (GpuMlp forward/backward/Adam +
+//! vortx `Ppo` actor/value grads) run on the GPU; only action sampling, GAE, and
+//! reward/obs (host) stay on the CPU. ~5x faster/iter than `biped_train_nexus`
+//! (which runs policy + PPO on CPU).
 //!
-//! Like `biped_train_nexus`, but the policy **forward** and the **PPO update**
-//! both run on the GPU (vortx), not the CPU `ActorCritic`. The CPU net stays the
-//! source of truth for checkpointing: each iter we GPU-forward the rollout
-//! (`GpuPolicy`), run the GPU-resident PPO update (`GpuMlp` + ppo/adam kernels,
-//! the same path benchmarked in `iter_e2e_bench`), then read the updated weights
-//! back into `ac` and re-sync the rollout policy. This moves the ~95% of the
-//! `biped_train_nexus` iteration that was CPU-bound (policy fwd 41% + update 54%)
-//! onto the GPU.
+//! Net + hyperparameters match WBC-AGILE's T1 velocity policy (actor
+//! [obs,256,256,128,12], critic [cobs,512,256,128,1], init_noise_std=1.0,
+//! entropy 0.005, clip 0.2, velocity curriculum 0→1 over the first 40% of iters).
 //!
-//! Run: `BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
-//!        --features "gpu biped_gpu cuda_backend" -- [iters] [num_envs]`
+//! Unlike the throughput bench, this is a correct multi-iteration optimizer:
+//! the GPU nets + Adam moments PERSIST across iterations, Adam bias-correction
+//! advances with a global step, and the updated weights are synced
+//! GPU→CPU(ActorCritic)→GpuPolicy each iteration for the next rollout.
+//!
+//! Run:
+//!   export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D=$HOME/nexus_ptx/nexus_rbd_shaders3d.cubin
+//!   export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS=$HOME/nexus_ptx/vortx_shaders.cubin
+//!   BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
+//!       --features "gpu biped_gpu cuda_backend" -- [iters] [num_envs] [ckpt]
 
+#[path = "biped_env.rs"]
+mod biped_env;
 #[path = "biped_env_nexus.rs"]
 mod biped_env_nexus;
 #[path = "gpu_policy.rs"]
 mod gpu_policy;
 
-use biped_env_nexus::{BipedNexusBatchEnv, StepOut, default_mjcf_path};
+use biped_env_nexus::{default_mjcf_path, BipedNexusBatchEnv};
 use gpu_policy::GpuPolicy;
+use khal::backend::{Backend, Encoder, GpuBackend};
 use khal::BufferUsages;
 use khal::Shader;
-use khal::backend::{Backend, Encoder, GpuBackend};
 use nalgebra::DMatrix;
 use std::time::Instant;
 use vortx::linalg::{
@@ -32,12 +42,25 @@ use vortx::shapes::TensorLayoutBuffers;
 use vortx::tensor::Tensor;
 use zealot_env::robots::lerobot_bipedal::NUM_JOINTS;
 use zealot_rl::net::Mlp;
-use zealot_rl::ppo::{Sample, gae};
+use zealot_rl::ppo::{gae, Sample};
 use zealot_rl::rng::Lcg;
-use zealot_rl::{ActorCritic, PpoConfig};
+use zealot_rl::ActorCritic;
 
-const T: usize = 32; // steps per env per iteration
 const LOG_SQRT_2PI: f32 = 0.918_938_5;
+const T: usize = 24; // rollout horizon
+const EPOCHS: usize = 5;
+const MINIBATCHES: usize = 4;
+const LR: f32 = 1e-3;
+const CLIP: f32 = 0.2;
+const ENTROPY: f32 = 0.005;
+const VALUE_COEF: f32 = 1.0; // WBC-AGILE / rsl_rl value_coef
+const GAMMA: f32 = 0.99;
+const LAM: f32 = 0.95;
+// Adaptive-KL LR schedule (rsl_rl / WBC-AGILE): lr ÷1.5 when KL > 2·desired,
+// ×1.5 when KL < desired/2, clamped to [LR_MIN, LR_MAX].
+const DESIRED_KL: f32 = 0.01;
+const LR_MIN: f32 = 1e-5;
+const LR_MAX: f32 = 1e-2;
 
 fn mk(b: &GpuBackend, m: &DMatrix<f32>, u: BufferUsages) -> Tensor<f32> {
     Tensor::matrix_from_na(b, m, u).unwrap()
@@ -51,7 +74,8 @@ fn to_action(v: &[f32]) -> [f32; NUM_JOINTS] {
     a
 }
 
-// ── GPU MLP with forward/backward/adam (lifted from iter_e2e_bench) ─────────
+/// GPU MLP with persistent weights + Adam moments (copied from iter_e2e_bench,
+/// plus `read_into` to write the trained weights back to a CPU `Mlp`).
 struct GpuMlp {
     dims: Vec<usize>,
     batch: usize,
@@ -98,7 +122,10 @@ impl GpuMlp {
         for i in 0..l {
             let (lf, rt) = self.a.split_at_mut(i + 1);
             let (ain, aout) = (&lf[i], &mut rt[0]);
-            { let mut p = enc.begin_pass("z", None); g.dispatch_tiled(bk, sh, &mut p, &mut *aout, &self.w[i], ain)?; }
+            {
+                let mut p = enc.begin_pass("z", None);
+                g.dispatch_tiled(bk, sh, &mut p, &mut *aout, &self.w[i], ain)?;
+            }
             { let mut p = enc.begin_pass("bb", None); g.dispatch_naive(bk, sh, &mut p, &mut self.bb[i], &self.b[i], o1m)?; }
             { let mut p = enc.begin_pass("bias", None); op.launch(bk, sh, &mut p, OpAssignVariant::Add, &mut *aout, &self.bb[i])?; }
             if i < l - 1 { let mut p = enc.begin_pass("elu", None); act.elu(bk, sh, &mut p, &mut *aout)?; }
@@ -123,96 +150,103 @@ impl GpuMlp {
         }
         Ok(())
     }
-    /// Read the (possibly Adam-updated) GPU weights back into a CPU `Mlp`.
-    /// `w[i]` is `[out x in]` row-major, matching `Mlp::w[i]`'s flat layout.
-    async fn read_into(&self, bk: &GpuBackend, net: &mut Mlp) -> anyhow::Result<()> {
-        for i in 0..self.layers() {
-            net.w[i] = bk.slow_read_vec(self.w[i].buffer()).await?;
-            net.b[i] = bk.slow_read_vec(self.b[i].buffer()).await?;
+    /// Write the trained GPU weights back into a CPU `Mlp` (`w[l]` is row-major
+    /// `[out x in]`, `b[l]` is `[out x 1]`).
+    async fn read_into(&self, bk: &GpuBackend, net: &mut Mlp) {
+        for l in 0..self.w.len() {
+            let (out, inp) = (self.dims[l + 1], self.dims[l]);
+            let w = bk.slow_read_vec(self.w[l].buffer()).await.unwrap();
+            net.w[l].copy_from_slice(&w[..out * inp]);
+            let b = bk.slow_read_vec(self.b[l].buffer()).await.unwrap();
+            net.b[l].copy_from_slice(&b[..out]);
         }
-        Ok(())
     }
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(60);
-    let num_envs: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1024);
-    let policy_path = std::env::args().nth(3).unwrap_or_else(|| "/tmp/biped_policy_gpu.safetensors".to_string());
-    let epochs = 5usize;
-    let minibatches = 16usize;
-
+    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200);
+    let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(2048);
+    let ckpt = std::env::args().nth(3).unwrap_or_else(|| "/tmp/biped_policy_gpu.safetensors".to_string());
     let xml = std::fs::read_to_string(default_mjcf_path()).expect("read mjcf");
-    println!("building {num_envs} GPU envs (32 DR templates)...");
 
     pollster::block_on(async {
-        let mut env = BipedNexusBatchEnv::new(&xml, num_envs, 32, 0xC0FFEE).await;
-        let bk = env.backend().clone();
-        let (od, cd, ad_) = (env.obs_dim(), env.critic_obs_dim(), env.action_dim());
-        println!("obs={od} critic_obs={cd} action={ad_}");
-
+        println!("building {n} GPU nexus envs...");
+        let mut env = BipedNexusBatchEnv::new(&xml, n, 32, 0xC0FFEE).await;
+        let (od, cd) = (env.obs_dim(), env.critic_obs_dim());
         let mut rng = Lcg::new(7);
-        let mut ac = if !policy_path.is_empty() && std::path::Path::new(&policy_path).exists() {
-            println!("resuming from {policy_path}...");
-            ActorCritic::load(&policy_path).expect("load checkpoint")
+        let mut ac = if !ckpt.is_empty() && std::path::Path::new(&ckpt).exists() {
+            println!("resuming from {ckpt}...");
+            ActorCritic::load(&ckpt).expect("load checkpoint")
         } else {
-            ActorCritic::new(&[od, 256, 256, 128, ad_], &[cd, 512, 256, 128, 1], 1.0, 1e-3, &mut rng)
+            ActorCritic::new(&[od, 256, 256, 128, NUM_JOINTS], &[cd, 512, 256, 128, 1], 1.0, 1e-3, &mut rng)
         };
-        let cfg = PpoConfig { entropy_coef: 0.005, ..PpoConfig::default() };
-        let mut gpu = GpuPolicy::new(&bk, &ac, num_envs).expect("gpu policy");
+        let bk = env.backend().clone();
+        let mut gpu = GpuPolicy::new(&bk, &ac, n).expect("gpu policy");
 
-        // Persistent GPU update ops (built once).
+        // Persistent GPU update state (weights + Adam moments survive all iters).
+        let total = n * T;
+        let mb = total / MINIBATCHES;
         let g = Gemm::from_backend(&bk).unwrap();
         let op = OpAssign::from_backend(&bk).unwrap();
         let act = Activation::from_backend(&bk).unwrap();
-        let adam = Adam::from_backend(&bk).unwrap();
+        let ad = Adam::from_backend(&bk).unwrap();
         let ppo = Ppo::from_backend(&bk).unwrap();
         let cont = Contiguous::from_backend(&bk).unwrap();
+        let mut sh = TensorLayoutBuffers::new(&bk);
+        let (st, rw) = (BufferUsages::STORAGE, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+        let mut a_net = GpuMlp::new(&bk, &ac.actor, mb);
+        let mut c_net = GpuMlp::new(&bk, &ac.critic, mb);
+        let ad_ = NUM_JOINTS;
+        let mut lst = mk(&bk, &DMatrix::from_fn(ad_, 1, |r, _| ac.log_std[r]), rw);
+        let (mut mls, mut vls) = (mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), st), mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), st));
+        // Reused mb-sized scratch.
+        let mut action_t = mk(&bk, &DMatrix::<f32>::zeros(ad_, mb), rw);
+        let mut adv_t = mk(&bk, &DMatrix::<f32>::zeros(1, mb), rw);
+        let mut lpo = mk(&bk, &DMatrix::<f32>::zeros(1, mb), rw);
+        let mut vo = mk(&bk, &DMatrix::<f32>::zeros(1, mb), rw);
+        let mut ret = mk(&bk, &DMatrix::<f32>::zeros(1, mb), rw);
+        let o1m = mk(&bk, &DMatrix::<f32>::from_element(1, mb, 1.0), st);
+        let om1 = mk(&bk, &DMatrix::<f32>::from_element(mb, 1, 1.0), st);
+        let mut gls = mk(&bk, &DMatrix::<f32>::zeros(ad_, mb), rw);
+        let mut dls = mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), rw);
+        let scale_mb = 1.0 / mb as f32;
+        let (la, lc) = (a_net.layers() - 1, c_net.layers() - 1);
+        let mut gstep: u64 = 0;
+        let mut lr = LR; // adaptive-KL LR, persists across iterations
 
-        let total = num_envs * T;
-        let mb = total / minibatches;
-        assert_eq!(mb * minibatches, total, "num_envs*T must divide minibatches");
-
-        let (mut cur, mut cur_c) = env.initial_obs().await;
-        println!("\n{:>4}  {:>5}  {:>9}  {:>7}  {:>8}  {:>10}", "iter", "curr", "step_rew", "falls", "torso_z", "iter_ms");
-
+        let (mut gc, mut gcc) = env.initial_obs().await;
         let warmup = (iters as f32 * 0.4).max(1.0);
-        const CHECKPOINT_EVERY: usize = 50;
+        println!("\n{:>4}  {:>5}  {:>9}  {:>7}  {:>8}  {:>9}  {:>7}  {:>6}", "iter", "curr", "step_rew", "falls", "torso_z", "lr", "kl", "sec");
 
         for it in 0..iters {
             let t_iter = Instant::now();
-            let scale = (it as f32 / warmup).min(1.0);
-            env.set_command_scale(scale);
+            let cscale = (it as f32 / warmup).min(1.0);
+            env.set_command_scale(cscale);
 
-            let mut samples: Vec<Vec<Sample>> = (0..num_envs).map(|_| Vec::with_capacity(T)).collect();
-            let mut rs: Vec<Vec<f32>> = (0..num_envs).map(|_| Vec::with_capacity(T)).collect();
-            let mut vs: Vec<Vec<f32>> = (0..num_envs).map(|_| Vec::with_capacity(T)).collect();
-            let mut ds: Vec<Vec<bool>> = (0..num_envs).map(|_| Vec::with_capacity(T)).collect();
+            // ---------------- ROLLOUT (GPU policy forward, host sample) ----------------
+            let mut samp: Vec<Vec<Sample>> = (0..n).map(|_| Vec::with_capacity(T)).collect();
+            let (mut rs, mut vs, mut ds): (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<bool>>) =
+                ((0..n).map(|_| vec![]).collect(), (0..n).map(|_| vec![]).collect(), (0..n).map(|_| vec![]).collect());
             let (mut total_reward, mut falls) = (0.0f32, 0u32);
-            let (mut t_roll, mut t_upd) = (0u128, 0u128);
-
-            // ── Rollout: GPU forward + CPU sample + GPU physics ──
-            let tr = Instant::now();
             for _ in 0..T {
-                for e in 0..num_envs {
-                    ac.record_obs(&cur[e], &cur_c[e]); // updates running normalizers (cheap)
+                for e in 0..n {
+                    ac.record_obs(&gc[e], &gcc[e]);
                 }
-                // GPU batched forward (the 41% that was CPU).
-                let (means, values) = gpu.forward(&bk, &ac, &cur, &cur_c).await.unwrap();
-                let mut actions: Vec<[f32; NUM_JOINTS]> = Vec::with_capacity(num_envs);
-                for e in 0..num_envs {
+                let (means, values) = gpu.forward(&bk, &ac, &gc, &gcc).await.unwrap();
+                let mut acts = Vec::with_capacity(n);
+                for e in 0..n {
                     let mean = means[e];
                     let mut a = vec![0.0f32; NUM_JOINTS];
                     for k in 0..NUM_JOINTS {
                         a[k] = mean[k] + ac.log_std[k].exp() * rng.gauss();
                     }
-                    let mean_v = mean.to_vec();
-                    let lp = ac.logp(&a, &mean_v);
-                    actions.push(to_action(&a));
-                    samples[e].push(Sample {
-                        obs: cur[e].clone(),
-                        critic_obs: cur_c[e].clone(),
+                    let lp = ac.logp(&a, &mean[..]);
+                    acts.push(to_action(&a));
+                    samp[e].push(Sample {
+                        obs: gc[e].clone(),
+                        critic_obs: gcc[e].clone(),
                         action: a,
-                        mean_old: mean_v,
+                        mean_old: mean.to_vec(),
                         logp_old: lp,
                         value_old: values[e],
                         adv: 0.0,
@@ -220,128 +254,139 @@ fn main() {
                     });
                     vs[e].push(values[e]);
                 }
-                let outs: Vec<StepOut> = env.step(&actions).await;
-                for e in 0..num_envs {
-                    let out = &outs[e];
-                    total_reward += out.reward;
-                    rs[e].push(out.reward);
-                    ds[e].push(out.done);
-                    if out.fell {
+                let outs = env.step(&acts).await;
+                for e in 0..n {
+                    total_reward += outs[e].reward;
+                    if outs[e].fell {
                         falls += 1;
                     }
-                    if out.done {
+                    rs[e].push(outs[e].reward);
+                    ds[e].push(outs[e].done);
+                    if outs[e].done {
                         let (o, c) = env.reset_env(e).await;
-                        cur[e] = o;
-                        cur_c[e] = c;
+                        gc[e] = o;
+                        gcc[e] = c;
                     } else {
-                        cur[e].clone_from(&out.obs);
-                        cur_c[e].clone_from(&out.critic_obs);
+                        gc[e].clone_from(&outs[e].obs);
+                        gcc[e].clone_from(&outs[e].critic_obs);
                     }
                 }
             }
-            t_roll += tr.elapsed().as_nanos();
 
-            // GAE + flat batch (CPU, cheap). Bootstrap value from the rollout net.
+            // ---------------- GAE + batch ----------------
             let mut batch: Vec<Sample> = Vec::with_capacity(total);
-            for e in 0..num_envs {
-                let last_v = ac.value(&cur_c[e]);
-                let (adv, ret) = gae(&rs[e], &vs[e], &ds[e], last_v, cfg.gamma, cfg.lam);
+            for e in 0..n {
+                let lv = ac.value(&gcc[e]);
+                let (adv, retn) = gae(&rs[e], &vs[e], &ds[e], lv, GAMMA, LAM);
                 for t in 0..T {
-                    samples[e][t].adv = adv[t];
-                    samples[e][t].ret = ret[t];
-                    batch.push(std::mem::take(&mut samples[e][t]));
+                    samp[e][t].adv = adv[t];
+                    samp[e][t].ret = retn[t];
+                    batch.push(std::mem::take(&mut samp[e][t]));
+                }
+            }
+            // Normalize advantages across the batch (mean 0, std 1) — this is what
+            // CPU `ActorCritic::update` does; the GPU `Ppo::actor_grad` consumes raw
+            // `adv`, so without this the PPO gradients are mis-scaled and the policy
+            // plateaus instead of learning.
+            let amean: f32 = batch.iter().map(|s| s.adv).sum::<f32>() / total as f32;
+            let avar: f32 = batch.iter().map(|s| (s.adv - amean).powi(2)).sum::<f32>() / total as f32;
+            let asd = avar.sqrt().max(1e-6);
+            for s in batch.iter_mut() {
+                s.adv = (s.adv - amean) / asd;
+            }
+
+            // ---------------- GPU PPO UPDATE (persistent nets, advancing Adam) -------
+            let on: Vec<Vec<f32>> = batch.iter().map(|s| ac.obs_norm.normalize(&s.obs)).collect();
+            let cn: Vec<Vec<f32>> = batch.iter().map(|s| ac.critic_norm.normalize(&s.critic_obs)).collect();
+            let f_obs = mk(&bk, &DMatrix::from_fn(od, total, |r, c| on[c][r]), st);
+            let f_cobs = mk(&bk, &DMatrix::from_fn(cd, total, |r, c| cn[c][r]), st);
+            let f_act = mk(&bk, &DMatrix::from_fn(ad_, total, |r, c| batch[c].action[r]), st);
+            let f_adv = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].adv), st);
+            let f_lpo = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].logp_old), st);
+            let f_vo = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].value_old), st);
+            let f_ret = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].ret), st);
+            let ap = Tensor::scalar(&bk, PpoActorParams { clip: CLIP, entropy_coef: ENTROPY, scale: scale_mb, log_sqrt_2pi: LOG_SQRT_2PI, action_dim: ad_ as u32, num_cols: mb as u32, pad0: 0, pad1: 0 }, BufferUsages::UNIFORM).unwrap();
+            let vp = Tensor::scalar(&bk, PpoValueParams { clip: CLIP, value_coef: VALUE_COEF, scale: scale_mb, num_cols: mb as u32, pad0: 0, pad1: 0, pad2: 0, pad3: 0 }, BufferUsages::UNIFORM).unwrap();
+
+            // Old-policy means for the LAST minibatch — drives the per-epoch KL
+            // for the adaptive-KL LR schedule (mirrors CPU `minibatch_step`'s
+            // `self.kl`, here at per-epoch rather than per-minibatch granularity).
+            let last_off = (MINIBATCHES - 1) * mb;
+            let mean_old_last: Vec<Vec<f32>> =
+                (0..mb).map(|c| batch[last_off + c].mean_old.clone()).collect();
+            let mut last_kl = 0.0f32;
+            for _epoch in 0..EPOCHS {
+                gstep += MINIBATCHES as u64;
+                let bc1 = 1.0 - 0.9f32.powi(gstep.min(1 << 30) as i32);
+                let bc2 = 1.0 - 0.999f32.powi(gstep.min(1 << 30) as i32);
+                let adp = Tensor::scalar(&bk, AdamParams { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, bias_correction1: bc1, bias_correction2: bc2, pad0: 0.0, pad1: 0.0 }, BufferUsages::UNIFORM).unwrap();
+                let mut enc = bk.begin_encoding();
+                for k in 0..MINIBATCHES {
+                    let off = (k * mb) as u32;
+                    let nb = mb as u32;
+                    { let mut p = enc.begin_pass("g_obs", None); cont.launch(&bk, &mut sh, &mut p, &mut a_net.a[0], f_obs.columns(off, nb), None).unwrap(); }
+                    { let mut p = enc.begin_pass("g_cobs", None); cont.launch(&bk, &mut sh, &mut p, &mut c_net.a[0], f_cobs.columns(off, nb), None).unwrap(); }
+                    { let mut p = enc.begin_pass("g_act", None); cont.launch(&bk, &mut sh, &mut p, &mut action_t, f_act.columns(off, nb), None).unwrap(); }
+                    { let mut p = enc.begin_pass("g_adv", None); cont.launch(&bk, &mut sh, &mut p, &mut adv_t, f_adv.columns(off, nb), None).unwrap(); }
+                    { let mut p = enc.begin_pass("g_lpo", None); cont.launch(&bk, &mut sh, &mut p, &mut lpo, f_lpo.columns(off, nb), None).unwrap(); }
+                    { let mut p = enc.begin_pass("g_vo", None); cont.launch(&bk, &mut sh, &mut p, &mut vo, f_vo.columns(off, nb), None).unwrap(); }
+                    { let mut p = enc.begin_pass("g_ret", None); cont.launch(&bk, &mut sh, &mut p, &mut ret, f_ret.columns(off, nb), None).unwrap(); }
+                    a_net.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m).unwrap();
+                    c_net.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m).unwrap();
+                    { let mut p = enc.begin_pass("ag", None); ppo.actor_grad(&mut p, &ap, &a_net.a[la + 1], &action_t, &lst, &adv_t, &lpo, &mut a_net.delta[la], &mut gls).unwrap(); }
+                    { let mut p = enc.begin_pass("vg", None); ppo.value_grad(&mut p, &vp, &c_net.a[lc + 1], &vo, &ret, &mut c_net.delta[lc]).unwrap(); }
+                    a_net.backward(&bk, &g, &act, &mut sh, &mut enc, &om1).unwrap();
+                    c_net.backward(&bk, &g, &act, &mut sh, &mut enc, &om1).unwrap();
+                    { let mut p = enc.begin_pass("dl", None); g.dispatch_naive(&bk, &mut sh, &mut p, &mut dls, &gls, &om1).unwrap(); }
+                    a_net.adam(&bk, &ad, &mut sh, &mut enc, &adp).unwrap();
+                    c_net.adam(&bk, &ad, &mut sh, &mut enc, &adp).unwrap();
+                    { let mut p = enc.begin_pass("al", None); ad.step(&bk, &mut sh, &mut p, &adp, &mut lst, &dls, &mut mls, &mut vls).unwrap(); }
+                }
+                bk.submit(enc).unwrap();
+                bk.synchronize().unwrap();
+
+                // Per-epoch KL (last minibatch) → adaptive-KL LR for the next epoch.
+                let mn = bk.slow_read_vec(a_net.a[la + 1].buffer()).await.unwrap(); // [ad x mb]
+                let ls = bk.slow_read_vec(lst.buffer()).await.unwrap(); // [ad]
+                let mut kl = 0.0f32;
+                for c in 0..mb {
+                    for k in 0..ad_ {
+                        let inv = (-ls[k]).exp();
+                        let d = (mn[k * mb + c] - mean_old_last[c][k]) * inv;
+                        kl += 0.5 * d * d;
+                    }
+                }
+                kl /= mb as f32;
+                last_kl = kl;
+                if kl > DESIRED_KL * 2.0 {
+                    lr = (lr / 1.5).max(LR_MIN);
+                } else if kl > 0.0 && kl < DESIRED_KL / 2.0 {
+                    lr = (lr * 1.5).min(LR_MAX);
                 }
             }
 
-            // ── GPU-resident PPO update (the 54% that was CPU) ──
-            let tu = Instant::now();
-            {
-                let (st, rw) = (BufferUsages::STORAGE, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
-                let mut sh = TensorLayoutBuffers::new(&bk);
-                let mut a_net = GpuMlp::new(&bk, &ac.actor, mb);
-                let mut c_net = GpuMlp::new(&bk, &ac.critic, mb);
-                let on: Vec<Vec<f32>> = batch.iter().map(|s| ac.obs_norm.normalize(&s.obs)).collect();
-                let cn: Vec<Vec<f32>> = batch.iter().map(|s| ac.critic_norm.normalize(&s.critic_obs)).collect();
-                let f_obs = mk(&bk, &DMatrix::from_fn(od, total, |r, c| on[c][r]), st);
-                let f_cobs = mk(&bk, &DMatrix::from_fn(cd, total, |r, c| cn[c][r]), st);
-                let f_act = mk(&bk, &DMatrix::from_fn(ad_, total, |r, c| batch[c].action[r]), st);
-                let f_adv = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].adv), st);
-                let f_lpo = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].logp_old), st);
-                let f_vo = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].value_old), st);
-                let f_ret = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].ret), st);
-                let mut action_t = mk(&bk, &DMatrix::<f32>::zeros(ad_, mb), rw);
-                let mut adv_t = mk(&bk, &DMatrix::<f32>::zeros(1, mb), rw);
-                let mut lpo = mk(&bk, &DMatrix::<f32>::zeros(1, mb), rw);
-                let mut vo = mk(&bk, &DMatrix::<f32>::zeros(1, mb), rw);
-                let mut ret = mk(&bk, &DMatrix::<f32>::zeros(1, mb), rw);
-                let mut lst = mk(&bk, &DMatrix::from_fn(ad_, 1, |r, _| ac.log_std[r]), rw);
-                let o1m = mk(&bk, &DMatrix::<f32>::from_element(1, mb, 1.0), st);
-                let om1 = mk(&bk, &DMatrix::<f32>::from_element(mb, 1, 1.0), st);
-                let mut gls = mk(&bk, &DMatrix::<f32>::zeros(ad_, mb), rw);
-                let mut dls = mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), rw);
-                let (mut mls, mut vls) = (mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), st), mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), st));
-                let sc = 1.0 / mb as f32;
-                let ap = Tensor::scalar(&bk, PpoActorParams { clip: 0.2, entropy_coef: 0.005, scale: sc, log_sqrt_2pi: LOG_SQRT_2PI, action_dim: ad_ as u32, num_cols: mb as u32, pad0: 0, pad1: 0 }, BufferUsages::UNIFORM).unwrap();
-                let vp = Tensor::scalar(&bk, PpoValueParams { clip: 0.2, value_coef: 0.5, scale: sc, num_cols: mb as u32, pad0: 0, pad1: 0, pad2: 0, pad3: 0 }, BufferUsages::UNIFORM).unwrap();
-                let adp = Tensor::scalar(&bk, AdamParams { lr: 1e-3, beta1: 0.9, beta2: 0.999, eps: 1e-8, bias_correction1: 0.1, bias_correction2: 0.001, pad0: 0.0, pad1: 0.0 }, BufferUsages::UNIFORM).unwrap();
-                let (la, lc) = (a_net.layers() - 1, c_net.layers() - 1);
-                macro_rules! run_minibatches {
-                    ($enc:ident) => {{
-                        for k in 0..minibatches {
-                            let off = (k * mb) as u32;
-                            let nb = mb as u32;
-                            { let mut p = $enc.begin_pass("g_obs", None); cont.launch(&bk, &mut sh, &mut p, &mut a_net.a[0], f_obs.columns(off, nb), None).unwrap(); }
-                            { let mut p = $enc.begin_pass("g_cobs", None); cont.launch(&bk, &mut sh, &mut p, &mut c_net.a[0], f_cobs.columns(off, nb), None).unwrap(); }
-                            { let mut p = $enc.begin_pass("g_act", None); cont.launch(&bk, &mut sh, &mut p, &mut action_t, f_act.columns(off, nb), None).unwrap(); }
-                            { let mut p = $enc.begin_pass("g_adv", None); cont.launch(&bk, &mut sh, &mut p, &mut adv_t, f_adv.columns(off, nb), None).unwrap(); }
-                            { let mut p = $enc.begin_pass("g_lpo", None); cont.launch(&bk, &mut sh, &mut p, &mut lpo, f_lpo.columns(off, nb), None).unwrap(); }
-                            { let mut p = $enc.begin_pass("g_vo", None); cont.launch(&bk, &mut sh, &mut p, &mut vo, f_vo.columns(off, nb), None).unwrap(); }
-                            { let mut p = $enc.begin_pass("g_ret", None); cont.launch(&bk, &mut sh, &mut p, &mut ret, f_ret.columns(off, nb), None).unwrap(); }
-                            a_net.forward(&bk, &g, &op, &act, &mut sh, &mut $enc, &o1m).unwrap();
-                            c_net.forward(&bk, &g, &op, &act, &mut sh, &mut $enc, &o1m).unwrap();
-                            { let mut p = $enc.begin_pass("ag", None); ppo.actor_grad(&mut p, &ap, &a_net.a[la + 1], &action_t, &lst, &adv_t, &lpo, &mut a_net.delta[la], &mut gls).unwrap(); }
-                            { let mut p = $enc.begin_pass("vg", None); ppo.value_grad(&mut p, &vp, &c_net.a[lc + 1], &vo, &ret, &mut c_net.delta[lc]).unwrap(); }
-                            a_net.backward(&bk, &g, &act, &mut sh, &mut $enc, &om1).unwrap();
-                            c_net.backward(&bk, &g, &act, &mut sh, &mut $enc, &om1).unwrap();
-                            { let mut p = $enc.begin_pass("dl", None); g.dispatch_naive(&bk, &mut sh, &mut p, &mut dls, &gls, &om1).unwrap(); }
-                            a_net.adam(&bk, &adam, &mut sh, &mut $enc, &adp).unwrap();
-                            c_net.adam(&bk, &adam, &mut sh, &mut $enc, &adp).unwrap();
-                            { let mut p = $enc.begin_pass("al", None); adam.step(&bk, &mut sh, &mut p, &adp, &mut lst, &dls, &mut mls, &mut vls).unwrap(); }
-                        }
-                    }};
-                }
-                // Eager epochs (per-iter buffers => no graph replay).
-                for _ in 0..epochs {
-                    let mut enc = bk.begin_encoding();
-                    run_minibatches!(enc);
-                    bk.submit(enc).unwrap();
-                    bk.synchronize().unwrap();
-                }
-                // Close the loop: GPU weights -> CPU ac -> re-sync rollout policy.
-                a_net.read_into(&bk, &mut ac.actor).await.unwrap();
-                c_net.read_into(&bk, &mut ac.critic).await.unwrap();
-                ac.log_std = bk.slow_read_vec(lst.buffer()).await.unwrap();
-            }
+            // ---------------- SYNC trained weights GPU → ac → GpuPolicy ----------------
+            a_net.read_into(&bk, &mut ac.actor).await;
+            c_net.read_into(&bk, &mut ac.critic).await;
+            let ls = bk.slow_read_vec(lst.buffer()).await.unwrap();
+            ac.log_std.copy_from_slice(&ls[..ad_]);
             gpu.sync_weights(&bk, &ac);
-            t_upd += tu.elapsed().as_nanos();
 
-            if it % 5 == 0 || it == iters - 1 {
+            if it % 10 == 0 || it == iters - 1 {
                 let zs = env.torso_heights().await;
-                let torso = zs.iter().sum::<f32>() / num_envs as f32;
+                let torso = zs.iter().sum::<f32>() / n as f32;
                 println!(
-                    "{:>4}  {:>5.2}  {:>9.4}  {:>7}  {:>8.3}  {:>10.0}  [roll {:.0} upd {:.0}]",
-                    it, scale, total_reward / (num_envs * T) as f32, falls, torso,
-                    t_iter.elapsed().as_secs_f64() * 1e3,
-                    t_roll as f64 / 1e6, t_upd as f64 / 1e6,
+                    "{:>4}  {:>5.2}  {:>9.4}  {:>7}  {:>8.3}  {:>9.2e}  {:>7.4}  {:>6.1}",
+                    it, cscale, total_reward / total as f32, falls, torso, lr, last_kl, t_iter.elapsed().as_secs_f64()
                 );
             }
-            if !policy_path.is_empty() && it > 0 && (it % CHECKPOINT_EVERY == 0 || it == iters - 1) {
-                ac.save(&policy_path).unwrap_or_else(|e| eprintln!("checkpoint failed: {e}"));
+            if !ckpt.is_empty() && (it % 50 == 0 || it == iters - 1) {
+                let _ = ac.save(&ckpt);
             }
         }
-        if !policy_path.is_empty() {
-            ac.save(&policy_path).expect("save policy");
-            println!("saved final policy → {policy_path}");
+        if !ckpt.is_empty() {
+            ac.save(&ckpt).expect("save");
+            println!("saved → {ckpt}");
         }
     });
 }

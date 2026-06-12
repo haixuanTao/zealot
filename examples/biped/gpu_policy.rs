@@ -48,14 +48,7 @@ impl GpuNet {
         let rw = BufferUsages::STORAGE | BufferUsages::COPY_SRC;
         let mut a = Vec::with_capacity(net.w.len() + 1);
         for l in 0..=net.w.len() {
-            // a[0] is overwritten in place each step via write_buffer (needs
-            // COPY_DST); a[1..] are copied out / read back (needs COPY_SRC).
-            let usage = if l == 0 {
-                BufferUsages::STORAGE | BufferUsages::COPY_DST
-            } else {
-                rw
-            };
-            a.push(matrix(backend, &DMatrix::<f32>::zeros(dims[l], n), usage));
+            a.push(matrix(backend, &DMatrix::<f32>::zeros(dims[l], n), rw));
         }
         let mut me = Self {
             w: Vec::new(),
@@ -84,13 +77,9 @@ impl GpuNet {
         }
     }
 
-    /// Overwrite the persistent `a[0]` input buffer in place. `x` is `[in x n]`;
-    /// `matrix_from_na` stores row-major, so we write `x.transpose()`'s slice to
-    /// match that layout — no fresh GPU allocation per rollout step.
+    /// Upload the input matrix `[in x n]` into `a[0]`.
     fn set_input(&mut self, backend: &GpuBackend, x: &DMatrix<f32>) {
-        backend
-            .write_buffer(self.a[0].buffer_mut(), 0, x.transpose().as_slice())
-            .expect("write a[0]");
+        self.a[0] = matrix(backend, x, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
     }
 
     /// Encode GEMM -> bias -> ELU per hidden layer (linear output) into `enc`.
@@ -109,7 +98,7 @@ impl GpuNet {
             {
                 let mut p = enc.begin_pass("gemm", None);
                 ops.gemm
-                    .dispatch_tiled(backend, shapes, &mut p, &mut *a_out, &self.w[l], a_in)?;
+                    .dispatch_naive(backend, shapes, &mut p, &mut *a_out, &self.w[l], a_in)?;
             }
             {
                 let mut p = enc.begin_pass("bias", None);
@@ -198,12 +187,12 @@ impl GpuPolicy {
         self.critic.set_input(backend, &crit_m);
 
         let mut enc = backend.begin_encoding();
-        self.actor.encode(backend, &self.ops, &mut self.shapes, &mut enc)?;
-        self.critic.encode(backend, &self.ops, &mut self.shapes, &mut enc)?;
+        self.actor
+            .encode(backend, &self.ops, &mut self.shapes, &mut enc)?;
+        self.critic
+            .encode(backend, &self.ops, &mut self.shapes, &mut enc)?;
         backend.submit(enc)?;
-        // No explicit synchronize(): the slow_read_vec below copies-to-staging
-        // (ordered after this submit) and maps, which drains the queue anyway.
-        // An extra synchronize() here is just a redundant device poll.
+        backend.synchronize()?;
 
         // Outputs are row-major [out x n] -> element (r, e) at index r*n + e.
         let a_out = backend.slow_read_vec(self.actor.output().buffer()).await?;

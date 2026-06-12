@@ -137,6 +137,21 @@ path = "examples/biped/iter_e2e_bench.rs"
 required-features = ["gpu", "biped_gpu"]
 
 [[example]]
+name = "sample_compare"
+path = "examples/biped/sample_compare.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "resident_rollout_bench"
+path = "examples/biped/resident_rollout_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "physics_capture_bench"
+path = "examples/biped/physics_capture_bench.rs"
+required-features = ["gpu", "biped_gpu", "cuda_backend"]
+
+[[example]]
 name = "cuda_gather_check"
 required-features = ["gpu", "biped_gpu"]
 
@@ -288,3 +303,8 @@ required-features = ["cpu", "biped_gpu"]
 name = "foot_tip_stability"
 path = "examples/biped/foot_tip_stability.rs"
 required-features = ["cpu"]
+
+[[example]]
+name = "passive_stand"
+path = "examples/biped/passive_stand.rs"
+required-features = ["gpu", "biped_gpu"]
