@@ -413,9 +413,10 @@ fn build_env_scene(
             continue;
         };
         let spec = robot.joints.iter().find(|j| &j.name == jname);
-        let (kp, kd, effort) = spec
-            .map(|s| (s.kp * dr.pd_scale, s.kd * dr.pd_scale, s.effort_limit))
-            .unwrap_or((50.0, 1.0, 20.0));
+        let pi = std::f32::consts::PI;
+        let (kp, kd, effort, pos_limit) = spec
+            .map(|s| (s.kp * dr.pd_scale, s.kd * dr.pd_scale, s.effort_limit, s.pos_limit))
+            .unwrap_or((50.0, 1.0, 20.0, (-pi, pi)));
         let mut joint = GenericJointBuilder::new(locked)
             .local_frame1(Pose::from_parts(b.local_pos, b.local_quat))
             .local_frame2(Pose::IDENTITY)
@@ -423,6 +424,12 @@ fn build_env_scene(
         joint.set_motor_model(JointAxis::AngZ, MotorModel::ForceBased);
         joint.set_motor_position(JointAxis::AngZ, 0.0, kp, kd);
         joint.set_motor_max_force(JointAxis::AngZ, effort);
+        // Enforce the free axis's position limits. Without this the GPU
+        // multibody emits the limit-constraint slots but they're never
+        // populated (±f32::MAX defaults), so legs spin freely past ±π. NOTE:
+        // pos_limit is currently the URDF/spec ±π placeholder — real per-joint
+        // ranges (WBC-AGILE/mjlab) would make this meaningfully tighter.
+        joint.set_limits(JointAxis::AngZ, [pos_limit.0, pos_limit.1]);
         multibody.insert(handles[parent], handles[i], joint, true);
         mb_link_of_mjcf.insert(i, next_mb_link);
         name_to_link.insert(jname.clone(), next_mb_link);
@@ -1546,8 +1553,16 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
     // getting a learning gradient (the rng draws are still consumed, so dynamics
     // DR and determinism are unchanged).
     let sdr: f32 = std::env::var("BIPED_SPAWN_DR").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    // BIPED_FRICTION: force a fixed Coulomb μ on every env (overrides the random
+    // draw) — used to A/B-test that friction actually reaches the GPU contact
+    // solver. The rng draw is still consumed so other DR + determinism are
+    // unchanged.
+    let friction = match std::env::var("BIPED_FRICTION").ok().and_then(|s| s.parse::<f32>().ok()) {
+        Some(f) => { let _ = rng.range(0.5, 1.5); f }
+        None => rng.range(0.5, 1.5),
+    };
     DrParams {
-        friction: rng.range(0.5, 1.5),
+        friction,
         restitution: rng.range(0.0, 0.15),
         pd_scale: rng.range(0.85, 1.15),
         contact_natural_frequency: rng.range(10.0, 50.0),
