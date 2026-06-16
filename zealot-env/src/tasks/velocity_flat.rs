@@ -495,10 +495,34 @@ impl VelocityFlatTask {
             }
         }
         debug_assert_eq!(k, 4);
+        // Reward-weight overrides for fast retuning without a rebuild. The
+        // stand-still local optimum (policy collects upright + base_height +
+        // free track_ang at zero command, ignores the velocity command) is the
+        // walking blocker, so the key dials are the velocity-tracking weight vs
+        // the standing magnets (upright / base_height). Set e.g.
+        // `BIPED_W_TRACK_LIN=10 BIPED_W_UPRIGHT=3 BIPED_W_BASE_H=1.5` at launch.
+        let mut weights = RewardWeights::default();
+        let env_f32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
+        if let Some(v) = env_f32("BIPED_W_TRACK_LIN") {
+            weights.track_lin_vel = v;
+        }
+        if let Some(v) = env_f32("BIPED_W_TRACK_ANG") {
+            weights.track_ang_vel = v;
+        }
+        if let Some(v) = env_f32("BIPED_W_UPRIGHT") {
+            weights.upright = v;
+        }
+        if let Some(v) = env_f32("BIPED_W_BASE_H") {
+            weights.base_height = v;
+        }
+        let mut stds = RewardStds::default();
+        if let Some(v) = env_f32("BIPED_STD_LIN") {
+            stds.lin_vel = v;
+        }
         Self {
             robot,
-            weights: RewardWeights::default(),
-            stds: RewardStds::default(),
+            weights,
+            stds,
             sim_dt: 1.0 / 200.0,
             decimation: 4,
             episode_s: 20.0,
@@ -525,7 +549,18 @@ impl VelocityFlatTask {
     pub fn joint_targets(&self, action: &[f32; NUM_JOINTS]) -> [f32; NUM_JOINTS] {
         std::array::from_fn(|i| {
             let j = self.robot.joints[i];
-            j.default_pos + j.action_scale * action[i]
+            // Clamp the PD target to the joint's physical limit. Unbounded targets
+            // let the policy command far past the stops (measured: hipx target
+            // ~1.5 rad vs a ±0.35 rad limit), so the PD slams the joint into its
+            // limit at near-saturated torque every step. That "limit-riding" pose
+            // is a degenerate local optimum: it wastes torque (critically on the
+            // fragile ankle) and gives the policy a flat, zero-gradient region to
+            // get stuck in — every trained policy collapsed to it. Clamping keeps
+            // the commanded pose physical and the PD error (hence torque) bounded,
+            // while still allowing each joint its FULL range (the action scale,
+            // not ±1, sets how far |action| must go to reach the limit).
+            let (lo, hi) = j.pos_limit;
+            (j.default_pos + j.action_scale * action[i]).clamp(lo, hi)
         })
     }
 

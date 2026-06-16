@@ -27,7 +27,7 @@ mod biped_env_nexus;
 #[path = "gpu_policy.rs"]
 mod gpu_policy;
 
-use biped_env_nexus::{default_mjcf_path, BipedNexusBatchEnv};
+use biped_env_nexus::{default_mjcf_path, BipedNexusBatchEnv, REWARD_COMP_NAMES};
 use gpu_policy::GpuPolicy;
 use khal::backend::{Backend, Encoder, GpuBackend};
 use khal::BufferUsages;
@@ -218,10 +218,19 @@ fn main() {
         let warmup = (iters as f32 * 0.4).max(1.0);
         println!("\n{:>4}  {:>5}  {:>9}  {:>7}  {:>8}  {:>9}  {:>7}  {:>6}", "iter", "curr", "step_rew", "falls", "torso_z", "lr", "kl", "sec");
 
+        // Torque-penalty curriculum target (full WBC weight = 1.0). Ramped 0→max
+        // over iters 40%→90% so the effort penalty engages only AFTER the policy
+        // can stand — at full strength from scratch it fights learning to stand.
+        let torque_max = std::env::var("BIPED_TORQUE_MAX")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0);
         for it in 0..iters {
             let t_iter = Instant::now();
             let cscale = (it as f32 / warmup).min(1.0);
             env.set_command_scale(cscale);
+            let tscale = ((it as f32 / iters as f32 - 0.4) / 0.5).clamp(0.0, 1.0) * torque_max;
+            env.set_torque_scale(tscale);
 
             // ---------------- ROLLOUT (GPU policy forward, host sample) ----------------
             let mut samp: Vec<Vec<Sample>> = (0..n).map(|_| Vec::with_capacity(T)).collect();
@@ -370,6 +379,25 @@ fn main() {
             c_net.read_into(&bk, &mut ac.critic).await;
             let ls = bk.slow_read_vec(lst.buffer()).await.unwrap();
             ac.log_std.copy_from_slice(&ls[..ad_]);
+            // Floor the exploration std. The GPU Adam path that trains `log_std`
+            // (the "al" pass) has NO clamp — left alone it collapses to ~ln(0.06),
+            // exploration dies, and the policy locks into the limit-riding optimum
+            // (the dead clamp in ppo.rs::step_log_std never runs on this path).
+            // Re-floor to [ln 0.2, ln 1.0] each iter and push the clamped values
+            // back into the GPU param buffer so the next update continues from them.
+            const LOG_STD_MIN: f32 = -1.6; // std 0.20
+            const LOG_STD_MAX: f32 = 0.0; // std 1.0
+            let mut clamped = false;
+            for v in ac.log_std.iter_mut() {
+                let c = v.clamp(LOG_STD_MIN, LOG_STD_MAX);
+                if c != *v {
+                    *v = c;
+                    clamped = true;
+                }
+            }
+            if clamped {
+                lst = mk(&bk, &DMatrix::from_fn(ad_, 1, |r, _| ac.log_std[r]), rw);
+            }
             gpu.sync_weights(&bk, &ac);
 
             if it % 10 == 0 || it == iters - 1 {
@@ -379,6 +407,21 @@ fn main() {
                     "{:>4}  {:>5.2}  {:>9.4}  {:>7}  {:>8.3}  {:>9.2e}  {:>7.4}  {:>6.1}",
                     it, cscale, total_reward / total as f32, falls, torso, lr, last_kl, t_iter.elapsed().as_secs_f64()
                 );
+                // Structured per-component reward + termination-cause line for the
+                // W&B sidecar (`wandb_logger.py` parses the `[rb]` prefix). Mean of
+                // each reward term over the window since the last drain, plus
+                // episode-termination counts split by cause.
+                if let Some(rl) = env.take_reward_log() {
+                    let mut s = format!("[rb] iter {it}");
+                    for (name, v) in REWARD_COMP_NAMES.iter().zip(rl.comps.iter()) {
+                        s.push_str(&format!(" {name}={v:.5}"));
+                    }
+                    s.push_str(&format!(
+                        " term_illegal={} term_fell={} term_timeout={} samples={}",
+                        rl.illegal, rl.fell, rl.timeout, rl.samples
+                    ));
+                    println!("{s}");
+                }
             }
             if !ckpt.is_empty() && (it % 50 == 0 || it == iters - 1) {
                 let _ = ac.save(&ckpt);

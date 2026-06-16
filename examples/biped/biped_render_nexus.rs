@@ -281,6 +281,12 @@ fn main() {
         let mut bases: Vec<[f32; 7]> = Vec::with_capacity(rollout_steps);
         let mut joints: Vec<[f32; NUM_JOINTS]> = Vec::with_capacity(rollout_steps);
         let mut resets: Vec<usize> = Vec::new();
+        // Ground-truth policy I/O per step, for the sim-to-sim cross-val parity
+        // check: the exact 43-dim obs fed to the actor and the 12-dim mean action
+        // it produced. A Python re-implementation of the obs+net must reproduce
+        // these before we trust its MuJoCo closed-loop rollout.
+        let mut obss: Vec<Vec<f32>> = Vec::with_capacity(rollout_steps);
+        let mut acts: Vec<[f32; NUM_JOINTS]> = Vec::with_capacity(rollout_steps);
 
         // Build initial obs from a fresh snapshot so the first action sees the
         // post-reset state (matching `BipedEnv::reset_full + step` pattern).
@@ -301,14 +307,34 @@ fn main() {
 
             // Mean (noise-free) action for env 0.
             let mean = ac.mean(&cur[0]);
+            // Record the exact obs that produced this action + the action itself.
+            obss.push(cur[0].clone());
+            acts.push(to_action(&mean));
             let mut actions: Vec<[f32; NUM_JOINTS]> = vec![[0.0; NUM_JOINTS]; num_envs];
             actions[0] = to_action(&mean);
+            // PASSIVE mode: ignore the policy and hold the default (zero) pose
+            // every step (action = 0 → target = default_pos). No resets — record
+            // the uninterrupted settle so we can compare nexus's passive dynamics
+            // to MuJoCo's (isolates physics instability from the policy).
+            let passive = std::env::var("BIPED_PASSIVE").is_ok();
+            if passive {
+                actions[0] = [0.0; NUM_JOINTS];
+            }
             // Other envs: just hold zero (we don't render them).
             let outs = env.step(&actions).await;
 
-            if outs[0].done {
+            if !passive && outs[0].done {
                 resets.push(step);
-                let (o, _) = env.reset_env_to_default_template(0).await;
+                // Randomized resets BY DEFAULT (random DR template + spawn
+                // perturbation), so each reset cycle starts differently and the
+                // video shows the policy recovering from varied states. Set
+                // BIPED_RENDER_DET=1 for the fixed DR-off default template (a
+                // reproducible, frame-comparable eval).
+                let o = if std::env::var("BIPED_RENDER_DET").is_ok() {
+                    env.reset_env_to_default_template(0).await.0
+                } else {
+                    env.reset_env(0).await.0
+                };
                 cur[0] = o;
                 env.pin_command_for(0, 0.4, 0.0, 0.0);
             } else {
@@ -349,6 +375,22 @@ fn main() {
             })
             .collect();
         let _ = write!(s, "  \"joints\": [{}],\n", joints_json.join(","));
+        let obs_json: Vec<String> = obss
+            .iter()
+            .map(|o| {
+                let v: Vec<String> = o.iter().map(|a| format!("{a:.6}")).collect();
+                format!("[{}]", v.join(","))
+            })
+            .collect();
+        let _ = write!(s, "  \"obs\": [{}],\n", obs_json.join(","));
+        let act_json: Vec<String> = acts
+            .iter()
+            .map(|a| {
+                let v: Vec<String> = a.iter().map(|x| format!("{x:.6}")).collect();
+                format!("[{}]", v.join(","))
+            })
+            .collect();
+        let _ = write!(s, "  \"actions\": [{}],\n", act_json.join(","));
         s.push_str("  \"frames\": [\n");
         for (fi, frame) in frames.iter().enumerate() {
             let pts: Vec<String> = frame

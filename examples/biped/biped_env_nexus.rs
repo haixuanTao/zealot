@@ -109,9 +109,21 @@ pub struct MjBody {
     pub local_pos: Vec3,
     pub local_quat: Rotation,
     pub joint: Option<String>,
+    /// Real per-joint position limits `(lo, hi)` from the MJCF `range` (rad).
+    /// `None` if unlimited. Used instead of the ±π JointSpec placeholder so the
+    /// ankle/knee can't over-flex (e.g. the foot folding into its own shin).
+    pub joint_range: Option<(f32, f32)>,
+    /// Passive joint damping (N·m·s/rad) from the MJCF `damping`. `None` if the
+    /// model omits it (then the JointSpec value is used).
+    pub joint_damping: Option<f32>,
     pub com: Vec3,
     pub mass: f32,
+    /// Diagonal inertia (Ixx, Iyy, Izz) from MJCF `fullinertia`.
     pub inertia_diag: Vec3,
+    /// Off-diagonal inertia products (Ixy, Ixz, Iyz) from MJCF `fullinertia`.
+    /// Several links have these comparable to the diagonal (~50–100%), so the
+    /// inertia tensor is significantly rotated — must not be dropped.
+    pub inertia_offdiag: Vec3,
     pub capsules: Vec<(Vec3, Vec3, f32)>,
 }
 
@@ -135,13 +147,23 @@ fn quat_wxyz(node: &Node) -> Rotation {
 
 fn parse_body(node: &Node, parent: Option<usize>, out: &mut Vec<MjBody>) {
     let mut joint = None;
+    let mut joint_range = None;
+    let mut joint_damping = None;
     let mut is_free = false;
     let (mut com, mut mass, mut inertia_diag) = (Vec3::ZERO, 0.0, Vec3::splat(1e-4));
+    let mut inertia_offdiag = Vec3::ZERO;
     let mut capsules = Vec::new();
     for c in node.children().filter(Node::is_element) {
         match c.tag_name().name() {
             "freejoint" => is_free = true,
-            "joint" => joint = Some(c.attribute("name").unwrap_or("").to_string()),
+            "joint" => {
+                joint = Some(c.attribute("name").unwrap_or("").to_string());
+                joint_range = c.attribute("range").map(|s| {
+                    let f = floats(s);
+                    (f[0], f[1])
+                });
+                joint_damping = c.attribute("damping").and_then(|s| s.parse().ok());
+            }
             "inertial" => {
                 com = vec3(&c, "pos", Vec3::ZERO);
                 mass = c
@@ -149,8 +171,12 @@ fn parse_body(node: &Node, parent: Option<usize>, out: &mut Vec<MjBody>) {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.0);
                 if let Some(s) = c.attribute("fullinertia") {
+                    // MuJoCo order: Ixx Iyy Izz Ixy Ixz Iyz.
                     let f = floats(s);
                     inertia_diag = Vec3::new(f[0], f[1], f[2]);
+                    if f.len() >= 6 {
+                        inertia_offdiag = Vec3::new(f[3], f[4], f[5]);
+                    }
                 }
             }
             "geom" if c.attribute("class") == Some("collision") => {
@@ -172,9 +198,12 @@ fn parse_body(node: &Node, parent: Option<usize>, out: &mut Vec<MjBody>) {
             local_pos: vec3(node, "pos", Vec3::ZERO),
             local_quat: quat_wxyz(node),
             joint,
+            joint_range,
+            joint_damping,
             com,
             mass,
             inertia_diag,
+            inertia_offdiag,
             capsules,
         });
     }
@@ -272,6 +301,18 @@ pub struct LinkIndices {
     pub torso_link: u32,
     /// Multibody link indices of the two feet (assembly order).
     pub foot_links: [u32; NUM_FEET],
+    /// Links that must NEVER touch the ground (thigh / shin / hip) — only the
+    /// feet have ground colliders in nexus, so the policy can otherwise clip
+    /// these straight through the floor for free support. Used for a
+    /// WBC-AGILE-style `illegal_contact` termination (terminate if any of these
+    /// drops below `BIPED_ILLEGAL_Z`).
+    pub illegal_ground_links: Vec<u32>,
+    /// Left/right link pairs (foot, shin, thigh) for a WBC-AGILE-style
+    /// `feet_distance`/`knee_distance` self-collision guard: nexus can't do
+    /// physical leg-leg self-collision (the leg colliders are inert), so instead
+    /// terminate if any pair gets closer than `BIPED_SELF_COLL_DIST` — i.e. the
+    /// legs cross. Each entry is `(left_link, right_link)`.
+    pub self_collision_pairs: Vec<(u32, u32)>,
     /// (multibody_link_index, joint_name) for each actuated revolute. In
     /// `JOINT_NAMES` (canonical policy) order, so observation/action layout
     /// lines up with the CPU env.
@@ -338,24 +379,31 @@ fn build_env_scene(
     let mut torso_handle = RigidBodyHandle::invalid();
     let mut foot_handles: Vec<(usize, RigidBodyHandle)> = Vec::new();
     for (i, b) in mjcf.iter().enumerate() {
-        // Add WBC-AGILE's system-identified rotor inertia (armature) to this
-        // joint's dof inertia. The joint rotates the child about its body-frame Z
-        // (AngZ, local_frame2 = IDENTITY), so armature adds to Izz (inertia_diag.z).
-        // This is the actuator-model piece that makes stiff PD joints stable in sim.
-        let arm_scale: f32 = std::env::var("BIPED_ARM").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-        let mut inertia = b.inertia_diag;
-        if let Some(jn) = b.joint.as_ref() {
-            if let Some(s) = robot.joints.iter().find(|j| &j.name == jn) {
-                inertia.z += s.armature * arm_scale;
-            }
-        }
+        // Armature (rotor inertia) is NO LONGER added to the link inertia tensor.
+        // It's now seeded into the multibody's mass-matrix DIAGONAL via
+        // set_dof_armature (see the seeding block after from_rapier). Baking it
+        // into Izz inflated M=JᵀIJ inconsistently with the gravity bias force, so
+        // a free-falling body spuriously buckled (joints to limits in ~0.1s) —
+        // the core nexus instability. The diagonal is the correct, consistent
+        // place (matches MuJoCo/rapier).
+        // Full inertia tensor (Ixx,Iyy,Izz + Ixy,Ixz,Iyz), diagonalized by parry
+        // (`with_inertia_matrix` → principal moments + frame, which nexus consumes).
+        let (d, o) = (b.inertia_diag, b.inertia_offdiag);
+        // DIAG-INERTIA A/B (diagnostic): zero the off-diagonals to isolate the
+        // principal-frame inertia from other effects.
+        let o = if std::env::var("BIPED_DIAG_INERTIA").is_ok() { Vec3::ZERO } else { o };
+        let inertia_mat = Mat3::from_cols(
+            Vec3::new(d.x, o.x, o.y), // col 0: Ixx, Ixy, Ixz
+            Vec3::new(o.x, d.y, o.z), // col 1: Ixy, Iyy, Iyz
+            Vec3::new(o.y, o.z, d.z), // col 2: Ixz, Iyz, Izz
+        );
         let h = bodies.insert(
             RigidBodyBuilder::dynamic()
                 .position(world[i])
-                .additional_mass_properties(MassProperties::new(
+                .additional_mass_properties(MassProperties::with_inertia_matrix(
                     b.com,
                     b.mass.max(1e-3),
-                    inertia,
+                    inertia_mat,
                 ))
                 .build(),
         );
@@ -417,26 +465,61 @@ fn build_env_scene(
         };
         let spec = robot.joints.iter().find(|j| &j.name == jname);
         let pi = std::f32::consts::PI;
-        let (kp, kd, effort, pos_limit) = spec
-            .map(|s| (s.kp * dr.pd_scale, s.kd * dr.pd_scale, s.effort_limit, s.pos_limit))
-            .unwrap_or((50.0, 1.0, 20.0, (-pi, pi)));
+        let (kp, kd, effort, pos_limit, spec_damping) = spec
+            .map(|s| {
+                (
+                    s.kp * dr.pd_scale,
+                    s.kd * dr.pd_scale,
+                    s.effort_limit,
+                    s.pos_limit,
+                    s.damping,
+                )
+            })
+            .unwrap_or((50.0, 1.0, 20.0, (-pi, pi), 0.0));
+        // Passive joint damping (N·m·s/rad): the real joints are damped 0.5–2.3,
+        // but nexus's passive-damping buffer is a hardcoded 0.1 default, so the
+        // sim joints slew at ~50 rad/s. Fold the real damping into the motor's
+        // velocity gain (kd) — the chosen no-shader-change fix. Prefer the MJCF
+        // `damping` attr when the model provides it; else the JointSpec value.
+        // It's NOT scaled by `pd_scale` (it's a physical property, not a gain).
+        let damping = b.joint_damping.unwrap_or(spec_damping);
+        let kd = kd + damping;
         let mut joint = GenericJointBuilder::new(locked)
             .local_frame1(Pose::from_parts(b.local_pos, b.local_quat))
             .local_frame2(Pose::IDENTITY)
             .build();
-        joint.set_motor_model(JointAxis::AngZ, MotorModel::ForceBased);
-        joint.set_motor_position(JointAxis::AngZ, 0.0, kp, kd);
+        // AccelerationBased motor: compliance is mass-normalized (cfm_coeff path),
+        // so commanded kp realizes consistent stiffness regardless of the joint's
+        // (tiny) link inertia — like MuJoCo's actuators. ForceBased (raw cfm_gain)
+        // under-realized kp on the low-inertia leg joints, so the motors couldn't
+        // hold and a passive robot buckled to its limits in ~0.1s. BIPED_FORCE_MOTOR
+        // reverts to ForceBased for A/B.
+        let motor_model = if std::env::var("BIPED_FORCE_MOTOR").is_ok() {
+            MotorModel::ForceBased
+        } else {
+            MotorModel::AccelerationBased
+        };
+        joint.set_motor_model(JointAxis::AngZ, motor_model);
+        // Diagnostic knobs to test the "constraint-motor too soft to hold" theory
+        // without a cubin rebuild (gains are host-side). BIPED_KP_SCALE/KD_SCALE
+        // scale the motor stiffness/damping.
+        let kp_scale: f32 = std::env::var("BIPED_KP_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let kd_scale: f32 = std::env::var("BIPED_KD_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        joint.set_motor_position(JointAxis::AngZ, 0.0, kp * kp_scale, kd * kd_scale);
         joint.set_motor_max_force(JointAxis::AngZ, effort);
         // Enforce the free axis's position limits — OFF by default (set
         // BIPED_JOINT_LIMITS=1 to enable). Setting a limit makes the multibody
         // solver emit a limit constraint (kind=1) alongside each motor
         // constraint, ~doubling per-step joint constraints and costing ~1.7x
-        // iter time. With the current ±π URDF/spec placeholder that buys
-        // nothing (legs never reach ±π), so it's not worth the cost yet; the
-        // plumbing is proven and ready for real WBC-AGILE/mjlab ranges, which
-        // WOULD justify it. Without this, limit slots stay ±f32::MAX (inactive).
+        // iter time, so it's gated. When enabled, use the REAL per-joint range
+        // from the MJCF (`joint_range`) when present — the ankle is only
+        // ~[-10°,+20°], so the ±π JointSpec placeholder let the foot fold into
+        // its own shin — falling back to the placeholder if the model omits one.
+        // (The PD target is separately clamped to the joint range in
+        // VelocityFlatTask::joint_targets regardless of this physical limit.)
         if joint_limits_on {
-            joint.set_limits(JointAxis::AngZ, [pos_limit.0, pos_limit.1]);
+            let (lo, hi) = b.joint_range.unwrap_or(pos_limit);
+            joint.set_limits(JointAxis::AngZ, [lo, hi]);
         }
         multibody.insert(handles[parent], handles[i], joint, true);
         mb_link_of_mjcf.insert(i, next_mb_link);
@@ -462,12 +545,18 @@ fn build_env_scene(
         rb.recompute_mass_properties_from_colliders(&colliders_snapshot);
     }
 
-    // Sim params: per-env contact softness via DR.
+    // Sim params: per-env contact softness via DR. Env overrides let us A/B the
+    // contact-solver knobs against the WBC-AGILE-matched config without a rebuild
+    // each time (BIPED_SOLVER_ITERS / BIPED_CONTACT_NF / BIPED_CONTACT_DR).
+    let env_f32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
     let mut sp = GpuSimParams::default();
     sp.dt = task_dt;
-    sp.num_solver_iterations = SOLVER_ITERS;
-    sp.contact_natural_frequency = dr.contact_natural_frequency;
-    sp.contact_damping_ratio = dr.contact_damping_ratio;
+    sp.num_solver_iterations = std::env::var("BIPED_SOLVER_ITERS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(SOLVER_ITERS);
+    sp.contact_natural_frequency = env_f32("BIPED_CONTACT_NF").unwrap_or(dr.contact_natural_frequency);
+    sp.contact_damping_ratio = env_f32("BIPED_CONTACT_DR").unwrap_or(dr.contact_damping_ratio);
 
     // Build the index table from the canonical joint ordering.
     let mut actuated: Vec<(u32, String)> = Vec::with_capacity(NUM_JOINTS);
@@ -496,6 +585,35 @@ fn build_env_scene(
         .map(|i| *mb_link_of_mjcf.get(&i).unwrap_or(&0))
         .collect();
 
+    // Thigh / shin / hip links — the parts that have NO ground collider (only
+    // the feet do), so they must never legitimately touch the floor. (Names use
+    // the model's spelling: `tigh_subassembly`, `shin_subassembly`, `hip*`.)
+    // Ankle + foot are excluded (they sit legitimately low next to the sole).
+    let illegal_ground_links: Vec<u32> = (0..mjcf.len())
+        .filter(|&i| {
+            let n = &mjcf[i].name;
+            n.contains("shin") || n.contains("tigh") || n.contains("hip")
+        })
+        .filter_map(|i| mb_link_of_mjcf.get(&i).copied())
+        .collect();
+
+    // Left/right link pairs for the self-collision (leg-crossing) guard. The
+    // model's right side is the bare name and the left side gets a `_sym`/`_2`
+    // suffix, so pair each base body with its mirrored twin.
+    let link_of_name = |name: &str| -> Option<u32> {
+        mjcf.iter()
+            .position(|b| b.name == name)
+            .and_then(|i| mb_link_of_mjcf.get(&i).copied())
+    };
+    let self_collision_pairs: Vec<(u32, u32)> = [
+        ("foot_subassembly", "foot_subassembly_2"),
+        ("shin_subassembly", "shin_subassembly_sym"),
+        ("tigh_subassembly", "tigh_subassembly_sym"),
+    ]
+    .iter()
+    .filter_map(|(r, l)| Some((link_of_name(r)?, link_of_name(l)?)))
+    .collect();
+
     // Per-joint parent link + rest quat, used by the ws-free joint-angle
     // extraction (`q_child = q_parent · rest_quat · R_z(θ)`).
     let mut actuated_parent_links = [0u32; NUM_JOINTS];
@@ -522,6 +640,8 @@ fn build_env_scene(
         colliders_per_batch: (mjcf.len() + 1) as u32, // robot bodies + ground
         torso_link: 0,
         foot_links,
+        illegal_ground_links,
+        self_collision_pairs,
         actuated,
         joint_dof_offset,
         foot_sole_local,
@@ -599,6 +719,14 @@ pub struct BipedNexusBatchEnv {
     /// scaled ranges from a known baseline, mirroring the CPU env.
     sampler_default: CommandSampler,
 
+    /// Curriculum scale on the torque (effort) penalty (0 = off, 1 = full WBC
+    /// weight). Set per-iteration by the trainer via `set_torque_scale` so the
+    /// penalty ramps in only AFTER the policy can stand — a torque penalty at
+    /// full strength from scratch fights learning to stand at all. Initialised
+    /// from `BIPED_TORQUE_W` so non-curriculum callers (e.g. render) still get a
+    /// fixed value.
+    torque_scale: f32,
+
     // GPU state
     gpu: KhalGpuBackend,
     pipeline: GpuPhysicsPipeline,
@@ -614,6 +742,66 @@ pub struct BipedNexusBatchEnv {
 
     /// Phase-level timing accumulators — read + reset via `take_step_timings`.
     timings: StepTimings,
+
+    /// Per-component reward + termination-cause accumulators for W&B logging.
+    /// `rlog_comps[i]` sums component `i` (see `REWARD_COMP_NAMES`) over every
+    /// (env, step) sample since the last `take_reward_log`; `rlog_steps` is the
+    /// sample count (divide to get the per-step mean). The three termination
+    /// counters are episode totals over the same window. Read + reset via
+    /// `take_reward_log` so the trainer can emit one structured line per iter.
+    rlog_comps: [f64; NUM_REWARD_COMPS],
+    rlog_steps: u64,
+    rlog_illegal: u64,
+    rlog_fell: u64,
+    rlog_timeout: u64,
+}
+
+/// Number of logged reward components (see [`REWARD_COMP_NAMES`]).
+pub const NUM_REWARD_COMPS: usize = 24;
+
+/// Names of the per-component reward terms, in `rlog_comps` / `RewardLog::comps`
+/// order. The first 20 mirror `RewardBreakdown`'s live terms; the last four are
+/// env-side penalties applied after `total()` (leg torque, ankle torque,
+/// self-collision) plus the termination penalty.
+pub const REWARD_COMP_NAMES: [&str; NUM_REWARD_COMPS] = [
+    "track_lin_vel",
+    "track_ang_vel",
+    "upright",
+    "base_height",
+    "pose",
+    "bilateral_symmetry",
+    "action_rate",
+    "action_rate_hipz_hipx",
+    "body_ang_vel",
+    "lin_vel_z",
+    "dof_pos_limits",
+    "dof_vel",
+    "air_time",
+    "flight",
+    "single_support",
+    "foot_slip",
+    "foot_clearance",
+    "foot_orientation",
+    "feet_yaw_mean",
+    "feet_distance",
+    "torque_leg",
+    "torque_ankle",
+    "self_coll",
+    "termination",
+];
+
+/// One window of accumulated reward/termination stats (see `take_reward_log`).
+pub struct RewardLog {
+    /// Per-step mean of each reward component, in `REWARD_COMP_NAMES` order.
+    pub comps: [f32; NUM_REWARD_COMPS],
+    /// Episodes ended by illegal ground contact over the window.
+    pub illegal: u64,
+    /// Episodes ended by a fall (tilt / low base height), excluding `illegal`.
+    pub fell: u64,
+    /// Episodes ended by hitting the max-step timeout (not a failure).
+    pub timeout: u64,
+    /// Number of (env, step) samples averaged into `comps`.
+    pub samples: u64,
 }
 
 impl BipedNexusBatchEnv {
@@ -667,6 +855,52 @@ impl BipedNexusBatchEnv {
             .collect();
         let mut state = GpuPhysicsState::from_rapier(&gpu, &envs_refs);
         state.multibodies_mut().set_gravity(&gpu, [0.0, 0.0, -9.81]);
+
+        // Seed per-DOF Coulomb joint friction (MJCF `frictionloss`) into the
+        // multibody. Env-major `[env][dof]` layout matching the velocity section:
+        // 0 for the 6 root DOFs, each leg joint's frictionloss at its DOF offset.
+        // Static across envs (same robot), set once — the per-env reset copies
+        // dof_state/values, not this separate `dof_frictionloss` buffer.
+        {
+            let dpb = idx.dofs_per_batch as usize;
+            let mut fl_per_dof = vec![0.0f32; dpb];
+            for k in 0..NUM_JOINTS {
+                let dof = idx.joint_dof_offset[k] as usize;
+                if let Some(s) = robot.joints.iter().find(|j| j.name == idx.actuated[k].1) {
+                    if dof < dpb {
+                        fl_per_dof[dof] = s.frictionloss;
+                    }
+                }
+            }
+            let fl_flat: Vec<f32> = (0..num_envs).flat_map(|_| fl_per_dof.iter().copied()).collect();
+            state.multibodies_mut().set_dof_frictionloss(&gpu, &fl_flat);
+        }
+
+        // Seed per-DOF armature (rotor inertia) into the multibody's mass-matrix
+        // diagonal — the CORRECT place for armature. Previously armature was baked
+        // into each link's inertia tensor (izz_extra), which inflated M=JᵀIJ
+        // inconsistently with the gravity bias force and made a free-falling body
+        // spuriously buckle (joints slammed to limits in ~0.1s — the nexus
+        // instability that blocked all training). Same env-major `[env][dof]`
+        // layout as frictionloss; 0 for the root DOFs. Scaled by BIPED_ARM (A/B).
+        {
+            let dpb = idx.dofs_per_batch as usize;
+            let arm_scale: f32 = std::env::var("BIPED_ARM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0);
+            let mut arm_per_dof = vec![0.0f32; dpb];
+            for k in 0..NUM_JOINTS {
+                let dof = idx.joint_dof_offset[k] as usize;
+                if let Some(s) = robot.joints.iter().find(|j| j.name == idx.actuated[k].1) {
+                    if dof < dpb {
+                        arm_per_dof[dof] = s.armature * arm_scale;
+                    }
+                }
+            }
+            let arm_flat: Vec<f32> = (0..num_envs).flat_map(|_| arm_per_dof.iter().copied()).collect();
+            state.multibodies_mut().set_dof_armature(&gpu, &arm_flat);
+        }
 
         // Spawn templates: one single-env GPU state per DR sample.
         let mut templates: Vec<GpuPhysicsState> = Vec::with_capacity(num_templates);
@@ -733,6 +967,10 @@ impl BipedNexusBatchEnv {
             has_prev_pose,
             foot_sole_local,
             sampler_default,
+            torque_scale: std::env::var("BIPED_TORQUE_W")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.1),
             gpu,
             pipeline,
             state,
@@ -740,6 +978,11 @@ impl BipedNexusBatchEnv {
             template_dr,
             tick_since_resize: 0,
             timings: StepTimings::default(),
+            rlog_comps: [0.0; NUM_REWARD_COMPS],
+            rlog_steps: 0,
+            rlog_illegal: 0,
+            rlog_fell: 0,
+            rlog_timeout: 0,
         };
         // Seed every env's command and resample schedule (mirrors `reset_full`
         // on the CPU side without an actual GPU reset — the GPU state is
@@ -785,6 +1028,13 @@ impl BipedNexusBatchEnv {
         self.sampler.lin_vel_x = (d.lin_vel_x.0 * s, d.lin_vel_x.1 * s);
         self.sampler.lin_vel_y = (d.lin_vel_y.0 * s, d.lin_vel_y.1 * s);
         self.sampler.ang_vel_z = (d.ang_vel_z.0 * s, d.ang_vel_z.1 * s);
+    }
+
+    /// Curriculum hook — scales the torque (effort) penalty by `s`. The trainer
+    /// ramps this from 0 up to the target so the penalty engages only after the
+    /// policy can stand (full strength from scratch fights learning to stand).
+    pub fn set_torque_scale(&mut self, s: f32) {
+        self.torque_scale = s.max(0.0);
     }
 
     /// Read every link's workspace + every body's world pose for ALL envs.
@@ -1251,10 +1501,73 @@ impl BipedNexusBatchEnv {
             critic_obs: Vec<f32>,
             reward: f32,
             fell: bool,
+            illegal: bool,
+            // Per-term reward breakdown for logging (W&B). Indices:
+            // Per-term reward contributions, in `REWARD_COMP_NAMES` order.
+            comps: [f32; NUM_REWARD_COMPS],
             new_air: [f32; NUM_FEET],
             new_joint_pos: [f32; NUM_JOINTS],
         }
         let t = Instant::now();
+        // WBC-AGILE-style illegal-ground-contact termination: only the feet have
+        // ground colliders in nexus, so the policy can clip thigh/shin/hip links
+        // through the floor for free support (we measured shins ~3 cm below the
+        // floor in an early policy). Terminate if any monitored link drops below
+        // `BIPED_ILLEGAL_Z`. Default 0.0 = actual floor penetration only: a
+        // trained policy's shins sit ~+0.046 m, so 0.0 catches real clipping
+        // (the −0.03 case) without over-terminating legitimate low stances —
+        // 0.06 was too tight and killed the learning gradient. Set large-negative
+        // to disable entirely.
+        let illegal_z = std::env::var("BIPED_ILLEGAL_Z")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        // WBC-AGILE-style self-collision avoidance, as a SOFT reward penalty
+        // (not a hard termination). nexus can't do physical leg-leg collision
+        // (inert leg colliders), and a hard distance-termination is the ONLY
+        // guard here so it fires every episode for a from-scratch policy and
+        // buries the gradient (measured: falls 6.8k→46k). Instead, smoothly
+        // penalize each left/right link pair (foot/shin/thigh) by how far it
+        // intrudes inside `sc_margin`: `penalty = w · Σ max(0, margin − dist)`.
+        // DEFAULT OFF (weight 0): the real per-joint angle limits already keep the
+        // legs apart — measured min L/R separation is 0.105 m (shins) with limits
+        // and no penalty, well above the ~0.07 crossing threshold. The joint
+        // ranges (esp. hipx ±20° ad/abduction) are designed so the reachable
+        // workspace doesn't self-collide, so an explicit distance penalty is
+        // redundant AND competes with learning. Kept as opt-in (`BIPED_SELF_COLL_W`)
+        // for cases the limits don't cover (e.g. foot↔torso). margin 0.12 m.
+        let sc_margin = std::env::var("BIPED_SELF_COLL_DIST")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.12);
+        let sc_weight = std::env::var("BIPED_SELF_COLL_W")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        let sc_dt = self.task.control_dt();
+        // Torque (effort) penalty: we're PD position-controlled and had NO cost
+        // on joint torque, so the policy reward-hacks strained high-torque poses
+        // (e.g. balancing on one leg at saturated effort). Reconstruct the
+        // applied PD torque τ = clamp(kp·(q_target−q) − kd·q̇, ±effort) and
+        // penalize Στ², mirroring WBC-AGILE's lerobot config: base -5e-4 on all
+        // leg joints, an extra -1e-3 on the (weaker) ankles, and an extra -5e-3
+        // on ankle-roll. Scaled by `self.torque_scale` (the trainer's curriculum
+        // hook, init from `BIPED_TORQUE_W`): full WBC weight from scratch breaks
+        // learning (falls 6k→12.6k) because a torque penalty fights "learn to
+        // stand at all", so the trainer ramps it in only after standing is
+        // learned (set_torque_scale 0→target). 0 disables.
+        let torque_w = self.torque_scale;
+        // Ankle torque is penalized at FULL strength AT ALL TIMES (not ramped by
+        // the curriculum) — the real ankle motor is fragile (~11 N·m diamond vs
+        // the sim's 44), so we discourage ankle torque from iter 0. Soft (a
+        // penalty, not a hard effort cap) to keep learning feasible. Scale via
+        // BIPED_ANKLE_TORQUE_W (default 1.0; raise if rollouts still show high
+        // ankle torque, 0 disables).
+        let ankle_torque_w = std::env::var("BIPED_ANKLE_TORQUE_W")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        let cpb_idx = self.idx.colliders_per_batch as usize;
         let computed: Vec<PerEnv> = (0..self.n)
             .into_par_iter()
             .with_min_len(64)
@@ -1262,10 +1575,86 @@ impl BipedNexusBatchEnv {
                 let (feet, new_air) = self.compute_feet_from_poses(e, &poses);
                 let (mut state, new_joint_pos) = self.read_state_from_poses(e, &poses);
                 state.feet = feet;
-                let fell = self.task.fell_over(&state.base) || !state.base.height.is_finite();
-                let mut reward = self.task.reward(&state, &self.cmd[e]).total();
+                let env_base = e * cpb_idx;
+                let illegal = self
+                    .idx
+                    .illegal_ground_links
+                    .iter()
+                    .any(|&l| poses[env_base + l as usize].translation.z < illegal_z);
+                let fell = illegal
+                    || self.task.fell_over(&state.base)
+                    || !state.base.height.is_finite();
+                let rb = self.task.reward(&state, &self.cmd[e]);
+                let mut reward = rb.total();
+                let mut comps = [0.0f32; NUM_REWARD_COMPS];
+                comps[0] = rb.track_lin_vel;
+                comps[1] = rb.track_ang_vel;
+                comps[2] = rb.upright;
+                comps[3] = rb.base_height;
+                comps[4] = rb.pose;
+                comps[5] = rb.bilateral_symmetry;
+                comps[6] = rb.action_rate;
+                comps[7] = rb.action_rate_hipz_hipx;
+                comps[8] = rb.body_ang_vel;
+                comps[9] = rb.lin_vel_z;
+                comps[10] = rb.dof_pos_limits;
+                comps[11] = rb.dof_vel;
+                comps[12] = rb.air_time;
+                comps[13] = rb.flight;
+                comps[14] = rb.single_support;
+                comps[15] = rb.foot_slip;
+                comps[16] = rb.foot_clearance;
+                comps[17] = rb.foot_orientation;
+                comps[18] = rb.feet_yaw_mean;
+                comps[19] = rb.feet_distance;
                 if fell {
+                    comps[23] = self.task.weights.termination;
                     reward += self.task.weights.termination;
+                }
+                // Soft self-collision penalty: ramp up as any L/R pair intrudes
+                // inside `sc_margin` (legs crossing). ~0 for a clean stance.
+                if sc_weight > 0.0 {
+                    let intrusion: f32 = self
+                        .idx
+                        .self_collision_pairs
+                        .iter()
+                        .map(|&(a, b)| {
+                            let pa = poses[env_base + a as usize].translation;
+                            let pb = poses[env_base + b as usize].translation;
+                            (sc_margin - (pa - pb).length()).max(0.0)
+                        })
+                        .sum();
+                    let sc_pen = sc_weight * intrusion * sc_dt;
+                    comps[22] = -sc_pen;
+                    reward -= sc_pen;
+                }
+                // Torque (effort) penalty — reconstruct the applied PD torque per
+                // joint and penalize Στ². The ANKLE motors are fragile hardware
+                // (real diamond limit ~11 N·m vs the sim's 44), so the ankle term
+                // is FULL-STRENGTH AT ALL TIMES (`ankle_torque_w`, not ramped),
+                // while the leg term ramps with the curriculum (`torque_w`). WBC
+                // lerobot base weights: -5e-4 legs, -1.5e-3 ankle pitch, -6.5e-3
+                // ankle roll (coupled, weakest).
+                if torque_w > 0.0 || ankle_torque_w > 0.0 {
+                    let q_target = self.task.joint_targets(&actions[e]);
+                    let mut leg_pen = 0.0f32;
+                    let mut ankle_pen = 0.0f32;
+                    for i in 0..NUM_JOINTS {
+                        let j = &self.task.robot.joints[i];
+                        let tau = (j.kp * (q_target[i] - state.joint_pos[i])
+                            - j.kd * state.joint_vel[i])
+                            .clamp(-j.effort_limit, j.effort_limit);
+                        let t2 = tau * tau;
+                        if j.name.contains("ankle") {
+                            let w = if j.name.contains("anklex") { 6.5e-3 } else { 1.5e-3 };
+                            ankle_pen += w * t2;
+                        } else {
+                            leg_pen += 5e-4 * t2;
+                        }
+                    }
+                    comps[20] = -(torque_w * leg_pen) * sc_dt;
+                    comps[21] = -(ankle_torque_w * ankle_pen) * sc_dt;
+                    reward -= (torque_w * leg_pen + ankle_torque_w * ankle_pen) * sc_dt;
                 }
                 let mut obs = vec![0.0; OBS_DIM];
                 self.task.observe(&state, &self.cmd[e], &mut obs);
@@ -1277,6 +1666,8 @@ impl BipedNexusBatchEnv {
                     critic_obs,
                     reward,
                     fell,
+                    illegal,
+                    comps,
                     new_air,
                     new_joint_pos,
                 }
@@ -1301,6 +1692,20 @@ impl BipedNexusBatchEnv {
             self.prev_action[e] = self.last_action[e];
             self.last_action[e] = actions[e];
             let timeout = self.step_count[e] >= self.task.max_steps();
+            // Accumulate per-component reward + termination causes for W&B
+            // (drained by `take_reward_log`). Every (env, step) contributes to
+            // the component means; termination counters tally episode ends.
+            for i in 0..NUM_REWARD_COMPS {
+                self.rlog_comps[i] += c.comps[i] as f64;
+            }
+            self.rlog_steps += 1;
+            if c.illegal {
+                self.rlog_illegal += 1;
+            } else if c.fell {
+                self.rlog_fell += 1;
+            } else if timeout {
+                self.rlog_timeout += 1;
+            }
             outs.push(StepOut {
                 obs: c.obs,
                 critic_obs: c.critic_obs,
@@ -1312,6 +1717,34 @@ impl BipedNexusBatchEnv {
         self.timings.serial_commit_ns += t.elapsed().as_nanos() as u64;
         self.timings.steps += 1;
         outs
+    }
+
+    /// Drain the accumulated per-component reward + termination stats since the
+    /// last call and reset the counters. Returns `None` if no steps were taken
+    /// (nothing to log). The trainer calls this once per PPO iteration to emit a
+    /// structured line the W&B sidecar logs.
+    pub fn take_reward_log(&mut self) -> Option<RewardLog> {
+        if self.rlog_steps == 0 {
+            return None;
+        }
+        let n = self.rlog_steps as f64;
+        let mut comps = [0.0f32; NUM_REWARD_COMPS];
+        for i in 0..NUM_REWARD_COMPS {
+            comps[i] = (self.rlog_comps[i] / n) as f32;
+        }
+        let out = RewardLog {
+            comps,
+            illegal: self.rlog_illegal,
+            fell: self.rlog_fell,
+            timeout: self.rlog_timeout,
+            samples: self.rlog_steps,
+        };
+        self.rlog_comps = [0.0; NUM_REWARD_COMPS];
+        self.rlog_steps = 0;
+        self.rlog_illegal = 0;
+        self.rlog_fell = 0;
+        self.rlog_timeout = 0;
+        Some(out)
     }
 
     /// Read the accumulated per-phase timings and reset the counters.

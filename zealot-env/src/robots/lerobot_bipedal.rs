@@ -58,6 +58,15 @@ pub struct JointSpec {
     /// (`config.yaml` `joint_armature`). Added to the joint's dof inertia — what
     /// makes stiff PD-controlled joints numerically stable in sim.
     pub armature: f32,
+    /// Passive joint damping (N·m·s/rad), from the MJCF `damping`. The real
+    /// joints are significantly damped (0.5–2.3); without it the sim joints slew
+    /// far too fast (~50 rad/s). Folded into the motor's velocity gain since the
+    /// nexus passive-damping buffer is otherwise a hardcoded 0.1 default.
+    pub damping: f32,
+    /// Coulomb joint friction (N·m), from the MJCF `frictionloss` — a constant
+    /// torque opposing motion. Applied as `-frictionloss·sign(q̇)` via the nexus
+    /// `dof_frictionloss` buffer (energy dissipation / stiction).
+    pub frictionloss: f32,
 }
 
 const PI: f32 = std::f32::consts::PI;
@@ -85,19 +94,29 @@ pub const JOINT_NAMES: [&str; NUM_JOINTS] = [
 /// 44 N·m. Action scales and PD gains are from the deployed policy's `gain.md` /
 /// action config.
 const fn family(name: &'static str) -> JointSpec {
-    // (kp, kd, effort, action_scale, armature) per joint family. Armature is
-    // WBC-AGILE's system-identified rotor inertia (`joint_armature` in config.yaml).
-    let (kp, kd, effort, scale, armature) = if starts_with(name, "hipz") {
-        (30.0, 3.0, 88.0, 0.733, 0.0227)
+    // (kp, kd, effort, action_scale, armature, pos_limit) per joint family.
+    // Armature is WBC-AGILE's system-identified rotor inertia. `pos_limit` is the
+    // real per-joint range from the MJCF (mjlab `range`, rad) — NOT the old ±π
+    // placeholder, which let the ankle fold the foot into its own shin. The model
+    // ranges are mildly L/R-asymmetric; we use the symmetric magnitude (enough to
+    // stop the over-flex). The nexus env prefers an explicit MJCF `range` when the
+    // model provides one (`MjBody::joint_range`) and falls back to this.
+    // ...also the MJCF per-joint passive `damping` (N·m·s/rad) — real joints are
+    // damped 0.5–2.3; the sim default (0.1) leaves them slewing at ~50 rad/s.
+    // ...and the MJCF per-joint `frictionloss` (N·m, Coulomb) — last tuple slot.
+    let (kp, kd, effort, scale, armature, lim, damping, frictionloss) = if starts_with(name, "hipz") {
+        (30.0, 3.0, 88.0, 0.733, 0.0227, (-0.349, 0.349), 0.514, 1.351)
     } else if starts_with(name, "hipx") {
-        (40.0, 3.0, 88.0, 0.55, 0.1333)
+        (40.0, 3.0, 88.0, 0.55, 0.1333, (-0.349, 0.349), 0.738, 1.158)
     } else if starts_with(name, "hipy") {
-        (60.0, 4.0, 88.0, 0.367, 0.1408)
+        (60.0, 4.0, 88.0, 0.367, 0.1408, (-1.047, 1.047), 1.455, 1.312)
     } else if starts_with(name, "knee") {
-        (60.0, 4.0, 88.0, 0.367, 0.1233)
+        (60.0, 4.0, 88.0, 0.367, 0.1233, (-0.524, 0.524), 2.264, 0.998)
+    } else if starts_with(name, "anklex") {
+        (20.0, 1.5, 44.0, 0.55, 0.0299, (-0.175, 0.175), 0.214, 0.262) // ankle-roll
     } else {
-        // ankley / anklex
-        (20.0, 1.5, 44.0, 0.55, 0.0299)
+        // ankley (ankle pitch) — the one that folds the foot into the shin.
+        (20.0, 1.5, 44.0, 0.55, 0.0299, (-0.349, 0.349), 0.0286, 0.171)
     };
     JointSpec {
         name,
@@ -107,8 +126,10 @@ const fn family(name: &'static str) -> JointSpec {
         vel_limit: 10.0,
         action_scale: scale,
         default_pos: 0.0,
-        pos_limit: (-PI, PI),
+        pos_limit: lim,
         armature,
+        damping,
+        frictionloss,
     }
 }
 
