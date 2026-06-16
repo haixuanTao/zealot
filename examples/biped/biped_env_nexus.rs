@@ -408,6 +408,9 @@ fn build_env_scene(
     mb_link_of_mjcf.insert(0, 0); // torso is multibody root → link 0
     let mut next_mb_link: u32 = 1;
     let mut name_to_link: HashMap<String, u32> = HashMap::new();
+    // Joint position limits cost ~1.7x iter time (extra per-step constraints);
+    // only worth it with real (tight) ranges, so gate them off by default.
+    let joint_limits_on = std::env::var_os("BIPED_JOINT_LIMITS").is_some();
     for (i, b) in mjcf.iter().enumerate() {
         let (Some(parent), Some(jname)) = (b.parent, b.joint.as_ref()) else {
             continue;
@@ -424,12 +427,17 @@ fn build_env_scene(
         joint.set_motor_model(JointAxis::AngZ, MotorModel::ForceBased);
         joint.set_motor_position(JointAxis::AngZ, 0.0, kp, kd);
         joint.set_motor_max_force(JointAxis::AngZ, effort);
-        // Enforce the free axis's position limits. Without this the GPU
-        // multibody emits the limit-constraint slots but they're never
-        // populated (±f32::MAX defaults), so legs spin freely past ±π. NOTE:
-        // pos_limit is currently the URDF/spec ±π placeholder — real per-joint
-        // ranges (WBC-AGILE/mjlab) would make this meaningfully tighter.
-        joint.set_limits(JointAxis::AngZ, [pos_limit.0, pos_limit.1]);
+        // Enforce the free axis's position limits — OFF by default (set
+        // BIPED_JOINT_LIMITS=1 to enable). Setting a limit makes the multibody
+        // solver emit a limit constraint (kind=1) alongside each motor
+        // constraint, ~doubling per-step joint constraints and costing ~1.7x
+        // iter time. With the current ±π URDF/spec placeholder that buys
+        // nothing (legs never reach ±π), so it's not worth the cost yet; the
+        // plumbing is proven and ready for real WBC-AGILE/mjlab ranges, which
+        // WOULD justify it. Without this, limit slots stay ±f32::MAX (inactive).
+        if joint_limits_on {
+            joint.set_limits(JointAxis::AngZ, [pos_limit.0, pos_limit.1]);
+        }
         multibody.insert(handles[parent], handles[i], joint, true);
         mb_link_of_mjcf.insert(i, next_mb_link);
         name_to_link.insert(jname.clone(), next_mb_link);
