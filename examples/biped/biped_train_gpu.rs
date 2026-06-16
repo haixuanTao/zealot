@@ -215,7 +215,18 @@ fn main() {
         let mut lr = LR; // adaptive-KL LR, persists across iterations
 
         let (mut gc, mut gcc) = env.initial_obs().await;
-        let warmup = (iters as f32 * 0.4).max(1.0);
+        // Velocity-command curriculum: STAND-BEFORE-WALK. Hold the command at 0
+        // (cscale=0 → all commands standing) for the first `stand_frac` of training
+        // so the policy first learns to BALANCE, then ramp the command 0→1 over
+        // `stand_frac`→`ramp_end`, full command after. v10 (and earlier) ramped
+        // the command from iter 0, so it was asked to move before it could stand —
+        // it never escaped the falling/ignore-command regime. Now that the motor
+        // fix makes the zero pose stable, a dedicated standing phase is learnable.
+        let stand_frac: f32 = std::env::var("BIPED_STAND_FRAC")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.3);
+        let ramp_end: f32 = 0.7;
         println!("\n{:>4}  {:>5}  {:>9}  {:>7}  {:>8}  {:>9}  {:>7}  {:>6}", "iter", "curr", "step_rew", "falls", "torso_z", "lr", "kl", "sec");
 
         // Torque-penalty curriculum target (full WBC weight = 1.0). Ramped 0→max
@@ -227,7 +238,12 @@ fn main() {
             .unwrap_or(1.0);
         for it in 0..iters {
             let t_iter = Instant::now();
-            let cscale = (it as f32 / warmup).min(1.0);
+            let frac = it as f32 / iters as f32;
+            let cscale = if frac < stand_frac {
+                0.0
+            } else {
+                ((frac - stand_frac) / (ramp_end - stand_frac)).clamp(0.0, 1.0)
+            };
             env.set_command_scale(cscale);
             let tscale = ((it as f32 / iters as f32 - 0.4) / 0.5).clamp(0.0, 1.0) * torque_max;
             env.set_torque_scale(tscale);
@@ -237,6 +253,8 @@ fn main() {
             let (mut rs, mut vs, mut ds): (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<bool>>) =
                 ((0..n).map(|_| vec![]).collect(), (0..n).map(|_| vec![]).collect(), (0..n).map(|_| vec![]).collect());
             let (mut total_reward, mut falls) = (0.0f32, 0u32);
+            let t_roll = Instant::now();
+            let mut reset_dur = std::time::Duration::ZERO;
             for _ in 0..T {
                 for e in 0..n {
                     ac.record_obs(&gc[e], &gcc[e]);
@@ -272,7 +290,9 @@ fn main() {
                     rs[e].push(outs[e].reward);
                     ds[e].push(outs[e].done);
                     if outs[e].done {
+                        let tr = Instant::now();
                         let (o, c) = env.reset_env(e).await;
+                        reset_dur += tr.elapsed();
                         gc[e] = o;
                         gcc[e] = c;
                     } else {
@@ -282,7 +302,9 @@ fn main() {
                 }
             }
 
+            let roll_s = t_roll.elapsed().as_secs_f64();
             // ---------------- GAE + batch ----------------
+            let t_gae = Instant::now();
             let mut batch: Vec<Sample> = Vec::with_capacity(total);
             for e in 0..n {
                 let lv = ac.value(&gcc[e]);
@@ -304,7 +326,9 @@ fn main() {
                 s.adv = (s.adv - amean) / asd;
             }
 
+            let gae_s = t_gae.elapsed().as_secs_f64();
             // ---------------- GPU PPO UPDATE (persistent nets, advancing Adam) -------
+            let t_upd = Instant::now();
             let on: Vec<Vec<f32>> = batch.iter().map(|s| ac.obs_norm.normalize(&s.obs)).collect();
             let cn: Vec<Vec<f32>> = batch.iter().map(|s| ac.critic_norm.normalize(&s.critic_obs)).collect();
             let f_obs = mk(&bk, &DMatrix::from_fn(od, total, |r, c| on[c][r]), st);
@@ -399,6 +423,7 @@ fn main() {
                 lst = mk(&bk, &DMatrix::from_fn(ad_, 1, |r, _| ac.log_std[r]), rw);
             }
             gpu.sync_weights(&bk, &ac);
+            let upd_s = t_upd.elapsed().as_secs_f64();
 
             if it % 10 == 0 || it == iters - 1 {
                 let zs = env.torso_heights().await;
@@ -406,6 +431,16 @@ fn main() {
                 println!(
                     "{:>4}  {:>5.2}  {:>9.4}  {:>7}  {:>8.3}  {:>9.2e}  {:>7.4}  {:>6.1}",
                     it, cscale, total_reward / total as f32, falls, torso, lr, last_kl, t_iter.elapsed().as_secs_f64()
+                );
+                // [prof] coarse iteration split + rollout per-phase ms/step
+                // (env.take_step_timings drains the StepTimings accumulator).
+                let st = env.take_step_timings();
+                let ns2ms = |x: u64| (x as f64) / (st.steps.max(1) as f64) / 1e6;
+                println!(
+                    "[prof] roll={:.2}s (reset={:.2}s) gae={:.2}s upd={:.2}s | per-step ms: pipe={:.1} gpuwait={:.1} readback={:.1} reward={:.1} stage={:.1} flush={:.1} commit={:.1}",
+                    roll_s, reset_dur.as_secs_f64(), gae_s, upd_s,
+                    ns2ms(st.pipeline_step_ns), ns2ms(st.gpu_wait_ns), ns2ms(st.readback_ns),
+                    ns2ms(st.par_compute_ns), ns2ms(st.stage_motors_ns), ns2ms(st.flush_static_ns), ns2ms(st.serial_commit_ns),
                 );
                 // Structured per-component reward + termination-cause line for the
                 // W&B sidecar (`wandb_logger.py` parses the `[rb]` prefix). Mean of

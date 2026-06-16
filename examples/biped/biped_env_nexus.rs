@@ -99,6 +99,22 @@ impl StepTimings {
 // steps, sizes stop changing — calling it every step adds dispatch latency
 // for no work. 32 control steps ≈ 0.64 s of sim time, plenty fast to react.
 const AUTO_RESIZE_PERIOD: u32 = 32;
+/// Steps to run eager before capturing the physics CUDA graph — long enough for
+/// the dispatch structure (color count / buffer sizes) to stabilise through a
+/// couple of `auto_resize_buffers` cycles, so the captured graph stays valid.
+const GRAPH_CAPTURE_AT: u32 = 64;
+
+/// `Send`+`Sync` wrapper for a captured physics graph. `CapturedGraph` holds raw
+/// CUDA handles (not thread-safe), but the env is shared by-ref with rayon in the
+/// par-compute closure — which NEVER touches the graph (it's launched only on the
+/// main thread in `step`). The unsafe impls assert that main-thread-only access,
+/// which holds for our usage.
+#[cfg(feature = "cuda_backend")]
+struct SyncGraph(khal::backend::cuda::CapturedGraph);
+#[cfg(feature = "cuda_backend")]
+unsafe impl Send for SyncGraph {}
+#[cfg(feature = "cuda_backend")]
+unsafe impl Sync for SyncGraph {}
 
 // --- MJCF parsing (duplicated from biped_env.rs — small, self-contained) ----
 
@@ -732,9 +748,33 @@ pub struct BipedNexusBatchEnv {
     pipeline: GpuPhysicsPipeline,
     state: GpuPhysicsState,
 
+    /// CUDA-graph capture of one control step's `decimation × pipeline.step`
+    /// physics sequence. The per-step host re-encode of those dispatches is
+    /// ~half the physics time (~24 ms/step measured); capturing once and
+    /// replaying via `cuGraphLaunch` removes it. Opt-in via `BIPED_GRAPH=1`
+    /// (eager dispatch is the default). Captured lazily after warmup; replayed
+    /// thereafter with the freshly-staged motor buffer (the graph records kernel
+    /// launches, not data, so per-step buffer writes + resets are honoured).
+    #[cfg(feature = "cuda_backend")]
+    physics_graph: Option<SyncGraph>,
+    /// Steps taken since construction — used to delay graph capture until the
+    /// dispatch structure (color count / buffers) has stabilised.
+    graph_warmup_steps: u32,
+
     // Pre-built spawn templates for reset_env_from (different DR samples).
     templates: Vec<GpuPhysicsState>,
     template_dr: Vec<DrParams>,
+    /// Cached per-template `foot_sole_local` (constant per template) so reset_env
+    /// doesn't rebuild the rapier scene every reset.
+    template_foot_sole: Vec<[Vec3; NUM_FEET]>,
+    /// Cached per-template spawn obs / critic-obs (populated by `initial_obs`).
+    /// The post-reset obs is deterministic from the template spawn state; the
+    /// velocity command enters ONLY obs[12:16], so reset_env serves these cached
+    /// vectors with the fresh command patched in — eliminating the per-reset
+    /// `slurp_poses` full readback (the dominant reset cost). Empty until
+    /// `initial_obs` runs, in which case reset_env falls back to the readback.
+    template_spawn_obs: Vec<Vec<f32>>,
+    template_spawn_critic_obs: Vec<Vec<f32>>,
 
     /// Counter for the periodic `pipeline.auto_resize_buffers` call (see
     /// `AUTO_RESIZE_PERIOD`). Resets to 0 after each resize.
@@ -902,10 +942,17 @@ impl BipedNexusBatchEnv {
             state.multibodies_mut().set_dof_armature(&gpu, &arm_flat);
         }
 
-        // Spawn templates: one single-env GPU state per DR sample.
+        // Spawn templates: one single-env GPU state per DR sample. Also CACHE
+        // each template's `foot_sole_local` — it depends only on the (fixed) DR
+        // sample, so it's constant per template. reset_env looks it up instead of
+        // rebuilding the whole rapier scene every reset (build_env_scene is heavy:
+        // bodies + colliders + joints + inertia eigendecomps — and reset_env runs
+        // thousands of times per training iteration, once per fallen env).
         let mut templates: Vec<GpuPhysicsState> = Vec::with_capacity(num_templates);
+        let mut template_foot_sole: Vec<[Vec3; NUM_FEET]> = Vec::with_capacity(num_templates);
         for dr in &template_dr {
-            let (scene, _) = build_env_scene(&mjcf, &robot, dr, task.sim_dt);
+            let (scene, ix) = build_env_scene(&mjcf, &robot, dr, task.sim_dt);
+            template_foot_sole.push(ix.foot_sole_local);
             let envs_refs = vec![(
                 &scene.bodies,
                 &scene.colliders,
@@ -919,15 +966,10 @@ impl BipedNexusBatchEnv {
         }
 
         // Per-env initial sole-normal: every env starts from the corresponding
-        // template, so its foot_sole_local matches that template's at-spawn
-        // computation. Re-derive by re-building the rapier scene with the same
-        // DR (cheap; bodies are tiny).
-        let mut foot_sole_local: Vec<[Vec3; NUM_FEET]> = Vec::with_capacity(num_envs);
-        for e in 0..num_envs {
-            let dr = template_dr[e % num_templates];
-            let (_, ix) = build_env_scene(&mjcf, &robot, &dr, task.sim_dt);
-            foot_sole_local.push(ix.foot_sole_local);
-        }
+        // template, so its foot_sole_local matches that template's. Look up the
+        // cached per-template value (no rebuild).
+        let foot_sole_local: Vec<[Vec3; NUM_FEET]> =
+            (0..num_envs).map(|e| template_foot_sole[e % num_templates]).collect();
 
         let cmd = vec![VelocityCommand::default(); num_envs];
         let step_count = vec![0u32; num_envs];
@@ -976,7 +1018,13 @@ impl BipedNexusBatchEnv {
             state,
             templates,
             template_dr,
+            template_foot_sole,
+            template_spawn_obs: Vec::new(),
+            template_spawn_critic_obs: Vec::new(),
             tick_since_resize: 0,
+            #[cfg(feature = "cuda_backend")]
+            physics_graph: None,
+            graph_warmup_steps: 0,
             timings: StepTimings::default(),
             rlog_comps: [0.0; NUM_REWARD_COMPS],
             rlog_steps: 0,
@@ -1436,12 +1484,37 @@ impl BipedNexusBatchEnv {
             .expect("flush motor targets");
         self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
 
-        // (2) Advance physics at the control decimation. Each `pipeline.step`
-        // is async — the await may include queue submit + any implicit GPU
-        // sync the backend needs between sub-steps.
+        // (2) Advance physics at the control decimation. With BIPED_GRAPH=1 on a
+        // CUDA backend, capture the `decimation × pipeline.step` dispatch sequence
+        // ONCE (after warmup) into a CUDA graph and replay it per step — removing
+        // the ~24 ms/step host re-encode (~half the physics cost). The graph
+        // records kernel launches, not data, so the per-step motor-buffer write
+        // (above) and resets are honoured on replay. Eager dispatch otherwise.
         let t = Instant::now();
-        for _ in 0..self.task.decimation {
-            let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+        let mut ran_physics = false;
+        #[cfg(feature = "cuda_backend")]
+        if std::env::var("BIPED_GRAPH").is_ok() {
+            if let Some(g) = self.physics_graph.as_ref() {
+                g.0.launch().expect("physics graph replay");
+                ran_physics = true;
+            } else if self.graph_warmup_steps >= GRAPH_CAPTURE_AT {
+                let cuda = self.gpu.as_cuda().expect("cuda backend for BIPED_GRAPH");
+                cuda.begin_capture().expect("begin_capture");
+                for _ in 0..self.task.decimation {
+                    let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+                }
+                let g = cuda.end_capture().expect("end_capture");
+                g.upload().ok();
+                g.launch().expect("first graph launch"); // capture only records; execute once
+                self.physics_graph = Some(SyncGraph(g));
+                ran_physics = true;
+            }
+            self.graph_warmup_steps += 1;
+        }
+        if !ran_physics {
+            for _ in 0..self.task.decimation {
+                let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+            }
         }
         self.timings.pipeline_step_ns += t.elapsed().as_nanos() as u64;
 
@@ -1458,7 +1531,20 @@ impl BipedNexusBatchEnv {
         // for a static scene it stabilises after warmup and per-step calls
         // just add dispatch latency for no work.
         self.tick_since_resize += 1;
-        if self.tick_since_resize >= AUTO_RESIZE_PERIOD {
+        // Skip auto-resize once a physics graph is captured — reallocating the
+        // state buffers would invalidate the graph's recorded buffer addresses.
+        // (Buffers are already stable by capture time, so this is a no-op anyway.)
+        let graph_captured = {
+            #[cfg(feature = "cuda_backend")]
+            {
+                self.physics_graph.is_some()
+            }
+            #[cfg(not(feature = "cuda_backend"))]
+            {
+                false
+            }
+        };
+        if self.tick_since_resize >= AUTO_RESIZE_PERIOD && !graph_captured {
             let t = Instant::now();
             self.pipeline
                 .auto_resize_buffers(&self.gpu, &mut self.state)
@@ -1765,9 +1851,8 @@ impl BipedNexusBatchEnv {
             .reset_env_from(&self.gpu, env as u32, &self.templates[t])
             .await;
         // Mirror the template's sole-normal so update_feet's tilt makes sense.
-        let dr = self.template_dr[t];
-        let (_, ix) = build_env_scene(&self.mjcf, &self.robot, &dr, self.task.sim_dt);
-        self.foot_sole_local[env] = ix.foot_sole_local;
+        // Cached per-template (constant) — NO per-reset rapier-scene rebuild.
+        self.foot_sole_local[env] = self.template_foot_sole[t];
 
         // Reset host state.
         self.cmd[env] = self.sampler.sample(&mut self.rng[env]);
@@ -1783,7 +1868,37 @@ impl BipedNexusBatchEnv {
         // the next step seeds them again with zero velocity.
         self.has_prev_joint_pos[env] = false;
         self.has_prev_pose[env] = false;
-        // Build the initial obs from the freshly-copied state.
+
+        // Fast path: serve the cached per-template spawn obs with the fresh
+        // command patched into [12:16] — NO `slurp_poses` readback (the dominant
+        // per-reset cost). The post-reset state is the template spawn state
+        // (joints 0, vel 0, last_action 0); the command is the only thing that
+        // varies and it enters obs ONLY at [12:16] (see VelocityFlatTask::observe).
+        if !self.template_spawn_obs.is_empty() {
+            let mut obs = self.template_spawn_obs[t].clone();
+            let mut critic_obs = self.template_spawn_critic_obs[t].clone();
+            let c = self.cmd[env].obs(); // [vx, vy, yaw, 0]
+            obs[NUM_JOINTS..NUM_JOINTS + 4].copy_from_slice(&c);
+            critic_obs[NUM_JOINTS..NUM_JOINTS + 4].copy_from_slice(&c);
+            // Opt-in self-check: confirm the cached obs equals the live readback
+            // path bit-for-bit (run once with BIPED_VERIFY_RESET=1 to validate).
+            if std::env::var("BIPED_VERIFY_RESET").is_ok() {
+                let poses = self.slurp_poses().await;
+                let (feet, _) = self.compute_feet_from_poses(env, &poses);
+                let (mut state, _) = self.read_state_from_poses(env, &poses);
+                state.feet = feet;
+                let mut ref_obs = vec![0.0; OBS_DIM];
+                self.task.observe(&state, &self.cmd[env], &mut ref_obs);
+                let mut ref_co = vec![0.0; CRITIC_OBS_DIM];
+                self.task.observe_critic(&state, &self.cmd[env], &mut ref_co);
+                let do_max = obs.iter().zip(&ref_obs).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                let dc_max = critic_obs.iter().zip(&ref_co).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                eprintln!("[verify_reset] env {env} tpl {t}: obs maxdiff={do_max:.3e} critic maxdiff={dc_max:.3e}");
+            }
+            return (obs, critic_obs);
+        }
+
+        // Fallback (cache not yet populated): build obs from a readback.
         let poses = self.slurp_poses().await;
         let (feet, _) = self.compute_feet_from_poses(env, &poses);
         let (mut state, _) = self.read_state_from_poses(env, &poses);
@@ -1813,6 +1928,14 @@ impl BipedNexusBatchEnv {
             obs.push(o);
             critic_obs.push(c);
         }
+        // Cache the per-template spawn obs: env `t` was seeded from template `t`
+        // at construction and no reset has happened yet, so obs[t] IS template
+        // t's spawn obs. reset_env serves these (with the command patched into
+        // [12:16]) instead of a per-reset readback. Command-agnostic: the baked-in
+        // command is overwritten on reset.
+        let nt = self.templates.len().min(self.n);
+        self.template_spawn_obs = obs[..nt].to_vec();
+        self.template_spawn_critic_obs = critic_obs[..nt].to_vec();
         (obs, critic_obs)
     }
 
