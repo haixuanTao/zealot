@@ -329,11 +329,20 @@ impl Default for RewardWeights {
             dof_pos_limits: -0.5,       // WBC -0.1; strengthened to discourage limit-bracing
             dof_vel: -2e-4,             // WBC -2e-4 (was -1e-4)
             termination: -2.0,          // WBC is_terminated -100 ×dt(0.02) (was -25 one-shot)
-            air_time: 0.0,
-            flight: 0.0,                // WBC has NO flight/jumping penalty (was -20.0)
-            single_support: 0.0,
-            foot_slip: -0.01,           // WBC feet_slip -0.01 (was -0.05)
-            foot_clearance: 0.0,
+            // Gait shaping — turned ON to drive a clean, TRANSFERABLE alternating
+            // stride. The un-shaped reward let the policy track velocity with a
+            // nexus-specific foot-shuffle (ankle-slam propulsion) that didn't
+            // survive MuJoCo (sim2sim ratio 0.19 walking vs 1.00 standing). These
+            // push toward real stepping: swing duration (air_time), exactly one
+            // foot planted (single_support), no double-flight (flight), foot lifted
+            // to a target clearance while swinging (foot_clearance), and — the key
+            // anti-shuffle / anti-exploit term — a strong penalty on a planted foot
+            // sliding (foot_slip, 50× the old WBC value).
+            air_time: 1.5,              // reward completed swing time at touchdown
+            flight: -1.0,               // penalize both feet airborne (no hopping)
+            single_support: 1.0,        // bonus for the one-foot-down walking phase
+            foot_slip: -0.5,            // STRONG: planted feet must not slide (was -0.01)
+            foot_clearance: -1.0,       // lift the swing foot to the target height
             foot_clearance_target: 0.08,
             foot_orientation: -0.01,    // WBC feet_roll_l2 -0.01 (was -0.5)
             feet_yaw_mean: -0.4,        // WBC feet_yaw_mean_vs_base -0.4 (was -2.0)

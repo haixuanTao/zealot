@@ -226,7 +226,15 @@ fn main() {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.3);
-        let ramp_end: f32 = 0.7;
+        // Fraction of training by which the velocity command reaches full scale
+        // (command ramps 0→1 over [stand_frac, ramp_end]). BIPED_RAMP_END lets a
+        // WARM-STARTED run (resuming a competent standing policy with
+        // BIPED_STAND_FRAC=0) reach walking speed quickly instead of over the
+        // default 70% of training.
+        let ramp_end: f32 = std::env::var("BIPED_RAMP_END")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.7);
         println!("\n{:>4}  {:>5}  {:>9}  {:>7}  {:>8}  {:>9}  {:>7}  {:>6}", "iter", "curr", "step_rew", "falls", "torso_z", "lr", "kl", "sec");
 
         // Torque-penalty curriculum target (full WBC weight = 1.0). Ramped 0→max
