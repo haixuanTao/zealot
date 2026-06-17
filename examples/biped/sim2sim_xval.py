@@ -39,7 +39,13 @@ FREEJOINT = "torso_subassembly_freejoint"
 CONTROL_DT = 0.02
 PHYS_DT = 1.0 / 200.0
 DECIMATION = 4
-COMMAND = np.array([0.4, 0.0, 0.0, 0.0], dtype=np.float64)
+# The velocity command the rollout was generated under. Default 0.4 m/s
+# forward, overridable with BIPED_XVAL_CMD="vx,vy,yaw" — e.g. "0,0,0" to
+# cross-validate a standing-only policy at its trained (zero-command) point.
+COMMAND = np.array(
+    [*(float(x) for x in os.environ.get("BIPED_XVAL_CMD", "0.4,0,0").split(",")), 0.0][:4],
+    dtype=np.float64,
+)
 FALL_Z = 0.40
 
 # Per-joint-family PD gains + effort caps (kp, kd, effort N.m) and action scale.

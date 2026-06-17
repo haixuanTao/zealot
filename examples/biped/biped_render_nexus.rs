@@ -273,8 +273,20 @@ fn main() {
         // Recording rollout: reset env 0 to the DR-OFF template + pin command
         // forward, then step deterministically (mean action) and record state.
         println!("recording {rollout_steps}-step deterministic rollout from env 0...");
+        // Pinned command [vx,vy,yaw], default forward 0.4. Override with
+        // BIPED_RENDER_CMD="0,0,0" to render a stand-trained policy fairly.
+        let rcmd: Vec<f32> = std::env::var("BIPED_RENDER_CMD")
+            .unwrap_or_else(|_| "0.4,0,0".to_string())
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let (rvx, rvy, ryaw) = (
+            rcmd.first().copied().unwrap_or(0.4),
+            rcmd.get(1).copied().unwrap_or(0.0),
+            rcmd.get(2).copied().unwrap_or(0.0),
+        );
         let _ = env.reset_env_to_default_template(0).await;
-        env.pin_command_for(0, 0.4, 0.0, 0.0);
+        env.pin_command_for(0, rvx, rvy, ryaw);
         let (names, edges, feet) = env.skeleton();
 
         let mut frames: Vec<Vec<[f32; 3]>> = Vec::with_capacity(rollout_steps);
@@ -336,7 +348,7 @@ fn main() {
                     env.reset_env(0).await.0
                 };
                 cur[0] = o;
-                env.pin_command_for(0, 0.4, 0.0, 0.0);
+                env.pin_command_for(0, rvx, rvy, ryaw);
             } else {
                 cur[0].clone_from(&outs[0].obs);
             }

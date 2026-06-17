@@ -113,10 +113,16 @@ const fn family(name: &'static str) -> JointSpec {
     } else if starts_with(name, "knee") {
         (60.0, 4.0, 88.0, 0.367, 0.1233, (-0.524, 0.524), 2.264, 0.998)
     } else if starts_with(name, "anklex") {
-        (20.0, 1.5, 44.0, 0.55, 0.0299, (-0.175, 0.175), 0.214, 0.262) // ankle-roll
+        // Ankle EFFORT capped at 15 N·m (was 44): the real ankle motor is fragile
+        // (~11 N·m diamond/peak) and overheats under sustained load. 44 let the
+        // policy hold lateral balance with ~16 N·m sustained on the ankle roll —
+        // it would cook the real motor. 15 caps the motor saturation (and the
+        // reward torque-clamp), forcing a lower-ankle-torque stance; the ankle
+        // torque penalty (BIPED_ANKLE_TORQUE_W) drives sustained usage lower still.
+        (20.0, 1.5, 15.0, 0.55, 0.0299, (-0.175, 0.175), 0.214, 0.262) // ankle-roll
     } else {
         // ankley (ankle pitch) — the one that folds the foot into the shin.
-        (20.0, 1.5, 44.0, 0.55, 0.0299, (-0.349, 0.349), 0.0286, 0.171)
+        (20.0, 1.5, 15.0, 0.55, 0.0299, (-0.349, 0.349), 0.0286, 0.171)
     };
     JointSpec {
         name,
@@ -244,7 +250,7 @@ mod tests {
         assert_eq!(by("hipy_left").kp, 60.0);
         assert_eq!(by("knee_right").kp, 60.0);
         assert_eq!(by("ankley_left").kp, 20.0);
-        assert_eq!(by("anklex_right").effort_limit, 44.0);
+        assert_eq!(by("anklex_right").effort_limit, 15.0); // capped (fragile ankle motor)
         assert_eq!(by("knee_left").effort_limit, 88.0);
         // Action scales per family.
         assert_eq!(by("hipz_left").action_scale, 0.733);

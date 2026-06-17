@@ -34,6 +34,10 @@ OUT = sys.argv[3] if len(sys.argv) > 3 else "/tmp/biped_sim2sim_mujoco.mp4"
 N_STEPS = int(sys.argv[4]) if len(sys.argv) > 4 else 500
 W, H = 640, 480  # within MuJoCo's default offscreen framebuffer
 FALL_Z = X.FALL_Z
+# Velocity command [vx,vy,yaw] for the closed loop. Override with BIPED_CMD,
+# e.g. BIPED_CMD="0,0,0" to test a stand-trained policy fairly.
+_cmd = os.environ.get("BIPED_CMD", "0.4,0,0").split(",")
+CMD = np.array([float(_cmd[0]), float(_cmd[1]), float(_cmd[2]), 0.0])
 
 
 def main():
@@ -105,7 +109,7 @@ def main():
             jvel = np.zeros(12)
         else:
             jvel = np.array([data.qvel[hinge_d[n]] for n in jnames])
-        cmd = X.COMMAND  # command not zeroed mid-run; warmup only zeros action/vel
+        cmd = CMD  # command not zeroed mid-run; warmup only zeros action/vel
         qj = np.array([data.qpos[hinge_q[n]] for n in jnames])
         qw_, qx_, qy_, qz_ = data.qpos[free_q + 3:free_q + 7]
         obs = np.zeros(43)

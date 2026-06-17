@@ -244,7 +244,9 @@ pub struct RewardWeights {
     pub base_height: f32,
     /// Target base (torso) height, m (for `base_height`).
     pub base_height_target: f32,
-    /// Posture: stay near the default pose (exp kernel).
+    /// Hip yaw/roll deviation penalty gain (NEGATIVE). L2 penalty on hipz+hipx
+    /// deviation from default, always-on — stops the policy from limit-riding the
+    /// lateral hips into a splayed brace. (Was an unused full-posture reward.)
     pub pose: f32,
     /// Left/right symmetry (exp kernel on mirror error).
     pub bilateral_symmetry: f32,
@@ -304,37 +306,39 @@ impl Default for RewardWeights {
         // stepping from "strong tracking + strong upright + jumping penalty"
         // without an explicit step bonus, and our additions were workarounds for
         // weights being too weak elsewhere.
+        // ALIGNED to WBC-AGILE's *lerobot* velocity config (the one that actually
+        // trained THIS robot), not the G1 config the old weights were ported from.
+        // The G1 port over-penalized motion (ang_vel/lin_vel/action_rate 5x too
+        // harsh) and used the wrong base-height target (0.62 vs the lerobot trunk
+        // height 0.72 = spawn height), so the reward pushed the robot to crouch
+        // into a fall and punished the very motion it needed to learn.
+        // (Per-step terms are ×control_dt like Isaac Lab; `termination` is applied
+        // once WITHOUT dt in the env, so -2.0 here ≈ WBC's -100·dt effective.)
         Self {
-            track_lin_vel: 5.0,
-            track_ang_vel: 5.0,
-            upright: 5.0, // was 1.0 — WBC's `orientation = 5.0` is the big delta
-            base_height: 2.5,
-            base_height_target: 0.62, // kept LeRobot-specific (G1 is ~0.78)
-            pose: 0.0,
+            track_lin_vel: 5.0,         // WBC 5.0
+            track_ang_vel: 5.0,         // WBC 5.0
+            upright: 5.0,               // ~WBC flat_orientation_l2 -5.0 (exp form here)
+            base_height: 2.0,           // WBC 2.0
+            base_height_target: 0.72,   // WBC DEFAULT_TRUNK_HEIGHT (was 0.62 — crouch bug)
+            pose: -8.0, // hip yaw/roll deviation penalty (anti-limit-ride)
             bilateral_symmetry: 0.0,
-            action_rate: -0.25, // was -0.05 — WBC's full action smoothness weight
-            action_rate_hipz_hipx: 0.0, // WBC doesn't double up on hip dofs
-            body_ang_vel: -0.25, // was -0.05 — anti-torso-flail
-            lin_vel_z: -0.25,
-            dof_pos_limits: -0.5,
-            dof_vel: -1e-4,
-            // WBC uses -100; at our budget that dwarfs the per-step signal and
-            // paralyses exploration (peak fall rate × -100 destroys the gradient).
-            // -25 still strongly discourages falls without dominating the episode.
-            termination: -25.0,
-            air_time: 0.0,       // WBC has no positive swing-time bonus
-            flight: -20.0,       // WBC's `jumping` weight — decisive no-hop
-            single_support: 0.0, // WBC has no single-support bonus
-            foot_slip: -0.05,
-            foot_clearance: 0.0, // WBC doesn't shape swing height explicitly
+            action_rate: -0.1,          // WBC -0.1 (was -0.25)
+            action_rate_hipz_hipx: 0.0,
+            body_ang_vel: -0.05,        // WBC ang_vel_xy -0.05 (was -0.25)
+            lin_vel_z: -0.05,           // WBC -0.05 (was -0.25)
+            dof_pos_limits: -0.5,       // WBC -0.1; strengthened to discourage limit-bracing
+            dof_vel: -2e-4,             // WBC -2e-4 (was -1e-4)
+            termination: -2.0,          // WBC is_terminated -100 ×dt(0.02) (was -25 one-shot)
+            air_time: 0.0,
+            flight: 0.0,                // WBC has NO flight/jumping penalty (was -20.0)
+            single_support: 0.0,
+            foot_slip: -0.01,           // WBC feet_slip -0.01 (was -0.05)
+            foot_clearance: 0.0,
             foot_clearance_target: 0.08,
-            // WBC's `feet_roll` weight is -0.05 — they get flat feet implicitly via
-            // strong upright + vast samples. At our budget that's too weak; the
-            // policy lands feet at 30–40° tilt. -0.5 is the compromise.
-            foot_orientation: -0.5,
-            feet_yaw_mean: -2.0,    // WBC's strong "feet point forward" term
-            feet_distance: -0.1,    // stance-width regularizer
-            feet_distance_ref: 0.2, // WBC's reference distance between feet (m)
+            foot_orientation: -0.01,    // WBC feet_roll_l2 -0.01 (was -0.5)
+            feet_yaw_mean: -0.4,        // WBC feet_yaw_mean_vs_base -0.4 (was -2.0)
+            feet_distance: -0.02,       // WBC feet_distance_from_ref -0.02 (was -0.1)
+            feet_distance_ref: 0.2,
         }
     }
 }
@@ -663,18 +667,20 @@ impl VelocityFlatTask {
         let base_height =
             self.weights.base_height * (-h_err / self.stds.base_height.powi(2)).exp() * dt;
 
-        // Posture: deviation from the default pose — only rewarded when *standing*
-        // is commanded. While moving it would penalize the leg motion of walking.
+        // Hip yaw/roll deviation penalty (reuses the `pose` slot — the WBC port
+        // left the full-posture reward at weight 0). The LATERAL hip DOFs (hipz
+        // yaw, hipx roll) should stay near neutral whether standing OR walking
+        // straight; without a penalty the policy braces by jamming them to their
+        // ±20° limits (limit-riding — a degenerate, non-transferring stance).
+        // L2 penalty (negative weight), ALWAYS-on so it also keeps the gait from
+        // splaying. Targets ONLY hipz/hipx, leaving the sagittal walking DOFs
+        // (hipy/knee/ankley) free. `weights.pose` is the (negative) penalty gain.
         let standing = cmd.speed() < 0.1;
-        let mut pose_err = 0.0;
-        for i in 0..NUM_JOINTS {
-            pose_err += (state.joint_pos[i] - self.robot.joints[i].default_pos).powi(2);
+        let mut hip_dev2 = 0.0;
+        for &i in &self.hip_yawroll_idx {
+            hip_dev2 += (state.joint_pos[i] - self.robot.joints[i].default_pos).powi(2);
         }
-        let pose = if standing {
-            self.weights.pose * (-pose_err / self.stds.pose.powi(2)).exp() * dt
-        } else {
-            0.0
-        };
+        let pose = self.weights.pose * hip_dev2 * dt;
 
         // Bilateral symmetry: sagittal joints (hipy/knee/ankley) mirror equal,
         // lateral joints (hipz/hipx/anklex) mirror opposite. Reward exp(-error).

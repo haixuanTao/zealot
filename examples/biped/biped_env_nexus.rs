@@ -265,6 +265,10 @@ pub struct DrParams {
     pub friction: f32,
     pub restitution: f32,
     pub pd_scale: f32,
+    /// Per-env multiplier on every link's mass (and, to stay physically
+    /// consistent, its inertia tensor). Models payload / build-tolerance /
+    /// CAD-vs-reality mass error. ~±20% by default.
+    pub mass_scale: f32,
     pub contact_natural_frequency: f32,
     pub contact_damping_ratio: f32,
     /// Sampled base orientation at spawn — separate axes so a single template
@@ -282,6 +286,7 @@ impl Default for DrParams {
             friction: 1.0,
             restitution: 0.0,
             pd_scale: 1.0,
+            mass_scale: 1.0,
             contact_natural_frequency: 30.0,
             contact_damping_ratio: 5.0,
             spawn_yaw: 0.0,
@@ -413,13 +418,17 @@ fn build_env_scene(
             Vec3::new(o.x, d.y, o.z), // col 1: Ixy, Iyy, Iyz
             Vec3::new(o.y, o.z, d.z), // col 2: Ixz, Iyz, Izz
         );
+        // Mass DR: scale mass and inertia together so the body stays physically
+        // consistent (fixed geometry/density → I ∝ m). Applied per-env from the
+        // template's sampled `dr.mass_scale`.
+        let ms = dr.mass_scale;
         let h = bodies.insert(
             RigidBodyBuilder::dynamic()
                 .position(world[i])
                 .additional_mass_properties(MassProperties::with_inertia_matrix(
                     b.com,
-                    b.mass.max(1e-3),
-                    inertia_mat,
+                    (b.mass * ms).max(1e-3),
+                    inertia_mat * ms,
                 ))
                 .build(),
         );
@@ -437,13 +446,38 @@ fn build_env_scene(
                 &mut bodies,
             );
         } else {
-            // Foot box.
+            // Foot box. The MJCF sole is a cage of thin capsules; nexus allows
+            // only ONE collider per body, so we approximate it with a single
+            // cuboid. CRUCIAL: the cuboid spans the capsule CENTERLINES, and the
+            // capsule radius is added back ONLY on the sole-thickness axis (the
+            // one where the centerlines are ~coplanar) — NOT on the two footprint
+            // axes. A horizontal capsule resting on the floor contacts along the
+            // line directly beneath its axis, so the real support polygon is the
+            // centerline rectangle; the old `±r` bounding box inflated the sole
+            // footprint by ~1.5 cm per side (~+47% area), giving an
+            // unrealistically large/stable support base the policy braced on
+            // (stands rock-solid in nexus, falls in ~1.3 s in MuJoCo). Keeping the
+            // radius on the thickness axis preserves the foot's bottom-surface
+            // height, so the spawn height / penetration are unchanged.
             let mut lo = Vec3::splat(f32::INFINITY);
             let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            let mut rmax = 0.0f32;
             for (a, c, r) in &b.capsules {
-                lo = lo.min(a.min(*c) - Vec3::splat(*r));
-                hi = hi.max(a.max(*c) + Vec3::splat(*r));
+                lo = lo.min(a.min(*c));
+                hi = hi.max(a.max(*c));
+                rmax = rmax.max(*r);
             }
+            // Add the radius back only on axes whose centerline extent is below
+            // the radius (i.e. the capsules are essentially coplanar there → the
+            // sole-thickness direction). Footprint axes keep centerline bounds.
+            let ext = hi - lo;
+            let pad = Vec3::new(
+                if ext.x < rmax { rmax } else { 0.0 },
+                if ext.y < rmax { rmax } else { 0.0 },
+                if ext.z < rmax { rmax } else { 0.0 },
+            );
+            lo -= pad;
+            hi += pad;
             let he = ((hi - lo) * 0.5).max(Vec3::splat(1e-3));
             let center = (hi + lo) * 0.5;
             colliders.insert_with_parent(
@@ -474,7 +508,14 @@ fn build_env_scene(
     let mut name_to_link: HashMap<String, u32> = HashMap::new();
     // Joint position limits cost ~1.7x iter time (extra per-step constraints);
     // only worth it with real (tight) ranges, so gate them off by default.
-    let joint_limits_on = std::env::var_os("BIPED_JOINT_LIMITS").is_some();
+    // Physical joint limits ON by default (opt out with BIPED_JOINT_LIMITS=0).
+    // Without them the policy "stands" by jamming joints to the target-clamp
+    // boundary — a degenerate brace that doesn't balance and doesn't transfer to
+    // MuJoCo. Real limits (the per-joint MJCF range) force genuine balance,
+    // matching WBC's soft_joint_pos_limit_factor=0.9. ~1.7x iter cost.
+    let joint_limits_on = std::env::var("BIPED_JOINT_LIMITS")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     for (i, b) in mjcf.iter().enumerate() {
         let (Some(parent), Some(jname)) = (b.parent, b.joint.as_ref()) else {
             continue;
@@ -504,16 +545,26 @@ fn build_env_scene(
             .local_frame1(Pose::from_parts(b.local_pos, b.local_quat))
             .local_frame2(Pose::IDENTITY)
             .build();
-        // AccelerationBased motor: compliance is mass-normalized (cfm_coeff path),
-        // so commanded kp realizes consistent stiffness regardless of the joint's
-        // (tiny) link inertia — like MuJoCo's actuators. ForceBased (raw cfm_gain)
-        // under-realized kp on the low-inertia leg joints, so the motors couldn't
-        // hold and a passive robot buckled to its limits in ~0.1s. BIPED_FORCE_MOTOR
-        // reverts to ForceBased for A/B.
-        let motor_model = if std::env::var("BIPED_FORCE_MOTOR").is_ok() {
-            MotorModel::ForceBased
-        } else {
+        // Motor model. ForceBased is now applied as an EXPLICIT generalized-force
+        // PD torque inside the nexus solver (gpu_mb_gravity_and_lu: gen_forces +=
+        // clamp(kp·(target−q) − kd·q̇, ±effort)), exactly matching the real robot
+        // and MuJoCo's position actuator. AccelerationBased uses the mass-
+        // normalized soft constraint (cfm_coeff): commanded kp realizes the same
+        // stiffness regardless of the joint's (tiny) link inertia — crisp, but
+        // UNREALISTIC (the real actuator is force-based, so the policy overfits to
+        // nexus's inertia-decoupled tracking; sim-to-sim diverges at the ankles).
+        // The OLD constraint-based ForceBased (raw cfm_gain) under-realized kp and
+        // sagged — that path is bypassed now. BIPED_FORCE_MOTOR=1 selects the
+        // explicit force-based PD (the sim-to-real-faithful default candidate).
+        // Explicit force-based PD is now the DEFAULT: it matches the real robot /
+        // MuJoCo actuator (τ = kp·err − kd·q̇), and with it the standing policy
+        // survives the full 6 s in MuJoCo (vs 1.7 s on AccelerationBased — the
+        // inertia-decoupled tracking the policy used to overfit to). Opt back into
+        // the old AccelerationBased motor with BIPED_ACCEL_MOTOR=1 for A/B.
+        let motor_model = if std::env::var("BIPED_ACCEL_MOTOR").is_ok() {
             MotorModel::AccelerationBased
+        } else {
+            MotorModel::ForceBased
         };
         joint.set_motor_model(JointAxis::AngZ, motor_model);
         // Diagnostic knobs to test the "constraint-motor too soft to hold" theory
@@ -1764,8 +1815,32 @@ impl BipedNexusBatchEnv {
         // (5) Serial commit: per-env mutable state + StepOut assembly.
         let t = Instant::now();
         let cpb = self.idx.colliders_per_batch as usize;
+        // Observation noise (sensor DR): uniform additive noise on the ACTOR obs
+        // only (the critic keeps a clean privileged obs — asymmetric PPO). Models
+        // encoder quantization / IMU noise so the policy can't overfit to
+        // pixel-perfect proprioception. Amplitudes mirror Isaac Lab's UniformNoise
+        // for proprioceptive humanoid obs; BIPED_OBS_NOISE scales them (0 = off).
+        let obs_noise: f32 = std::env::var("BIPED_OBS_NOISE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         let mut outs = Vec::with_capacity(self.n);
-        for (e, c) in computed.into_iter().enumerate() {
+        for (e, mut c) in computed.into_iter().enumerate() {
+            if obs_noise > 0.0 {
+                let rng = &mut self.rng[e];
+                // joint_pos_rel [16..28]: ±0.01 rad
+                for v in &mut c.obs[NUM_JOINTS + 4..2 * NUM_JOINTS + 4] {
+                    *v += rng.range(-0.01, 0.01) * obs_noise;
+                }
+                // joint_vel [28..40]: ±1.5 rad/s
+                for v in &mut c.obs[2 * NUM_JOINTS + 4..3 * NUM_JOINTS + 4] {
+                    *v += rng.range(-1.5, 1.5) * obs_noise;
+                }
+                // projected_gravity [40..43]: ±0.05
+                for v in &mut c.obs[3 * NUM_JOINTS + 4..3 * NUM_JOINTS + 7] {
+                    *v += rng.range(-0.05, 0.05) * obs_noise;
+                }
+            }
             self.air_time[e] = c.new_air;
             self.prev_joint_pos[e] = c.new_joint_pos;
             self.has_prev_joint_pos[e] = true;
@@ -2121,16 +2196,45 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
     // draw) — used to A/B-test that friction actually reaches the GPU contact
     // solver. The rng draw is still consumed so other DR + determinism are
     // unchanged.
+    // Friction range widened DOWN into the slip regime: 0.3–1.3 (was 0.5–1.5).
+    // The low tail (μ≈0.3) makes the foot actually slip, so the policy can't
+    // rely on a consistent grip to brace — this is the dominant "slippery
+    // contact" DR lever both MuJoCo (geom friction randomization) and Isaac
+    // (randomize_rigid_body_material) use. Center stays ≈ MuJoCo's default μ=1.
+    // (Per-foot and static-vs-dynamic friction would express stick-slip even
+    // better, but nexus stores a single Coulomb μ per multibody — engine-blocked.)
     let friction = match std::env::var("BIPED_FRICTION").ok().and_then(|s| s.parse::<f32>().ok()) {
-        Some(f) => { let _ = rng.range(0.5, 1.5); f }
-        None => rng.range(0.5, 1.5),
+        Some(f) => { let _ = rng.range(0.3, 1.3); f }
+        None => rng.range(0.3, 1.3),
     };
+    // BIPED_MASS_DR scales the half-width of the per-link mass randomization
+    // (default 1.0 → ±20%). Set 0.0 to disable (mass fixed at nominal); the rng
+    // draw is still consumed so other DR + determinism are unchanged.
+    let mdr: f32 = std::env::var("BIPED_MASS_DR").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let mass_scale = 1.0 + rng.range(-0.2, 0.2) * mdr;
     DrParams {
         friction,
         restitution: rng.range(0.0, 0.15),
-        pd_scale: rng.range(0.85, 1.15),
-        contact_natural_frequency: rng.range(10.0, 50.0),
-        contact_damping_ratio: rng.range(2.0, 8.0),
+        // Widened from ±15% to ±30%: PD-gain error is a major sim-to-real gap
+        // (the real actuators' effective kp/kd differ from the modelled values),
+        // and a policy that's robust to ±30% gain error transfers far better.
+        pd_scale: rng.range(0.7, 1.3),
+        mass_scale,
+        // Contact-stiffness DR — now LIVE on the multibody contact solver (the
+        // kernel reads per-env contact_natural_frequency / contact_damping_ratio
+        // from SimParams; it used to hardcode 30/5). This is the analog of
+        // MuJoCo's solref randomization. BIPED_CONTACT_FREQ / BIPED_CONTACT_DAMP
+        // pin every env to a fixed value (rng draw still consumed) — set both to
+        // 30 / 5 to reproduce the old hardcoded path and verify the new binding
+        // is bit-identical.
+        contact_natural_frequency: match std::env::var("BIPED_CONTACT_FREQ").ok().and_then(|s| s.parse::<f32>().ok()) {
+            Some(f) => { let _ = rng.range(10.0, 50.0); f }
+            None => rng.range(10.0, 50.0),
+        },
+        contact_damping_ratio: match std::env::var("BIPED_CONTACT_DAMP").ok().and_then(|s| s.parse::<f32>().ok()) {
+            Some(d) => { let _ = rng.range(2.0, 8.0); d }
+            None => rng.range(2.0, 8.0),
+        },
         // Initial-pose DR — aggressive ranges so the policy sees a wide
         // distribution of starts and learns to recover from non-trivial
         // perturbations. Comparable to WBC-AGILE / Isaac Lab humanoid
