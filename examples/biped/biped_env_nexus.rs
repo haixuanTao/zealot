@@ -1375,7 +1375,20 @@ impl BipedNexusBatchEnv {
         env: usize,
         poses: &[NexusPose],
     ) -> ([FootObs; NUM_FEET], [f32; NUM_FEET]) {
-        const CONTACT_Z: f32 = 0.025;
+        // Foot-contact threshold on the foot LINK-ORIGIN height (not the sole).
+        // The link origin rests at z~0.035-0.045 when the sole is planted (the
+        // sole/collider sits below it), so the old 0.025 was BELOW the planted
+        // height — contact never registered, breaking every contact-based gait
+        // reward (air_time/single_support/flight/foot_slip/clearance all saw the
+        // feet as permanently airborne). 0.05 sits just above the planted height
+        // and well below a real swing (foot_clearance_target 0.08), so a planted
+        // foot reads contact and a lifted foot reads swing. Overridable for tuning.
+        let contact_z: f32 = std::env::var("BIPED_CONTACT_Z")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.05);
+        #[allow(non_snake_case)]
+        let CONTACT_Z = contact_z;
         let dt = self.task.control_dt();
         let cpb = self.idx.colliders_per_batch as usize;
         let env_base = env * cpb;

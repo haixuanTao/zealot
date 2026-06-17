@@ -753,11 +753,20 @@ impl VelocityFlatTask {
             0.0
         };
 
-        // Single-support bonus (while moving): exactly one foot down is the walking
-        // phase. Rewarding it makes stepping beat standing (double) and hopping (air).
+        // Single-support shaping (while moving): exactly one foot down is the
+        // walking phase. A BONUS for single-support alone wasn't enough — the
+        // policy just forgoes it and waddles in permanent double-support (both
+        // feet planted, shuffling). So while moving we now also PENALIZE
+        // double-support by the same magnitude: staying on both feet is actively
+        // costly, which forces the policy to pick a foot up and step. Flight
+        // (zero contacts) is left to the `flight` term.
         let contacts = state.feet.iter().filter(|f| f.contact).count();
-        let single_support = if moving && contacts == 1 {
-            self.weights.single_support * dt
+        let single_support = if moving {
+            match contacts {
+                1 => self.weights.single_support * dt,        // reward stepping
+                2 => -self.weights.single_support * dt,       // penalize double-support
+                _ => 0.0,                                     // flight: see `flight`
+            }
         } else {
             0.0
         };
