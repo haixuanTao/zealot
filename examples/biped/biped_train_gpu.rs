@@ -244,6 +244,15 @@ fn main() {
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(1.0);
+        // Cap the command scale (BIPED_MAX_CSCALE, default 1.0). The sampler's full
+        // range is ±0.5 m/s; capping at e.g. 0.4 → max ±0.2 m/s = a SLOW walk, so
+        // the policy learns a deliberate low-cadence gait (step → stabilize → step)
+        // instead of fast continuous tiny stepping. Slow + quasi-static also
+        // transfers far better (no reliance on dynamic contact timing).
+        let max_cscale: f32 = std::env::var("BIPED_MAX_CSCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         for it in 0..iters {
             let t_iter = Instant::now();
             let frac = it as f32 / iters as f32;
@@ -251,7 +260,7 @@ fn main() {
                 0.0
             } else {
                 ((frac - stand_frac) / (ramp_end - stand_frac)).clamp(0.0, 1.0)
-            };
+            } * max_cscale;
             env.set_command_scale(cscale);
             let tscale = ((it as f32 / iters as f32 - 0.4) / 0.5).clamp(0.0, 1.0) * torque_max;
             env.set_torque_scale(tscale);

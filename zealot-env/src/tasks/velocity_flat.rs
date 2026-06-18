@@ -776,10 +776,17 @@ impl VelocityFlatTask {
         let single_support = if moving {
             match contacts {
                 // Reward single-support ONLY when making forward progress (gated)
-                // so it can't be farmed by stepping in place; double-support is
-                // penalized regardless (always costly while moving).
+                // so it can't be farmed by stepping in place. Double-support is NO
+                // LONGER penalized while moving — that penalty forced continuous
+                // tiny stepping (never settling). Allowing double-support lets the
+                // gait be deliberate: step (single-support, earns the gated bonus)
+                // → SETTLE on both feet → step again. Forward progress still
+                // REQUIRES stepping because sliding a planted foot is penalized
+                // (foot_slip) and energy penalizes excess motion, so it can't just
+                // waddle. This quasi-static step-stabilize-step gait is also far
+                // more transfer-robust (no reliance on dynamic contact timing).
                 1 => self.weights.single_support * dt * progress,
-                2 => -self.weights.single_support * dt,
+                2 => 0.0,
                 _ => 0.0, // flight: see `flight`
             }
         } else {
