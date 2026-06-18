@@ -730,6 +730,18 @@ impl VelocityFlatTask {
 
         // --- foot-contact shaped terms ---
         let moving = !standing;
+        // Forward-progress gate for the stepping BONUSES (air_time, single-support
+        // bonus). Without it the policy farms those bonuses by stepping IN PLACE
+        // (v≈0) — it overcooked into marching, abandoning forward tracking.
+        // progress = clamp((v·cmd)/|cmd|², 0, 1): 1 when the base moves at the
+        // commanded velocity, 0 when stationary/backward. So a stepping bonus is
+        // only paid when the steps actually carry the robot toward the command.
+        let cmd_sp2 = cmd.vx * cmd.vx + cmd.vy * cmd.vy;
+        let progress = if cmd_sp2 > 1e-6 {
+            ((v[FWD] * cmd.vx + v[LAT] * cmd.vy) / cmd_sp2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         // Air time: reward the completed swing duration at touchdown (capped), so
         // any reasonable step is encouraged — only when commanded to move. (The old
         // `air_time − 0.5` form was negative for sub-0.5 s steps, i.e. it *punished*
@@ -741,7 +753,7 @@ impl VelocityFlatTask {
             }
         }
         let air_time = if moving {
-            self.weights.air_time * air * dt
+            self.weights.air_time * air * dt * progress
         } else {
             0.0
         };
@@ -763,9 +775,12 @@ impl VelocityFlatTask {
         let contacts = state.feet.iter().filter(|f| f.contact).count();
         let single_support = if moving {
             match contacts {
-                1 => self.weights.single_support * dt,        // reward stepping
-                2 => -self.weights.single_support * dt,       // penalize double-support
-                _ => 0.0,                                     // flight: see `flight`
+                // Reward single-support ONLY when making forward progress (gated)
+                // so it can't be farmed by stepping in place; double-support is
+                // penalized regardless (always costly while moving).
+                1 => self.weights.single_support * dt * progress,
+                2 => -self.weights.single_support * dt,
+                _ => 0.0, // flight: see `flight`
             }
         } else {
             0.0

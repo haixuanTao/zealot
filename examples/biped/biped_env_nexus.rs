@@ -479,10 +479,46 @@ fn build_env_scene(
             lo -= pad;
             hi += pad;
             let he = ((hi - lo) * 0.5).max(Vec3::splat(1e-3));
-            let center = (hi + lo) * 0.5;
-            colliders.insert_with_parent(
+            let mut center = (hi + lo) * 0.5;
+            // Foot collider shape. Default CAPSULE (rounded sole): nexus's flat box
+            // foot caught on its sharp edges at foot-strike, so a dynamic gait
+            // diverged at the ankles in MuJoCo (whose sole is 6 ROUNDED capsules) —
+            // the walking sim2sim gap. A capsule rounds the heel/toe so the foot
+            // ROLLS through strike/push-off like MuJoCo's. Axis = longest footprint
+            // axis; radius = the foot half-width; the center is shifted on the
+            // thickness axis so the sole-bottom height is unchanged. BIPED_FOOT_SHAPE=box reverts.
+            let foot_shape = std::env::var("BIPED_FOOT_SHAPE").unwrap_or_else(|_| "capsule".to_string());
+            let cb = if foot_shape == "box" {
                 ColliderBuilder::cuboid(he.x, he.y, he.z)
-                    .position(Pose::from_parts(center, Rotation::IDENTITY))
+            } else {
+                let he_arr = [he.x, he.y, he.z];
+                // Thickness axis = where the radius pad was added (capsules ~coplanar).
+                let tax = if pad.x > 0.0 { 0 } else if pad.y > 0.0 { 1 } else { 2 };
+                let foot_axes: Vec<usize> = (0..3).filter(|&a| a != tax).collect();
+                // long = larger-extent footprint axis (capsule axis); wide = the other.
+                let (long_ax, wide_ax) = if he_arr[foot_axes[0]] >= he_arr[foot_axes[1]] {
+                    (foot_axes[0], foot_axes[1])
+                } else {
+                    (foot_axes[1], foot_axes[0])
+                };
+                let radius = he_arr[wide_ax].max(1e-3);
+                let half_height = (he_arr[long_ax] - radius).max(1e-3);
+                // Preserve the sole-bottom height: capsule bottom is center−radius
+                // vs the box's center−he[tax]; shift the center up by the difference.
+                let shift = radius - he_arr[tax];
+                match tax {
+                    0 => center.x += shift,
+                    1 => center.y += shift,
+                    _ => center.z += shift,
+                }
+                match long_ax {
+                    0 => ColliderBuilder::capsule_x(half_height, radius),
+                    1 => ColliderBuilder::capsule_y(half_height, radius),
+                    _ => ColliderBuilder::capsule_z(half_height, radius),
+                }
+            };
+            colliders.insert_with_parent(
+                cb.position(Pose::from_parts(center, Rotation::IDENTITY))
                     .density(0.0)
                     .friction(dr.friction)
                     .restitution(dr.restitution),
