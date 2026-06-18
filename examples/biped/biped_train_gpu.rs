@@ -304,7 +304,23 @@ fn main() {
                     if outs[e].fell {
                         falls += 1;
                     }
-                    rs[e].push(outs[e].reward);
+                    // Time-limit bootstrapping (Pardo et al.): a TIMEOUT is a
+                    // truncation, NOT a failure — the episode would have continued,
+                    // so bootstrap the value of the final state (`r + γ·V(s_final)`)
+                    // instead of treating it as terminal (value 0). A FALL stays a
+                    // true termination (no bootstrap). Both still set `done` so GAE
+                    // cuts the trajectory at the episode boundary (no bleed into the
+                    // post-reset state). Without this, surviving to the 20 s cap was
+                    // valued at 0 → the value fn under-valued long-stable-survival,
+                    // biasing AGAINST the stability we want (worsens as the policy
+                    // improves and more episodes reach timeout). `critic_obs` is the
+                    // final (pre-reset) state, since env.step doesn't reset.
+                    let r = if outs[e].done && !outs[e].fell {
+                        outs[e].reward + GAMMA * ac.value(&outs[e].critic_obs)
+                    } else {
+                        outs[e].reward
+                    };
+                    rs[e].push(r);
                     ds[e].push(outs[e].done);
                     if outs[e].done {
                         let tr = Instant::now();
