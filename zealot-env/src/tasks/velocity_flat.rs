@@ -783,7 +783,16 @@ impl VelocityFlatTask {
                 _ => 0.0, // flight: see `flight`
             }
         } else {
-            0.0
+            // STANDING (command ~0): the inverse — reward BOTH feet planted,
+            // penalize stepping. Without this the walking policy keeps lifting
+            // feet / stamping in place at zero command (it drifts + fidgets,
+            // since nothing rewarded standing still). Now "step when told to move,
+            // plant when told to stand" is symmetric.
+            match contacts {
+                2 => self.weights.single_support * dt,  // both feet planted = good
+                1 => -self.weights.single_support * dt, // stepping while told to stand = bad
+                _ => 0.0,
+            }
         };
 
         // Slip: penalize horizontal foot speed while the foot is in contact.
