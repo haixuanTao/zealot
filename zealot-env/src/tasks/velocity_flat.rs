@@ -371,7 +371,12 @@ impl Default for RewardWeights {
             air_time: 0.0,              // was 1.5 — let stepping emerge, don't force cadence
             flight: -1.0,               // keep: no hopping (both feet airborne)
             single_support: 0.0,        // was 1.0 — allow 2-foot stabilize; don't force single-support
-            foot_slip: -0.5,            // keep: planted feet must not slide (forces real steps)
+            foot_slip: -3.0,            // CRANKED (was -0.5): -0.5 left a sub-threshold
+                                        // slide-shuffle (feet at ~0.045 < contact 0.05,
+                                        // skating forward). Strong slip makes sliding a
+                                        // planted foot genuinely costly, so to track
+                                        // velocity it must LIFT the foot clear of contact
+                                        // → real swings; foot_clearance then shapes height.
             foot_clearance: -1.0,       // keep: lift the swing foot to target height
             foot_clearance_target: 0.06, // was 0.08 (above the foot's actual ~0.068 peak → high-stepping)
             foot_orientation: -0.01,    // WBC feet_roll_l2 -0.01 (was -0.5)
