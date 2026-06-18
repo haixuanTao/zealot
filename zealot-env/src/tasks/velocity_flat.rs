@@ -330,10 +330,19 @@ impl Default for RewardWeights {
         // (Per-step terms are ×control_dt like Isaac Lab; `termination` is applied
         // once WITHOUT dt in the env, so -2.0 here ≈ WBC's -100·dt effective.)
         Self {
-            track_lin_vel: 5.0,         // WBC 5.0
-            track_ang_vel: 5.0,         // WBC 5.0
-            upright: 5.0,               // ~WBC flat_orientation_l2 -5.0 (exp form here)
-            base_height: 2.0,           // WBC 2.0
+            // TRACKING is now the DOMINANT objective (the task). Raised + the std
+            // is tightened (below) so the reward is SHARP: large for tracking the
+            // commanded velocity, ~0 for not tracking — i.e. not-following-the-
+            // command is heavily penalized in effect (big opportunity cost). This
+            // replaces the brittle "force stepping" gait machinery: walking emerges
+            // because the robot MUST track velocity, and it may settle on two feet
+            // between steps (double-support no longer penalized).
+            track_lin_vel: 10.0,        // was 5.0 — make following velocity the point
+            track_ang_vel: 8.0,         // was 5.0
+            // Stay-up lowered so it can't out-earn tracking (it used to: upright+
+            // height ≈0.13/step > tracking ≈0.07 → the policy preferred to STAND).
+            upright: 3.0,               // was 5.0
+            base_height: 1.0,           // was 2.0
             base_height_target: 0.72,   // WBC DEFAULT_TRUNK_HEIGHT (was 0.62 — crouch bug)
             pose: -8.0, // hip yaw/roll deviation penalty (anti-limit-ride)
             bilateral_symmetry: 2.0, // reward L/R-mirrored gait (natural, fixes lopsidedness)
@@ -353,12 +362,18 @@ impl Default for RewardWeights {
             // to a target clearance while swinging (foot_clearance), and — the key
             // anti-shuffle / anti-exploit term — a strong penalty on a planted foot
             // sliding (foot_slip, 50× the old WBC value).
-            air_time: 1.5,              // reward completed swing time at touchdown
-            flight: -1.0,               // penalize both feet airborne (no hopping)
-            single_support: 1.0,        // bonus for the one-foot-down walking phase
-            foot_slip: -0.5,            // STRONG: planted feet must not slide (was -0.01)
-            foot_clearance: -1.0,       // lift the swing foot to the target height
-            foot_clearance_target: 0.08,
+            // Forced-stepping terms OFF — they were band-aids for the old stand-bias
+            // and made the gait gameable (slide/hop/march). With tracking now
+            // dominant, stepping emerges from NEEDING to track velocity while
+            // sliding is blocked (foot_slip) and settling on two feet is allowed
+            // (double-support unpenalized). Keep only: no-hop (flight), no-slide
+            // (foot_slip), lift the swing foot cleanly (foot_clearance).
+            air_time: 0.0,              // was 1.5 — let stepping emerge, don't force cadence
+            flight: -1.0,               // keep: no hopping (both feet airborne)
+            single_support: 0.0,        // was 1.0 — allow 2-foot stabilize; don't force single-support
+            foot_slip: -0.5,            // keep: planted feet must not slide (forces real steps)
+            foot_clearance: -1.0,       // keep: lift the swing foot to target height
+            foot_clearance_target: 0.06, // was 0.08 (above the foot's actual ~0.068 peak → high-stepping)
             foot_orientation: -0.01,    // WBC feet_roll_l2 -0.01 (was -0.5)
             feet_yaw_mean: -0.4,        // WBC feet_yaw_mean_vs_base -0.4 (was -2.0)
             feet_distance: -0.02,       // WBC feet_distance_from_ref -0.02 (was -0.1)
@@ -395,8 +410,9 @@ impl Default for RewardStds {
         // no useful gradient. Widen to 0.3 so a 0.3 m/s walk vs standing gives a
         // ~6× reward difference at the rollout's pinned cmd=0.4.
         Self {
-            lin_vel: 0.3,
-            ang_vel: 0.2,
+            lin_vel: 0.15, // tightened (was 0.3): sharp tracking → standing-when-
+            ang_vel: 0.1,  // commanded scores ~0, i.e. NOT tracking is penalized
+
             upright: 10_f32.to_radians(),
             base_height: 0.1,
             pose: 1.0, // unused (pose weight = 0) but kept for API stability
