@@ -321,7 +321,7 @@ impl Default for RewardWeights {
             base_height: 2.0,           // WBC 2.0
             base_height_target: 0.72,   // WBC DEFAULT_TRUNK_HEIGHT (was 0.62 — crouch bug)
             pose: -8.0, // hip yaw/roll deviation penalty (anti-limit-ride)
-            bilateral_symmetry: 0.0,
+            bilateral_symmetry: 2.0, // reward L/R-mirrored gait (natural, fixes lopsidedness)
             action_rate: -0.1,          // WBC -0.1 (was -0.25)
             action_rate_hipz_hipx: 0.0,
             body_ang_vel: -0.05,        // WBC ang_vel_xy -0.05 (was -0.25)
@@ -956,9 +956,11 @@ mod tests {
         assert!((r.track_lin_vel - w.track_lin_vel * dt).abs() < 1e-6);
         assert!((r.track_ang_vel - w.track_ang_vel * dt).abs() < 1e-6);
         assert!((r.upright - w.upright * dt).abs() < 1e-6);
-        assert!((r.bilateral_symmetry).abs() < 1e-6); // symmetry term disabled
-        // pose weight is 0 in the WBC port (they have no `pose` term).
-        assert!((r.pose - w.pose * dt).abs() < 1e-6);
+        // Neutral pose is L/R-mirrored, so sym_err=0 → full symmetry reward.
+        assert!((r.bilateral_symmetry - w.bilateral_symmetry * dt).abs() < 1e-6);
+        // `pose` is now the hip yaw/roll DEVIATION penalty: 0 at the neutral pose
+        // (hipx/hipz = default), regardless of its (negative) weight.
+        assert!(r.pose.abs() < 1e-6);
         // No motion/action → penalties zero.
         assert_eq!(r.action_rate, 0.0);
         assert_eq!(r.dof_vel, 0.0);

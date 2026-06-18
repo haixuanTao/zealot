@@ -884,7 +884,7 @@ pub struct BipedNexusBatchEnv {
 }
 
 /// Number of logged reward components (see [`REWARD_COMP_NAMES`]).
-pub const NUM_REWARD_COMPS: usize = 24;
+pub const NUM_REWARD_COMPS: usize = 25;
 
 /// Names of the per-component reward terms, in `rlog_comps` / `RewardLog::comps`
 /// order. The first 20 mirror `RewardBreakdown`'s live terms; the last four are
@@ -915,6 +915,7 @@ pub const REWARD_COMP_NAMES: [&str; NUM_REWARD_COMPS] = [
     "torque_ankle",
     "self_coll",
     "termination",
+    "power", // Σ|τ·q̇| mechanical-power (energy / cost-of-transport) penalty
 ];
 
 /// One window of accumulated reward/termination stats (see `take_reward_log`).
@@ -1753,6 +1754,16 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(1.0);
+        // Mechanical-power (energy) penalty weight. Penalizes Σ|τᵢ·q̇ᵢ| — the rate
+        // of mechanical work, the principled cost-of-transport proxy. Unlike Στ²
+        // (effort, penalized even when static), this only charges for work done in
+        // motion, so energy-economical (natural) gaits are favored and degenerate
+        // high-energy modes (marching in place, frantic shuffling) are punished.
+        // BIPED_POWER_W tunes it (0 = off).
+        let power_w: f32 = std::env::var("BIPED_POWER_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2e-3);
         let cpb_idx = self.idx.colliders_per_batch as usize;
         let computed: Vec<PerEnv> = (0..self.n)
             .into_par_iter()
@@ -1821,16 +1832,18 @@ impl BipedNexusBatchEnv {
                 // while the leg term ramps with the curriculum (`torque_w`). WBC
                 // lerobot base weights: -5e-4 legs, -1.5e-3 ankle pitch, -6.5e-3
                 // ankle roll (coupled, weakest).
-                if torque_w > 0.0 || ankle_torque_w > 0.0 {
+                if torque_w > 0.0 || ankle_torque_w > 0.0 || power_w > 0.0 {
                     let q_target = self.task.joint_targets(&actions[e]);
                     let mut leg_pen = 0.0f32;
                     let mut ankle_pen = 0.0f32;
+                    let mut power = 0.0f32; // Σ|τ·q̇| mechanical power (energy rate)
                     for i in 0..NUM_JOINTS {
                         let j = &self.task.robot.joints[i];
                         let tau = (j.kp * (q_target[i] - state.joint_pos[i])
                             - j.kd * state.joint_vel[i])
                             .clamp(-j.effort_limit, j.effort_limit);
                         let t2 = tau * tau;
+                        power += (tau * state.joint_vel[i]).abs();
                         if j.name.contains("ankle") {
                             let w = if j.name.contains("anklex") { 6.5e-3 } else { 1.5e-3 };
                             ankle_pen += w * t2;
@@ -1840,7 +1853,9 @@ impl BipedNexusBatchEnv {
                     }
                     comps[20] = -(torque_w * leg_pen) * sc_dt;
                     comps[21] = -(ankle_torque_w * ankle_pen) * sc_dt;
-                    reward -= (torque_w * leg_pen + ankle_torque_w * ankle_pen) * sc_dt;
+                    comps[24] = -(power_w * power) * sc_dt;
+                    reward -=
+                        (torque_w * leg_pen + ankle_torque_w * ankle_pen + power_w * power) * sc_dt;
                 }
                 let mut obs = vec![0.0; OBS_DIM];
                 self.task.observe(&state, &self.cmd[e], &mut obs);
