@@ -217,6 +217,22 @@ name = "biped_train_nexus"
 path = "examples/biped/biped_train_nexus.rs"
 required-features = ["biped_gpu"]
 
+# GPU-rollout benchmarks: full CPU vs full GPU policy rollout, per the README tables.
+[[example]]
+name = "rollout_bench"
+path = "examples/biped/rollout_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "rollout_e2e_bench"
+path = "examples/biped/rollout_e2e_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "iter_e2e_bench"
+path = "examples/biped/iter_e2e_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
 # Train briefly on nexus then record a deterministic env-0 rollout to JSON.
 # Render with `python3 examples/biped/render_biped.py <out.json> <out.mp4>`.
 [[example]]
