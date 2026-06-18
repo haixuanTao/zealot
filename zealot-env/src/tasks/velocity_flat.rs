@@ -203,8 +203,23 @@ impl Default for CommandSampler {
             lin_vel_x: (-0.5, 0.5),
             lin_vel_y: (-0.3, 0.3),
             ang_vel_z: (-0.2, 0.2),
-            standing_prob: 0.1,
-            resample_s: (3.0, 8.0),
+            // Fraction of command resamples that are a pure STAND (zero). Raising
+            // it (BIPED_STAND_PROB) makes the robot stop more often → trains
+            // explicit walk→stand→walk (go-stop-go) transitions and gives frequent
+            // quasi-static "stabilize" checkpoints (helps the deliberate gait +
+            // transfer). Resample interval (BIPED_RESAMPLE_S, "lo,hi" seconds);
+            // shorter = more frequent transitions.
+            standing_prob: std::env::var("BIPED_STAND_PROB")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.1),
+            resample_s: std::env::var("BIPED_RESAMPLE_S")
+                .ok()
+                .and_then(|s| {
+                    let p: Vec<f32> = s.split(',').filter_map(|x| x.parse().ok()).collect();
+                    if p.len() == 2 { Some((p[0], p[1])) } else { None }
+                })
+                .unwrap_or((3.0, 8.0)),
         }
     }
 }
