@@ -119,6 +119,126 @@ fn mirror_sample(s: &Sample) -> Sample {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Symmetry method 4 — NET: an *architecturally* equivariant policy.
+//
+// A signed permutation P on R^d: `(P x)[i] = sign[i] * x[perm[i]]`, an
+// involution (P·P = I). The four mirrors above are all signed permutations:
+// `mirror_obs`/`mirror_critic`/`jmirror` ARE such P on the obs/critic/action
+// spaces. A linear layer `y = W x` is equivariant under input rep `P_in` and
+// output rep `P_out` iff `W = P_out · W · P_in`; the symmetric projection
+// `W ← ½(W + P_out W P_in)` lands W in that subspace exactly. Chain it through
+// every layer (re-projecting each iter so Adam can't drift it) and the whole
+// net satisfies `π(mirror(s)) = mirror(π(s))` BY CONSTRUCTION — provably
+// symmetric, zero inference cost, and (unlike DUP) no batch/KL distortion so it
+// warm-starts cleanly. ELU commutes with the hidden reps ONLY if they are pure
+// permutations (sign +1) — ELU(−x) ≠ −ELU(x) — so hidden layers use an
+// adjacent-pair swap (no sign); the signed input/output reps sit at the linear
+// boundaries (raw input, linear output) where no nonlinearity breaks them.
+struct SPerm {
+    perm: Vec<usize>,
+    sign: Vec<f32>,
+}
+impl SPerm {
+    fn identity(d: usize) -> Self {
+        SPerm { perm: (0..d).collect(), sign: vec![1.0; d] }
+    }
+    /// Pure adjacent-pair swap 2k↔2k+1 (sign +1) — a permutation involution that
+    /// commutes with elementwise ELU. `d` must be even (our hidden dims are).
+    fn pair_swap(d: usize) -> Self {
+        let mut perm: Vec<usize> = (0..d).collect();
+        let mut k = 0;
+        while k + 1 < d {
+            perm[k] = k + 1;
+            perm[k + 1] = k;
+            k += 2;
+        }
+        SPerm { perm, sign: vec![1.0; d] }
+    }
+}
+fn action_sperm() -> SPerm {
+    SPerm { perm: JMIRROR.to_vec(), sign: JSIGN.to_vec() }
+}
+// obs(45) signed perm — exactly the index/sign pattern of `mirror_obs`.
+fn obs_sperm() -> SPerm {
+    let mut perm: Vec<usize> = (0..45).collect();
+    let mut sign = vec![1.0f32; 45];
+    for i in 0..NUM_JOINTS {
+        perm[i] = JMIRROR[i];
+        sign[i] = JSIGN[i]; // last_action
+        perm[16 + i] = 16 + JMIRROR[i];
+        sign[16 + i] = JSIGN[i]; // joint_pos
+        perm[28 + i] = 28 + JMIRROR[i];
+        sign[28 + i] = JSIGN[i]; // joint_vel
+    }
+    sign[13] = -1.0; // cmd vy
+    sign[14] = -1.0; // cmd yaw
+    sign[41] = -1.0; // proj_grav lateral
+    sign[43] = -1.0; // gait phase sin
+    sign[44] = -1.0; // gait phase cos
+    SPerm { perm, sign }
+}
+// critic(51) signed perm = obs(45) + [lin_vel(3), ang_vel(3)] per `mirror_critic`.
+fn critic_sperm() -> SPerm {
+    let mut sp = obs_sperm();
+    sp.perm.extend(45..51);
+    sp.sign.extend(std::iter::repeat(1.0).take(6));
+    sp.sign[46] = -1.0; // lin_vel lateral
+    sp.sign[48] = -1.0; // ang_vel roll
+    sp.sign[50] = -1.0; // ang_vel yaw
+    sp
+}
+/// Project every layer of `net` onto the equivariant subspace for the given
+/// per-layer reps (`reps[l]` acts on layer-l activations; `reps[0]` = input rep,
+/// `reps[L]` = output rep). Idempotent; called each iter after the GPU→CPU sync.
+fn symmetrize_mlp(net: &mut Mlp, reps: &[SPerm]) {
+    for l in 0..net.layers() {
+        let (out, inp) = (net.dims[l + 1], net.dims[l]);
+        let (ro, ri) = (&reps[l + 1], &reps[l]);
+        let orig = net.w[l].clone();
+        for o in 0..out {
+            for i in 0..inp {
+                let m = ro.sign[o] * ri.sign[i] * orig[ro.perm[o] * inp + ri.perm[i]];
+                net.w[l][o * inp + i] = 0.5 * (orig[o * inp + i] + m);
+            }
+        }
+        let ob = net.b[l].clone();
+        for o in 0..out {
+            net.b[l][o] = 0.5 * (ob[o] + ro.sign[o] * ob[ro.perm[o]]);
+        }
+    }
+}
+fn actor_reps(net: &Mlp) -> Vec<SPerm> {
+    let mut r = vec![obs_sperm()];
+    for &h in &net.dims[1..net.dims.len() - 1] {
+        r.push(SPerm::pair_swap(h));
+    }
+    r.push(action_sperm());
+    r
+}
+fn critic_reps(net: &Mlp) -> Vec<SPerm> {
+    let mut r = vec![critic_sperm()];
+    for &h in &net.dims[1..net.dims.len() - 1] {
+        r.push(SPerm::pair_swap(h));
+    }
+    r.push(SPerm::identity(1)); // value is mirror-INVARIANT (trivial output rep)
+    r
+}
+fn symmetrize_ac(ac: &mut ActorCritic) {
+    let ar = actor_reps(&ac.actor);
+    symmetrize_mlp(&mut ac.actor, &ar);
+    let cr = critic_reps(&ac.critic);
+    symmetrize_mlp(&mut ac.critic, &cr);
+    // Also symmetrize the per-action exploration std so the action DISTRIBUTION
+    // (not just the mean) is equivariant: std[i] = std[JMIRROR[i]]. log_std is
+    // magnitude (sign-free), so just average the mirror pair. Without this the
+    // mean is exactly symmetric but exploration is slightly lopsided.
+    let orig = ac.log_std.clone();
+    for i in 0..NUM_JOINTS {
+        ac.log_std[i] = 0.5 * (orig[i] + orig[JMIRROR[i]]);
+    }
+}
+
 /// GPU MLP with persistent weights + Adam moments (copied from iter_e2e_bench,
 /// plus `read_into` to write the trained weights back to a CPU `Mlp`).
 struct GpuMlp {
@@ -206,6 +326,20 @@ impl GpuMlp {
             net.b[l].copy_from_slice(&b[..out]);
         }
     }
+    /// Overwrite the GPU weight/bias tensors from a CPU `Mlp` (reverse of
+    /// `read_into`). Used by the NET symmetry method to push the re-projected
+    /// (equivariant) weights back into the authoritative GPU training copy each
+    /// iter, so the constraint actually guides training (the Adam moment tensors
+    /// are untouched — the projection is a small correction). Recreating the
+    /// tensors is fine: `forward`/`backward` only borrow `w`/`b` per pass.
+    fn write_w(&mut self, bk: &GpuBackend, net: &Mlp) {
+        let rw = BufferUsages::STORAGE | BufferUsages::COPY_SRC;
+        for l in 0..self.w.len() {
+            let (out, inp) = (self.dims[l + 1], self.dims[l]);
+            self.w[l] = mk(bk, &wmat(&net.w[l], out, inp), rw);
+            self.b[l] = mk(bk, &DMatrix::from_fn(out, 1, |r, _| net.b[l][r]), rw);
+        }
+    }
 }
 
 fn main() {
@@ -225,6 +359,16 @@ fn main() {
         } else {
             ActorCritic::new(&[od, 256, 256, 128, NUM_JOINTS], &[cd, 512, 256, 128, 1], 1.0, 1e-3, &mut rng)
         };
+        // Symmetry method 4 — NET (BIPED_MIRROR_NET): project the actor+critic
+        // weights onto the equivariant subspace so the policy is symmetric BY
+        // CONSTRUCTION. Done here (before the GPU nets are built from `ac`) so the
+        // rollout policy and the GpuMlp update copies all start equivariant, and
+        // re-applied each iter after the GPU→CPU sync (below).
+        let mirror_net = std::env::var("BIPED_MIRROR_NET").is_ok();
+        if mirror_net {
+            println!("equivariant NET ENABLED (weight symmetrization, provably symmetric)");
+            symmetrize_ac(&mut ac);
+        }
         let bk = env.backend().clone();
         let mut gpu = GpuPolicy::new(&bk, &ac, n).expect("gpu policy");
 
@@ -238,6 +382,19 @@ fn main() {
         let mirror_aug = std::env::var("BIPED_MIRROR_AUG").is_ok();
         if mirror_aug {
             println!("mirror augmentation ENABLED (symmetric policy)");
+        }
+        // Symmetry method 2 — LOSS (BIPED_MIRROR_LOSS=<weight>, 0=off): add an
+        // auxiliary symmetry penalty ½·w·‖μ(s) − mirror(μ(mirror(s)))‖² to the
+        // actor loss. Stop-gradient on the mirrored branch (the mirrored output
+        // is a target), so it needs only ONE extra actor forward per minibatch
+        // and no second backward — and, unlike DUP, doesn't touch the batch size
+        // or the KL signal, so it warm-starts cleanly.
+        let mirror_loss: f32 = std::env::var("BIPED_MIRROR_LOSS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        if mirror_loss > 0.0 {
+            println!("mirror LOSS ENABLED (auxiliary symmetry penalty, weight={mirror_loss})");
         }
         let g = Gemm::from_backend(&bk).unwrap();
         let op = OpAssign::from_backend(&bk).unwrap();
@@ -264,6 +421,16 @@ fn main() {
         let mut dls = mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), rw);
         let scale_mb = 1.0 / mb as f32;
         let (la, lc) = (a_net.layers() - 1, c_net.layers() - 1);
+        // LOSS scratch: a second actor net (weights refreshed each iter as the
+        // stop-grad target source), the action mirror as a [ad×ad] signed-perm
+        // matrix `pa` (so `pa·μ = jmirror(μ)` via GEMM), per-minibatch scratch
+        // `tgt`/`res`, and a constant gradient-scale tensor `gw` = w/mb (matches
+        // the PPO grad's own 1/mb averaging).
+        let mut s_net = if mirror_loss > 0.0 { Some(GpuMlp::new(&bk, &ac.actor, mb)) } else { None };
+        let pa = mk(&bk, &DMatrix::from_fn(ad_, ad_, |o, j| if j == JMIRROR[o] { JSIGN[o] } else { 0.0 }), st);
+        let mut tgt = mk(&bk, &DMatrix::<f32>::zeros(ad_, mb), rw);
+        let mut res = mk(&bk, &DMatrix::<f32>::zeros(ad_, mb), rw);
+        let gw = mk(&bk, &DMatrix::<f32>::from_element(ad_, mb, mirror_loss * scale_mb), st);
         let mut gstep: u64 = 0;
         let mut lr = LR; // adaptive-KL LR, persists across iterations
 
@@ -427,6 +594,18 @@ fn main() {
             let cn: Vec<Vec<f32>> = batch.iter().map(|s| ac.critic_norm.normalize(&s.critic_obs)).collect();
             let f_obs = mk(&bk, &DMatrix::from_fn(od, total, |r, c| on[c][r]), st);
             let f_cobs = mk(&bk, &DMatrix::from_fn(cd, total, |r, c| cn[c][r]), st);
+            // LOSS: normalized MIRRORED obs (normalize ∘ mirror — exact, not
+            // mirror ∘ normalize), and refresh the stop-grad target net to the
+            // current (iter-start) actor weights.
+            let f_obs_mir = if mirror_loss > 0.0 {
+                let onm: Vec<Vec<f32>> = batch.iter().map(|s| ac.obs_norm.normalize(&mirror_obs(&s.obs))).collect();
+                if let Some(sn) = s_net.as_mut() {
+                    sn.write_w(&bk, &ac.actor);
+                }
+                Some(mk(&bk, &DMatrix::from_fn(od, total, |r, c| onm[c][r]), st))
+            } else {
+                None
+            };
             let f_act = mk(&bk, &DMatrix::from_fn(ad_, total, |r, c| batch[c].action[r]), st);
             let f_adv = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].adv), st);
             let f_lpo = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].logp_old), st);
@@ -461,6 +640,20 @@ fn main() {
                     a_net.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m).unwrap();
                     c_net.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m).unwrap();
                     { let mut p = enc.begin_pass("ag", None); ppo.actor_grad(&mut p, &ap, &a_net.a[la + 1], &action_t, &lst, &adv_t, &lpo, &mut a_net.delta[la], &mut gls).unwrap(); }
+                    // LOSS: add the symmetry-penalty gradient to the actor output
+                    // delta BEFORE backward — `delta[la] += gw·(μ(s) − pa·μ(Ms))`,
+                    // with `pa·μ(Ms)` the mirror of the (stop-grad) mirrored-obs
+                    // forward. One extra forward + a signed-perm GEMM + 4 op-assigns.
+                    if let Some(sn) = s_net.as_mut() {
+                        let fom = f_obs_mir.as_ref().unwrap();
+                        { let mut p = enc.begin_pass("s_obs", None); cont.launch(&bk, &mut sh, &mut p, &mut sn.a[0], fom.columns(off, nb), None).unwrap(); }
+                        sn.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m).unwrap();
+                        { let mut p = enc.begin_pass("s_tgt", None); g.dispatch_tiled(&bk, &mut sh, &mut p, &mut tgt, &pa, &sn.a[la + 1]).unwrap(); }
+                        { let mut p = enc.begin_pass("s_cp", None); op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Copy, &mut res, &a_net.a[la + 1]).unwrap(); }
+                        { let mut p = enc.begin_pass("s_sub", None); op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Sub, &mut res, &tgt).unwrap(); }
+                        { let mut p = enc.begin_pass("s_mul", None); op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Mul, &mut res, &gw).unwrap(); }
+                        { let mut p = enc.begin_pass("s_add", None); op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Add, &mut a_net.delta[la], &res).unwrap(); }
+                    }
                     { let mut p = enc.begin_pass("vg", None); ppo.value_grad(&mut p, &vp, &c_net.a[lc + 1], &vo, &ret, &mut c_net.delta[lc]).unwrap(); }
                     a_net.backward(&bk, &g, &act, &mut sh, &mut enc, &om1).unwrap();
                     c_net.backward(&bk, &g, &act, &mut sh, &mut enc, &om1).unwrap();
@@ -515,6 +708,17 @@ fn main() {
             }
             if clamped {
                 lst = mk(&bk, &DMatrix::from_fn(ad_, 1, |r, _| ac.log_std[r]), rw);
+            }
+            // NET: re-project the freshly-trained weights onto the equivariant
+            // subspace, then push them BACK into the GPU training nets (so next
+            // iter's update starts equivariant) as well as the rollout policy.
+            if mirror_net {
+                symmetrize_ac(&mut ac);
+                // Push the now-symmetrized log_std + weights back to the GPU update
+                // copies so the next iter's update continues from the equivariant state.
+                lst = mk(&bk, &DMatrix::from_fn(ad_, 1, |r, _| ac.log_std[r]), rw);
+                a_net.write_w(&bk, &ac.actor);
+                c_net.write_w(&bk, &ac.critic);
             }
             gpu.sync_weights(&bk, &ac);
             let upd_s = t_upd.elapsed().as_secs_f64();

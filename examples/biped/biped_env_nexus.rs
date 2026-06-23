@@ -278,6 +278,13 @@ pub struct DrParams {
     pub spawn_pitch: f32,
     /// Sampled additive jitter on `SPAWN_Z`, m. May be negative.
     pub spawn_z_offset: f32,
+    /// Per-actuated-joint gain/torque multiplier (independent draw per joint).
+    /// Models actuator-strength asymmetry — e.g. one hip motor stronger than its
+    /// mirror, or a worn/weaker joint — the asymmetry a perfectly symmetric
+    /// policy must handle REACTIVELY on the real robot. Independent per joint so
+    /// left/right differ; scales kp, kd, and the effort (torque) limit together.
+    /// Default `[1.0; NUM_JOINTS]` (symmetric, nominal).
+    pub pd_scale_per_joint: [f32; NUM_JOINTS],
 }
 
 impl Default for DrParams {
@@ -293,6 +300,7 @@ impl Default for DrParams {
             spawn_roll: 0.0,
             spawn_pitch: 0.0,
             spawn_z_offset: 0.0,
+            pd_scale_per_joint: [1.0; NUM_JOINTS],
         }
     }
 }
@@ -563,17 +571,25 @@ fn build_env_scene(
         };
         let spec = robot.joints.iter().find(|j| &j.name == jname);
         let pi = std::f32::consts::PI;
+        // Per-joint actuator-strength DR (asymmetry): look up this joint's action
+        // index and apply its independent gain/torque multiplier on top of the
+        // global `pd_scale`. `1.0` for joints not in the canonical action set.
+        let pj = JOINT_NAMES
+            .iter()
+            .position(|&n| n == jname.as_str())
+            .map(|k| dr.pd_scale_per_joint[k])
+            .unwrap_or(1.0);
         let (kp, kd, effort, pos_limit, spec_damping) = spec
             .map(|s| {
                 (
-                    s.kp * dr.pd_scale,
-                    s.kd * dr.pd_scale,
-                    s.effort_limit,
+                    s.kp * dr.pd_scale * pj,
+                    s.kd * dr.pd_scale * pj,
+                    s.effort_limit * pj,
                     s.pos_limit,
                     s.damping,
                 )
             })
-            .unwrap_or((50.0, 1.0, 20.0, (-pi, pi), 0.0));
+            .unwrap_or((50.0 * pj, 1.0 * pj, 20.0 * pj, (-pi, pi), 0.0));
         // Passive joint damping (N·m·s/rad): the real joints are damped 0.5–2.3,
         // but nexus's passive-damping buffer is a hardcoded 0.1 default, so the
         // sim joints slew at ~50 rad/s. Fold the real damping into the motor's
@@ -1575,15 +1591,26 @@ impl BipedNexusBatchEnv {
             // contact jacobian sees the real slip or is blind to it.
             let mut wb2 = 0.0f32;
             let mut nb2 = 0.0f32;
-            // Geometric contact-point world XY (from the normal constraint's _pad4).
+            // Geometric contact-point world XY of the MOST LOADED normal point
+            // (the active load-bearing point), + how many points share load — so
+            // we can see the single load-bearing point DANCE between candidate
+            // points across substeps (the ratchet-forward hypothesis).
             let mut cpx = 0.0f32;
             let mut cpy = 0.0f32;
+            let mut max_imp = 0.0f32;
+            let mut n_loaded = 0u32;
             for c in cons.iter().take(n0) {
                 if c.link_id == fl {
                     if c.kind == 1 {
                         n_imp += c.impulse;
-                        cpx = f32::from_bits(c._pad4[0]);
-                        cpy = f32::from_bits(c._pad4[1]);
+                        if c.impulse > 0.02 {
+                            n_loaded += 1;
+                        }
+                        if c.impulse > max_imp {
+                            max_imp = c.impulse;
+                            cpx = f32::from_bits(c._pad4[0]);
+                            cpy = f32::from_bits(c._pad4[1]);
+                        }
                     } else if c.kind == 2 {
                         let w = f32::from_bits(c._pad0);
                         let n = f32::from_bits(c._pad1);
@@ -1605,7 +1632,7 @@ impl BipedNexusBatchEnv {
             let cy = v.y + a.x * SOLE_DZ;
             let v_contact = (cx * cx + cy * cy).sqrt();
             out.push_str(&format!(
-                " foot{fl}: ox={:+.5} oy={:+.5} z={:.4} N={n_imp:.3} cpx={cpx:+.5} cpy={cpy:+.5} tJv={:.4}",
+                " foot{fl}: ox={:+.5} oy={:+.5} z={:.4} N={n_imp:.3} nL={n_loaded} cp=({cpx:+.5},{cpy:+.5}) tJv={:.4}",
                 p.x, p.y, p.z, wb2.sqrt()
             ));
             let _ = (v_contact, a);
@@ -2789,5 +2816,21 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
         spawn_roll: rng.range(-0.35, 0.35) * sdr,     // ±~20° (× BIPED_SPAWN_DR)
         spawn_pitch: rng.range(-0.35, 0.35) * sdr,    // ±~20° (× BIPED_SPAWN_DR)
         spawn_z_offset: rng.range(-0.08, 0.08) * sdr, // ±8 cm (× BIPED_SPAWN_DR)
+        // Per-joint actuator-strength asymmetry (BIPED_ASYM_DR = half-width,
+        // default ±15%; 0 disables). Each joint draws independently → left/right
+        // gains differ, modelling "one motor stronger than the other". Drawn LAST
+        // so enabling it doesn't perturb the rng order of the other DR fields.
+        // A symmetric policy handles this REACTIVELY: the weaker side tracks its
+        // target worse → shows up in the joint-pos/vel obs → the (symmetric) map
+        // responds; the distribution is L/R-balanced, so the mirror prior stays
+        // valid in expectation.
+        pd_scale_per_joint: {
+            let hw: f32 = std::env::var("BIPED_ASYM_DR").ok().and_then(|s| s.parse().ok()).unwrap_or(0.15);
+            let mut a = [1.0f32; NUM_JOINTS];
+            for v in a.iter_mut() {
+                *v = 1.0 + rng.range(-hw, hw);
+            }
+            a
+        },
     }
 }

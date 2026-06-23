@@ -103,14 +103,21 @@ def main():
     resets = []
     falls = 0
 
+    prev_qj = None
     for t in range(N_STEPS):
         last_action = act_hist[0] if since_reset >= 2 else np.zeros(12)
+        qj = np.array([data.qpos[hinge_q[n]] for n in jnames])
         if since_reset < 2:
             jvel = np.zeros(12)
+        elif os.environ.get("BIPED_JVEL_FD"):
+            # Finite-diff joint vel over the control step — MATCHES how the nexus
+            # env builds the obs joint_vel (q_now-q_prev)/control_dt). Default path
+            # uses instantaneous data.qvel, which the policy never trained on.
+            jvel = (qj - prev_qj) / X.CONTROL_DT
         else:
             jvel = np.array([data.qvel[hinge_d[n]] for n in jnames])
+        prev_qj = qj
         cmd = CMD  # command not zeroed mid-run; warmup only zeros action/vel
-        qj = np.array([data.qpos[hinge_q[n]] for n in jnames])
         qw_, qx_, qy_, qz_ = data.qpos[free_q + 3:free_q + 7]
         # Gait clock: held at 0 for the fresh step then advances (matches the env's
         # 1-step lag) — see sim2sim_xval phase3.
