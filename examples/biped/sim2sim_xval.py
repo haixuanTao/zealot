@@ -39,6 +39,10 @@ FREEJOINT = "torso_subassembly_freejoint"
 CONTROL_DT = 0.02
 PHYS_DT = 1.0 / 200.0
 DECIMATION = 4
+# Gait-clock period (s); must match BIPED_GAIT_PERIOD used for the rollout. The
+# obs now carries (sin 2πφ, cos 2πφ) at indices 43,44, φ advancing CONTROL_DT/
+# GAIT_PERIOD per control step and reset to 0 at each episode start.
+GAIT_PERIOD = float(os.environ.get("BIPED_GAIT_PERIOD", "0.7"))
 # The velocity command the rollout was generated under. Default 0.4 m/s
 # forward, overridable with BIPED_XVAL_CMD="vx,vy,yaw" — e.g. "0,0,0" to
 # cross-validate a standing-only policy at its trained (zero-command) point.
@@ -49,13 +53,16 @@ COMMAND = np.array(
 FALL_Z = 0.40
 
 # Per-joint-family PD gains + effort caps (kp, kd, effort N.m) and action scale.
+# kp/kd are the PHYSICAL torque-PD gains = WBC value × 4 / × 2 (the same baked-in
+# correction zealot's LeRobotBipedal applies — see STIFFNESS_SCALE there). Fixed,
+# identical to nexus and the real robot; no scaling. Ankle effort = fragile 15 N·m.
 GAINS = {
-    "hipz":   (30, 3,   88),
-    "hipx":   (40, 3,   88),
-    "hipy":   (60, 4,   88),
-    "knee":   (60, 4,   88),
-    "ankley": (20, 1.5, 44),
-    "anklex": (20, 1.5, 44),
+    "hipz":   (120, 6,  88),
+    "hipx":   (160, 6,  88),
+    "hipy":   (240, 8,  88),
+    "knee":   (240, 8,  88),
+    "ankley": (40,  2.25,  15),  # ankle scaled ×2 (gentler — avoids bang-bang)
+    "anklex": (40,  2.25,  15),
 }
 ACTION_SCALE = {
     "hipz": 0.733, "hipx": 0.55, "hipy": 0.367,
@@ -181,7 +188,12 @@ def phase2(gt):
     cmd_zero = set(s + 1 for s in resets if s + 1 < T)
 
     recon = np.zeros_like(obs)
+    ph = 0.0  # gait clock: 0 at each fresh step, advances CONTROL_DT/GAIT_PERIOD
+    held = False  # skip the advance on the fresh step itself (1-step hold)
     for t in range(T):
+        if t in fresh:
+            ph = 0.0
+            held = True
         last_action = np.zeros(12) if (t in warmup) else actions[t - 2]
         jvel = np.zeros(12) if (t in warmup) else (joints[t] - joints[t - 1]) / CONTROL_DT
         cmd = np.zeros(4) if (t in cmd_zero) else COMMAND
@@ -190,6 +202,12 @@ def phase2(gt):
         recon[t, 16:28] = joints[t]          # joint_pos_rel (default 0)
         recon[t, 28:40] = jvel
         recon[t, 40:43] = projected_gravity(base[t, 3:7])
+        recon[t, 43] = np.sin(2.0 * np.pi * ph)
+        recon[t, 44] = np.cos(2.0 * np.pi * ph)
+        if held:
+            held = False  # fresh step: hold phase, don't advance yet
+        else:
+            ph = (ph + CONTROL_DT / GAIT_PERIOD) % 1.0
 
     blocks = {
         "last_action": (0, 12),
@@ -197,6 +215,7 @@ def phase2(gt):
         "joint_pos_rel": (16, 28),
         "joint_vel":   (28, 40),
         "proj_grav":   (40, 43),
+        "gait_phase":  (43, 45),
     }
     # joint_vel: the 2-step warmup is reconstructed exactly (=0), so nothing to
     # exclude; any residual is pure finite-diff vs nexus-stored vel.
@@ -269,6 +288,8 @@ def build_mujoco_model(joint_names):
              ' rgba="0.3 0.34 0.42 1" contype="1" conaffinity="1"/>',
              '  </worldbody>',
              '  <actuator>']
+    # Gains are the fixed physical torque-PD values (GAINS above) — identical to
+    # nexus and the real robot. No scaling.
     for side in ("left", "right"):
         for j in ACT_JOINT_ORDER:
             kp, kv, eff = GAINS[j]
@@ -310,23 +331,25 @@ def phase3(policy, gt):
     data.qvel[:] = 0.0
     mujoco.mj_forward(model, data)
 
-    def read_obs(last_action, command, joint_vel):
+    def read_obs(last_action, command, joint_vel, phase):
         qjoint = np.array([data.qpos[hinge_qadr[n]] for n in jnames])
         qw_, qx_, qy_, qz_ = data.qpos[free_qadr + 3:free_qadr + 7]  # WXYZ
         pg = projected_gravity((qx_, qy_, qz_, qw_))               # XYZW
-        o = np.zeros(43)
+        o = np.zeros(45)
         o[0:12] = last_action
         o[12:16] = command
         o[16:28] = qjoint
         o[28:40] = joint_vel
         o[40:43] = pg
+        o[43] = np.sin(2.0 * np.pi * phase)
+        o[44] = np.cos(2.0 * np.pi * phase)
         return o
 
     print("=" * 70)
     print("PHASE 3 - MuJoCo CLOSED-LOOP ROLLOUT (policy reactive on MuJoCo state)")
 
     # sanity: projected_gravity at step 0 should match the dumped obs[0][40:43]
-    obs0 = read_obs(np.zeros(12), COMMAND, np.zeros(12))
+    obs0 = read_obs(np.zeros(12), COMMAND, np.zeros(12), 0.0)
     print(f"  proj_grav sanity @step0  mujoco={np.array2string(obs0[40:43], precision=4)}"
           f"  dump={np.array2string(obs_gt[0, 40:43], precision=4)}")
     print(f"    abs diff = {np.abs(obs0[40:43] - obs_gt[0, 40:43]).max():.3e}")
@@ -340,6 +363,37 @@ def phase3(policy, gt):
     act_hist = [np.zeros(12), np.zeros(12)]  # [t-2, t-1]
     z_trace, xy_trace = [], []
     fell_step = None
+
+    # --- stance-foot drift instrumentation (mirror of the nexus debug) ---------
+    # Track, while each foot is LOADED (vertical contact force above threshold),
+    # how far its body origin drifts horizontally across the stance phase. This is
+    # the exact metric the nexus env prints; comparing the two tells us whether
+    # MuJoCo holds the planted foot (drift→0) where nexus lets it slide ~2 m/s.
+    foot_bids = [int(model.body("foot_subassembly").id),
+                 int(model.body("foot_subassembly_2").id)]
+    floor_gid = int(model.geom("floor").id)
+    foot_geoms = {b: {i for i in range(model.ngeom) if int(model.geom_bodyid[i]) == b}
+                  for b in foot_bids}
+    WEIGHT_N = float(model.body_subtreemass[1]) * 9.81
+    LOAD_THRESH_N = 0.20 * WEIGHT_N  # ~20% body weight = genuinely bearing load
+    cforce = np.zeros(6)
+
+    def foot_normal_force(bid):
+        tot = 0.0
+        for i in range(data.ncon):
+            c = data.contact[i]
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if (g1 == floor_gid and g2 in foot_geoms[bid]) or \
+               (g2 == floor_gid and g1 in foot_geoms[bid]):
+                mujoco.mj_contactForce(model, data, i, cforce)
+                tot += abs(cforce[0])  # normal is component 0 in contact frame
+        return tot
+
+    stance = {b: dict(loaded=False, sx=0.0, sy=0.0, steps=0, px=0.0, py=0.0, path=0.0)
+              for b in foot_bids}
+    loaded_step_drifts = []  # per-step drift_rate while loaded, for a summary stat
+    print("  --- stance-foot drift (MuJoCo) ---")
+
     for t in range(n_steps):
         last_action = act_hist[0] if t >= 2 else np.zeros(12)
         if t < 2:
@@ -347,7 +401,10 @@ def phase3(policy, gt):
         else:
             joint_vel = np.array([data.qvel[hinge_dofadr[n]] for n in jnames])
         command = COMMAND  # never reset mid-run (we stop at fall)
-        obs = read_obs(last_action, command, joint_vel)
+        # Gait clock: the env holds phase at 0 for the fresh step then advances, so
+        # obs[t] sees phase = max(0, t-1)·dt (matches the dump's 1-step lag).
+        phase = (max(0, t - 1) * CONTROL_DT / GAIT_PERIOD) % 1.0
+        obs = read_obs(last_action, command, joint_vel, phase)
         action = policy.act(obs)
         act_hist = [act_hist[1], action.copy()]
         target = ACTION_SCALE_DEFAULT_POS + scale * action
@@ -359,11 +416,41 @@ def phase3(policy, gt):
         xy = data.qpos[free_qadr:free_qadr + 2].copy()
         z_trace.append(z)
         xy_trace.append(xy)
+
+        # Per-foot stance-phase drift (same logic as the nexus env debug).
+        for b in foot_bids:
+            n_force = foot_normal_force(b)
+            fx, fy = float(data.xpos[b][0]), float(data.xpos[b][1])
+            loaded = n_force > LOAD_THRESH_N
+            s = stance[b]
+            if loaded and not s["loaded"]:
+                s.update(loaded=True, sx=fx, sy=fy, steps=1, px=fx, py=fy, path=0.0)
+            elif loaded and s["loaded"]:
+                step_d = ((fx - s["px"]) ** 2 + (fy - s["py"]) ** 2) ** 0.5
+                s["path"] += step_d
+                loaded_step_drifts.append(step_d / CONTROL_DT)
+                s["px"], s["py"], s["steps"] = fx, fy, s["steps"] + 1
+            elif not loaded and s["loaded"]:
+                net = ((fx - s["sx"]) ** 2 + (fy - s["sy"]) ** 2) ** 0.5
+                dur = s["steps"] * CONTROL_DT
+                tag = "L" if b == foot_bids[0] else "R"
+                print(f"    [stance {tag}] dur={dur:.2f}s  net_drift={net*100:.1f}cm  "
+                      f"path={s['path']*100:.1f}cm  (drift_rate={net/dur if dur>1e-3 else 0:.2f} m/s)")
+                s["loaded"] = False
+
         if fell_step is None and z < FALL_Z:
             fell_step = t
             # stop once fallen: integrating a collapsed robot for hundreds more
             # steps just produces meaningless (often exploding) trajectory data.
             break
+
+    if loaded_step_drifts:
+        d = np.array(loaded_step_drifts)
+        print(f"  loaded-foot drift_rate (MuJoCo): mean={d.mean():.2f}  median={np.median(d):.2f}"
+              f"  p90={np.percentile(d,90):.2f}  max={d.max():.2f} m/s  (n={len(d)} loaded steps)")
+    else:
+        print("  (no loaded-foot steps recorded before fall)")
+    print()
 
     z_trace = np.array(z_trace)
     xy_trace = np.array(xy_trace)
@@ -379,9 +466,13 @@ def phase3(policy, gt):
         idx = int(round(ts / CONTROL_DT))
         if idx < len(z_trace):
             print(f"    t={ts:4.2f}s (step {idx:3d})  z = {z_trace[idx]:+.4f}")
-    disp = float(np.linalg.norm(xy_trace[min(survived, n_steps) - 1] - base[0, :2]))
+    last_xy = xy_trace[min(survived, n_steps) - 1]
+    dxy = last_xy - base[0, :2]
+    disp = float(np.linalg.norm(dxy))
     print(f"\n  final base xy displacement = {disp * 100:.1f} cm "
           f"(at step {min(survived, n_steps) - 1})")
+    print(f"    forward (x) = {dxy[0]*100:+.1f} cm   lateral (y) = {dxy[1]*100:+.1f} cm   "
+          f"fwd speed = {dxy[0]/(min(survived,n_steps)*CONTROL_DT):+.3f} m/s")
     print()
 
     # nexus comparison
@@ -431,8 +522,13 @@ def main():
         sys.exit(1)
     p2 = phase2(gt)
     if not p2:
-        print("PHASE 2 FAILED - obs reconstruction wrong. Aborting before MuJoCo.")
-        sys.exit(1)
+        if os.environ.get("BIPED_FORCE_PHASE3"):
+            print("PHASE 2 marginal - BIPED_FORCE_PHASE3 set, running MuJoCo anyway "
+                  "(phase 3 rebuilds obs from MuJoCo state, independent of the dump's "
+                  "reconstruction self-check).\n")
+        else:
+            print("PHASE 2 FAILED - obs reconstruction wrong. Aborting before MuJoCo.")
+            sys.exit(1)
     phase3(policy, gt)
 
 

@@ -74,6 +74,51 @@ fn to_action(v: &[f32]) -> [f32; NUM_JOINTS] {
     a
 }
 
+// L/R mirror augmentation → symmetric policy (fixes the lopsided, veering gait).
+// JOINT_NAMES order: 0/1 anklex, 2/3 ankley, 4/5 hipx, 6/7 hipy, 8/9 hipz, 10/11
+// knee; lateral families (anklex/hipx/hipz) negate, sagittal keep. The mirror is
+// an action-space isometry, so logp_old/adv are preserved when mean_old mirrors.
+const JMIRROR: [usize; NUM_JOINTS] = [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10];
+const JSIGN: [f32; NUM_JOINTS] = [-1., -1., 1., 1., -1., -1., 1., 1., -1., -1., 1., 1.];
+fn jmirror(v: &[f32]) -> Vec<f32> {
+    (0..NUM_JOINTS).map(|i| JSIGN[i] * v[JMIRROR[i]]).collect()
+}
+// obs(45): last_action[0:12], cmd[12:16]=(vx,vy,yaw,aux), joint_pos[16:28],
+// joint_vel[28:40], proj_grav[40:43]=(fwd,lat,up), gait_phase[43:45]=(sin,cos).
+fn mirror_obs(o: &[f32]) -> Vec<f32> {
+    let mut m = o.to_vec();
+    m[0..12].copy_from_slice(&jmirror(&o[0..12]));
+    m[13] = -o[13];
+    m[14] = -o[14];
+    m[16..28].copy_from_slice(&jmirror(&o[16..28]));
+    m[28..40].copy_from_slice(&jmirror(&o[28..40]));
+    m[41] = -o[41];
+    m[43] = -o[43];
+    m[44] = -o[44];
+    m
+}
+// critic(51) = obs(45) + base_lin_vel(3)[fwd,lat,up] + base_ang_vel(3)[roll,pitch,yaw].
+fn mirror_critic(c: &[f32]) -> Vec<f32> {
+    let mut m = mirror_obs(&c[0..45]);
+    m.extend_from_slice(&c[45..]);
+    m[46] = -c[46];
+    m[48] = -c[48];
+    m[50] = -c[50];
+    m
+}
+fn mirror_sample(s: &Sample) -> Sample {
+    Sample {
+        obs: mirror_obs(&s.obs),
+        critic_obs: mirror_critic(&s.critic_obs),
+        action: jmirror(&s.action),
+        mean_old: jmirror(&s.mean_old),
+        logp_old: s.logp_old,
+        value_old: s.value_old,
+        adv: s.adv,
+        ret: s.ret,
+    }
+}
+
 /// GPU MLP with persistent weights + Adam moments (copied from iter_e2e_bench,
 /// plus `read_into` to write the trained weights back to a CPU `Mlp`).
 struct GpuMlp {
@@ -186,6 +231,14 @@ fn main() {
         // Persistent GPU update state (weights + Adam moments survive all iters).
         let total = n * T;
         let mb = total / MINIBATCHES;
+        // Mirror augmentation (BIPED_MIRROR_AUG=1): append the L/R mirror of every
+        // sample → symmetric policy. To keep the minibatch SIZE `mb` (and the
+        // pre-sized GPU buffers) unchanged, we double the minibatch COUNT instead
+        // (n_mb below), so a doubled batch just runs 2× minibatches at the same mb.
+        let mirror_aug = std::env::var("BIPED_MIRROR_AUG").is_ok();
+        if mirror_aug {
+            println!("mirror augmentation ENABLED (symmetric policy)");
+        }
         let g = Gemm::from_backend(&bk).unwrap();
         let op = OpAssign::from_backend(&bk).unwrap();
         let act = Activation::from_backend(&bk).unwrap();
@@ -348,6 +401,14 @@ fn main() {
                     batch.push(std::mem::take(&mut samp[e][t]));
                 }
             }
+            // Mirror augmentation: append the L/R mirror of every sample. `total`
+            // doubles; minibatch size `mb` is unchanged, so `n_mb` (count) doubles.
+            if mirror_aug {
+                let mir: Vec<Sample> = batch.iter().map(mirror_sample).collect();
+                batch.extend(mir);
+            }
+            let total = batch.len();
+            let n_mb = total / mb;
             // Normalize advantages across the batch (mean 0, std 1) — this is what
             // CPU `ActorCritic::update` does; the GPU `Ppo::actor_grad` consumes raw
             // `adv`, so without this the PPO gradients are mis-scaled and the policy
@@ -377,17 +438,17 @@ fn main() {
             // Old-policy means for the LAST minibatch — drives the per-epoch KL
             // for the adaptive-KL LR schedule (mirrors CPU `minibatch_step`'s
             // `self.kl`, here at per-epoch rather than per-minibatch granularity).
-            let last_off = (MINIBATCHES - 1) * mb;
+            let last_off = (n_mb - 1) * mb;
             let mean_old_last: Vec<Vec<f32>> =
                 (0..mb).map(|c| batch[last_off + c].mean_old.clone()).collect();
             let mut last_kl = 0.0f32;
             for _epoch in 0..EPOCHS {
-                gstep += MINIBATCHES as u64;
+                gstep += n_mb as u64;
                 let bc1 = 1.0 - 0.9f32.powi(gstep.min(1 << 30) as i32);
                 let bc2 = 1.0 - 0.999f32.powi(gstep.min(1 << 30) as i32);
                 let adp = Tensor::scalar(&bk, AdamParams { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, bias_correction1: bc1, bias_correction2: bc2, pad0: 0.0, pad1: 0.0 }, BufferUsages::UNIFORM).unwrap();
                 let mut enc = bk.begin_encoding();
-                for k in 0..MINIBATCHES {
+                for k in 0..n_mb {
                     let off = (k * mb) as u32;
                     let nb = mb as u32;
                     { let mut p = enc.begin_pass("g_obs", None); cont.launch(&bk, &mut sh, &mut p, &mut a_net.a[0], f_obs.columns(off, nb), None).unwrap(); }

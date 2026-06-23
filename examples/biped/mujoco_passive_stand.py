@@ -66,13 +66,21 @@ data = mujoco.MjData(model)
 # Base freejoint: pos (0,0,0.72), quat wxyz = (0.9962,0,-0.0872,0) ≈ 10° pitch.
 free_adr = model.joint("torso_subassembly_freejoint").qposadr[0]
 data.qpos[free_adr:free_adr + 3] = [0.0, 0.0, 0.72]
-data.qpos[free_adr + 3:free_adr + 7] = [0.9962, 0.0, -0.0872, 0.0]
+_pitch = os.environ.get("BIPED_SPAWN_PITCH", "10")  # default 10° lean (recovery test)
+if _pitch == "0":
+    data.qpos[free_adr + 3:free_adr + 7] = [1.0, 0.0, 0.0, 0.0]  # upright, matches nexus
+else:
+    data.qpos[free_adr + 3:free_adr + 7] = [0.9962, 0.0, -0.0872, 0.0]
 
 # Per-joint qpos/dof addresses + gains; override armature to WBC values.
 jinfo = []
+kp_s = float(os.environ.get("BIPED_KP_SCALE", "1.0"))
+kd_s = float(os.environ.get("BIPED_KD_SCALE", "1.0"))
 for n in JOINTS:
     j = model.joint(n)
     kp, kd, arm = fam_of(n)
+    kp *= kp_s
+    kd *= kd_s
     dofadr = int(j.dofadr[0])
     model.dof_armature[dofadr] = arm
     jinfo.append((int(j.qposadr[0]), dofadr, kp, kd))

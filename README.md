@@ -247,29 +247,34 @@ BIPED_CUDA=1 cargo run --release --example iter_e2e_bench --features "gpu biped_
 BIPED_CAPTURE=1 BIPED_CUDA=1 cargo run --release --example iter_e2e_bench --features "gpu biped_gpu cuda_backend" -- <num_envs> 32 5 16
 ```
 
-## End-to-end training (GPU PPO)
+## End-to-end training (GPU PPO) — **default trainer**
 
 The iteration benchmark above times *one* step end-to-end (rollout + update) for
-**throughput**. `examples/biped/biped_train_gpu.rs` runs the **full training
-loop** to a learned policy with the same GPU-resident machinery — rollout forward
-(`GpuPolicy`) **and** the PPO update (`GpuMlp` forward/backward/Adam + vortx `Ppo`
-actor/value grads) on the GPU, with weights + Adam moments **persisted across
-iterations** (the benchmark discards them; the trainer also advances Adam
-bias-correction with a global step) and a velocity curriculum. Net +
-hyperparameters mirror WBC-AGILE's T1 velocity policy (actor
-`[obs,256,256,128,12]`, critic `[cobs,512,256,128,1]`, `init_noise_std=1.0`,
-entropy 0.005, clip 0.2).
+**throughput**. `examples/biped/biped_train_gpu.rs` is the **default end-to-end
+trainer**: it runs the **full training loop** to a learned policy with the same
+GPU-resident machinery — rollout forward (`GpuPolicy`) **and** the PPO update
+(`GpuMlp` forward/backward/Adam + vortx `Ppo` actor/value grads) on the GPU, with
+weights + Adam moments **persisted across iterations** (the benchmark discards
+them; the trainer also advances Adam bias-correction with a global step). It also
+carries the full feature set — stand-before-walk + torque curricula,
+time-limit bootstrapping, adaptive-KL LR, log_std re-flooring, L/R mirror
+augmentation, and per-component reward logging. Net + hyperparameters mirror
+WBC-AGILE's T1 velocity policy (actor `[obs,256,256,128,12]`, critic
+`[cobs,512,256,128,1]`, `init_noise_std=1.0`, entropy 0.01, clip 0.2).
 
 ```sh
-BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
+# Default: native CUDA + CUDA-graph capture of the rollout (the fast path).
+BIPED_CUDA=1 BIPED_GRAPH=1 cargo run --release --example biped_train_gpu \
     --features "gpu biped_gpu cuda_backend" -- <iters> <num_envs> <ckpt.safetensors>
 ```
 
-Logs `iter / curr / step_rew / falls / torso_z / sec` per 10 iters and
-checkpoints to safetensors (auto-resumes). **~9 s/iter @ N=2048** — ≈5× the
-CPU-policy reference trainer `biped_train_nexus` (which runs the policy + PPO on
-the CPU). This is the *training* counterpart to the throughput benchmark, and the
-basis for a WBC-AGILE training A/B (matched config, matched iteration count).
+Logs `iter / curr / step_rew / falls / torso_z / lr / kl / sec` per 10 iters
+(plus a `[prof]` per-phase split and a `[rb]` per-component reward line) and
+checkpoints to safetensors (auto-resumes). **~1.1 s/iter @ N=2048** with the
+CUDA graph — ≈8–10× the legacy CPU-policy trainer `biped_train_nexus` (policy +
+PPO on the CPU), which is kept only as a reference/fallback. This is the
+*training* counterpart to the throughput benchmark, and the basis for a WBC-AGILE
+training A/B (matched config, matched iteration count).
 
 ## Benchmark — full CPU vs full GPU rollout
 

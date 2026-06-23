@@ -338,6 +338,10 @@ pub struct BipedEnv {
     resample_at: u32,
     last_action: [f32; NUM_JOINTS],
     prev_action: [f32; NUM_JOINTS],
+    /// Action from 2 steps ago. The nexus env (validated by sim2sim_xval) feeds
+    /// `last_action = action[t-2]` (lag-2, zero for the first 2 post-reset steps);
+    /// fed to the obs under the explicit-PD/transfer path to match the policy.
+    prev2_action: [f32; NUM_JOINTS],
     /// Seconds each foot has been airborne (tracked across steps for air-time reward).
     air_time: [f32; NUM_FEET],
     /// Each foot's sole-normal in its own link frame, captured at the flat spawn
@@ -357,6 +361,16 @@ pub struct BipedEnv {
     push_at: u32,
     gravity: Vec3,
     ip: IntegrationParameters,
+    /// Gait-clock phase ∈ [0,1), advanced control_dt/gait_period per step, reset
+    /// to 0 on episode reset, fed to the policy as (sin,cos) at obs[43,44]. The
+    /// nexus env the policy trains on has this clock; without it the CPU env was
+    /// feeding a frozen phase=0 and the policy's gait timing broke.
+    gait_phase: f32,
+    gait_period: f32,
+    /// Previous-step joint positions. Under the transfer path the obs joint_vel is
+    /// the finite-diff `(q[t]-q[t-1])/control_dt` the nexus env/policy use — NOT
+    /// the body-angular-velocity projection `read_state` computes by default.
+    prev_joint_pos: [f32; NUM_JOINTS],
 }
 
 /// Domain randomization knobs. Defaults are training-grade (broad enough to break
@@ -458,6 +472,7 @@ impl BipedEnv {
             resample_at: 0,
             last_action: [0.0; NUM_JOINTS],
             prev_action: [0.0; NUM_JOINTS],
+            prev2_action: [0.0; NUM_JOINTS],
             air_time: [0.0; NUM_FEET],
             foot_sole_local,
             randomization: Randomization::default(),
@@ -466,6 +481,12 @@ impl BipedEnv {
             push_at: u32::MAX,
             gravity: Vec3::new(0.0, 0.0, -9.81),
             ip,
+            gait_phase: 0.0,
+            gait_period: std::env::var("BIPED_GAIT_PERIOD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.7),
+            prev_joint_pos: [0.0; NUM_JOINTS],
         };
         env.reset();
         env
@@ -624,13 +645,17 @@ impl BipedEnv {
         self.push_at = self.next_push_step();
         self.last_action = [0.0; NUM_JOINTS];
         self.prev_action = [0.0; NUM_JOINTS];
+        self.prev2_action = [0.0; NUM_JOINTS];
         self.air_time = [0.0; NUM_FEET];
+        self.gait_phase = 0.0;
         // Apply pinned joint offsets (multi-pose rollout) before observing.
         if let Some(offsets) = self.pinned_joint_offsets {
             self.perturb_initial_joints(&offsets);
         }
         let mut state = self.read_state();
         state.feet = self.update_feet();
+        state.phase = self.gait_phase;
+        self.prev_joint_pos = state.joint_pos;
         let mut obs = vec![0.0; OBS_DIM];
         self.task.observe(&state, &self.cmd, &mut obs);
         let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
@@ -650,9 +675,16 @@ impl BipedEnv {
         }
         // Apply PD position targets.
         let targets = self.task.joint_targets(&noisy_action);
+        // Actuator model. BIPED_EXPLICIT_PD=1 applies force-based PD as an EXPLICIT
+        // joint torque each substep (the nexus fix), bypassing rapier's soft
+        // constraint motor — which under-realizes kp on the low-inertia leg joints
+        // and lets the robot buckle. Default = the (soft) constraint motor, so CPU
+        // training is unchanged.
+        let explicit_pd = std::env::var("BIPED_EXPLICIT_PD").is_ok();
         for k in 0..NUM_JOINTS {
             let jr = &self.world.joints[k];
-            let (kp, kd) = (jr.kp, jr.kd);
+            // With explicit PD, zero the constraint motor so it doesn't double-act.
+            let (kp, kd) = if explicit_pd { (0.0, 0.0) } else { (jr.kp, jr.kd) };
             if let Some((mb, link_id)) = self.world.multibody.get_mut(jr.handle) {
                 if let Some(link) = mb.link_mut(link_id) {
                     link.joint
@@ -669,6 +701,31 @@ impl BipedEnv {
         }
         // Advance physics at the control decimation.
         for _ in 0..self.task.decimation {
+            // Explicit force-based PD: recompute τ = clamp(kp·(target−q) − kd·q̇,
+            // ±effort) from the CURRENT joint state each substep and apply it as an
+            // internal torque (+τ on child, −τ on parent) about the world joint
+            // axis. Mirrors nexus's gen-force PD; realizes kp exactly (no soft-motor
+            // sag) so the rapier multibody can actually stand the policy.
+            if explicit_pd {
+                for k in 0..NUM_JOINTS {
+                    let (parent, child, kp, kd, effort, rest) = {
+                        let jr = &self.world.joints[k];
+                        (jr.parent, jr.child, jr.kp, jr.kd, jr.effort, jr.rest_quat)
+                    };
+                    let rp = *self.world.bodies[parent].rotation();
+                    let rc = *self.world.bodies[child].rotation();
+                    let qrel = rest.conjugate() * (rp.conjugate() * rc);
+                    let q = 2.0 * qrel.z.atan2(qrel.w);
+                    let wp = self.world.bodies[parent].angvel();
+                    let wc = self.world.bodies[child].angvel();
+                    let axis = rc * Vec3::Z;
+                    let qd = (wc - wp).dot(axis);
+                    let tau = (kp * (targets[k] - q) - kd * qd).clamp(-effort, effort);
+                    let tvec = axis * tau;
+                    self.world.bodies[child].add_torque(tvec, true);
+                    self.world.bodies[parent].add_torque(-tvec, true);
+                }
+            }
             self.world.pipeline.step(
                 self.gravity,
                 &self.ip,
@@ -684,6 +741,7 @@ impl BipedEnv {
                 &(),
             );
         }
+        self.prev2_action = self.prev_action;
         self.prev_action = self.last_action;
         self.last_action = *action;
         self.step_count += 1;
@@ -708,10 +766,29 @@ impl BipedEnv {
             // One-shot termination penalty (per `task.weights.termination`).
             reward += self.task.weights.termination;
         }
+        state.phase = self.gait_phase;
+        // Match the nexus env's obs conventions for transfer: lag-2 last_action and
+        // finite-diff joint_vel (q[t]-q[t-1])/dt, both zeroed during the 2-step
+        // post-reset warmup.
+        if explicit_pd {
+            state.last_action = self.prev2_action;
+            if self.step_count <= 2 {
+                state.joint_vel = [0.0; NUM_JOINTS];
+            } else {
+                let cdt = self.task.control_dt();
+                for k in 0..NUM_JOINTS {
+                    state.joint_vel[k] = (state.joint_pos[k] - self.prev_joint_pos[k]) / cdt;
+                }
+            }
+            self.prev_joint_pos = state.joint_pos;
+        }
         let mut obs = vec![0.0; OBS_DIM];
         self.task.observe(&state, &self.cmd, &mut obs);
         let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
         self.task.observe_critic(&state, &self.cmd, &mut critic_obs);
+        // Advance the gait clock AFTER building this step's obs (matches the nexus
+        // env order: observe with current phase, then advance; reset → 0).
+        self.gait_phase = (self.gait_phase + self.task.control_dt() / self.gait_period).fract();
         StepOut {
             obs,
             critic_obs,
@@ -912,6 +989,9 @@ impl BipedEnv {
                 tilt,
                 yaw_rel_base,
                 pos_xy: [pos.x, pos.y],
+                // CPU env (not the GPU training path) doesn't track gait
+                // alternation; alt_step stays false → no air_time reward here.
+                alt_step: false,
             };
         }
         out
@@ -928,6 +1008,7 @@ impl BipedEnv {
             lin_vel_world: [lv.x, lv.y, lv.z],
             ang_vel_world: [av.x, av.y, av.z],
             height: t.z,
+            pos_xy: [t.x, t.y],
         };
         let mut joint_pos = [0.0f32; NUM_JOINTS];
         let mut joint_vel = [0.0f32; NUM_JOINTS];
@@ -951,6 +1032,7 @@ impl BipedEnv {
             last_action: self.last_action,
             prev_action: self.prev_action,
             feet: [FootObs::default(); NUM_FEET], // overwritten by the caller
+            phase: 0.0, // CPU env doesn't use the gait clock
         }
     }
 }

@@ -39,8 +39,10 @@ pub const LAT: usize = 1;
 pub const UP: usize = 2;
 
 /// Observation vector length (policy group): `last_action(12) + command(4) +
-/// joint_pos_rel(12) + joint_vel(12) + projected_gravity(3)`.
-pub const OBS_DIM: usize = NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3;
+/// joint_pos_rel(12) + joint_vel(12) + projected_gravity(3) + gait_phase(2)`.
+/// The trailing 2 are (sin 2πφ, cos 2πφ) of the gait clock so the policy can
+/// time its steps to the periodic gait reward.
+pub const OBS_DIM: usize = NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2;
 /// Action vector length: one position target per leg DOF.
 pub const ACTION_DIM: usize = NUM_JOINTS;
 /// Privileged (critic) observation length: policy obs plus base linear & angular
@@ -58,6 +60,12 @@ pub struct BaseState {
     pub ang_vel_world: [f32; 3],
     /// World height of the base, m (for height-based termination/reward).
     pub height: f32,
+    /// World horizontal position of the base (torso), m. Used by the CoM-centering
+    /// reward to keep the center of mass over the support foot — balancing on one
+    /// foot with the CoM centered needs ~0 ankle torque, so this lets a fragile
+    /// (15 N·m) ankle sustain single-support instead of saturating fighting an
+    /// off-center CoM.
+    pub pos_xy: [f32; 2],
 }
 
 impl Default for BaseState {
@@ -67,6 +75,7 @@ impl Default for BaseState {
             lin_vel_world: [0.0; 3],
             ang_vel_world: [0.0; 3],
             height: 0.5,
+            pos_xy: [0.0, 0.0],
         }
     }
 }
@@ -102,6 +111,13 @@ pub struct FootObs {
     /// the two feet's positions, transformed into the base frame, to compute the
     /// lateral stance width.
     pub pos_xy: [f32; 2],
+    /// Touchdown this step that ALTERNATED feet — `first_contact` AND the *other*
+    /// foot was the most recent to touch down (set by the env, which tracks the
+    /// last-touchdown foot per env). The swing/air-time reward keys off this so a
+    /// step only pays when feet alternate (L→R→L→R): a foot held permanently in
+    /// the air never touches down (no reward), and double-tapping the same foot
+    /// (hopping) earns nothing on the repeat. Forces a real alternating gait.
+    pub alt_step: bool,
 }
 
 impl Default for FootObs {
@@ -116,6 +132,7 @@ impl Default for FootObs {
             tilt: 0.0,
             yaw_rel_base: 0.0,
             pos_xy: [0.0, 0.0],
+            alt_step: false,
         }
     }
 }
@@ -134,6 +151,14 @@ pub struct RobotState {
     pub prev_action: [f32; NUM_JOINTS],
     /// Per-foot contact state (left, right).
     pub feet: [FootObs; NUM_FEET],
+    /// Gait-clock phase ∈ [0,1), advanced by the env each control step. Drives
+    /// the periodic gait reward (foot 0 should swing near phase 0, foot 1 near
+    /// phase 0.5) and is fed to the policy as (sin 2πφ, cos 2πφ) so it can lock
+    /// its leg motion to the clock. The phase-clock reward provides a DENSE
+    /// per-step gradient toward an alternating swing/stance pattern — which the
+    /// sparse touchdown bonus (air_time) could not, since a step's payoff never
+    /// beat the fall risk (the shuffle stayed a stable local optimum).
+    pub phase: f32,
 }
 
 impl Default for RobotState {
@@ -145,6 +170,7 @@ impl Default for RobotState {
             last_action: [0.0; NUM_JOINTS],
             prev_action: [0.0; NUM_JOINTS],
             feet: [FootObs::default(); NUM_FEET],
+            phase: 0.0,
         }
     }
 }
@@ -250,6 +276,10 @@ impl CommandSampler {
 pub struct RewardWeights {
     /// Linear-velocity tracking (exp kernel), `std` below.
     pub track_lin_vel: f32,
+    /// Linear forward-progress reward: `w · clamp(v·ĉmd, 0, |cmd|)`. A non-saturating
+    /// gradient toward the commanded direction (breaks the march-in-place dead zone
+    /// where the exp tracking kernel is flat). Folded into the `track_lin_vel` term.
+    pub forward_progress: f32,
     /// Angular (yaw) velocity tracking (exp kernel).
     pub track_ang_vel: f32,
     /// Upright / flat-orientation (exp kernel on tilt).
@@ -308,6 +338,21 @@ pub struct RewardWeights {
     pub feet_distance: f32,
     /// Reference lateral foot separation, m (for `feet_distance`).
     pub feet_distance_ref: f32,
+    /// Periodic gait-clock reward (dense). Each step, each foot earns up to this
+    /// weight for matching its prescribed phase: airborne during its swing window,
+    /// in contact during its stance window. Provides the dense gradient toward an
+    /// alternating gait that the sparse touchdown bonus could not.
+    pub gait_clock: f32,
+    /// Fraction of each foot's gait cycle spent in swing (rest is stance). With
+    /// the feet offset by half a cycle, `1 - 2·swing_ratio` of the cycle is
+    /// double-support — the built-in "both feet down in the middle".
+    pub gait_swing_ratio: f32,
+    /// CoM-centering reward: keeps the base (CoM proxy) horizontally over the
+    /// support point (centroid of contacting feet). With the CoM over the stance
+    /// foot, the gravitational moment about the ankle ≈ 0, so single-support needs
+    /// almost no ankle torque — letting the fragile 15 N·m ankle hold one-foot
+    /// balance instead of saturating. This is what lets a real step survive.
+    pub com_centering: f32,
 }
 
 impl Default for RewardWeights {
@@ -338,11 +383,15 @@ impl Default for RewardWeights {
             // because the robot MUST track velocity, and it may settle on two feet
             // between steps (double-support no longer penalized).
             track_lin_vel: 10.0,        // was 5.0 — make following velocity the point
+            forward_progress: 8.0,      // linear forward-velocity gradient (breaks march-in-place)
             track_ang_vel: 8.0,         // was 5.0
             // Stay-up lowered so it can't out-earn tracking (it used to: upright+
             // height ≈0.13/step > tracking ≈0.07 → the policy preferred to STAND).
             upright: 3.0,               // was 5.0
-            base_height: 1.0,           // was 2.0
+            base_height: 2.0,           // restored to WBC value (was 1.0): at 1.0 the
+                                        // pure-stand phase let the torso slowly crouch
+                                        // 0.72→0.64 (lower CoM = more stable static stance).
+                                        // 2.0 keeps it tall in BOTH stand and walk.
             base_height_target: 0.72,   // WBC DEFAULT_TRUNK_HEIGHT (was 0.62 — crouch bug)
             pose: -8.0, // hip yaw/roll deviation penalty (anti-limit-ride)
             bilateral_symmetry: 2.0, // reward L/R-mirrored gait (natural, fixes lopsidedness)
@@ -368,21 +417,39 @@ impl Default for RewardWeights {
             // sliding is blocked (foot_slip) and settling on two feet is allowed
             // (double-support unpenalized). Keep only: no-hop (flight), no-slide
             // (foot_slip), lift the swing foot cleanly (foot_clearance).
-            air_time: 0.0,              // was 1.5 — let stepping emerge, don't force cadence
+            air_time: 1.0,              // RE-ENABLED (was 0): pure emergence + a static
+                                        // foot-lift reward got HACKED into a one-foot statue
+                                        // (one foot held up 100% → farms clearance, never
+                                        // steps; 0 transfer, MuJoCo fell in 0.66s). air_time
+                                        // pays the completed-swing duration ONLY at touchdown,
+                                        // so a permanently-raised foot earns nothing → forces
+                                        // real alternating step cycles. Progress+command gated.
             flight: -1.0,               // keep: no hopping (both feet airborne)
-            single_support: 0.0,        // was 1.0 — allow 2-foot stabilize; don't force single-support
-            foot_slip: -3.0,            // CRANKED (was -0.5): -0.5 left a sub-threshold
-                                        // slide-shuffle (feet at ~0.045 < contact 0.05,
-                                        // skating forward). Strong slip makes sliding a
-                                        // planted foot genuinely costly, so to track
-                                        // velocity it must LIFT the foot clear of contact
-                                        // → real swings; foot_clearance then shapes height.
-            foot_clearance: -1.0,       // keep: lift the swing foot to target height
-            foot_clearance_target: 0.06, // was 0.08 (above the foot's actual ~0.068 peak → high-stepping)
+            single_support: 0.5,        // REPURPOSED → double-support SETTLE bonus (both feet
+                                        // planted while moving). Modest, so it shapes a
+                                        // "swing → settle → swing" cycle without farmable waddle.
+            foot_slip: -1.0,            // dialed back from -3.0: -3.0 suppressed motion
+                                        // (slip penalty satisfied by NOT moving → backward
+                                        // drift) rather than inducing lift. The positive
+                                        // foot_clearance reward below now supplies the
+                                        // "pick your feet up" incentive directly.
+            foot_clearance: 0.0,        // DROPPED. A static foot-height reward is farmable —
+                                        // it got hacked into a one-foot statue (foot held up
+                                        // 100% to farm clearance; 0 transfer, MuJoCo fell in
+                                        // 0.66s). Step height now comes for free once steps are
+                                        // real (alternation-gated air_time below).
+            foot_clearance_target: 0.03, // (unused at weight 0; kept for the gated compute)
             foot_orientation: -0.01,    // WBC feet_roll_l2 -0.01 (was -0.5)
             feet_yaw_mean: -0.4,        // WBC feet_yaw_mean_vs_base -0.4 (was -2.0)
             feet_distance: -0.02,       // WBC feet_distance_from_ref -0.02 (was -0.1)
             feet_distance_ref: 0.2,
+            gait_clock: 3.0,            // dense periodic gait reward (the load-bearing
+                                        // stepping signal). Symmetric ±: standing during a
+                                        // swing window is penalized, so lifting on schedule
+                                        // is clearly worth more than staying planted.
+            gait_swing_ratio: 0.4,      // 40% swing per foot → 20% double-support overlap
+            com_centering: 2.0,         // keep CoM over the support foot → ~0 ankle torque
+                                        // in single-support (fragile 15 N·m ankle can hold it)
         }
     }
 }
@@ -469,6 +536,11 @@ pub struct RewardBreakdown {
     pub feet_yaw_mean: f32,
     /// Lateral foot-distance penalty contribution.
     pub feet_distance: f32,
+    /// Periodic gait-clock contribution (dense reward for matching each foot's
+    /// swing/stance to the gait phase).
+    pub gait_clock: f32,
+    /// CoM-centering contribution (CoM over the support point → low ankle torque).
+    pub com_centering: f32,
 }
 
 impl RewardBreakdown {
@@ -495,6 +567,8 @@ impl RewardBreakdown {
             + self.foot_orientation
             + self.feet_yaw_mean
             + self.feet_distance
+            + self.gait_clock
+            + self.com_centering
     }
 }
 
@@ -672,6 +746,10 @@ impl VelocityFlatTask {
         for g in self.projected_gravity(&state.base) {
             put(obs, &mut o, g);
         }
+        // Gait clock as (sin, cos) so it's continuous across the 1→0 wrap.
+        let ph = state.phase * std::f32::consts::TAU;
+        put(obs, &mut o, ph.sin());
+        put(obs, &mut o, ph.cos());
         debug_assert_eq!(o, OBS_DIM);
     }
 
@@ -693,10 +771,25 @@ impl VelocityFlatTask {
         let w = self.base_ang_vel_body(&state.base);
         let grav = self.projected_gravity(&state.base);
 
-        // Tracking (exp kernels).
+        // Tracking (exp kernels) + a LINEAR forward-progress term. The exp kernel
+        // saturates to ~0 (and flat) when the robot is far below the commanded
+        // speed, so a march-in-place policy sits in a dead zone with no gradient
+        // pulling it forward (measured: track_lin_vel stuck ~0.014 for thousands
+        // of iters while vx≈0.03). The linear term `w · clamp(v·ĉmd, 0, |cmd|)`
+        // rewards forward velocity PROPORTIONALLY — a gradient at any speed, zero
+        // for standing/backward — so any forward motion is rewarded and it can
+        // climb out of the in-place optimum.
         let lin_err = (cmd.vx - v[FWD]).powi(2) + (cmd.vy - v[LAT]).powi(2);
-        let track_lin_vel =
-            self.weights.track_lin_vel * (-lin_err / self.stds.lin_vel.powi(2)).exp() * dt;
+        let cmd_speed = (cmd.vx * cmd.vx + cmd.vy * cmd.vy).sqrt();
+        let v_along = if cmd_speed > 1e-6 {
+            (v[FWD] * cmd.vx + v[LAT] * cmd.vy) / cmd_speed
+        } else {
+            0.0
+        };
+        let track_lin_vel = self.weights.track_lin_vel
+            * (-lin_err / self.stds.lin_vel.powi(2)).exp()
+            * dt
+            + self.weights.forward_progress * v_along.clamp(0.0, cmd_speed) * dt;
 
         let ang_err = (cmd.yaw_rate - w[UP]).powi(2);
         let track_ang_vel =
@@ -782,9 +875,13 @@ impl VelocityFlatTask {
         // any reasonable step is encouraged — only when commanded to move. (The old
         // `air_time − 0.5` form was negative for sub-0.5 s steps, i.e. it *punished*
         // this small robot's normal-cadence stepping.)
+        // Pay the completed swing duration ONLY at an ALTERNATING touchdown
+        // (f.alt_step). This is the unfarmable core of the gait: a foot held up
+        // forever never lands (no reward); hopping on one foot earns nothing on
+        // the repeat; only L→R→L→R stepping pays. Capped at 0.4 s/step.
         let mut air = 0.0;
         for f in &state.feet {
-            if f.first_contact {
+            if f.alt_step {
                 air += f.air_time.min(0.4);
             }
         }
@@ -801,28 +898,38 @@ impl VelocityFlatTask {
             0.0
         };
 
-        // Single-support shaping (while moving): exactly one foot down is the
-        // walking phase. A BONUS for single-support alone wasn't enough — the
-        // policy just forgoes it and waddles in permanent double-support (both
-        // feet planted, shuffling). So while moving we now also PENALIZE
-        // double-support by the same magnitude: staying on both feet is actively
-        // costly, which forces the policy to pick a foot up and step. Flight
-        // (zero contacts) is left to the `flight` term.
+        // Gait-phase shaping (while moving). A *bonus* for stepping (air_time) gives
+        // no exploration pressure — you only collect it AFTER you already step — so
+        // from a shuffle the policy never discovers the first step. And a settle
+        // BONUS for double-support actively rewarded the shuffle (measured: v40 sat
+        // in permanent double-support, air_time stuck at 0). The pressure must come
+        // from making NOT-stepping costly. So this term PENALIZES both degenerate
+        // modes and leaves only alternating stepping unpunished:
+        //   contacts==2 (permanent double-support = slide-shuffle) → penalty,
+        //   contacts==1 but the airborne foot is HELD (air_time > MAX_SWING, i.e. a
+        //     one-foot statue — the other hack) → penalty,
+        //   contacts==1 with an ACTIVE swing (air_time ≤ MAX_SWING) → 0 (allowed),
+        //   contacts==0 (flight) → 0, handled by `flight`.
+        // A brief double-support SETTLE between steps costs little (a few steps of
+        // small penalty); only PERMANENT double- or single-support is expensive.
+        // The reward for doing it right is the alternation-gated air_time above.
         let contacts = state.feet.iter().filter(|f| f.contact).count();
         let single_support = if moving {
             match contacts {
-                // Reward single-support ONLY when making forward progress (gated)
-                // so it can't be farmed by stepping in place. Double-support is NO
-                // LONGER penalized while moving — that penalty forced continuous
-                // tiny stepping (never settling). Allowing double-support lets the
-                // gait be deliberate: step (single-support, earns the gated bonus)
-                // → SETTLE on both feet → step again. Forward progress still
-                // REQUIRES stepping because sliding a planted foot is penalized
-                // (foot_slip) and energy penalizes excess motion, so it can't just
-                // waddle. This quasi-static step-stabilize-step gait is also far
-                // more transfer-robust (no reliance on dynamic contact timing).
-                1 => self.weights.single_support * dt * progress,
-                2 => 0.0,
+                2 => -self.weights.single_support * dt, // permanent double-support = shuffle
+                1 => {
+                    // One foot up: fine if it's an active swing, penalized if it's a
+                    // held statue (foot airborne longer than a normal swing).
+                    let held = state
+                        .feet
+                        .iter()
+                        .any(|f| !f.contact && f.air_time > MAX_SWING_S);
+                    if held {
+                        -self.weights.single_support * dt
+                    } else {
+                        0.0
+                    }
+                }
                 _ => 0.0, // flight: see `flight`
             }
         } else {
@@ -847,15 +954,29 @@ impl VelocityFlatTask {
         }
         let foot_slip = self.weights.foot_slip * slip * dt;
 
-        // Clearance: penalize swing-foot height deviation from the target, scaled by
-        // foot speed (encourages lifting the foot while swinging it forward).
-        let mut clr = 0.0;
+        // Clearance: POSITIVE, capped reward for lifting an ACTIVE SWING foot above
+        // its resting height, saturating at foot_clearance_target. Gated three ways
+        // so it can't be farmed by holding one foot in the air (which is exactly how
+        // the ungated version got hacked into a one-foot statue — 0 transfer):
+        //   (1) f.contact == false   — only a lifted foot,
+        //   (2) f.air_time < 0.45 s   — only an ACTIVE swing, not a held statue: a
+        //       foot raised longer than a normal swing stops earning, so to keep
+        //       collecting it must touch down (resetting air_time) and re-swing,
+        //   (3) moving                — never at zero command (no stamping in place).
+        const FOOT_REST_H: f32 = 0.035;
+        const MAX_SWING_S: f32 = 0.45;
+        let mut foot_h = 0.0;
         for f in &state.feet {
-            if !f.contact {
-                clr += (f.height - self.weights.foot_clearance_target).powi(2) * f.planar_speed;
+            if !f.contact && f.air_time < MAX_SWING_S {
+                let lift = (f.height - FOOT_REST_H).max(0.0) / self.weights.foot_clearance_target;
+                foot_h += lift.min(1.0);
             }
         }
-        let foot_clearance = self.weights.foot_clearance * clr * dt;
+        let foot_clearance = if moving {
+            self.weights.foot_clearance * foot_h * dt
+        } else {
+            0.0
+        };
 
         // Flat foot: penalize the squared sole tilt of any foot in contact, so the
         // robot plants its whole sole rather than balancing on a toe/heel/edge.
@@ -897,6 +1018,67 @@ impl VelocityFlatTask {
             0.0
         };
 
+        // Periodic gait clock (DENSE). Foot 0's cycle starts at `phase`, foot 1 is
+        // offset half a cycle, so they alternate. Within a foot's cycle, the first
+        // `gait_swing_ratio` is the SWING window (the foot should be airborne), the
+        // rest is STANCE (it should be in contact). Each step, each foot earns the
+        // weight if its actual contact matches its prescribed phase. This pays
+        // every step (not just at touchdown), so the gradient pulls the foot up at
+        // the right time even before a full step succeeds — the dense signal the
+        // sparse air_time bonus lacked. Only while moving (no forced gait at stand).
+        // Siekmann-style: each foot scores +1 when its contact MATCHES its phase
+        // (airborne in swing / grounded in stance) and −1 when it MISMATCHES. The
+        // −1 for contact-during-swing is the crucial part (my first version gave 0
+        // there): it makes keeping a foot down during its swing window actively
+        // COSTLY, so standing no longer farms the stance windows for free — the
+        // only way to stop bleeding reward is to actually lift on schedule. The
+        // −1 for airborne-during-stance also penalizes a held-up statue foot.
+        let gait_clock = if moving {
+            let sr = self.weights.gait_swing_ratio;
+            let mut gc = 0.0;
+            for (k, f) in state.feet.iter().enumerate() {
+                let ph = (state.phase + 0.5 * k as f32).fract();
+                let want_swing = ph < sr;
+                let matched = if want_swing { !f.contact } else { f.contact };
+                gc += if matched { 1.0 } else { -1.0 };
+            }
+            // PROGRESS-GATE the gait reward: on-schedule stepping only pays when the
+            // steps actually carry the body toward the command. Without this the
+            // policy farms gait_clock by marching IN PLACE (measured: v47 stepped
+            // cleanly — 5 cm lifts, 8–9 touchdowns — but vx≈0.03 m/s). The gate
+            // makes forward steps the only way to earn it (progress = (v·cmd)/|cmd|²).
+            // The double-support penalty (single_support, ungated) still backstops
+            // against simply standing, so it must step — now forward.
+            self.weights.gait_clock * gc * dt * progress
+        } else {
+            0.0
+        };
+
+        // CoM centering: keep the base (CoM proxy) over the support point — the
+        // centroid of whatever feet are in contact. Offset → 0 means the CoM is
+        // over the base of support, so the ankle needs ~no torque to hold balance
+        // (crucial in single-support, where an off-center CoM saturated the 15 N·m
+        // ankle). exp kernel, active whenever at least one foot is down.
+        const COM_STD: f32 = 0.12;
+        let mut sx = 0.0;
+        let mut sy = 0.0;
+        let mut nc = 0u32;
+        for f in &state.feet {
+            if f.contact {
+                sx += f.pos_xy[0];
+                sy += f.pos_xy[1];
+                nc += 1;
+            }
+        }
+        let com_centering = if nc > 0 {
+            let dx = state.base.pos_xy[0] - sx / nc as f32;
+            let dy = state.base.pos_xy[1] - sy / nc as f32;
+            let d2 = dx * dx + dy * dy;
+            self.weights.com_centering * (-d2 / (COM_STD * COM_STD)).exp() * dt
+        } else {
+            0.0
+        };
+
         RewardBreakdown {
             track_lin_vel,
             track_ang_vel,
@@ -918,6 +1100,8 @@ impl VelocityFlatTask {
             foot_orientation,
             feet_yaw_mean,
             feet_distance,
+            gait_clock,
+            com_centering,
         }
     }
 
@@ -966,18 +1150,19 @@ mod tests {
 
     #[test]
     fn obs_dim_consistent() {
-        assert_eq!(OBS_DIM, 43);
+        assert_eq!(OBS_DIM, 45);
         assert_eq!(ACTION_DIM, 12);
         let task = VelocityFlatTask::new();
         let mut obs = vec![0.0; OBS_DIM];
         task.observe(&upright_state(), &VelocityCommand::default(), &mut obs);
-        // Upright, neutral pose, zero command → projected gravity ≈ (0,0,-1)
-        // (Z-up), everything else zero.
-        assert!(obs.iter().take(OBS_DIM - 3).all(|&x| x == 0.0));
-        assert!(
-            (obs[OBS_DIM - 1] - (-1.0)).abs() < 1e-6,
-            "up component of gravity"
-        );
+        // Layout: last_action[0..12], command[12..16], joint_pos_rel[16..28],
+        // joint_vel[28..40], projected_gravity[40..43], gait_phase(sin,cos)[43..45].
+        // Upright, neutral pose, zero command, phase 0 → everything zero except
+        // gravity up = -1 and cos(0) = 1.
+        assert!(obs.iter().take(40).all(|&x| x == 0.0));
+        assert!((obs[42] - (-1.0)).abs() < 1e-6, "up component of gravity");
+        assert!(obs[43].abs() < 1e-6, "sin(phase 0) = 0");
+        assert!((obs[44] - 1.0).abs() < 1e-6, "cos(phase 0) = 1");
     }
 
     #[test]
@@ -991,9 +1176,11 @@ mod tests {
     fn joint_targets_offset_by_scale() {
         let task = VelocityFlatTask::new();
         let mut a = [0.0; NUM_JOINTS];
-        a[0] = 1.0; // anklex_left, scale 0.55
+        a[0] = 1.0; // anklex_left, scale 0.55, pos_limit ±0.175
         let t = task.joint_targets(&a);
-        assert!((t[0] - 0.55).abs() < 1e-6);
+        // 0 + 0.55·1 = 0.55, CLAMPED to the joint limit 0.175 (joint_targets caps
+        // PD targets at pos_limit to stop limit-riding — see joint_targets()).
+        assert!((t[0] - 0.175).abs() < 1e-6);
         assert_eq!(t[1], 0.0);
     }
 
@@ -1027,8 +1214,9 @@ mod tests {
             vy: 0.0,
             yaw_rate: 0.0,
         };
-        // The WBC port disables air_time (weight=0), so a touchdown produces zero
-        // air-time reward regardless of swing duration.
+        // air_time pays ONLY on an alternating touchdown (alt_step). A plain
+        // first_contact that did NOT alternate feet earns zero — this is what
+        // blocks the one-foot-statue / same-foot-hop hacks.
         let mut s = RobotState::default();
         s.feet[0] = FootObs {
             contact: true,
@@ -1039,8 +1227,15 @@ mod tests {
             tilt: 0.0,
             yaw_rel_base: 0.0,
             pos_xy: [0.0, 0.0],
+            alt_step: false,
         };
         assert_eq!(task.reward(&s, &cmd).air_time, 0.0);
+        // Same swing, but now it ALTERNATED while the base actually tracks the
+        // forward command (progress > 0) → positive air-time reward.
+        let mut s_alt = s;
+        s_alt.feet[0].alt_step = true;
+        s_alt.base.lin_vel_world = [0.5, 0.0, 0.0];
+        assert!(task.reward(&s_alt, &cmd).air_time > 0.0);
         // A foot sliding while in contact → negative slip penalty.
         let mut s2 = RobotState::default();
         s2.feet[0].planar_speed = 1.0;

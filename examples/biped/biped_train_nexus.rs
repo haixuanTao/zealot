@@ -1,5 +1,13 @@
 //! Train flat velocity tracking on the LeRobot bipedal — **nexus GPU physics**.
 //!
+//! LEGACY / REFERENCE TRAINER. The **default** end-to-end trainer is
+//! `biped_train_gpu.rs`, which runs both the rollout policy forward AND the PPO
+//! update on the GPU (~8–10× faster) and carries the full feature set
+//! (stand/torque curricula, time-limit bootstrapping, adaptive-KL LR, log_std
+//! re-flooring, mirror augmentation, per-component reward logging). This file
+//! keeps the policy + PPO on the CPU and is retained only as a simple reference
+//! / fallback; prefer `biped_train_gpu` for real runs.
+//!
 //! Mirror of `biped_train.rs` but uses `BipedNexusBatchEnv` (one batched
 //! `GpuPhysicsState` holding N envs) instead of `Vec<BipedEnv>` over rapier CPU.
 //! Same MDP (`zealot-env`), same PPO (`zealot-rl`), same obs/action layout — so
@@ -22,6 +30,59 @@ fn to_action(v: &[f32]) -> [f32; NUM_JOINTS] {
     let mut a = [0.0; NUM_JOINTS];
     a.copy_from_slice(&v[..NUM_JOINTS]);
     a
+}
+
+// --- Left/right mirror augmentation (forces a SYMMETRIC policy → straight,
+// non-veering gait; the instantaneous bilateral_symmetry reward can't, since a
+// walking gait is half-a-cycle out of phase). The mirror is an isometry of the
+// action space (joint L/R swap + sign flips), so logp_old/adv are preserved when
+// mean_old is mirrored too — the policy loss is EXACT. JOINT_NAMES order:
+// 0/1 anklex, 2/3 ankley, 4/5 hipx, 6/7 hipy, 8/9 hipz, 10/11 knee. Lateral
+// families (anklex/hipx/hipz) negate; sagittal (ankley/hipy/knee) keep.
+const JMIRROR: [usize; NUM_JOINTS] = [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10];
+const JSIGN: [f32; NUM_JOINTS] = [-1., -1., 1., 1., -1., -1., 1., 1., -1., -1., 1., 1.];
+
+fn jmirror(v: &[f32]) -> Vec<f32> {
+    (0..NUM_JOINTS).map(|i| JSIGN[i] * v[JMIRROR[i]]).collect()
+}
+
+// obs layout (45): last_action[0:12], command[12:16]=(vx,vy,yaw,aux),
+// joint_pos[16:28], joint_vel[28:40], proj_grav[40:43]=(fwd,lat,up),
+// gait_phase[43:45]=(sin,cos).
+fn mirror_obs(o: &[f32]) -> Vec<f32> {
+    let mut m = o.to_vec();
+    m[0..12].copy_from_slice(&jmirror(&o[0..12]));
+    m[13] = -o[13]; // command vy
+    m[14] = -o[14]; // command yaw_rate
+    m[16..28].copy_from_slice(&jmirror(&o[16..28]));
+    m[28..40].copy_from_slice(&jmirror(&o[28..40]));
+    m[41] = -o[41]; // proj_grav lateral
+    m[43] = -o[43]; // gait phase sin → contralateral (half-cycle)
+    m[44] = -o[44]; // gait phase cos
+    m
+}
+
+// critic_obs (51) = obs(45) + base_lin_vel(3)[fwd,lat,up] + base_ang_vel(3)[roll,pitch,yaw].
+fn mirror_critic(c: &[f32]) -> Vec<f32> {
+    let mut m = mirror_obs(&c[0..45]);
+    m.extend_from_slice(&c[45..]);
+    m[46] = -c[46]; // lin_vel lateral (polar vector)
+    m[48] = -c[48]; // ang_vel roll  (axial: negate roll + yaw, keep pitch)
+    m[50] = -c[50]; // ang_vel yaw
+    m
+}
+
+fn mirror_sample(s: &Sample) -> Sample {
+    Sample {
+        obs: mirror_obs(&s.obs),
+        critic_obs: mirror_critic(&s.critic_obs),
+        action: jmirror(&s.action),
+        mean_old: jmirror(&s.mean_old),
+        logp_old: s.logp_old,
+        value_old: s.value_old,
+        adv: s.adv,
+        ret: s.ret,
+    }
 }
 
 fn main() {
@@ -81,6 +142,10 @@ fn main() {
             "iter", "curr", "step_rew", "falls", "torso_z"
         );
 
+        let mirror_aug = std::env::var("BIPED_MIRROR_AUG").is_ok();
+        if mirror_aug {
+            println!("mirror augmentation ENABLED (symmetric policy)");
+        }
         // Curriculum: command-velocity ramps 0 → 1 over the first 40% of iters.
         let warmup = (iters as f32 * 0.4).max(1.0);
         for it in 0..iters {
@@ -164,6 +229,13 @@ fn main() {
                     samples[e][t].ret = ret[t];
                     batch.push(std::mem::take(&mut samples[e][t]));
                 }
+            }
+            // Mirror augmentation: append the L/R-mirrored copy of every sample so
+            // the policy is trained to be symmetric (fixes the lopsided, veering
+            // gait). BIPED_MIRROR_AUG=1 to enable.
+            if mirror_aug {
+                let mirrored: Vec<Sample> = batch.iter().map(mirror_sample).collect();
+                batch.extend(mirrored);
             }
             let tu = Instant::now();
             let _stats = ac.update(&mut batch, &cfg);

@@ -112,12 +112,17 @@ def main():
         cmd = CMD  # command not zeroed mid-run; warmup only zeros action/vel
         qj = np.array([data.qpos[hinge_q[n]] for n in jnames])
         qw_, qx_, qy_, qz_ = data.qpos[free_q + 3:free_q + 7]
-        obs = np.zeros(43)
+        # Gait clock: held at 0 for the fresh step then advances (matches the env's
+        # 1-step lag) — see sim2sim_xval phase3.
+        phase = (max(0, since_reset - 1) * X.CONTROL_DT / X.GAIT_PERIOD) % 1.0
+        obs = np.zeros(45)
         obs[0:12] = last_action
         obs[12:16] = cmd
         obs[16:28] = qj
         obs[28:40] = jvel
         obs[40:43] = X.projected_gravity((qx_, qy_, qz_, qw_))
+        obs[43] = np.sin(2.0 * np.pi * phase)
+        obs[44] = np.cos(2.0 * np.pi * phase)
         action = policy.act(obs)
         act_hist = [act_hist[1], action.copy()]
         target = scale * action  # default_pos = 0
