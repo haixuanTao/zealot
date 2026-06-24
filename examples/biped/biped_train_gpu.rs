@@ -59,7 +59,12 @@ const LAM: f32 = 0.95;
 // Adaptive-KL LR schedule (rsl_rl / WBC-AGILE): lr ÷1.5 when KL > 2·desired,
 // ×1.5 when KL < desired/2, clamped to [LR_MIN, LR_MAX].
 const DESIRED_KL: f32 = 0.01;
-const LR_MIN: f32 = 1e-5;
+// LR floor. Was 1e-5, but on this task KL persistently sits ~0.02–0.04 so the
+// adaptive-KL controller cut lr toward that floor (~1e-4), too low to learn —
+// the policy crept into a crouch-and-fall local optimum. 3e-4 (≈3× below the
+// 1e-3 start) keeps updates large enough to actually learn while the KL target
+// still throttles destructive steps.
+const LR_MIN: f32 = 3e-4;
 const LR_MAX: f32 = 1e-2;
 
 fn mk(b: &GpuBackend, m: &DMatrix<f32>, u: BufferUsages) -> Tensor<f32> {

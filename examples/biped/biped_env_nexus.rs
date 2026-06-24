@@ -24,7 +24,9 @@ use khal::backend::{Backend, Buffer, GpuBackend as KhalGpuBackend, WebGpu};
 use khal::re_exports::wgpu;
 use nexus3d::rbd::dynamics::GpuSimParams;
 use nexus3d::rbd::math::Pose as NexusPose;
-use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
+use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsSnapshot, GpuPhysicsState};
+use nexus3d::rbd::queries::GpuIndexedContact as NexusIndexedContact;
+use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint as NexusMbContact;
 use nexus3d::rbd::shaders::dynamics::MultibodyLinkWorkspace;
 use rapier3d::prelude::*;
 use rayon::prelude::*;
@@ -914,6 +916,10 @@ pub struct BipedNexusBatchEnv {
 
     // Pre-built spawn templates for reset_env_from (different DR samples).
     templates: Vec<GpuPhysicsState>,
+    /// CPU snapshot of each template, read off the GPU once at setup so resets
+    /// are write-only (no per-reset `slow_read_buffer` stalls — the dominant
+    /// reset cost on WebGPU). Parallel to `templates`.
+    template_snapshots: Vec<GpuPhysicsSnapshot>,
     template_dr: Vec<DrParams>,
     /// Cached per-template `foot_sole_local` (constant per template) so reset_env
     /// doesn't rebuild the rapier scene every reset.
@@ -1142,6 +1148,16 @@ impl BipedNexusBatchEnv {
             templates.push(tpl);
         }
 
+        // Snapshot each template off the GPU ONCE so per-env resets are
+        // write-only. reset_env runs thousands of times per iteration (once per
+        // fallen env); the old reset_env_from re-read the constant template from
+        // the GPU 6× per reset, and each slow_read_buffer stalls the WebGPU queue
+        // (tens of seconds/iter on Metal). Reading once here makes resets cheap.
+        let mut template_snapshots: Vec<GpuPhysicsSnapshot> = Vec::with_capacity(num_templates);
+        for tpl in &templates {
+            template_snapshots.push(tpl.snapshot(&gpu).await);
+        }
+
         // Per-env initial sole-normal: every env starts from the corresponding
         // template, so its foot_sole_local matches that template's. Look up the
         // cached per-template value (no rebuild).
@@ -1215,6 +1231,7 @@ impl BipedNexusBatchEnv {
             pipeline,
             state,
             templates,
+            template_snapshots,
             template_dr,
             template_foot_sole,
             template_spawn_obs: Vec::new(),
@@ -2489,8 +2506,7 @@ impl BipedNexusBatchEnv {
         let r = self.rng[env].range(0.0, 1.0);
         let t = ((r * self.templates.len() as f32) as usize).min(self.templates.len() - 1);
         self.state
-            .reset_env_from(&self.gpu, env as u32, &self.templates[t])
-            .await;
+            .reset_env_from_snapshot(&self.gpu, env as u32, &self.template_snapshots[t]);
         // Mirror the template's sole-normal so update_feet's tilt makes sense.
         // Cached per-template (constant) — NO per-reset rapier-scene rebuild.
         self.foot_sole_local[env] = self.template_foot_sole[t];
@@ -2590,10 +2606,9 @@ impl BipedNexusBatchEnv {
     /// a rendering rollout so the recorded trajectory doesn't drift on the
     /// per-env DR sample the env was originally seeded with.
     pub async fn reset_env_to_default_template(&mut self, e: usize) -> (Vec<f32>, Vec<f32>) {
-        assert!(!self.templates.is_empty());
+        assert!(!self.template_snapshots.is_empty());
         self.state
-            .reset_env_from(&self.gpu, e as u32, &self.templates[0])
-            .await;
+            .reset_env_from_snapshot(&self.gpu, e as u32, &self.template_snapshots[0]);
         self.foot_sole_local[e] = self.idx.foot_sole_local;
         self.cmd[e] = VelocityCommand::default();
         self.step_count[e] = 0;
@@ -2714,6 +2729,79 @@ impl BipedNexusBatchEnv {
                 poses[i].translation.z
             })
             .collect()
+    }
+
+    /// DEBUG: read back the narrow-phase contact manifolds (the shared
+    /// collision-detection output consumed by the multibody contact solver).
+    /// Returns `(reported_len[..], manifolds[..capacity])`. Used to diagnose
+    /// foot↔ground contact on WebGpu vs CUDA: contact COUNT (is narrow-phase
+    /// generating foot-ground pairs at all?) and the contact NORMAL direction.
+    pub async fn dbg_contacts(&mut self) -> (Vec<u32>, Vec<NexusIndexedContact>) {
+        let lbuf = self.state.dbg_contacts_len().buffer();
+        let mut len = vec![0u32; lbuf.len()];
+        self.gpu
+            .slow_read_buffer(lbuf, &mut len)
+            .await
+            .expect("contacts_len readback");
+        let cbuf = self.state.dbg_contacts().buffer();
+        let mut v = vec![NexusIndexedContact::default(); cbuf.len()];
+        self.gpu
+            .slow_read_buffer(cbuf, &mut v)
+            .await
+            .expect("contacts readback");
+        (len, v)
+    }
+
+    /// DEBUG: broad-phase pair count (how many collider pairs the LBVH found),
+    /// and the raw pair list. Splits "broad-phase finds nothing" from
+    /// "narrow-phase generates no manifold" when contacts come back empty.
+    pub async fn dbg_collision_pairs(&mut self) -> (Vec<u32>, Vec<[u32; 2]>) {
+        let lbuf = self.state.dbg_collision_pairs_len().buffer();
+        let mut len = vec![0u32; lbuf.len()];
+        self.gpu
+            .slow_read_buffer(lbuf, &mut len)
+            .await
+            .expect("pairs_len readback");
+        let pbuf = self.state.dbg_collision_pairs().buffer();
+        let mut v = vec![[0u32; 2]; pbuf.len()];
+        self.gpu
+            .slow_read_buffer(pbuf, &mut v)
+            .await
+            .expect("pairs readback");
+        (len, v)
+    }
+
+    /// DEBUG: read back the per-multibody contact-constraint bank
+    /// (`inv_lhs` = 1/(J·M⁻¹·Jᵀ), `rhs`, accumulated `impulse`, jacobians) and
+    /// the per-batch active counts. Diagnoses the WebGpu contact-solve blow-up.
+    pub async fn dbg_mb_contacts(&mut self) -> (Vec<u32>, Vec<NexusMbContact>) {
+        let mut cnt =
+            vec![0u32; self.state.multibodies_mut().dbg_contact_constraint_count().buffer().len()];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().dbg_contact_constraint_count().buffer(),
+                &mut cnt,
+            )
+            .await
+            .expect("cc count readback");
+        let mut ccs = vec![
+            NexusMbContact::default();
+            self.state.multibodies_mut().dbg_contact_constraints().buffer().len()
+        ];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().dbg_contact_constraints().buffer(),
+                &mut ccs,
+            )
+            .await
+            .expect("cc readback");
+        (cnt, ccs)
+    }
+
+    /// Global collider index of the ground in env `e` (last collider per env).
+    pub fn ground_collider(&self, e: usize) -> u32 {
+        // colliders_per_batch = robot bodies + 1 ground (ground inserted last).
+        (e as u32 + 1) * self.idx.colliders_per_batch - 1
     }
 }
 

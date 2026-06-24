@@ -56,7 +56,7 @@ cuda_backend = ["gpu", "biped_gpu", "khal/cuda", "nexus3d/cuda", "vortx/cuda"]
 
 [dependencies]
 vortx = { version = "0.1", optional = true }
-khal = { version = "0.1", features = ["derive", "webgpu"], optional = true }
+khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
 nexus3d = { path = "../nexus-cuda/crates/nexus3d", features = ["rbd", "from_rapier"], optional = true }
 rapier3d = { version = "0.32", optional = true }
 rapier3d-urdf = { path = "../rapier/crates/rapier3d-urdf", features = ["stl"], optional = true }
@@ -270,6 +270,18 @@ required-features = ["gpu", "biped_gpu"]
 name = "biped_render_nexus"
 path = "examples/biped/biped_render_nexus.rs"
 required-features = ["biped_gpu", "gpu"]
+
+# Numerical parity: GPU PPO output-grad kernels (vortx) vs scalar-CPU reference.
+[[example]]
+name = "ppo_grad_parity"
+path = "examples/biped/ppo_grad_parity.rs"
+required-features = ["gpu", "biped_gpu"]
+
+# Foot↔ground contact diagnostic for the WebGpu/Metal free-fall bug.
+[[example]]
+name = "contact_probe"
+path = "examples/biped/contact_probe.rs"
+required-features = ["gpu", "biped_gpu"]
 
 # Local dimforge forks — mirrors nexus-rl's workspace patch table so nexus3d
 # (and vortx) resolve to the exact sources they're built against there. zealot
