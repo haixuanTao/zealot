@@ -1273,6 +1273,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "crunchy",
+ "glam 0.32.1",
  "glamx",
  "khal",
  "khal-std",
@@ -2180,6 +2181,7 @@ name = "vortx"
 version = "0.1.1"
 dependencies = [
  "bytemuck",
+ "glamx",
  "include_dir",
  "khal",
  "khal-builder",

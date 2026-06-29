@@ -59,7 +59,15 @@ const LAM: f32 = 0.95;
 // Adaptive-KL LR schedule (rsl_rl / WBC-AGILE): lr ÷1.5 when KL > 2·desired,
 // ×1.5 when KL < desired/2, clamped to [LR_MIN, LR_MAX].
 const DESIRED_KL: f32 = 0.01;
-const LR_MIN: f32 = 1e-5;
+// LR floor. Was 1e-5, then 3e-4: KL used to persistently sit ~0.02–0.04 so the
+// adaptive-KL controller pegged lr at the floor — at 1e-5 too low to learn
+// (crouch-and-fall optimum), so it was raised to 3e-4. But 3e-4 was then too HIGH
+// to brake: once the walk-command ramp destabilized the policy, lr couldn't drop
+// enough and per-iter KL ran away to ~100. The real fix is the KL early-stop in
+// the epoch loop (caps per-iter KL), which stops KL persistently sitting high —
+// so the controller no longer pegs the floor and 1e-4 is safe (gives braking room
+// without the crouch regression).
+const LR_MIN: f32 = 1e-4;
 const LR_MAX: f32 = 1e-2;
 
 fn mk(b: &GpuBackend, m: &DMatrix<f32>, u: BufferUsages) -> Tensor<f32> {
@@ -682,6 +690,16 @@ fn main() {
                     lr = (lr / 1.5).max(LR_MIN);
                 } else if kl > 0.0 && kl < DESIRED_KL / 2.0 {
                     lr = (lr * 1.5).min(LR_MAX);
+                }
+                // KL early-stop (rsl_rl / WBC-AGILE): if this iteration's policy has
+                // already drifted far past target, stop the remaining epochs so one
+                // iteration can't run KL away. Without it the loop ran all EPOCHS
+                // regardless, letting per-iter KL blow to ~100 during the walk-command
+                // ramp (the policy thrashed instead of refining a gait). `kl` here is
+                // current-vs-rollout policy, i.e. cumulative per-iter drift, so this
+                // caps per-iter KL at ~5× target.
+                if kl > DESIRED_KL * 5.0 {
+                    break;
                 }
             }
 

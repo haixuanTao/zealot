@@ -24,7 +24,9 @@ use khal::backend::{Backend, Buffer, GpuBackend as KhalGpuBackend, WebGpu};
 use khal::re_exports::wgpu;
 use nexus3d::rbd::dynamics::GpuSimParams;
 use nexus3d::rbd::math::Pose as NexusPose;
-use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
+use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsSnapshot, GpuPhysicsState};
+use nexus3d::rbd::queries::GpuIndexedContact as NexusIndexedContact;
+use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint as NexusMbContact;
 use nexus3d::rbd::shaders::dynamics::MultibodyLinkWorkspace;
 use rapier3d::prelude::*;
 use rayon::prelude::*;
@@ -141,6 +143,12 @@ pub struct MjBody {
     /// inertia tensor is significantly rotated — must not be dropped.
     pub inertia_offdiag: Vec3,
     pub capsules: Vec<(Vec3, Vec3, f32)>,
+    /// Visual mesh geoms on this link: `(mesh_name, local_pos, local_quat)`.
+    /// Collected for the optional convex-hull collider path (`BIPED_FOOT_SHAPE=convex`).
+    pub mesh_geoms: Vec<(String, Vec3, Rotation)>,
+    /// Mesh vertices (link frame) used to build a convex-hull collider. Filled by
+    /// `load_mesh_hulls` only when the convex foot shape is requested; empty otherwise.
+    pub mesh_pts: Vec<Vec3>,
 }
 
 fn floats(s: &str) -> Vec<f32> {
@@ -169,6 +177,7 @@ fn parse_body(node: &Node, parent: Option<usize>, out: &mut Vec<MjBody>) {
     let (mut com, mut mass, mut inertia_diag) = (Vec3::ZERO, 0.0, Vec3::splat(1e-4));
     let mut inertia_offdiag = Vec3::ZERO;
     let mut capsules = Vec::new();
+    let mut mesh_geoms = Vec::new();
     for c in node.children().filter(Node::is_element) {
         match c.tag_name().name() {
             "freejoint" => is_free = true,
@@ -202,6 +211,11 @@ fn parse_body(node: &Node, parent: Option<usize>, out: &mut Vec<MjBody>) {
                     capsules.push((Vec3::new(f[0], f[1], f[2]), Vec3::new(f[3], f[4], f[5]), r));
                 }
             }
+            "geom" if c.attribute("type") == Some("mesh") => {
+                if let Some(name) = c.attribute("mesh") {
+                    mesh_geoms.push((name.to_string(), vec3(&c, "pos", Vec3::ZERO), quat_wxyz(&c)));
+                }
+            }
             _ => {}
         }
     }
@@ -221,6 +235,8 @@ fn parse_body(node: &Node, parent: Option<usize>, out: &mut Vec<MjBody>) {
             inertia_diag,
             inertia_offdiag,
             capsules,
+            mesh_geoms,
+            mesh_pts: Vec::new(),
         });
     }
     let this = if keep { Some(idx) } else { parent };
@@ -249,6 +265,104 @@ pub fn parse_mjcf(xml: &str) -> Vec<MjBody> {
 pub fn default_mjcf_path() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     format!("{home}/Documents/work/lerobot-humanoid-design/to_real_robot/RL_policy/robot.xml")
+}
+
+/// Minimal binary-STL vertex loader. Returns every triangle vertex (unindexed) —
+/// `ColliderBuilder::convex_hull` only needs the point cloud. Handles binary STL
+/// (the format the onshape CAD export uses). Returns empty on any error.
+fn load_stl_vertices(path: &std::path::Path) -> Vec<Vec3> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    if bytes.len() < 84 {
+        return Vec::new();
+    }
+    let n = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
+    if bytes.len() < 84 + n * 50 {
+        return Vec::new(); // not a well-formed binary STL
+    }
+    let rd = |o: usize| f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    let mut pts = Vec::with_capacity(n * 3);
+    for t in 0..n {
+        let base = 84 + t * 50 + 12; // skip the 12-byte triangle normal
+        for v in 0..3 {
+            let o = base + v * 12;
+            pts.push(Vec3::new(rd(o), rd(o + 4), rd(o + 8)));
+        }
+    }
+    pts
+}
+
+/// Fill `mesh_pts` (link-frame vertices for the convex-hull collider path) on each
+/// link that carries visual mesh geoms. Resolves STL files via the MJCF
+/// `<asset><mesh>` table + `<compiler meshdir>` relative to the robot.xml dir
+/// (override with `BIPED_MESH_DIR`). Called only when the convex foot shape is
+/// requested, so the one-time STL read is skipped otherwise.
+pub fn load_mesh_hulls(mjcf: &mut [MjBody], xml: &str) {
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return;
+    };
+    let assets: HashMap<String, String> = doc
+        .descendants()
+        .filter(|n| n.tag_name().name() == "mesh")
+        .filter_map(|n| {
+            let file = n.attribute("file")?.to_string();
+            // MuJoCo: an unnamed `<mesh file="foo.stl"/>` is referenced by the file
+            // basename sans extension ("foo"). This model omits `name` entirely.
+            let name = n.attribute("name").map(str::to_string).unwrap_or_else(|| {
+                std::path::Path::new(&file)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&file)
+                    .to_string()
+            });
+            Some((name, file))
+        })
+        .collect();
+    let meshdir = doc
+        .descendants()
+        .find(|n| n.tag_name().name() == "compiler")
+        .and_then(|n| n.attribute("meshdir"))
+        .unwrap_or("assets");
+    let base = std::path::Path::new(&default_mjcf_path())
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let asset_dir = std::env::var("BIPED_MESH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| base.join(meshdir));
+    for b in mjcf.iter_mut() {
+        // Only links that actually get a collider (the feet — the others are inert
+        // placeholders, see the scene builder) need a hull. Skip the rest so we
+        // don't hull the huge thigh/shin meshes (~700k verts) for nothing.
+        if b.capsules.is_empty() {
+            continue;
+        }
+        let mut pts = Vec::new();
+        for (name, pos, quat) in &b.mesh_geoms {
+            let Some(file) = assets.get(name) else {
+                continue;
+            };
+            for v in load_stl_vertices(&asset_dir.join(file)) {
+                pts.push(*quat * v + *pos);
+            }
+        }
+        // Reduce the raw mesh cloud (~10^5 verts) to the convex-hull vertices ONCE
+        // here, so each of the thousands of per-env colliders re-hulls only a few
+        // dozen points instead of the whole mesh (env build was minutes otherwise).
+        if !pts.is_empty() {
+            if let Ok((hull, _)) = rapier3d::parry::transformation::try_convex_hull(&pts) {
+                eprintln!(
+                    "[convex] link '{}': {} mesh verts -> {}-vertex hull collider",
+                    b.name,
+                    pts.len(),
+                    hull.len()
+                );
+                pts = hull;
+            }
+        }
+        b.mesh_pts = pts;
+    }
 }
 
 // --- Per-env scene parameters (the bits a single rapier scene needs) --------
@@ -500,9 +614,26 @@ fn build_env_scene(
             // ROLLS through strike/push-off like MuJoCo's. Axis = longest footprint
             // axis; radius = the foot half-width; the center is shifted on the
             // thickness axis so the sole-bottom height is unchanged. BIPED_FOOT_SHAPE=box reverts.
+            // BIPED_FOOT_SHAPE=convex adds a third option: a convex hull of the
+            // link's actual mesh geometry, so nexus collides with the real foot
+            // shape rather than the capsule/box approximation. The hull points are
+            // already in the link frame, so the collider pose is identity (unlike
+            // box/capsule, which sit at the computed `center`). NOTE the rounded-
+            // capsule rationale above: a hull reintroduces sharp foot-strike edges,
+            // so this is opt-in for fidelity experiments, not the tuned default.
             let foot_shape = std::env::var("BIPED_FOOT_SHAPE").unwrap_or_else(|_| "capsule".to_string());
-            let cb = if foot_shape == "box" {
-                ColliderBuilder::cuboid(he.x, he.y, he.z)
+            let convex_cb = if foot_shape == "convex" && !b.mesh_pts.is_empty() {
+                ColliderBuilder::convex_hull(&b.mesh_pts)
+            } else {
+                None
+            };
+            let (cb, cpose) = if let Some(cb) = convex_cb {
+                (cb, Pose::from_parts(Vec3::ZERO, Rotation::IDENTITY))
+            } else if foot_shape == "box" {
+                (
+                    ColliderBuilder::cuboid(he.x, he.y, he.z),
+                    Pose::from_parts(center, Rotation::IDENTITY),
+                )
             } else {
                 let he_arr = [he.x, he.y, he.z];
                 // Thickness axis = where the radius pad was added (capsules ~coplanar).
@@ -524,14 +655,15 @@ fn build_env_scene(
                     1 => center.y += shift,
                     _ => center.z += shift,
                 }
-                match long_ax {
+                let cb = match long_ax {
                     0 => ColliderBuilder::capsule_x(half_height, radius),
                     1 => ColliderBuilder::capsule_y(half_height, radius),
                     _ => ColliderBuilder::capsule_z(half_height, radius),
-                }
+                };
+                (cb, Pose::from_parts(center, Rotation::IDENTITY))
             };
             colliders.insert_with_parent(
-                cb.position(Pose::from_parts(center, Rotation::IDENTITY))
+                cb.position(cpose)
                     .density(0.0)
                     .friction(dr.friction)
                     .restitution(dr.restitution),
@@ -914,6 +1046,10 @@ pub struct BipedNexusBatchEnv {
 
     // Pre-built spawn templates for reset_env_from (different DR samples).
     templates: Vec<GpuPhysicsState>,
+    /// CPU snapshot of each template, read off the GPU once at setup so resets
+    /// are write-only (no per-reset `slow_read_buffer` stalls — the dominant
+    /// reset cost on WebGPU). Parallel to `templates`.
+    template_snapshots: Vec<GpuPhysicsSnapshot>,
     template_dr: Vec<DrParams>,
     /// Cached per-template `foot_sole_local` (constant per template) so reset_env
     /// doesn't rebuild the rapier scene every reset.
@@ -1003,7 +1139,13 @@ impl BipedNexusBatchEnv {
     /// how many distinct DR samples are pre-built and cycled across the N envs
     /// at construction and reset time (higher = better coverage, more GPU mem).
     pub async fn new(mjcf_xml: &str, num_envs: usize, num_templates: usize, seed: u64) -> Self {
-        let mjcf = parse_mjcf(mjcf_xml);
+        let mut mjcf = parse_mjcf(mjcf_xml);
+        // Convex-hull foot collider path: load the link meshes once so the scene
+        // builder can hull them (BIPED_FOOT_SHAPE=convex). Default capsule path
+        // skips this entirely.
+        if std::env::var("BIPED_FOOT_SHAPE").as_deref() == Ok("convex") {
+            load_mesh_hulls(&mut mjcf, mjcf_xml);
+        }
         let robot = LeRobotBipedal::new();
         let mut task = VelocityFlatTask::new();
         // BIPED_DECIMATION: shift physics work between narrow-phase refreshes
@@ -1142,6 +1284,16 @@ impl BipedNexusBatchEnv {
             templates.push(tpl);
         }
 
+        // Snapshot each template off the GPU ONCE so per-env resets are
+        // write-only. reset_env runs thousands of times per iteration (once per
+        // fallen env); the old reset_env_from re-read the constant template from
+        // the GPU 6× per reset, and each slow_read_buffer stalls the WebGPU queue
+        // (tens of seconds/iter on Metal). Reading once here makes resets cheap.
+        let mut template_snapshots: Vec<GpuPhysicsSnapshot> = Vec::with_capacity(num_templates);
+        for tpl in &templates {
+            template_snapshots.push(tpl.snapshot(&gpu).await);
+        }
+
         // Per-env initial sole-normal: every env starts from the corresponding
         // template, so its foot_sole_local matches that template's. Look up the
         // cached per-template value (no rebuild).
@@ -1215,6 +1367,7 @@ impl BipedNexusBatchEnv {
             pipeline,
             state,
             templates,
+            template_snapshots,
             template_dr,
             template_foot_sole,
             template_spawn_obs: Vec::new(),
@@ -2489,8 +2642,7 @@ impl BipedNexusBatchEnv {
         let r = self.rng[env].range(0.0, 1.0);
         let t = ((r * self.templates.len() as f32) as usize).min(self.templates.len() - 1);
         self.state
-            .reset_env_from(&self.gpu, env as u32, &self.templates[t])
-            .await;
+            .reset_env_from_snapshot(&self.gpu, env as u32, &self.template_snapshots[t]);
         // Mirror the template's sole-normal so update_feet's tilt makes sense.
         // Cached per-template (constant) — NO per-reset rapier-scene rebuild.
         self.foot_sole_local[env] = self.template_foot_sole[t];
@@ -2590,10 +2742,9 @@ impl BipedNexusBatchEnv {
     /// a rendering rollout so the recorded trajectory doesn't drift on the
     /// per-env DR sample the env was originally seeded with.
     pub async fn reset_env_to_default_template(&mut self, e: usize) -> (Vec<f32>, Vec<f32>) {
-        assert!(!self.templates.is_empty());
+        assert!(!self.template_snapshots.is_empty());
         self.state
-            .reset_env_from(&self.gpu, e as u32, &self.templates[0])
-            .await;
+            .reset_env_from_snapshot(&self.gpu, e as u32, &self.template_snapshots[0]);
         self.foot_sole_local[e] = self.idx.foot_sole_local;
         self.cmd[e] = VelocityCommand::default();
         self.step_count[e] = 0;
@@ -2714,6 +2865,79 @@ impl BipedNexusBatchEnv {
                 poses[i].translation.z
             })
             .collect()
+    }
+
+    /// DEBUG: read back the narrow-phase contact manifolds (the shared
+    /// collision-detection output consumed by the multibody contact solver).
+    /// Returns `(reported_len[..], manifolds[..capacity])`. Used to diagnose
+    /// foot↔ground contact on WebGpu vs CUDA: contact COUNT (is narrow-phase
+    /// generating foot-ground pairs at all?) and the contact NORMAL direction.
+    pub async fn dbg_contacts(&mut self) -> (Vec<u32>, Vec<NexusIndexedContact>) {
+        let lbuf = self.state.dbg_contacts_len().buffer();
+        let mut len = vec![0u32; lbuf.len()];
+        self.gpu
+            .slow_read_buffer(lbuf, &mut len)
+            .await
+            .expect("contacts_len readback");
+        let cbuf = self.state.dbg_contacts().buffer();
+        let mut v = vec![NexusIndexedContact::default(); cbuf.len()];
+        self.gpu
+            .slow_read_buffer(cbuf, &mut v)
+            .await
+            .expect("contacts readback");
+        (len, v)
+    }
+
+    /// DEBUG: broad-phase pair count (how many collider pairs the LBVH found),
+    /// and the raw pair list. Splits "broad-phase finds nothing" from
+    /// "narrow-phase generates no manifold" when contacts come back empty.
+    pub async fn dbg_collision_pairs(&mut self) -> (Vec<u32>, Vec<[u32; 2]>) {
+        let lbuf = self.state.dbg_collision_pairs_len().buffer();
+        let mut len = vec![0u32; lbuf.len()];
+        self.gpu
+            .slow_read_buffer(lbuf, &mut len)
+            .await
+            .expect("pairs_len readback");
+        let pbuf = self.state.dbg_collision_pairs().buffer();
+        let mut v = vec![[0u32; 2]; pbuf.len()];
+        self.gpu
+            .slow_read_buffer(pbuf, &mut v)
+            .await
+            .expect("pairs readback");
+        (len, v)
+    }
+
+    /// DEBUG: read back the per-multibody contact-constraint bank
+    /// (`inv_lhs` = 1/(J·M⁻¹·Jᵀ), `rhs`, accumulated `impulse`, jacobians) and
+    /// the per-batch active counts. Diagnoses the WebGpu contact-solve blow-up.
+    pub async fn dbg_mb_contacts(&mut self) -> (Vec<u32>, Vec<NexusMbContact>) {
+        let mut cnt =
+            vec![0u32; self.state.multibodies_mut().dbg_contact_constraint_count().buffer().len()];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().dbg_contact_constraint_count().buffer(),
+                &mut cnt,
+            )
+            .await
+            .expect("cc count readback");
+        let mut ccs = vec![
+            NexusMbContact::default();
+            self.state.multibodies_mut().dbg_contact_constraints().buffer().len()
+        ];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().dbg_contact_constraints().buffer(),
+                &mut ccs,
+            )
+            .await
+            .expect("cc readback");
+        (cnt, ccs)
+    }
+
+    /// Global collider index of the ground in env `e` (last collider per env).
+    pub fn ground_collider(&self, e: usize) -> u32 {
+        // colliders_per_batch = robot bodies + 1 ground (ground inserted last).
+        (e as u32 + 1) * self.idx.colliders_per_batch - 1
     }
 }
 
