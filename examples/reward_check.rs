@@ -14,7 +14,7 @@
 
 use khal::BufferUsages;
 use khal::Shader;
-use khal::backend::{Backend, Encoder, GpuBackend, WebGpu};
+use khal::backend::{Backend, Encoder, GpuBackend};
 use nexus3d::rbd::math::{Quat, Vec3};
 use vortx::linalg::{Reward, RewardJointCfg, RewardParams};
 use vortx::tensor::Tensor;
@@ -86,20 +86,13 @@ fn angle(buf: &[f32], e: usize, cfg: &RewardJointCfg) -> f32 {
 }
 
 async fn make_backend() -> GpuBackend {
-    #[cfg(feature = "cuda_backend")]
-    {
-        if std::env::var("BIPED_CUDA").as_deref() == Ok("1") {
-            use khal::backend::Cuda;
-            eprintln!("backend = native CUDA");
-            return GpuBackend::Cuda(Cuda::new(0).expect("cuda"));
-        }
-    }
-    eprintln!("backend = WebGPU");
     let limits = wgpu::Limits {
         max_storage_buffers_per_shader_stage: 14,
         ..Default::default()
     };
-    GpuBackend::WebGpu(WebGpu::new(wgpu::Features::default(), limits).await.expect("webgpu"))
+    GpuBackend::auto(wgpu::Features::default(), limits)
+        .await
+        .expect("init GPU backend")
 }
 
 #[async_std::main]

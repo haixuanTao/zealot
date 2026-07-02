@@ -13,7 +13,7 @@
 
 use khal::BufferUsages;
 use khal::Shader;
-use khal::backend::{Backend, Encoder, GpuBackend, WebGpu};
+use khal::backend::{Backend, Encoder, GpuBackend};
 use nalgebra::DMatrix;
 use vortx::linalg::{Sample, SampleParams};
 use vortx::tensor::Tensor;
@@ -42,20 +42,9 @@ fn mk(backend: &GpuBackend, m: &DMatrix<f32>, u: BufferUsages) -> Tensor<f32> {
 }
 
 async fn make_backend() -> GpuBackend {
-    #[cfg(feature = "cuda_backend")]
-    {
-        if std::env::var("BIPED_CUDA").as_deref() == Ok("1") {
-            use khal::backend::Cuda;
-            eprintln!("backend = native CUDA");
-            return GpuBackend::Cuda(Cuda::new(0).expect("cuda"));
-        }
-    }
-    eprintln!("backend = WebGPU");
-    GpuBackend::WebGpu(
-        WebGpu::new(Features::default(), Limits::default())
-            .await
-            .expect("webgpu"),
-    )
+    GpuBackend::auto(Features::default(), Limits::default())
+        .await
+        .expect("init GPU backend")
 }
 
 /// Run the kernel once for `seed`; returns (action, target, noise) row-major [A x N].

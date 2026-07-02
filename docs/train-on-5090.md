@@ -9,6 +9,20 @@ This is the all-Rust path: nexus physics + vortx PPO shaders compiled Rust→PTX
 cubins. The Mac is Metal-only and its contact path is broken — **train on CUDA
 boxes only** (`baguette` / `champagne` = the two 5090s; the vast 5060 also works).
 
+## Conventions
+
+Every path below is derived from two variables — set them once and the rest of
+the guide is copy-paste:
+
+```bash
+export WORK="$HOME/work"       # parent dir for the repos (pick anything)
+export PTX="$HOME/nexus_ptx"   # where the compiled cubins land
+```
+
+> **The repos must be siblings under `$WORK`.** zealot resolves `khal`, `vortx`,
+> and `nexus3d` by *relative* path (`../nexus-cuda`, …), so the directory layout
+> is load-bearing — keep them side by side. `$WORK` itself can be anywhere.
+
 ---
 
 ## TL;DR (box already provisioned)
@@ -18,21 +32,22 @@ If the toolchain, wheels, and cubins already exist on the box (the usual case on
 vars, and the run command.
 
 ```bash
-cd ~/Documents/work/nexus-cuda
-bash build_cuda/build_nexus_cubin.sh        # -> ~/nexus_ptx/nexus_rbd_shaders3d.cubin
-bash build_cuda/build_vortx_cubin_llc.sh    # -> ~/nexus_ptx/vortx_shaders.cubin
+cd "$WORK/nexus-cuda"
+bash build_cuda/build_nexus_cubin.sh        # -> $PTX/nexus_rbd_shaders3d.cubin
+bash build_cuda/build_vortx_cubin_llc.sh    # -> $PTX/vortx_shaders.cubin
 
-cd ~/Documents/work/zealot
-export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D=$HOME/nexus_ptx/nexus_rbd_shaders3d.cubin
-export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS=$HOME/nexus_ptx/vortx_shaders.cubin
+cd "$WORK/zealot"
+export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D="$PTX/nexus_rbd_shaders3d.cubin"
+export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS="$PTX/vortx_shaders.cubin"
 
+# Native CUDA is auto-selected on sm_120 — no flag needed.
 # iters  num_envs  checkpoint
-BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
-    --features "gpu biped_gpu cuda_backend" -- 2000 4096 ~/biped_convex.safetensors
+cargo run --release --example biped_train_gpu \
+    --features "gpu biped_gpu cuda_backend" -- 2000 4096 "$HOME/biped_convex.safetensors"
 ```
 
 Run it inside `tmux` so it survives the SSH session. Skip to
-[Run training](#5-run-training) for the knobs.
+[Run training](#6-run-training) for the knobs.
 
 ---
 
@@ -50,29 +65,30 @@ Run it inside `tmux` so it survives the SSH session. Skip to
 
 ## 1. Repos (sibling layout)
 
-Clone the forks at these branches. `nexus-cuda`, `khal`, `vortx` live under
-`~/Documents/work/`; `cuda-oxide` lives at `~/cuda-oxide-src`.
+Clone the forks at these branches, all as siblings under `$WORK`.
 
 | repo | branch | path |
 |------|--------|------|
-| `haixuanTao/zealot` | `feat/native-cuda-e2e-bench` | `~/Documents/work/zealot` |
-| `haixuanTao/nexus-cuda` | `master` | `~/Documents/work/nexus-cuda` |
-| `haixuanTao/khal` | `feat/cuda-oxide-backend` | `~/Documents/work/khal` |
-| `haixuanTao/vortx` | `feat/gpu-policy-shaders` | `~/Documents/work/vortx` |
-| `haixuanTao/cuda-oxide` | `feat/nexus3d-vortx-native-cuda` | `~/cuda-oxide-src` |
+| `haixuanTao/zealot` | `feat/native-cuda-e2e-bench` | `$WORK/zealot` |
+| `haixuanTao/nexus-cuda` | `master` | `$WORK/nexus-cuda` |
+| `haixuanTao/khal` | `feat/cuda-oxide-backend` | `$WORK/khal` |
+| `haixuanTao/vortx` | `feat/gpu-policy-shaders` | `$WORK/vortx` |
+| `haixuanTao/cuda-oxide` | `feat/nexus3d-vortx-native-cuda` | `$HOME/cuda-oxide-src` |
 
-> zealot resolves `khal`/`vortx`/`nexus3d` as **path siblings** — the directory
-> layout matters. `cuda-oxide` is public (clone over https); the others may need
-> `gh auth login` or an rsync from the Mac if the box has no GitHub access.
+> `cuda-oxide` is public (clone over https); the others may need `gh auth login`
+> or an rsync from the Mac if the box has no GitHub access. Its checkout lives
+> outside `$WORK` (the build scripts reference `$HOME/cuda-oxide-src`); adjust if
+> you keep it elsewhere.
 
 **Fastest path — copy a built environment from an existing 5090:**
 
 ```bash
-rsync -a baguette:~/{cuda-oxide-src,make_cubin,nvvm-wheel,nvjit-wheel,llvm21} ~/
-rsync -a baguette:~/Documents/work/{nexus-cuda,khal,vortx,zealot} ~/Documents/work/
+rsync -a baguette:'~/{cuda-oxide-src,make_cubin,nvvm-wheel,nvjit-wheel,llvm21}' "$HOME/"
+rsync -a baguette:'~/work/{nexus-cuda,khal,vortx,zealot}' "$WORK/"
 ```
 
-This skips sections 2–4 entirely. Prefer it when a 5090 is reachable.
+This skips sections 2–4 entirely. Prefer it when a 5090 is reachable. (Adjust the
+remote source paths to wherever baguette keeps its checkout.)
 
 ---
 
@@ -86,8 +102,8 @@ rustup component add rust-src rustc-dev llvm-tools --toolchain nightly-2026-04-0
 - `rust-src` — needed for `-Zbuild-std=core` (shaders target `nvptx64` bare).
 - `rustc-dev` + `llvm-tools` — the cuda-oxide codegen backend links rustc
   internals and uses `llvm-as`/`llvm-link`/`opt`/`llc` from the toolchain.
-- **LLVM 21.1.0** at `~/llvm21` (the backend links it; scripts reference
-  `~/llvm21/bin/llc` as `CUDA_OXIDE_LLC`).
+- **LLVM 21.1.0** at `$HOME/llvm21` (the backend links it; scripts reference
+  `$HOME/llvm21/bin/llc` as `CUDA_OXIDE_LLC`).
 
 ---
 
@@ -105,15 +121,15 @@ pip download nvidia-nvjitlink-cu12==12.9.86   # -> libnvJitLink.so.12
 
 Extract each wheel and point the build scripts at the resulting paths (see the
 `LIBDEV`, `PTXAS`, `LIBNVVM_PATH`, `LIBNVJITLINK_PATH` vars in
-`nexus-cuda/build_cuda/*.sh`). For `sm_120` SASS inspection you also want the
-12.9 `cuobjdump` / `nvdisasm` redist tarballs.
+`$WORK/nexus-cuda/build_cuda/*.sh`). For `sm_120` SASS inspection you also want
+the 12.9 `cuobjdump` / `nvdisasm` redist tarballs.
 
 ---
 
 ## 4. Build the cuda-oxide backend `.so`
 
 ```bash
-cd ~/cuda-oxide-src/crates/rustc-codegen-cuda
+cd "$HOME/cuda-oxide-src/crates/rustc-codegen-cuda"
 cargo +nightly-2026-04-03 build          # -> target/debug/librustc_codegen_cuda.so
 ```
 
@@ -129,16 +145,16 @@ Two cubins get compiled Rust→PTX and embedded into the zealot host:
 - **`vortx_shaders.cubin`** — the PPO GEMM/Adam/actor-value gradient shaders.
 
 ```bash
-cd ~/Documents/work/nexus-cuda
-bash build_cuda/build_nexus_cubin.sh       # nexus physics -> ~/nexus_ptx/nexus_rbd_shaders3d.cubin
-bash build_cuda/build_vortx_cubin_llc.sh   # vortx PPO     -> ~/nexus_ptx/vortx_shaders.cubin
+cd "$WORK/nexus-cuda"
+bash build_cuda/build_nexus_cubin.sh       # nexus physics -> $PTX/nexus_rbd_shaders3d.cubin
+bash build_cuda/build_vortx_cubin_llc.sh   # vortx PPO     -> $PTX/vortx_shaders.cubin
 ```
 
-> **Edit the hardcoded paths first.** The scripts contain absolute
+> **Edit the paths in the scripts first.** They still contain absolute
 > `/home/baguette/...` paths and a stale `nightly-2025-08-04` llvm-tools path.
 > Point `TOOL`/`LIBDEV`/`PTXAS`/`BACKEND` at *this* box's toolchain, wheels, and
-> the `.so` from section 4. The `.ll` is LLVM-21 IR, so the assembler must be
-> LLVM 21.
+> the `.so` from section 4, and `CUDA_OXIDE_PTX_DIR` at `$PTX`. The `.ll` is
+> LLVM-21 IR, so the assembler must be LLVM 21.
 
 ### Critical flags (already baked into the scripts — do not drop them)
 
@@ -157,18 +173,31 @@ embedded in the host binary (`EMBED HASH MATCH OK`). If you see
 `EMBED MISMATCH`, the host is linking a stale cubin — `touch
 crates/nexus_rbd3d/build.rs` and rebuild.
 
+> **Shortcut — download prebuilt `sm_120` cubins** instead of building (only valid
+> on Blackwell, and only for the matching source commit — see the release notes):
+> ```bash
+> mkdir -p "$PTX" && base=https://github.com/haixuanTao/zealot/releases/download/cubins-sm120-20260624
+> curl -L "$base/nexus_rbd_shaders3d.cubin" -o "$PTX/nexus_rbd_shaders3d.cubin"
+> curl -L "$base/vortx_shaders.cubin"       -o "$PTX/vortx_shaders.cubin"
+> ```
+
 ---
 
 ## 6. Run training
 
 ```bash
-cd ~/Documents/work/zealot
-export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D=$HOME/nexus_ptx/nexus_rbd_shaders3d.cubin
-export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS=$HOME/nexus_ptx/vortx_shaders.cubin
+cd "$WORK/zealot"
+export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D="$PTX/nexus_rbd_shaders3d.cubin"
+export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS="$PTX/vortx_shaders.cubin"
 
-BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
+cargo run --release --example biped_train_gpu \
     --features "gpu biped_gpu cuda_backend" -- <iters> <num_envs> <checkpoint>
 ```
+
+> **Backend selection.** Built with `cuda_backend`, the trainer **auto-selects
+> native CUDA on `sm_120`** (Blackwell) and falls back to WebGPU otherwise — no
+> flag needed. Force it with `KHAL_BACKEND=cuda` or `KHAL_BACKEND=webgpu`.
+> (`BIPED_CUDA=1` still works as a deprecated alias.)
 
 **Positional args** (after `--`):
 
@@ -187,10 +216,7 @@ epochs, 4 minibatches, `lr=1e-3` (adaptive-KL scheduled), clip 0.2, entropy 0.01
 
 | env var | effect |
 |---------|--------|
-| `BIPED_CUDA=1` | select the native-CUDA backend (required here) |
-| `BIPED_MIRROR_AUG=1` | append the L/R mirror of every transition (free 2× data, symmetry) |
-| `BIPED_MIRROR_LOSS=<w>` | symmetry loss term, weight `w` (0 = off) |
-| `BIPED_MIRROR_NET=1` | project actor+critic onto the symmetric subspace (NET method) |
+| `KHAL_BACKEND=cuda`\|`webgpu` | force the backend; unset auto-selects native CUDA on sm_120 (`BIPED_CUDA=1` = deprecated alias) |
 | `BIPED_STAND_FRAC=<f>` | fraction of the curriculum spent standing before the command ramps |
 | `BIPED_RAMP_END=<f>` | curriculum point where the command reaches full speed |
 | `BIPED_TORQUE_MAX=<nm>` | motor torque clamp |
@@ -200,8 +226,8 @@ Always launch under `tmux` so training survives disconnects:
 
 ```bash
 tmux new -s train
-BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
-    --features "gpu biped_gpu cuda_backend" -- 2000 4096 ~/biped_convex.safetensors
+cargo run --release --example biped_train_gpu \
+    --features "gpu biped_gpu cuda_backend" -- 2000 4096 "$HOME/biped_convex.safetensors"
 # detach: Ctrl-b d   |   reattach: tmux attach -t train
 ```
 
@@ -214,11 +240,10 @@ BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
   forward it with `-L` on your SSH command if you want the UI.
 - Checkpoints are `.safetensors` at the path you passed. Pull them to the Mac:
   ```bash
-  rsync -avP -e 'ssh -p 16199' root@ssh1.vast.ai:'~/biped_convex*.safetensors' \
-      ~/Documents/work/zealot/
+  rsync -avP -e 'ssh -p 16199' root@ssh1.vast.ai:'~/biped_convex*.safetensors' "$WORK/zealot/"
   ```
-- Back up the cubins too (`~/nexus_ptx/*.cubin`) — they cost a full toolchain
-  rebuild to regenerate.
+- Back up the cubins too (`$PTX/*.cubin`) — they cost a full toolchain rebuild to
+  regenerate (or grab them from the release linked in section 5).
 
 ---
 
@@ -235,4 +260,3 @@ BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
   `upstream/*`.
 - **5060 vs 5090:** identical code path; just scale `num_envs` down (8 GB vs
   32 GB) and expect proportionally lower throughput.
-

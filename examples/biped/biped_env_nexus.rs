@@ -20,7 +20,7 @@
 //! Joint angles / velocities, base linear / angular velocity all come from
 //! `links_workspace[k].{coords, joint_rot, rb_vels}` (rb_vels is world-space).
 
-use khal::backend::{Backend, Buffer, GpuBackend as KhalGpuBackend, WebGpu};
+use khal::backend::{Backend, Buffer, GpuBackend as KhalGpuBackend};
 use khal::re_exports::wgpu;
 use nexus3d::rbd::dynamics::GpuSimParams;
 use nexus3d::rbd::math::Pose as NexusPose;
@@ -2943,24 +2943,11 @@ impl BipedNexusBatchEnv {
 
 // --- Helpers -----------------------------------------------------------------
 
-/// Pick the GPU backend for the batched physics. Defaults to WebGPU; when the
-/// `cuda_backend` feature is compiled in AND `BIPED_CUDA=1`, runs the native
-/// CUDA (cuda-oxide) backend instead — used by the all-native e2e benchmark.
-/// The nexus + vortx cubins are embedded at build time via the per-crate
-/// `CUDA_OXIDE_SHADERS_PTX_*` env vars (see khal-builder `build_ptx`).
+/// Pick the GPU backend for the batched physics via [`KhalGpuBackend::auto`]:
+/// native CUDA on Blackwell (`sm_120`+, when built with `cuda_backend`), else
+/// WebGPU. Override with `KHAL_BACKEND=cuda|webgpu`. The nexus + vortx cubins are
+/// embedded at build time via the per-crate `CUDA_OXIDE_SHADERS_PTX_*` env vars.
 async fn make_backend() -> KhalGpuBackend {
-    #[cfg(feature = "cuda_backend")]
-    {
-        if std::env::var("BIPED_CUDA").as_deref() == Ok("1") {
-            use khal::backend::Cuda;
-            eprintln!("[biped] backend = native CUDA (cuda-oxide)");
-            return KhalGpuBackend::Cuda(Cuda::new(0).expect("init CUDA backend"));
-        }
-    }
-    webgpu_backend().await
-}
-
-async fn webgpu_backend() -> KhalGpuBackend {
     let limits = wgpu::Limits {
         max_buffer_size: 1_200_000_000,
         max_storage_buffer_binding_size: 1_200_000_000,
@@ -2968,11 +2955,14 @@ async fn webgpu_backend() -> KhalGpuBackend {
         max_compute_workgroup_storage_size: 19_904,
         ..Default::default()
     };
-    let mut w = WebGpu::new(wgpu::Features::default(), limits)
+    let mut bk = KhalGpuBackend::auto(wgpu::Features::default(), limits)
         .await
-        .expect("webgpu");
-    w.force_buffer_copy_src = true;
-    KhalGpuBackend::WebGpu(w)
+        .expect("init GPU backend");
+    // The WebGPU biped path needs buffer copy-src for state readbacks.
+    if let KhalGpuBackend::WebGpu(w) = &mut bk {
+        w.force_buffer_copy_src = true;
+    }
+    bk
 }
 
 /// Sample one DR point. Ranges mirror `Randomization::default()` from the CPU
