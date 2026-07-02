@@ -235,5 +235,4 @@ BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
   `upstream/*`.
 - **5060 vs 5090:** identical code path; just scale `num_envs` down (8 GB vs
   32 GB) and expect proportionally lower throughput.
-```
 
