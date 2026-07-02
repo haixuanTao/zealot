@@ -1,5 +1,9 @@
 /target
 *.mp4
 *.tgz
+*.safetensors
+*.log
 MUJOCO_LOG.TXT
 __pycache__/
+.claude/
+wandb/

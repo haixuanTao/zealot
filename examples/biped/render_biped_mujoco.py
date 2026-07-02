@@ -15,6 +15,10 @@ import subprocess
 import sys
 import tempfile
 
+# Headless offscreen GL: EGL works on the boxes without an X server. Set before
+# importing mujoco so the renderer picks it up. Override by exporting MUJOCO_GL.
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 import mujoco
 import numpy as np
 import trimesh
@@ -22,8 +26,10 @@ import trimesh
 src = sys.argv[1] if len(sys.argv) > 1 else "/tmp/biped_rollout.json"
 out = sys.argv[2] if len(sys.argv) > 2 else "/tmp/biped_mesh.mp4"
 HOME = os.path.expanduser("~")
-XML = f"{HOME}/Documents/work/lerobot-humanoid-design/to_real_robot/RL_policy/robot.xml"
-ASSETS = f"{HOME}/Documents/work/lerobot-humanoid-design/urdf/bipedal_plateform/urdf/assets"
+# Default to the live eval model (the one sim2sim_xval / passive_stand use). The
+# old lerobot-humanoid-design paths moved; override with BIPED_ROBOT_XML/BIPED_ASSETS.
+XML = os.environ.get("BIPED_ROBOT_XML", f"{HOME}/tmp_eval/mjcf/robot.xml")
+ASSETS = os.environ.get("BIPED_ASSETS", f"{HOME}/tmp_eval/mjcf/assets")
 W, H = 720, 720
 
 with open(src) as f:

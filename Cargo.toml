@@ -48,6 +48,11 @@ cpu = ["dep:rapier3d", "dep:rapier3d-urdf", "dep:zealot-env", "dep:zealot-rl", "
 # nexus trainer can build (the smoke example doesn't need it, but it's a
 # negligible link-time addition).
 biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "dep:rayon"]
+# cuda_backend — additively enables the native-CUDA (cuda-oxide) khal backend on
+# the vortx + nexus3d stack, alongside WebGPU. Selected at runtime via BIPED_CUDA=1.
+# Used for the all-native end-to-end benchmark (iter_e2e_bench). The cubins are
+# embedded at build time via CUDA_OXIDE_SHADERS_PTX_{NEXUS_RBD_SHADERS3D,VORTX_SHADERS}.
+cuda_backend = ["gpu", "biped_gpu", "khal/cuda", "nexus3d/cuda", "vortx/cuda"]
 
 [dependencies]
 vortx = { version = "0.1", optional = true }
@@ -97,6 +102,18 @@ name = "ppo_grad_check"
 required-features = ["gpu"]
 
 [[example]]
+name = "sample_check"
+required-features = ["gpu"]
+
+[[example]]
+name = "obs_check"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "reward_check"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
 name = "gpu_update_check"
 required-features = ["gpu", "biped_gpu"]
 
@@ -117,6 +134,30 @@ required-features = ["gpu", "biped_gpu"]
 [[example]]
 name = "iter_e2e_bench"
 path = "examples/biped/iter_e2e_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "sample_compare"
+path = "examples/biped/sample_compare.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "resident_rollout_bench"
+path = "examples/biped/resident_rollout_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "physics_capture_bench"
+path = "examples/biped/physics_capture_bench.rs"
+required-features = ["gpu", "biped_gpu", "cuda_backend"]
+
+[[example]]
+name = "cuda_gather_check"
+required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "iter_e2e_boxes_bench"
+path = "examples/biped/iter_e2e_boxes_bench.rs"
 required-features = ["gpu", "biped_gpu"]
 
 [[example]]
@@ -217,12 +258,30 @@ name = "biped_train_nexus"
 path = "examples/biped/biped_train_nexus.rs"
 required-features = ["biped_gpu"]
 
+# Fully GPU-resident trainer: GPU policy forward + GPU PPO update (vortx).
+[[example]]
+name = "biped_train_gpu"
+path = "examples/biped/biped_train_gpu.rs"
+required-features = ["gpu", "biped_gpu"]
+
 # Train briefly on nexus then record a deterministic env-0 rollout to JSON.
 # Render with `python3 examples/biped/render_biped.py <out.json> <out.mp4>`.
 [[example]]
 name = "biped_render_nexus"
 path = "examples/biped/biped_render_nexus.rs"
 required-features = ["biped_gpu", "gpu"]
+
+# Numerical parity: GPU PPO output-grad kernels (vortx) vs scalar-CPU reference.
+[[example]]
+name = "ppo_grad_parity"
+path = "examples/biped/ppo_grad_parity.rs"
+required-features = ["gpu", "biped_gpu"]
+
+# Foot↔ground contact diagnostic for the WebGpu/Metal free-fall bug.
+[[example]]
+name = "contact_probe"
+path = "examples/biped/contact_probe.rs"
+required-features = ["gpu", "biped_gpu"]
 
 # Local dimforge forks — mirrors nexus-rl's workspace patch table so nexus3d
 # (and vortx) resolve to the exact sources they're built against there. zealot
@@ -256,3 +315,8 @@ required-features = ["cpu", "biped_gpu"]
 name = "foot_tip_stability"
 path = "examples/biped/foot_tip_stability.rs"
 required-features = ["cpu"]
+
+[[example]]
+name = "passive_stand"
+path = "examples/biped/passive_stand.rs"
+required-features = ["gpu", "biped_gpu"]

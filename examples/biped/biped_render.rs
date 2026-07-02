@@ -143,6 +143,9 @@ fn main() {
         env.pin_yaw(0.0);
         env.pin_joint_offsets(offsets);
         let mut obs = env.reset_full().0;
+        if std::env::var("BIPED_DUMP_OBS0").is_ok() {
+            eprintln!("[obs0] {:?}", &obs);
+        }
         let mut frames: Vec<Vec<[f32; 3]>> = Vec::with_capacity(rollout_steps);
         let mut bases: Vec<[f32; 7]> = Vec::with_capacity(rollout_steps);
         let mut joints: Vec<[f32; NUM_JOINTS]> = Vec::with_capacity(rollout_steps);

@@ -71,8 +71,7 @@ impl GpuNet {
 
     /// Upload the input matrix `[in x N]` into `a[0]`.
     fn set_input(&mut self, backend: &GpuBackend, x: &DMatrix<f32>) -> anyhow::Result<()> {
-        self.a[0] =
-            Tensor::matrix_from_na(backend, x, BufferUsages::STORAGE | BufferUsages::COPY_SRC)?;
+        self.a[0] = Tensor::matrix_from_na(backend, x, BufferUsages::STORAGE | BufferUsages::COPY_SRC)?;
         Ok(())
     }
 
@@ -93,18 +92,11 @@ impl GpuNet {
             let a_out = &mut right[0];
             {
                 let mut p = enc.begin_pass("gemm", None);
-                gemm.dispatch_naive(backend, shapes, &mut p, &mut *a_out, &self.w[l], a_in)?;
+                gemm.dispatch_tiled(backend, shapes, &mut p, &mut *a_out, &self.w[l], a_in)?;
             }
             {
                 let mut p = enc.begin_pass("bias", None);
-                op.launch(
-                    backend,
-                    shapes,
-                    &mut p,
-                    OpAssignVariant::Add,
-                    &mut *a_out,
-                    &self.b[l],
-                )?;
+                op.launch(backend, shapes, &mut p, OpAssignVariant::Add, &mut *a_out, &self.b[l])?;
             }
             if l < layers - 1 {
                 let mut p = enc.begin_pass("elu", None);
@@ -205,17 +197,28 @@ async fn main() -> anyhow::Result<()> {
     }
     let gpu = t1.elapsed();
 
+    // R1 measurement: same forward, but reading BOTH outputs back to CPU each
+    // step (what the rollout actually does). delta vs `gpu` = the per-step
+    // readback cost we'd remove by going GPU-resident.
+    let t2 = Instant::now();
+    for _ in 0..STEPS {
+        run_once(&backend, &mut shapes, &mut g_actor, &mut g_critic)?;
+        let _a = backend.slow_read_vec(g_actor.output().buffer()).await?;
+        let _c = backend.slow_read_vec(g_critic.output().buffer()).await?;
+        sink += _a[0] + _c[0];
+    }
+    let gpu_rb = t2.elapsed();
+
     let cpu_per = cpu.as_secs_f64() / STEPS as f64 * 1e3;
     let gpu_per = gpu.as_secs_f64() / STEPS as f64 * 1e3;
+    let gpu_rb_per = gpu_rb.as_secs_f64() / STEPS as f64 * 1e3;
     println!("policy forward bench — N={N} envs, {STEPS} steps");
     println!("  actor {ACTOR:?}  critic {CRITIC:?}  (ELU hidden, linear out)");
     println!("  GPU vs CPU max|out| err = {max_err:.3e}");
     anyhow::ensure!(max_err < 2e-3, "GPU forward diverged from CPU reference");
-    println!(
-        "  CPU serial loop : {cpu_per:8.3} ms/step  ({:.2} us/env)",
-        cpu_per * 1e3 / N as f64
-    );
-    println!("  GPU batched     : {gpu_per:8.3} ms/step");
+    println!("  CPU serial loop : {cpu_per:8.3} ms/step  ({:.2} us/env)", cpu_per * 1e3 / N as f64);
+    println!("  GPU batched     : {gpu_per:8.3} ms/step  (no readback)");
+    println!("  GPU + readback  : {gpu_rb_per:8.3} ms/step  (R1 = {:.3} ms/step)", gpu_rb_per - gpu_per);
     println!("  speedup         : {:.1}x", cpu_per / gpu_per);
     println!("  (sink={sink:.3})");
     Ok(())

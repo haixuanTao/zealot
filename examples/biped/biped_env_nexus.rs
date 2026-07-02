@@ -24,7 +24,9 @@ use khal::backend::{Backend, Buffer, GpuBackend as KhalGpuBackend, WebGpu};
 use khal::re_exports::wgpu;
 use nexus3d::rbd::dynamics::GpuSimParams;
 use nexus3d::rbd::math::Pose as NexusPose;
-use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
+use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsSnapshot, GpuPhysicsState};
+use nexus3d::rbd::queries::GpuIndexedContact as NexusIndexedContact;
+use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint as NexusMbContact;
 use nexus3d::rbd::shaders::dynamics::MultibodyLinkWorkspace;
 use rapier3d::prelude::*;
 use rayon::prelude::*;
@@ -99,6 +101,22 @@ impl StepTimings {
 // steps, sizes stop changing — calling it every step adds dispatch latency
 // for no work. 32 control steps ≈ 0.64 s of sim time, plenty fast to react.
 const AUTO_RESIZE_PERIOD: u32 = 32;
+/// Steps to run eager before capturing the physics CUDA graph — long enough for
+/// the dispatch structure (color count / buffer sizes) to stabilise through a
+/// couple of `auto_resize_buffers` cycles, so the captured graph stays valid.
+const GRAPH_CAPTURE_AT: u32 = 64;
+
+/// `Send`+`Sync` wrapper for a captured physics graph. `CapturedGraph` holds raw
+/// CUDA handles (not thread-safe), but the env is shared by-ref with rayon in the
+/// par-compute closure — which NEVER touches the graph (it's launched only on the
+/// main thread in `step`). The unsafe impls assert that main-thread-only access,
+/// which holds for our usage.
+#[cfg(feature = "cuda_backend")]
+struct SyncGraph(khal::backend::cuda::CapturedGraph);
+#[cfg(feature = "cuda_backend")]
+unsafe impl Send for SyncGraph {}
+#[cfg(feature = "cuda_backend")]
+unsafe impl Sync for SyncGraph {}
 
 // --- MJCF parsing (duplicated from biped_env.rs — small, self-contained) ----
 
@@ -109,10 +127,28 @@ pub struct MjBody {
     pub local_pos: Vec3,
     pub local_quat: Rotation,
     pub joint: Option<String>,
+    /// Real per-joint position limits `(lo, hi)` from the MJCF `range` (rad).
+    /// `None` if unlimited. Used instead of the ±π JointSpec placeholder so the
+    /// ankle/knee can't over-flex (e.g. the foot folding into its own shin).
+    pub joint_range: Option<(f32, f32)>,
+    /// Passive joint damping (N·m·s/rad) from the MJCF `damping`. `None` if the
+    /// model omits it (then the JointSpec value is used).
+    pub joint_damping: Option<f32>,
     pub com: Vec3,
     pub mass: f32,
+    /// Diagonal inertia (Ixx, Iyy, Izz) from MJCF `fullinertia`.
     pub inertia_diag: Vec3,
+    /// Off-diagonal inertia products (Ixy, Ixz, Iyz) from MJCF `fullinertia`.
+    /// Several links have these comparable to the diagonal (~50–100%), so the
+    /// inertia tensor is significantly rotated — must not be dropped.
+    pub inertia_offdiag: Vec3,
     pub capsules: Vec<(Vec3, Vec3, f32)>,
+    /// Visual mesh geoms on this link: `(mesh_name, local_pos, local_quat)`.
+    /// Collected for the optional convex-hull collider path (`BIPED_FOOT_SHAPE=convex`).
+    pub mesh_geoms: Vec<(String, Vec3, Rotation)>,
+    /// Mesh vertices (link frame) used to build a convex-hull collider. Filled by
+    /// `load_mesh_hulls` only when the convex foot shape is requested; empty otherwise.
+    pub mesh_pts: Vec<Vec3>,
 }
 
 fn floats(s: &str) -> Vec<f32> {
@@ -135,13 +171,24 @@ fn quat_wxyz(node: &Node) -> Rotation {
 
 fn parse_body(node: &Node, parent: Option<usize>, out: &mut Vec<MjBody>) {
     let mut joint = None;
+    let mut joint_range = None;
+    let mut joint_damping = None;
     let mut is_free = false;
     let (mut com, mut mass, mut inertia_diag) = (Vec3::ZERO, 0.0, Vec3::splat(1e-4));
+    let mut inertia_offdiag = Vec3::ZERO;
     let mut capsules = Vec::new();
+    let mut mesh_geoms = Vec::new();
     for c in node.children().filter(Node::is_element) {
         match c.tag_name().name() {
             "freejoint" => is_free = true,
-            "joint" => joint = Some(c.attribute("name").unwrap_or("").to_string()),
+            "joint" => {
+                joint = Some(c.attribute("name").unwrap_or("").to_string());
+                joint_range = c.attribute("range").map(|s| {
+                    let f = floats(s);
+                    (f[0], f[1])
+                });
+                joint_damping = c.attribute("damping").and_then(|s| s.parse().ok());
+            }
             "inertial" => {
                 com = vec3(&c, "pos", Vec3::ZERO);
                 mass = c
@@ -149,8 +196,12 @@ fn parse_body(node: &Node, parent: Option<usize>, out: &mut Vec<MjBody>) {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.0);
                 if let Some(s) = c.attribute("fullinertia") {
+                    // MuJoCo order: Ixx Iyy Izz Ixy Ixz Iyz.
                     let f = floats(s);
                     inertia_diag = Vec3::new(f[0], f[1], f[2]);
+                    if f.len() >= 6 {
+                        inertia_offdiag = Vec3::new(f[3], f[4], f[5]);
+                    }
                 }
             }
             "geom" if c.attribute("class") == Some("collision") => {
@@ -158,6 +209,11 @@ fn parse_body(node: &Node, parent: Option<usize>, out: &mut Vec<MjBody>) {
                     let f = floats(ft);
                     let r = floats(c.attribute("size").unwrap_or("0.01"))[0];
                     capsules.push((Vec3::new(f[0], f[1], f[2]), Vec3::new(f[3], f[4], f[5]), r));
+                }
+            }
+            "geom" if c.attribute("type") == Some("mesh") => {
+                if let Some(name) = c.attribute("mesh") {
+                    mesh_geoms.push((name.to_string(), vec3(&c, "pos", Vec3::ZERO), quat_wxyz(&c)));
                 }
             }
             _ => {}
@@ -172,10 +228,15 @@ fn parse_body(node: &Node, parent: Option<usize>, out: &mut Vec<MjBody>) {
             local_pos: vec3(node, "pos", Vec3::ZERO),
             local_quat: quat_wxyz(node),
             joint,
+            joint_range,
+            joint_damping,
             com,
             mass,
             inertia_diag,
+            inertia_offdiag,
             capsules,
+            mesh_geoms,
+            mesh_pts: Vec::new(),
         });
     }
     let this = if keep { Some(idx) } else { parent };
@@ -206,6 +267,104 @@ pub fn default_mjcf_path() -> String {
     format!("{home}/Documents/work/lerobot-humanoid-design/to_real_robot/RL_policy/robot.xml")
 }
 
+/// Minimal binary-STL vertex loader. Returns every triangle vertex (unindexed) —
+/// `ColliderBuilder::convex_hull` only needs the point cloud. Handles binary STL
+/// (the format the onshape CAD export uses). Returns empty on any error.
+fn load_stl_vertices(path: &std::path::Path) -> Vec<Vec3> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    if bytes.len() < 84 {
+        return Vec::new();
+    }
+    let n = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
+    if bytes.len() < 84 + n * 50 {
+        return Vec::new(); // not a well-formed binary STL
+    }
+    let rd = |o: usize| f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    let mut pts = Vec::with_capacity(n * 3);
+    for t in 0..n {
+        let base = 84 + t * 50 + 12; // skip the 12-byte triangle normal
+        for v in 0..3 {
+            let o = base + v * 12;
+            pts.push(Vec3::new(rd(o), rd(o + 4), rd(o + 8)));
+        }
+    }
+    pts
+}
+
+/// Fill `mesh_pts` (link-frame vertices for the convex-hull collider path) on each
+/// link that carries visual mesh geoms. Resolves STL files via the MJCF
+/// `<asset><mesh>` table + `<compiler meshdir>` relative to the robot.xml dir
+/// (override with `BIPED_MESH_DIR`). Called only when the convex foot shape is
+/// requested, so the one-time STL read is skipped otherwise.
+pub fn load_mesh_hulls(mjcf: &mut [MjBody], xml: &str) {
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return;
+    };
+    let assets: HashMap<String, String> = doc
+        .descendants()
+        .filter(|n| n.tag_name().name() == "mesh")
+        .filter_map(|n| {
+            let file = n.attribute("file")?.to_string();
+            // MuJoCo: an unnamed `<mesh file="foo.stl"/>` is referenced by the file
+            // basename sans extension ("foo"). This model omits `name` entirely.
+            let name = n.attribute("name").map(str::to_string).unwrap_or_else(|| {
+                std::path::Path::new(&file)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&file)
+                    .to_string()
+            });
+            Some((name, file))
+        })
+        .collect();
+    let meshdir = doc
+        .descendants()
+        .find(|n| n.tag_name().name() == "compiler")
+        .and_then(|n| n.attribute("meshdir"))
+        .unwrap_or("assets");
+    let base = std::path::Path::new(&default_mjcf_path())
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let asset_dir = std::env::var("BIPED_MESH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| base.join(meshdir));
+    for b in mjcf.iter_mut() {
+        // Only links that actually get a collider (the feet — the others are inert
+        // placeholders, see the scene builder) need a hull. Skip the rest so we
+        // don't hull the huge thigh/shin meshes (~700k verts) for nothing.
+        if b.capsules.is_empty() {
+            continue;
+        }
+        let mut pts = Vec::new();
+        for (name, pos, quat) in &b.mesh_geoms {
+            let Some(file) = assets.get(name) else {
+                continue;
+            };
+            for v in load_stl_vertices(&asset_dir.join(file)) {
+                pts.push(*quat * v + *pos);
+            }
+        }
+        // Reduce the raw mesh cloud (~10^5 verts) to the convex-hull vertices ONCE
+        // here, so each of the thousands of per-env colliders re-hulls only a few
+        // dozen points instead of the whole mesh (env build was minutes otherwise).
+        if !pts.is_empty() {
+            if let Ok((hull, _)) = rapier3d::parry::transformation::try_convex_hull(&pts) {
+                eprintln!(
+                    "[convex] link '{}': {} mesh verts -> {}-vertex hull collider",
+                    b.name,
+                    pts.len(),
+                    hull.len()
+                );
+                pts = hull;
+            }
+        }
+        b.mesh_pts = pts;
+    }
+}
+
 // --- Per-env scene parameters (the bits a single rapier scene needs) --------
 
 /// Domain randomization knobs the GPU side CAN honour. Push-perturbation and
@@ -220,6 +379,10 @@ pub struct DrParams {
     pub friction: f32,
     pub restitution: f32,
     pub pd_scale: f32,
+    /// Per-env multiplier on every link's mass (and, to stay physically
+    /// consistent, its inertia tensor). Models payload / build-tolerance /
+    /// CAD-vs-reality mass error. ~±20% by default.
+    pub mass_scale: f32,
     pub contact_natural_frequency: f32,
     pub contact_damping_ratio: f32,
     /// Sampled base orientation at spawn — separate axes so a single template
@@ -229,6 +392,13 @@ pub struct DrParams {
     pub spawn_pitch: f32,
     /// Sampled additive jitter on `SPAWN_Z`, m. May be negative.
     pub spawn_z_offset: f32,
+    /// Per-actuated-joint gain/torque multiplier (independent draw per joint).
+    /// Models actuator-strength asymmetry — e.g. one hip motor stronger than its
+    /// mirror, or a worn/weaker joint — the asymmetry a perfectly symmetric
+    /// policy must handle REACTIVELY on the real robot. Independent per joint so
+    /// left/right differ; scales kp, kd, and the effort (torque) limit together.
+    /// Default `[1.0; NUM_JOINTS]` (symmetric, nominal).
+    pub pd_scale_per_joint: [f32; NUM_JOINTS],
 }
 
 impl Default for DrParams {
@@ -237,12 +407,14 @@ impl Default for DrParams {
             friction: 1.0,
             restitution: 0.0,
             pd_scale: 1.0,
+            mass_scale: 1.0,
             contact_natural_frequency: 30.0,
             contact_damping_ratio: 5.0,
             spawn_yaw: 0.0,
             spawn_roll: 0.0,
             spawn_pitch: 0.0,
             spawn_z_offset: 0.0,
+            pd_scale_per_joint: [1.0; NUM_JOINTS],
         }
     }
 }
@@ -272,6 +444,18 @@ pub struct LinkIndices {
     pub torso_link: u32,
     /// Multibody link indices of the two feet (assembly order).
     pub foot_links: [u32; NUM_FEET],
+    /// Links that must NEVER touch the ground (thigh / shin / hip) — only the
+    /// feet have ground colliders in nexus, so the policy can otherwise clip
+    /// these straight through the floor for free support. Used for a
+    /// WBC-AGILE-style `illegal_contact` termination (terminate if any of these
+    /// drops below `BIPED_ILLEGAL_Z`).
+    pub illegal_ground_links: Vec<u32>,
+    /// Left/right link pairs (foot, shin, thigh) for a WBC-AGILE-style
+    /// `feet_distance`/`knee_distance` self-collision guard: nexus can't do
+    /// physical leg-leg self-collision (the leg colliders are inert), so instead
+    /// terminate if any pair gets closer than `BIPED_SELF_COLL_DIST` — i.e. the
+    /// legs cross. Each entry is `(left_link, right_link)`.
+    pub self_collision_pairs: Vec<(u32, u32)>,
     /// (multibody_link_index, joint_name) for each actuated revolute. In
     /// `JOINT_NAMES` (canonical policy) order, so observation/action layout
     /// lines up with the CPU env.
@@ -323,7 +507,12 @@ fn build_env_scene(
     let root_rot = Rotation::from_rotation_z(dr.spawn_yaw)
         * Rotation::from_rotation_y(dr.spawn_pitch)
         * Rotation::from_rotation_x(dr.spawn_roll);
-    let root_pos = Vec3::new(0.0, 0.0, SPAWN_Z + dr.spawn_z_offset);
+    // BIPED_FREEFALL_Z lifts the spawn clear of the ground so the robot is in
+    // TRUE contact-free free-fall — the clean g/M-consistency test (pre-contact
+    // generalized accel `a` must equal pure free-fall: base linear = g, all joints
+    // ≈ 0). Diagnostic only.
+    let ff_z: f32 = std::env::var("BIPED_FREEFALL_Z").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let root_pos = Vec3::new(0.0, 0.0, SPAWN_Z + dr.spawn_z_offset + ff_z);
     let root_pose = Pose::from_parts(root_pos, root_rot);
     let mut world: Vec<Pose> = Vec::with_capacity(mjcf.len());
     for b in mjcf {
@@ -338,13 +527,35 @@ fn build_env_scene(
     let mut torso_handle = RigidBodyHandle::invalid();
     let mut foot_handles: Vec<(usize, RigidBodyHandle)> = Vec::new();
     for (i, b) in mjcf.iter().enumerate() {
+        // Armature (rotor inertia) is NO LONGER added to the link inertia tensor.
+        // It's now seeded into the multibody's mass-matrix DIAGONAL via
+        // set_dof_armature (see the seeding block after from_rapier). Baking it
+        // into Izz inflated M=JᵀIJ inconsistently with the gravity bias force, so
+        // a free-falling body spuriously buckled (joints to limits in ~0.1s) —
+        // the core nexus instability. The diagonal is the correct, consistent
+        // place (matches MuJoCo/rapier).
+        // Full inertia tensor (Ixx,Iyy,Izz + Ixy,Ixz,Iyz), diagonalized by parry
+        // (`with_inertia_matrix` → principal moments + frame, which nexus consumes).
+        let (d, o) = (b.inertia_diag, b.inertia_offdiag);
+        // DIAG-INERTIA A/B (diagnostic): zero the off-diagonals to isolate the
+        // principal-frame inertia from other effects.
+        let o = if std::env::var("BIPED_DIAG_INERTIA").is_ok() { Vec3::ZERO } else { o };
+        let inertia_mat = Mat3::from_cols(
+            Vec3::new(d.x, o.x, o.y), // col 0: Ixx, Ixy, Ixz
+            Vec3::new(o.x, d.y, o.z), // col 1: Ixy, Iyy, Iyz
+            Vec3::new(o.y, o.z, d.z), // col 2: Ixz, Iyz, Izz
+        );
+        // Mass DR: scale mass and inertia together so the body stays physically
+        // consistent (fixed geometry/density → I ∝ m). Applied per-env from the
+        // template's sampled `dr.mass_scale`.
+        let ms = dr.mass_scale;
         let h = bodies.insert(
             RigidBodyBuilder::dynamic()
                 .position(world[i])
-                .additional_mass_properties(MassProperties::new(
+                .additional_mass_properties(MassProperties::with_inertia_matrix(
                     b.com,
-                    b.mass.max(1e-3),
-                    b.inertia_diag,
+                    (b.mass * ms).max(1e-3),
+                    inertia_mat * ms,
                 ))
                 .build(),
         );
@@ -362,18 +573,97 @@ fn build_env_scene(
                 &mut bodies,
             );
         } else {
-            // Foot box.
+            // Foot box. The MJCF sole is a cage of thin capsules; nexus allows
+            // only ONE collider per body, so we approximate it with a single
+            // cuboid. CRUCIAL: the cuboid spans the capsule CENTERLINES, and the
+            // capsule radius is added back ONLY on the sole-thickness axis (the
+            // one where the centerlines are ~coplanar) — NOT on the two footprint
+            // axes. A horizontal capsule resting on the floor contacts along the
+            // line directly beneath its axis, so the real support polygon is the
+            // centerline rectangle; the old `±r` bounding box inflated the sole
+            // footprint by ~1.5 cm per side (~+47% area), giving an
+            // unrealistically large/stable support base the policy braced on
+            // (stands rock-solid in nexus, falls in ~1.3 s in MuJoCo). Keeping the
+            // radius on the thickness axis preserves the foot's bottom-surface
+            // height, so the spawn height / penetration are unchanged.
             let mut lo = Vec3::splat(f32::INFINITY);
             let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            let mut rmax = 0.0f32;
             for (a, c, r) in &b.capsules {
-                lo = lo.min(a.min(*c) - Vec3::splat(*r));
-                hi = hi.max(a.max(*c) + Vec3::splat(*r));
+                lo = lo.min(a.min(*c));
+                hi = hi.max(a.max(*c));
+                rmax = rmax.max(*r);
             }
+            // Add the radius back only on axes whose centerline extent is below
+            // the radius (i.e. the capsules are essentially coplanar there → the
+            // sole-thickness direction). Footprint axes keep centerline bounds.
+            let ext = hi - lo;
+            let pad = Vec3::new(
+                if ext.x < rmax { rmax } else { 0.0 },
+                if ext.y < rmax { rmax } else { 0.0 },
+                if ext.z < rmax { rmax } else { 0.0 },
+            );
+            lo -= pad;
+            hi += pad;
             let he = ((hi - lo) * 0.5).max(Vec3::splat(1e-3));
-            let center = (hi + lo) * 0.5;
+            let mut center = (hi + lo) * 0.5;
+            // Foot collider shape. Default CAPSULE (rounded sole): nexus's flat box
+            // foot caught on its sharp edges at foot-strike, so a dynamic gait
+            // diverged at the ankles in MuJoCo (whose sole is 6 ROUNDED capsules) —
+            // the walking sim2sim gap. A capsule rounds the heel/toe so the foot
+            // ROLLS through strike/push-off like MuJoCo's. Axis = longest footprint
+            // axis; radius = the foot half-width; the center is shifted on the
+            // thickness axis so the sole-bottom height is unchanged. BIPED_FOOT_SHAPE=box reverts.
+            // BIPED_FOOT_SHAPE=convex adds a third option: a convex hull of the
+            // link's actual mesh geometry, so nexus collides with the real foot
+            // shape rather than the capsule/box approximation. The hull points are
+            // already in the link frame, so the collider pose is identity (unlike
+            // box/capsule, which sit at the computed `center`). NOTE the rounded-
+            // capsule rationale above: a hull reintroduces sharp foot-strike edges,
+            // so this is opt-in for fidelity experiments, not the tuned default.
+            let foot_shape = std::env::var("BIPED_FOOT_SHAPE").unwrap_or_else(|_| "capsule".to_string());
+            let convex_cb = if foot_shape == "convex" && !b.mesh_pts.is_empty() {
+                ColliderBuilder::convex_hull(&b.mesh_pts)
+            } else {
+                None
+            };
+            let (cb, cpose) = if let Some(cb) = convex_cb {
+                (cb, Pose::from_parts(Vec3::ZERO, Rotation::IDENTITY))
+            } else if foot_shape == "box" {
+                (
+                    ColliderBuilder::cuboid(he.x, he.y, he.z),
+                    Pose::from_parts(center, Rotation::IDENTITY),
+                )
+            } else {
+                let he_arr = [he.x, he.y, he.z];
+                // Thickness axis = where the radius pad was added (capsules ~coplanar).
+                let tax = if pad.x > 0.0 { 0 } else if pad.y > 0.0 { 1 } else { 2 };
+                let foot_axes: Vec<usize> = (0..3).filter(|&a| a != tax).collect();
+                // long = larger-extent footprint axis (capsule axis); wide = the other.
+                let (long_ax, wide_ax) = if he_arr[foot_axes[0]] >= he_arr[foot_axes[1]] {
+                    (foot_axes[0], foot_axes[1])
+                } else {
+                    (foot_axes[1], foot_axes[0])
+                };
+                let radius = he_arr[wide_ax].max(1e-3);
+                let half_height = (he_arr[long_ax] - radius).max(1e-3);
+                // Preserve the sole-bottom height: capsule bottom is center−radius
+                // vs the box's center−he[tax]; shift the center up by the difference.
+                let shift = radius - he_arr[tax];
+                match tax {
+                    0 => center.x += shift,
+                    1 => center.y += shift,
+                    _ => center.z += shift,
+                }
+                let cb = match long_ax {
+                    0 => ColliderBuilder::capsule_x(half_height, radius),
+                    1 => ColliderBuilder::capsule_y(half_height, radius),
+                    _ => ColliderBuilder::capsule_z(half_height, radius),
+                };
+                (cb, Pose::from_parts(center, Rotation::IDENTITY))
+            };
             colliders.insert_with_parent(
-                ColliderBuilder::cuboid(he.x, he.y, he.z)
-                    .position(Pose::from_parts(center, Rotation::IDENTITY))
+                cb.position(cpose)
                     .density(0.0)
                     .friction(dr.friction)
                     .restitution(dr.restitution),
@@ -397,21 +687,99 @@ fn build_env_scene(
     mb_link_of_mjcf.insert(0, 0); // torso is multibody root → link 0
     let mut next_mb_link: u32 = 1;
     let mut name_to_link: HashMap<String, u32> = HashMap::new();
+    // Joint position limits cost ~1.7x iter time (extra per-step constraints);
+    // only worth it with real (tight) ranges, so gate them off by default.
+    // Physical joint limits ON by default (opt out with BIPED_JOINT_LIMITS=0).
+    // Without them the policy "stands" by jamming joints to the target-clamp
+    // boundary — a degenerate brace that doesn't balance and doesn't transfer to
+    // MuJoCo. Real limits (the per-joint MJCF range) force genuine balance,
+    // matching WBC's soft_joint_pos_limit_factor=0.9. ~1.7x iter cost.
+    let joint_limits_on = std::env::var("BIPED_JOINT_LIMITS")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     for (i, b) in mjcf.iter().enumerate() {
         let (Some(parent), Some(jname)) = (b.parent, b.joint.as_ref()) else {
             continue;
         };
         let spec = robot.joints.iter().find(|j| &j.name == jname);
-        let (kp, kd, effort) = spec
-            .map(|s| (s.kp * dr.pd_scale, s.kd * dr.pd_scale, s.effort_limit))
-            .unwrap_or((50.0, 1.0, 20.0));
+        let pi = std::f32::consts::PI;
+        // Per-joint actuator-strength DR (asymmetry): look up this joint's action
+        // index and apply its independent gain/torque multiplier on top of the
+        // global `pd_scale`. `1.0` for joints not in the canonical action set.
+        let pj = JOINT_NAMES
+            .iter()
+            .position(|&n| n == jname.as_str())
+            .map(|k| dr.pd_scale_per_joint[k])
+            .unwrap_or(1.0);
+        let (kp, kd, effort, pos_limit, spec_damping) = spec
+            .map(|s| {
+                (
+                    s.kp * dr.pd_scale * pj,
+                    s.kd * dr.pd_scale * pj,
+                    s.effort_limit * pj,
+                    s.pos_limit,
+                    s.damping,
+                )
+            })
+            .unwrap_or((50.0 * pj, 1.0 * pj, 20.0 * pj, (-pi, pi), 0.0));
+        // Passive joint damping (N·m·s/rad): the real joints are damped 0.5–2.3,
+        // but nexus's passive-damping buffer is a hardcoded 0.1 default, so the
+        // sim joints slew at ~50 rad/s. Fold the real damping into the motor's
+        // velocity gain (kd) — the chosen no-shader-change fix. Prefer the MJCF
+        // `damping` attr when the model provides it; else the JointSpec value.
+        // It's NOT scaled by `pd_scale` (it's a physical property, not a gain).
+        let damping = b.joint_damping.unwrap_or(spec_damping);
+        let kd = kd + damping;
         let mut joint = GenericJointBuilder::new(locked)
             .local_frame1(Pose::from_parts(b.local_pos, b.local_quat))
             .local_frame2(Pose::IDENTITY)
             .build();
-        joint.set_motor_model(JointAxis::AngZ, MotorModel::ForceBased);
-        joint.set_motor_position(JointAxis::AngZ, 0.0, kp, kd);
+        // Motor model. ForceBased is now applied as an EXPLICIT generalized-force
+        // PD torque inside the nexus solver (gpu_mb_gravity_and_lu: gen_forces +=
+        // clamp(kp·(target−q) − kd·q̇, ±effort)), exactly matching the real robot
+        // and MuJoCo's position actuator. AccelerationBased uses the mass-
+        // normalized soft constraint (cfm_coeff): commanded kp realizes the same
+        // stiffness regardless of the joint's (tiny) link inertia — crisp, but
+        // UNREALISTIC (the real actuator is force-based, so the policy overfits to
+        // nexus's inertia-decoupled tracking; sim-to-sim diverges at the ankles).
+        // The OLD constraint-based ForceBased (raw cfm_gain) under-realized kp and
+        // sagged — that path is bypassed now. BIPED_FORCE_MOTOR=1 selects the
+        // explicit force-based PD (the sim-to-real-faithful default candidate).
+        // Explicit force-based PD is now the DEFAULT: it matches the real robot /
+        // MuJoCo actuator (τ = kp·err − kd·q̇), and with it the standing policy
+        // survives the full 6 s in MuJoCo (vs 1.7 s on AccelerationBased — the
+        // inertia-decoupled tracking the policy used to overfit to). Opt back into
+        // the old AccelerationBased motor with BIPED_ACCEL_MOTOR=1 for A/B.
+        let motor_model = if std::env::var("BIPED_ACCEL_MOTOR").is_ok() {
+            MotorModel::AccelerationBased
+        } else {
+            MotorModel::ForceBased
+        };
+        joint.set_motor_model(JointAxis::AngZ, motor_model);
+        // Motor gains come straight from the robot spec (LeRobotBipedal::family),
+        // which already bakes in the physical torque-PD correction (STIFFNESS_SCALE
+        // / DAMPING_SCALE) — kp is a real torque/rad gain, FIXED, identical to what
+        // the MuJoCo transfer model and the real robot use. No runtime scaling.
+        // BIPED_KP_SCALE / BIPED_KD_SCALE remain only as optional diagnostics
+        // (default 1.0); leave them unset for the production gains.
+        let kp_scale: f32 = std::env::var("BIPED_KP_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let kd_scale: f32 = std::env::var("BIPED_KD_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        joint.set_motor_position(JointAxis::AngZ, 0.0, kp * kp_scale, kd * kd_scale);
         joint.set_motor_max_force(JointAxis::AngZ, effort);
+        // Enforce the free axis's position limits — OFF by default (set
+        // BIPED_JOINT_LIMITS=1 to enable). Setting a limit makes the multibody
+        // solver emit a limit constraint (kind=1) alongside each motor
+        // constraint, ~doubling per-step joint constraints and costing ~1.7x
+        // iter time, so it's gated. When enabled, use the REAL per-joint range
+        // from the MJCF (`joint_range`) when present — the ankle is only
+        // ~[-10°,+20°], so the ±π JointSpec placeholder let the foot fold into
+        // its own shin — falling back to the placeholder if the model omits one.
+        // (The PD target is separately clamped to the joint range in
+        // VelocityFlatTask::joint_targets regardless of this physical limit.)
+        if joint_limits_on {
+            let (lo, hi) = b.joint_range.unwrap_or(pos_limit);
+            joint.set_limits(JointAxis::AngZ, [lo, hi]);
+        }
         multibody.insert(handles[parent], handles[i], joint, true);
         mb_link_of_mjcf.insert(i, next_mb_link);
         name_to_link.insert(jname.clone(), next_mb_link);
@@ -436,12 +804,18 @@ fn build_env_scene(
         rb.recompute_mass_properties_from_colliders(&colliders_snapshot);
     }
 
-    // Sim params: per-env contact softness via DR.
+    // Sim params: per-env contact softness via DR. Env overrides let us A/B the
+    // contact-solver knobs against the WBC-AGILE-matched config without a rebuild
+    // each time (BIPED_SOLVER_ITERS / BIPED_CONTACT_NF / BIPED_CONTACT_DR).
+    let env_f32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
     let mut sp = GpuSimParams::default();
     sp.dt = task_dt;
-    sp.num_solver_iterations = SOLVER_ITERS;
-    sp.contact_natural_frequency = dr.contact_natural_frequency;
-    sp.contact_damping_ratio = dr.contact_damping_ratio;
+    sp.num_solver_iterations = std::env::var("BIPED_SOLVER_ITERS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(SOLVER_ITERS);
+    sp.contact_natural_frequency = env_f32("BIPED_CONTACT_NF").unwrap_or(dr.contact_natural_frequency);
+    sp.contact_damping_ratio = env_f32("BIPED_CONTACT_DR").unwrap_or(dr.contact_damping_ratio);
 
     // Build the index table from the canonical joint ordering.
     let mut actuated: Vec<(u32, String)> = Vec::with_capacity(NUM_JOINTS);
@@ -470,6 +844,35 @@ fn build_env_scene(
         .map(|i| *mb_link_of_mjcf.get(&i).unwrap_or(&0))
         .collect();
 
+    // Thigh / shin / hip links — the parts that have NO ground collider (only
+    // the feet do), so they must never legitimately touch the floor. (Names use
+    // the model's spelling: `tigh_subassembly`, `shin_subassembly`, `hip*`.)
+    // Ankle + foot are excluded (they sit legitimately low next to the sole).
+    let illegal_ground_links: Vec<u32> = (0..mjcf.len())
+        .filter(|&i| {
+            let n = &mjcf[i].name;
+            n.contains("shin") || n.contains("tigh") || n.contains("hip")
+        })
+        .filter_map(|i| mb_link_of_mjcf.get(&i).copied())
+        .collect();
+
+    // Left/right link pairs for the self-collision (leg-crossing) guard. The
+    // model's right side is the bare name and the left side gets a `_sym`/`_2`
+    // suffix, so pair each base body with its mirrored twin.
+    let link_of_name = |name: &str| -> Option<u32> {
+        mjcf.iter()
+            .position(|b| b.name == name)
+            .and_then(|i| mb_link_of_mjcf.get(&i).copied())
+    };
+    let self_collision_pairs: Vec<(u32, u32)> = [
+        ("foot_subassembly", "foot_subassembly_2"),
+        ("shin_subassembly", "shin_subassembly_sym"),
+        ("tigh_subassembly", "tigh_subassembly_sym"),
+    ]
+    .iter()
+    .filter_map(|(r, l)| Some((link_of_name(r)?, link_of_name(l)?)))
+    .collect();
+
     // Per-joint parent link + rest quat, used by the ws-free joint-angle
     // extraction (`q_child = q_parent · rest_quat · R_z(θ)`).
     let mut actuated_parent_links = [0u32; NUM_JOINTS];
@@ -496,6 +899,8 @@ fn build_env_scene(
         colliders_per_batch: (mjcf.len() + 1) as u32, // robot bodies + ground
         torso_link: 0,
         foot_links,
+        illegal_ground_links,
+        self_collision_pairs,
         actuated,
         joint_dof_offset,
         foot_sole_local,
@@ -528,6 +933,22 @@ pub struct StepOut {
     pub fell: bool,
 }
 
+/// Debug-only per-foot stance-phase accumulator (env 0). Records the foot
+/// origin's world XY + heading at the moment it became loaded, so when it lifts
+/// we can report how far the planted foot's origin actually drifted (slide) and
+/// how much it rotated (roll) over the whole single-support phase.
+#[derive(Clone, Copy, Default)]
+struct DbgStance {
+    loaded: bool,
+    start_x: f32,
+    start_y: f32,
+    start_quat: [f32; 4],
+    steps: u32,
+    prev_x: f32,
+    prev_y: f32,
+    path_len: f32, // accumulated horizontal path of the origin (total, not net)
+}
+
 /// One vectorized env over nexus GPU physics.
 ///
 /// All N envs share a single `GpuPhysicsState`. Per-env host state (RNG,
@@ -551,6 +972,30 @@ pub struct BipedNexusBatchEnv {
     last_action: Vec<[f32; NUM_JOINTS]>,
     prev_action: Vec<[f32; NUM_JOINTS]>,
     air_time: Vec<[f32; NUM_FEET]>,
+    /// Index of the foot that most recently touched down, per env (-1 = none yet,
+    /// reset on episode reset). Drives `FootObs.alt_step`: a touchdown only counts
+    /// as a step if it's the OTHER foot than this, enforcing L→R→L→R alternation.
+    last_td_foot: Vec<i8>,
+    /// Gait-clock phase ∈ [0,1) per env, advanced by `control_dt / gait_period`
+    /// each step (wraps at 1), reset to 0 on episode reset. Fed to the policy as
+    /// (sin,cos) and used by the periodic gait reward to prescribe swing/stance.
+    gait_phase: Vec<f32>,
+    /// Seconds per full gait cycle (both feet step once). BIPED_GAIT_PERIOD.
+    gait_period: f32,
+    /// Global control-step counter (for push-perturbation scheduling).
+    global_step: u64,
+    /// Debug-only per-foot stance-phase tracker (env 0). Tracks, while a foot is
+    /// continuously loaded, the net horizontal travel + rotation of its origin so
+    /// we can tell a planted-but-vaulting foot (origin ~fixed) from a SLIDING one
+    /// (origin drifts across the floor). Lazily init'd in debug_contact_impulses.
+    dbg_stance: Vec<DbgStance>,
+    /// Random torso-push magnitude, m/s (BIPED_PUSH_VEL, 0 = off) and interval in
+    /// control steps (BIPED_PUSH_INTERVAL). Every `push_interval` steps each env
+    /// gets a random horizontal velocity kick to the torso, forcing the policy to
+    /// learn genuine balance recovery (sim-to-real robustness) rather than a
+    /// brittle nexus-specific reflex.
+    push_vel: f32,
+    push_interval: u64,
     /// Previous control-step joint angles per env. Used to compute joint
     /// velocities by finite-diff `(q_now - q_prev) / control_dt` instead of
     /// reading nexus's `dof_state` buffer — saves one slow_read per step.
@@ -573,14 +1018,50 @@ pub struct BipedNexusBatchEnv {
     /// scaled ranges from a known baseline, mirroring the CPU env.
     sampler_default: CommandSampler,
 
+    /// Curriculum scale on the torque (effort) penalty (0 = off, 1 = full WBC
+    /// weight). Set per-iteration by the trainer via `set_torque_scale` so the
+    /// penalty ramps in only AFTER the policy can stand — a torque penalty at
+    /// full strength from scratch fights learning to stand at all. Initialised
+    /// from `BIPED_TORQUE_W` so non-curriculum callers (e.g. render) still get a
+    /// fixed value.
+    torque_scale: f32,
+
     // GPU state
     gpu: KhalGpuBackend,
     pipeline: GpuPhysicsPipeline,
     state: GpuPhysicsState,
 
+    /// CUDA-graph capture of one control step's `decimation × pipeline.step`
+    /// physics sequence. The per-step host re-encode of those dispatches is
+    /// ~half the physics time (~24 ms/step measured); capturing once and
+    /// replaying via `cuGraphLaunch` removes it. Opt-in via `BIPED_GRAPH=1`
+    /// (eager dispatch is the default). Captured lazily after warmup; replayed
+    /// thereafter with the freshly-staged motor buffer (the graph records kernel
+    /// launches, not data, so per-step buffer writes + resets are honoured).
+    #[cfg(feature = "cuda_backend")]
+    physics_graph: Option<SyncGraph>,
+    /// Steps taken since construction — used to delay graph capture until the
+    /// dispatch structure (color count / buffers) has stabilised.
+    graph_warmup_steps: u32,
+
     // Pre-built spawn templates for reset_env_from (different DR samples).
     templates: Vec<GpuPhysicsState>,
+    /// CPU snapshot of each template, read off the GPU once at setup so resets
+    /// are write-only (no per-reset `slow_read_buffer` stalls — the dominant
+    /// reset cost on WebGPU). Parallel to `templates`.
+    template_snapshots: Vec<GpuPhysicsSnapshot>,
     template_dr: Vec<DrParams>,
+    /// Cached per-template `foot_sole_local` (constant per template) so reset_env
+    /// doesn't rebuild the rapier scene every reset.
+    template_foot_sole: Vec<[Vec3; NUM_FEET]>,
+    /// Cached per-template spawn obs / critic-obs (populated by `initial_obs`).
+    /// The post-reset obs is deterministic from the template spawn state; the
+    /// velocity command enters ONLY obs[12:16], so reset_env serves these cached
+    /// vectors with the fresh command patched in — eliminating the per-reset
+    /// `slurp_poses` full readback (the dominant reset cost). Empty until
+    /// `initial_obs` runs, in which case reset_env falls back to the readback.
+    template_spawn_obs: Vec<Vec<f32>>,
+    template_spawn_critic_obs: Vec<Vec<f32>>,
 
     /// Counter for the periodic `pipeline.auto_resize_buffers` call (see
     /// `AUTO_RESIZE_PERIOD`). Resets to 0 after each resize.
@@ -588,6 +1069,69 @@ pub struct BipedNexusBatchEnv {
 
     /// Phase-level timing accumulators — read + reset via `take_step_timings`.
     timings: StepTimings,
+
+    /// Per-component reward + termination-cause accumulators for W&B logging.
+    /// `rlog_comps[i]` sums component `i` (see `REWARD_COMP_NAMES`) over every
+    /// (env, step) sample since the last `take_reward_log`; `rlog_steps` is the
+    /// sample count (divide to get the per-step mean). The three termination
+    /// counters are episode totals over the same window. Read + reset via
+    /// `take_reward_log` so the trainer can emit one structured line per iter.
+    rlog_comps: [f64; NUM_REWARD_COMPS],
+    rlog_steps: u64,
+    rlog_illegal: u64,
+    rlog_fell: u64,
+    rlog_timeout: u64,
+}
+
+/// Number of logged reward components (see [`REWARD_COMP_NAMES`]).
+pub const NUM_REWARD_COMPS: usize = 27;
+
+/// Names of the per-component reward terms, in `rlog_comps` / `RewardLog::comps`
+/// order. The first 20 mirror `RewardBreakdown`'s live terms; the last four are
+/// env-side penalties applied after `total()` (leg torque, ankle torque,
+/// self-collision) plus the termination penalty.
+pub const REWARD_COMP_NAMES: [&str; NUM_REWARD_COMPS] = [
+    "track_lin_vel",
+    "track_ang_vel",
+    "upright",
+    "base_height",
+    "pose",
+    "bilateral_symmetry",
+    "action_rate",
+    "action_rate_hipz_hipx",
+    "body_ang_vel",
+    "lin_vel_z",
+    "dof_pos_limits",
+    "dof_vel",
+    "air_time",
+    "flight",
+    "single_support",
+    "foot_slip",
+    "foot_clearance",
+    "foot_orientation",
+    "feet_yaw_mean",
+    "feet_distance",
+    "torque_leg",
+    "torque_ankle",
+    "self_coll",
+    "termination",
+    "power", // Σ|τ·q̇| mechanical-power (energy / cost-of-transport) penalty
+    "gait_clock", // dense periodic swing/stance-matching reward
+    "com_centering", // CoM-over-support-foot (low-ankle-torque single-support)
+];
+
+/// One window of accumulated reward/termination stats (see `take_reward_log`).
+pub struct RewardLog {
+    /// Per-step mean of each reward component, in `REWARD_COMP_NAMES` order.
+    pub comps: [f32; NUM_REWARD_COMPS],
+    /// Episodes ended by illegal ground contact over the window.
+    pub illegal: u64,
+    /// Episodes ended by a fall (tilt / low base height), excluding `illegal`.
+    pub fell: u64,
+    /// Episodes ended by hitting the max-step timeout (not a failure).
+    pub timeout: u64,
+    /// Number of (env, step) samples averaged into `comps`.
+    pub samples: u64,
 }
 
 impl BipedNexusBatchEnv {
@@ -595,11 +1139,28 @@ impl BipedNexusBatchEnv {
     /// how many distinct DR samples are pre-built and cycled across the N envs
     /// at construction and reset time (higher = better coverage, more GPU mem).
     pub async fn new(mjcf_xml: &str, num_envs: usize, num_templates: usize, seed: u64) -> Self {
-        let mjcf = parse_mjcf(mjcf_xml);
+        let mut mjcf = parse_mjcf(mjcf_xml);
+        // Convex-hull foot collider path: load the link meshes once so the scene
+        // builder can hull them (BIPED_FOOT_SHAPE=convex). Default capsule path
+        // skips this entirely.
+        if std::env::var("BIPED_FOOT_SHAPE").as_deref() == Ok("convex") {
+            load_mesh_hulls(&mut mjcf, mjcf_xml);
+        }
         let robot = LeRobotBipedal::new();
-        let task = VelocityFlatTask::new();
+        let mut task = VelocityFlatTask::new();
+        // BIPED_DECIMATION: shift physics work between narrow-phase refreshes
+        // (decimation) and solver substeps while KEEPING control_dt=0.02 fixed
+        // (sim_dt = 0.02/decimation = the contact-staleness window). Used with
+        // BIPED_SOLVER_ITERS to hold total substeps + substep dt' constant and
+        // vary ONLY how often the contact manifold is refreshed — the
+        // deconfounding test for the "stale multibody contact across substeps"
+        // hypothesis. Diagnostic only.
+        if let Some(d) = std::env::var("BIPED_DECIMATION").ok().and_then(|s| s.parse::<u32>().ok()) {
+            task.decimation = d;
+            task.sim_dt = 0.02 / d as f32;
+        }
 
-        let gpu = webgpu_backend().await;
+        let gpu = make_backend().await;
         let pipeline = GpuPhysicsPipeline::from_backend(&gpu);
 
         // Sample DR for the templates first (each defines one rapier scene).
@@ -608,8 +1169,13 @@ impl BipedNexusBatchEnv {
             .map(|_| sample_dr(&mut tpl_rng))
             .collect();
         // Always include one DR-OFF template at index 0 — keeps deterministic
-        // replay possible and provides a stable initialiser.
+        // replay possible and provides a stable initialiser. BIPED_FRICTION still
+        // pins its contact μ (the render uses this template, so the knob must reach
+        // it — otherwise friction A/B on the rendered env is a no-op).
         template_dr[0] = DrParams::default();
+        if let Some(f) = std::env::var("BIPED_FRICTION").ok().and_then(|s| s.parse::<f32>().ok()) {
+            template_dr[0].friction = f;
+        }
 
         // Build the per-env scenes — cycle across the templates so envs get
         // mixed DR from the start. We keep the LinkIndices from the first one
@@ -641,11 +1207,71 @@ impl BipedNexusBatchEnv {
             .collect();
         let mut state = GpuPhysicsState::from_rapier(&gpu, &envs_refs);
         state.multibodies_mut().set_gravity(&gpu, [0.0, 0.0, -9.81]);
+        // Implicit-coriolis augments the mass matrix with `dt·C` — at fewer
+        // substeps that over-damps, at more it under-damps, so passive feet creep
+        // ∝ num_solver_iterations (the sim-to-real foot-slip bug). MuJoCo/Genesis
+        // don't do this. Override with BIPED_IMPLICIT_CORIOLIS=0 to test/disable.
+        if let Ok(v) = std::env::var("BIPED_IMPLICIT_CORIOLIS") {
+            state.multibodies_mut().set_implicit_coriolis(v != "0");
+        }
 
-        // Spawn templates: one single-env GPU state per DR sample.
+        // Seed per-DOF Coulomb joint friction (MJCF `frictionloss`) into the
+        // multibody. Env-major `[env][dof]` layout matching the velocity section:
+        // 0 for the 6 root DOFs, each leg joint's frictionloss at its DOF offset.
+        // Static across envs (same robot), set once — the per-env reset copies
+        // dof_state/values, not this separate `dof_frictionloss` buffer.
+        {
+            let dpb = idx.dofs_per_batch as usize;
+            let mut fl_per_dof = vec![0.0f32; dpb];
+            for k in 0..NUM_JOINTS {
+                let dof = idx.joint_dof_offset[k] as usize;
+                if let Some(s) = robot.joints.iter().find(|j| j.name == idx.actuated[k].1) {
+                    if dof < dpb {
+                        fl_per_dof[dof] = s.frictionloss;
+                    }
+                }
+            }
+            let fl_flat: Vec<f32> = (0..num_envs).flat_map(|_| fl_per_dof.iter().copied()).collect();
+            state.multibodies_mut().set_dof_frictionloss(&gpu, &fl_flat);
+        }
+
+        // Seed per-DOF armature (rotor inertia) into the multibody's mass-matrix
+        // diagonal — the CORRECT place for armature. Previously armature was baked
+        // into each link's inertia tensor (izz_extra), which inflated M=JᵀIJ
+        // inconsistently with the gravity bias force and made a free-falling body
+        // spuriously buckle (joints slammed to limits in ~0.1s — the nexus
+        // instability that blocked all training). Same env-major `[env][dof]`
+        // layout as frictionloss; 0 for the root DOFs. Scaled by BIPED_ARM (A/B).
+        {
+            let dpb = idx.dofs_per_batch as usize;
+            let arm_scale: f32 = std::env::var("BIPED_ARM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0);
+            let mut arm_per_dof = vec![0.0f32; dpb];
+            for k in 0..NUM_JOINTS {
+                let dof = idx.joint_dof_offset[k] as usize;
+                if let Some(s) = robot.joints.iter().find(|j| j.name == idx.actuated[k].1) {
+                    if dof < dpb {
+                        arm_per_dof[dof] = s.armature * arm_scale;
+                    }
+                }
+            }
+            let arm_flat: Vec<f32> = (0..num_envs).flat_map(|_| arm_per_dof.iter().copied()).collect();
+            state.multibodies_mut().set_dof_armature(&gpu, &arm_flat);
+        }
+
+        // Spawn templates: one single-env GPU state per DR sample. Also CACHE
+        // each template's `foot_sole_local` — it depends only on the (fixed) DR
+        // sample, so it's constant per template. reset_env looks it up instead of
+        // rebuilding the whole rapier scene every reset (build_env_scene is heavy:
+        // bodies + colliders + joints + inertia eigendecomps — and reset_env runs
+        // thousands of times per training iteration, once per fallen env).
         let mut templates: Vec<GpuPhysicsState> = Vec::with_capacity(num_templates);
+        let mut template_foot_sole: Vec<[Vec3; NUM_FEET]> = Vec::with_capacity(num_templates);
         for dr in &template_dr {
-            let (scene, _) = build_env_scene(&mjcf, &robot, dr, task.sim_dt);
+            let (scene, ix) = build_env_scene(&mjcf, &robot, dr, task.sim_dt);
+            template_foot_sole.push(ix.foot_sole_local);
             let envs_refs = vec![(
                 &scene.bodies,
                 &scene.colliders,
@@ -658,16 +1284,21 @@ impl BipedNexusBatchEnv {
             templates.push(tpl);
         }
 
-        // Per-env initial sole-normal: every env starts from the corresponding
-        // template, so its foot_sole_local matches that template's at-spawn
-        // computation. Re-derive by re-building the rapier scene with the same
-        // DR (cheap; bodies are tiny).
-        let mut foot_sole_local: Vec<[Vec3; NUM_FEET]> = Vec::with_capacity(num_envs);
-        for e in 0..num_envs {
-            let dr = template_dr[e % num_templates];
-            let (_, ix) = build_env_scene(&mjcf, &robot, &dr, task.sim_dt);
-            foot_sole_local.push(ix.foot_sole_local);
+        // Snapshot each template off the GPU ONCE so per-env resets are
+        // write-only. reset_env runs thousands of times per iteration (once per
+        // fallen env); the old reset_env_from re-read the constant template from
+        // the GPU 6× per reset, and each slow_read_buffer stalls the WebGPU queue
+        // (tens of seconds/iter on Metal). Reading once here makes resets cheap.
+        let mut template_snapshots: Vec<GpuPhysicsSnapshot> = Vec::with_capacity(num_templates);
+        for tpl in &templates {
+            template_snapshots.push(tpl.snapshot(&gpu).await);
         }
+
+        // Per-env initial sole-normal: every env starts from the corresponding
+        // template, so its foot_sole_local matches that template's. Look up the
+        // cached per-template value (no rebuild).
+        let foot_sole_local: Vec<[Vec3; NUM_FEET]> =
+            (0..num_envs).map(|e| template_foot_sole[e % num_templates]).collect();
 
         let cmd = vec![VelocityCommand::default(); num_envs];
         let step_count = vec![0u32; num_envs];
@@ -675,6 +1306,20 @@ impl BipedNexusBatchEnv {
         let last_action = vec![[0.0f32; NUM_JOINTS]; num_envs];
         let prev_action = vec![[0.0f32; NUM_JOINTS]; num_envs];
         let air_time = vec![[0.0f32; NUM_FEET]; num_envs];
+        let last_td_foot = vec![-1i8; num_envs];
+        let gait_phase = vec![0.0f32; num_envs];
+        let gait_period = std::env::var("BIPED_GAIT_PERIOD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.7);
+        let push_vel = std::env::var("BIPED_PUSH_VEL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let push_interval = std::env::var("BIPED_PUSH_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
         let prev_joint_pos = vec![[0.0f32; NUM_JOINTS]; num_envs];
         let has_prev_joint_pos = vec![false; num_envs];
         // One pose entry per collider per env (matches `body_poses` layout).
@@ -701,19 +1346,42 @@ impl BipedNexusBatchEnv {
             last_action,
             prev_action,
             air_time,
+            last_td_foot,
+            gait_phase,
+            gait_period,
+            global_step: 0,
+            dbg_stance: Vec::new(),
+            push_vel,
+            push_interval,
             prev_joint_pos,
             has_prev_joint_pos,
             prev_body_poses,
             has_prev_pose,
             foot_sole_local,
             sampler_default,
+            torque_scale: std::env::var("BIPED_TORQUE_W")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.1),
             gpu,
             pipeline,
             state,
             templates,
+            template_snapshots,
             template_dr,
+            template_foot_sole,
+            template_spawn_obs: Vec::new(),
+            template_spawn_critic_obs: Vec::new(),
             tick_since_resize: 0,
+            #[cfg(feature = "cuda_backend")]
+            physics_graph: None,
+            graph_warmup_steps: 0,
             timings: StepTimings::default(),
+            rlog_comps: [0.0; NUM_REWARD_COMPS],
+            rlog_steps: 0,
+            rlog_illegal: 0,
+            rlog_fell: 0,
+            rlog_timeout: 0,
         };
         // Seed every env's command and resample schedule (mirrors `reset_full`
         // on the CPU side without an actual GPU reset — the GPU state is
@@ -761,6 +1429,13 @@ impl BipedNexusBatchEnv {
         self.sampler.ang_vel_z = (d.ang_vel_z.0 * s, d.ang_vel_z.1 * s);
     }
 
+    /// Curriculum hook — scales the torque (effort) penalty by `s`. The trainer
+    /// ramps this from 0 up to the target so the penalty engages only after the
+    /// policy can stand (full strength from scratch fights learning to stand).
+    pub fn set_torque_scale(&mut self, s: f32) {
+        self.torque_scale = s.max(0.0);
+    }
+
     /// Read every link's workspace + every body's world pose for ALL envs.
     /// `ws.rb_vels` carries velocities (only valid after the first FK pass);
     /// `body_poses` carries world positions/orientations and is correct at all
@@ -806,6 +1481,443 @@ impl BipedNexusBatchEnv {
             .await
             .expect("body_poses readback");
         poses
+    }
+
+    /// DEBUG: read env 0's post-solve contact constraints and print, per contact,
+    /// the normal impulse N, the friction impulse F, and the clamp μ·N — to settle
+    /// whether the sliding foot is loaded (large N) with friction below the clamp
+    /// (F < μ·N → solver issue) or unloaded (N≈0 → no contact / hovering).
+    pub async fn debug_contact_impulses(&mut self) {
+        use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint;
+        let total = self.state.multibodies_mut().contact_constraints().buffer().len();
+        let cnt_total = self
+            .state
+            .multibodies_mut()
+            .contact_constraint_count()
+            .buffer()
+            .len();
+        let mut cons: Vec<MultibodyContactConstraint> = vec![MultibodyContactConstraint::default(); total];
+        self.gpu
+            .slow_read_buffer(self.state.multibodies_mut().contact_constraints().buffer(), &mut cons)
+            .await
+            .expect("contact_constraints readback");
+        let mut cnt = vec![0u32; cnt_total];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().contact_constraint_count().buffer(),
+                &mut cnt,
+            )
+            .await
+            .expect("contact count readback");
+        let stride = total / cnt_total.max(1); // MAX constraints per mb
+        let n0 = (cnt[0] as usize).min(stride);
+        // Generalized velocities (env 0) + per-constraint jacobian rows, so we can
+        // recompute J·v = Σ_i jac[i]·dof_state[i] on the host — the contact-point
+        // tangential velocity the solver ACTUALLY perceives — and compare it to the
+        // foot's real world slip. For env 0 (batch 0, mb 0): v_base=0, the jac
+        // column for slot s starts at s*dpb, ndofs = dpb.
+        let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
+        let dtot = self.state.multibodies_mut().dof_state().buffer().len();
+        let mut dof = vec![0.0f32; dtot];
+        self.gpu
+            .slow_read_buffer(self.state.multibodies_mut().dof_state().buffer(), &mut dof)
+            .await
+            .expect("dof_state readback");
+        let jtot = self.state.multibodies_mut().contact_constraint_jacs().buffer().len();
+        let mut jacs = vec![0.0f32; jtot];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().contact_constraint_jacs().buffer(),
+                &mut jacs,
+            )
+            .await
+            .expect("contact_constraint_jacs readback");
+        let host_jv = |s: usize| -> f32 {
+            let base = s * dpb;
+            let mut v = 0.0f32;
+            for i in 0..dpb {
+                if base + i < jacs.len() {
+                    v += jacs[base + i] * dof[i]; // env0 dof_state = dof[0..dpb]
+                }
+            }
+            v
+        };
+        // |J| of a constraint's jac row — if a LOADED foot's tangent |J|≈0 the
+        // jacobian is degenerate (can't apply friction in that direction); if |J|
+        // is healthy then Jv_host≈0 means the velocity is genuinely zeroed.
+        let jnorm = |s: usize| -> f32 {
+            let base = s * dpb;
+            let mut v = 0.0f32;
+            for i in 0..dpb {
+                if base + i < jacs.len() {
+                    v += jacs[base + i] * jacs[base + i];
+                }
+            }
+            v.sqrt()
+        };
+        let mut out = String::from("[contact] env0:");
+        for s in 0..n0 {
+            let c = cons[s];
+            if c.kind == 1 {
+                // Normal: print impulse + the bias rhs. rhs_wo_bias = dist·inv_dt
+                // (speculative, dist>0) — the raw-inv_dt term suspected of the
+                // ∝inv_dt energy injection; rhs includes the (saturating) erp bias.
+                // _pad0 = with-bias-solve J·v, _pad1 = no-bias-stabilization J·v
+                // (both pre-impulse). Comparing across iters localizes the energy
+                // injection (with-bias = integrate adds too much; no-bias = removal
+                // leaves a growing residual).
+                let wbias_jv = f32::from_bits(c._pad0);
+                let nobias_jv = f32::from_bits(c._pad1);
+                out.push_str(&format!(
+                    " N[link{} s{}]={:.3}(wJv={:+.4} nJv={:+.4} il={:.2})",
+                    c.link_id, s, c.impulse, wbias_jv, nobias_jv, c.inv_lhs
+                ));
+            } else if c.kind == 2 {
+                let n = cons[c.normal_constraint_slot as usize];
+                // Jv_host = jac·dof_state (the foot's tangential velocity the solver
+                // sees). If Jv_host≈0 while the foot world-slips ~2 m/s, the contact
+                // jacobian is blind to the real motion (the bug). rhs is the target
+                // (0 = stick). F is the applied impulse vs clamp μN.
+                out.push_str(&format!(
+                    " F[s{}]={:.3} Jv_host={:+.3} |J|={:.2} (clampμN={:.2})",
+                    s,
+                    c.impulse,
+                    host_jv(s),
+                    jnorm(s),
+                    c.friction_coeff * n.impulse
+                ));
+            }
+        }
+        // Per-foot STANCE-PHASE kinematics from the link's WORLD POSE — no velocity
+        // convention, no assumed moment arm. While a foot is continuously loaded we
+        // track how far its origin (a) NET-drifts from where it touched down and
+        // (b) wanders in total path length, plus how much it rotates. A foot that
+        // is "planted" while the body vaults over it has NET drift ≈ 0; a foot that
+        // SLIDES has net drift growing across the phase. We also test the
+        // rolling-without-slip relation directly: v_origin ≈ ω·R ⇒ rolling;
+        // v_origin ≫ ω·R ⇒ translating (sliding). Requires per-step calls.
+        let wtotal = self.state.multibodies_mut().links_workspace().buffer().len();
+        let mut ws: Vec<MultibodyLinkWorkspace> = vec![unsafe { std::mem::zeroed() }; wtotal];
+        self.gpu
+            .slow_read_buffer(self.state.multibodies_mut().links_workspace().buffer(), &mut ws)
+            .await
+            .expect("links_workspace readback");
+        if self.dbg_stance.len() < self.idx.foot_links.len() {
+            self.dbg_stance = vec![DbgStance::default(); self.idx.foot_links.len()];
+        }
+        let cdt = self.task.control_dt();
+        for (fi, &fl) in self.idx.foot_links.iter().enumerate() {
+            // Loaded? Sum normal impulses on this link.
+            let mut n_imp = 0.0f32;
+            for s in 0..n0 {
+                let c = cons[s];
+                if c.kind == 1 && c.link_id == fl {
+                    n_imp += c.impulse;
+                }
+            }
+            let w = ws[fl as usize]; // env 0
+            let p = w.local_to_world.translation;
+            let q = w.local_to_world.rotation; // glam::Quat
+            let loaded = n_imp > 0.05; // well-loaded (≈ ½ body weight), not a graze
+            let st = &mut self.dbg_stance[fi];
+            if loaded && !st.loaded {
+                // Touchdown: start a fresh stance phase.
+                *st = DbgStance {
+                    loaded: true,
+                    start_x: p.x,
+                    start_y: p.y,
+                    start_quat: [q.x, q.y, q.z, q.w],
+                    steps: 1,
+                    prev_x: p.x,
+                    prev_y: p.y,
+                    path_len: 0.0,
+                };
+            } else if loaded && st.loaded {
+                let dx = p.x - st.prev_x;
+                let dy = p.y - st.prev_y;
+                st.path_len += (dx * dx + dy * dy).sqrt();
+                st.prev_x = p.x;
+                st.prev_y = p.y;
+                st.steps += 1;
+            } else if !loaded && st.loaded {
+                // Lift-off: report the whole stance phase.
+                let net = ((p.x - st.start_x).powi(2) + (p.y - st.start_y).powi(2)).sqrt();
+                let q0 = nexus3d::rbd::math::Quat::from_xyzw(
+                    st.start_quat[0],
+                    st.start_quat[1],
+                    st.start_quat[2],
+                    st.start_quat[3],
+                );
+                let rot_deg = q0.angle_between(q).to_degrees();
+                let dur = st.steps as f32 * cdt;
+                eprintln!(
+                    "[stance] foot{fl}: dur={dur:.2}s  net_drift={:.1}cm  path={:.1}cm  rot={rot_deg:.0}deg  (drift_rate={:.2} m/s)",
+                    net * 100.0,
+                    st.path_len * 100.0,
+                    if dur > 1e-3 { net / dur } else { 0.0 },
+                );
+                st.loaded = false;
+            }
+            let tag = if loaded { "STANCE" } else { "swing " };
+            out.push_str(&format!("  foot{fl}[{tag} N={n_imp:.2}]"));
+        }
+        // Generalized velocities (env 0): is the foot moved by the BASE translating
+        // (root linear DOFs large → planted foot dragged) or by the LEG joints
+        // spinning (joint q̇ large → motors actively swinging the stance foot)?
+        // Layout: [root lin x,y,z, root ang x,y,z, joint q̇ ×NUM_JOINTS].
+        // (`dpb` / `dof` were read at the top of this function.)
+        let b = 0; // env 0
+        let root_lin = (dof[b * dpb].powi(2) + dof[b * dpb + 1].powi(2)).sqrt();
+        let root_ang =
+            (dof[b * dpb + 3].powi(2) + dof[b * dpb + 4].powi(2) + dof[b * dpb + 5].powi(2)).sqrt();
+        // Max |q̇| over the joint DOFs (everything past the 6 root DOFs).
+        let mut qd_max = 0.0f32;
+        for d in 6..dpb {
+            qd_max = qd_max.max(dof[b * dpb + d].abs());
+        }
+        out.push_str(&format!(
+            "  | root_lin={root_lin:.2}m/s root_ang={root_ang:.2} max|q̇|={qd_max:.2}rad/s"
+        ));
+        // Generalized acceleration `a = M⁻¹τ` (gravity bias, pre-contact). For a
+        // PASSIVE standing robot under vertical gravity the HORIZONTAL base accel
+        // (DOF 0,1) and base angular accel should be ~0; a spurious value here is
+        // the task #27 g/M inconsistency that drives the foot creep.
+        let atot = self.state.multibodies_mut().gen_accelerations().buffer().len();
+        let mut acc = vec![0.0f32; atot];
+        self.gpu
+            .slow_read_buffer(self.state.multibodies_mut().gen_accelerations().buffer(), &mut acc)
+            .await
+            .expect("gen_accelerations readback");
+        if dpb <= atot {
+            out.push_str(&format!(
+                "  | a_base=[x={:+.2} y={:+.2} z={:+.2} | ωx={:+.2} ωy={:+.2} ωz={:+.2}] a_joints=[",
+                acc[0], acc[1], acc[2], acc[3], acc[4], acc[5]
+            ));
+            for d in 6..dpb {
+                out.push_str(&format!("{:+.1} ", acc[d]));
+            }
+            out.push(']');
+        }
+        eprintln!("{out}");
+    }
+
+    /// PHASE-A substep trace: read env0's foot-link world XY + per-foot normal
+    /// impulse and emit one `[sub]` line. Called per `pipeline.step` inside the
+    /// (non-graph) decimation loop when `BIPED_SUBSTEP_TRACE` is set. With
+    /// `BIPED_SOLVER_ITERS=1` each pipeline.step is ONE substep, so this gives
+    /// per-substep resolution of the foot contact-point trajectory — to isolate
+    /// the exact substep a loaded foot flips from planted to sliding. Reuses the
+    /// `debug_contact_impulses` readback pattern (links_workspace + contacts).
+    pub async fn trace_foot_substep(&mut self, gstep: u64, sub: u32) {
+        use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint;
+        let total = self.state.multibodies_mut().contact_constraints().buffer().len();
+        let cnt_total = self.state.multibodies_mut().contact_constraint_count().buffer().len();
+        let mut cons: Vec<MultibodyContactConstraint> =
+            vec![MultibodyContactConstraint::default(); total];
+        self.gpu
+            .slow_read_buffer(self.state.multibodies_mut().contact_constraints().buffer(), &mut cons)
+            .await
+            .expect("contact_constraints readback");
+        let mut cnt = vec![0u32; cnt_total];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().contact_constraint_count().buffer(),
+                &mut cnt,
+            )
+            .await
+            .expect("contact count readback");
+        let stride = total / cnt_total.max(1);
+        let n0 = (cnt[0] as usize).min(stride);
+        let wtotal = self.state.multibodies_mut().links_workspace().buffer().len();
+        let mut ws: Vec<MultibodyLinkWorkspace> = vec![unsafe { std::mem::zeroed() }; wtotal];
+        self.gpu
+            .slow_read_buffer(self.state.multibodies_mut().links_workspace().buffer(), &mut ws)
+            .await
+            .expect("links_workspace readback");
+        let mut out = format!("[sub] g={gstep} s={sub}");
+        for &fl in &self.idx.foot_links {
+            let mut n_imp = 0.0f32;
+            // Perceived tangent SPEED magnitude over BOTH orthonormal tangents of
+            // the foot's contacts: wbias = entering the with-bias solve (_pad0, post
+            // integrate_velocities+motor), nobias = entering stabilization (_pad1).
+            // Compared to the foot's actual world velocity, this tells us if the
+            // contact jacobian sees the real slip or is blind to it.
+            let mut wb2 = 0.0f32;
+            let mut nb2 = 0.0f32;
+            // Geometric contact-point world XY of the MOST LOADED normal point
+            // (the active load-bearing point), + how many points share load — so
+            // we can see the single load-bearing point DANCE between candidate
+            // points across substeps (the ratchet-forward hypothesis).
+            let mut cpx = 0.0f32;
+            let mut cpy = 0.0f32;
+            let mut max_imp = 0.0f32;
+            let mut n_loaded = 0u32;
+            for c in cons.iter().take(n0) {
+                if c.link_id == fl {
+                    if c.kind == 1 {
+                        n_imp += c.impulse;
+                        if c.impulse > 0.02 {
+                            n_loaded += 1;
+                        }
+                        if c.impulse > max_imp {
+                            max_imp = c.impulse;
+                            cpx = f32::from_bits(c._pad4[0]);
+                            cpy = f32::from_bits(c._pad4[1]);
+                        }
+                    } else if c.kind == 2 {
+                        let w = f32::from_bits(c._pad0);
+                        let n = f32::from_bits(c._pad1);
+                        wb2 += w * w;
+                        nb2 += n * n;
+                    }
+                }
+            }
+            let wref = &ws[fl as usize];
+            let p = wref.local_to_world.translation;
+            // Independent contact-point horizontal velocity from the foot's rigid-body
+            // velocity: v_contact = v_lin + ω × r, r = (0,0,-SOLE_DZ). If this ≈ tJv_wb
+            // → jacobian is correct and the foot is PIVOTING (contact ~stationary, not a
+            // slip bug). If v_contact ≫ tJv_wb → the jacobian is BLIND to the real slip.
+            const SOLE_DZ: f32 = 0.04;
+            let v = wref.rb_vels.linear;
+            let a = wref.rb_vels.angular;
+            let cx = v.x - a.y * SOLE_DZ;
+            let cy = v.y + a.x * SOLE_DZ;
+            let v_contact = (cx * cx + cy * cy).sqrt();
+            out.push_str(&format!(
+                " foot{fl}: ox={:+.5} oy={:+.5} z={:.4} N={n_imp:.3} nL={n_loaded} cp=({cpx:+.5},{cpy:+.5}) tJv={:.4}",
+                p.x, p.y, p.z, wb2.sqrt()
+            ));
+            let _ = (v_contact, a);
+        }
+        eprintln!("{out}");
+    }
+
+    /// Inject a random horizontal velocity kick to every env's torso (root link's
+    /// linear-velocity DOFs 0,1) — a push perturbation. The policy must re-establish
+    /// balance over its feet after each shove, which is what makes the learned
+    /// equilibrium ROBUST and engine-agnostic (sim-to-real) rather than a brittle
+    /// nexus-specific reflex. Read-modify-write the generalized-velocity section of
+    /// `dof_state` (env-major, `dofs_per_batch` DOFs per env; root linear = 0..3).
+    async fn apply_random_pushes(&mut self) {
+        let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
+        let n = self.n;
+        let total = self.state.multibodies_mut().dof_state().buffer().len();
+        let mut buf = vec![0.0f32; total];
+        self.gpu
+            .slow_read_buffer(self.state.multibodies_mut().dof_state().buffer(), &mut buf)
+            .await
+            .expect("dof_state readback for push");
+        let pv = self.push_vel;
+        for e in 0..n {
+            let dvx = self.rng[e].range(-pv, pv);
+            let dvy = self.rng[e].range(-pv, pv);
+            buf[e * dpb] += dvx; // root linear x velocity
+            buf[e * dpb + 1] += dvy; // root linear y velocity
+        }
+        let vel_len = dpb * n; // velocity section only (don't touch the damping section)
+        self.gpu
+            .write_buffer(
+                self.state.multibodies_mut().dof_state_mut().buffer_mut(),
+                0,
+                &buf[..vel_len],
+            )
+            .expect("dof_state push write");
+    }
+
+    /// Debug probe for the inert-motor bug: read `links_static` back FROM THE
+    /// GPU and print env `e`'s actuated links' motor state (target_pos,
+    /// motor_axes, gains, model). If the targets staged by the last `step()`
+    /// show up here, the upload path (stage → flush → write_buffer) works and
+    /// the bug is in the solver's consumption; if they don't, the upload is
+    /// broken. Expected target for constant action a: `default_pos + scale·a`.
+    pub async fn debug_dump_motors(&mut self, e: usize) {
+        use nexus3d::rbd::shaders::dynamics::MultibodyLinkStatic;
+        let lpb = self.state.multibodies_mut().links_per_batch() as usize;
+        let n = self.state.multibodies_mut().links_static_mut().buffer().len();
+        let mut st: Vec<MultibodyLinkStatic> = vec![unsafe { std::mem::zeroed() }; n];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().links_static_mut().buffer(),
+                &mut st,
+            )
+            .await
+            .expect("links_static readback");
+        println!("links_static GPU readback: env {e}, links_per_batch={lpb}");
+        for k in 0..NUM_JOINTS {
+            let (link, name) = &self.idx.actuated[k];
+            let s = &st[e * lpb + *link as usize];
+            let m = &s.data.motors[5]; // AngZ
+            println!(
+                "  {name:<14} link={link:>2} ndofs={} locked={:#04x} motor_axes={:#04x} \
+                 target_pos={:+.4} target_vel={:+.3} kp={} kd={} maxF={} model={}",
+                s.ndofs,
+                s.data.locked_axes,
+                s.data.motor_axes,
+                m.target_pos,
+                m.target_vel,
+                m.stiffness,
+                m.damping,
+                m.max_force,
+                m.model
+            );
+        }
+
+        // Raw f32 view of one actuated link's full MultibodyLinkStatic — used
+        // to fit which byte offset the (misreading) CUDA kernel's motors[5]
+        // access actually lands on.
+        {
+            let (link, name) = &self.idx.actuated[9]; // hipz_right, kp=30
+            let s = &st[e * lpb + *link as usize];
+            let words: &[f32] = unsafe {
+                std::slice::from_raw_parts(
+                    (s as *const MultibodyLinkStatic) as *const f32,
+                    std::mem::size_of::<MultibodyLinkStatic>() / 4,
+                )
+            };
+            println!(
+                "raw f32 dump of {name} (link {link}), {} words (idx: value, zeros elided):",
+                words.len()
+            );
+            for (i, w) in words.iter().enumerate() {
+                if *w != 0.0 {
+                    println!("  [{i:>3}] byte {:>3}: {w:+.6e}", i * 4);
+                }
+            }
+        }
+
+        // The constraint slots the limit/motor solve kernel should have filled
+        // last substep. kind=0 ⇒ init never wrote this slot; kind=2 with rhs
+        // tracking `-(target_pos)·erp_inv_dt` ⇒ init consumed the target and
+        // the bug is in the solve/apply.
+        use nexus3d::rbd::shaders::dynamics::MultibodyJointConstraint;
+        let cpb = self.state.multibodies_mut().joint_constraints_per_batch() as usize;
+        let nc = self.state.multibodies_mut().joint_constraints().buffer().len();
+        let mut cons: Vec<MultibodyJointConstraint> = vec![unsafe { std::mem::zeroed() }; nc];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().joint_constraints().buffer(),
+                &mut cons,
+            )
+            .await
+            .expect("joint_constraints readback");
+        println!("joint_constraints GPU readback: env {e}, slots_per_batch={cpb}");
+        for (s, c) in cons[e * cpb..(e + 1) * cpb].iter().enumerate().take(14) {
+            println!(
+                "  slot {s:>2}: dof_id={:>2} kind={} rhs={:+.4} rhs_wo_bias={:+.4} \
+                 inv_lhs={:+.4e} impulse={:+.4e} lo={:+.3e} hi={:+.3e} cfm_c={:.3} cfm_g={:.3e}",
+                c.dof_id,
+                c.kind,
+                c.rhs,
+                c.rhs_wo_bias,
+                c.inv_lhs,
+                c.impulse,
+                c.impulse_lo,
+                c.impulse_hi,
+                c.cfm_coeff,
+                c.cfm_gain
+            );
+        }
     }
 
     /// Build the per-env `RobotState` from a `body_poses` slurp ONLY (no
@@ -861,6 +1973,7 @@ impl BipedNexusBatchEnv {
             lin_vel_world: [lv.x, lv.y, lv.z],
             ang_vel_world: [av.x, av.y, av.z],
             height: t.z,
+            pos_xy: [t.x, t.y],
         };
 
         // Joint angles from parent⇄child relative rotation (see doc comment).
@@ -889,6 +2002,7 @@ impl BipedNexusBatchEnv {
                 last_action: self.last_action[env],
                 prev_action: self.prev_action[env],
                 feet: [FootObs::default(); NUM_FEET],
+                phase: 0.0, // overwritten with self.gait_phase[env] by the caller
             },
             joint_pos,
         )
@@ -905,7 +2019,20 @@ impl BipedNexusBatchEnv {
         env: usize,
         poses: &[NexusPose],
     ) -> ([FootObs; NUM_FEET], [f32; NUM_FEET]) {
-        const CONTACT_Z: f32 = 0.025;
+        // Foot-contact threshold on the foot LINK-ORIGIN height (not the sole).
+        // The link origin rests at z~0.035-0.045 when the sole is planted (the
+        // sole/collider sits below it), so the old 0.025 was BELOW the planted
+        // height — contact never registered, breaking every contact-based gait
+        // reward (air_time/single_support/flight/foot_slip/clearance all saw the
+        // feet as permanently airborne). 0.05 sits just above the planted height
+        // and well below a real swing (foot_clearance_target 0.08), so a planted
+        // foot reads contact and a lifted foot reads swing. Overridable for tuning.
+        let contact_z: f32 = std::env::var("BIPED_CONTACT_Z")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.05);
+        #[allow(non_snake_case)]
+        let CONTACT_Z = contact_z;
         let dt = self.task.control_dt();
         let cpb = self.idx.colliders_per_batch as usize;
         let env_base = env * cpb;
@@ -935,6 +2062,9 @@ impl BipedNexusBatchEnv {
             let contact = pos.z < CONTACT_Z;
             let prev_air = self.air_time[env][i];
             let first_contact = contact && prev_air > 0.0;
+            // Alternating touchdown: a step that lands on the OTHER foot than the
+            // last one to touch down (or the first step ever, last_td_foot == -1).
+            let alt_step = first_contact && self.last_td_foot[env] != i as i8;
             new_air[i] = if contact { 0.0 } else { prev_air + dt };
             out[i] = FootObs {
                 contact,
@@ -945,6 +2075,7 @@ impl BipedNexusBatchEnv {
                 tilt,
                 yaw_rel_base,
                 pos_xy: [pos.x, pos.y],
+                alt_step,
             };
         }
         (out, new_air)
@@ -965,6 +2096,78 @@ impl BipedNexusBatchEnv {
     ///    independently across worker threads.
     /// 5. Serial post-pass: commit per-env mutable state (air_time, prev_*,
     ///    action history), assemble `StepOut`s.
+    /// Physics-only throughput A/B for the GPU-resident rollout: time the
+    /// decimation loop run with a host `synchronize()` per control step (the
+    /// current rollout pattern — the per-step stall we diagnosed) vs captured
+    /// ONCE into a CUDA graph and replayed with a single `cuGraphLaunch` per
+    /// step (zero host encode/submit/sync between the ~decimation×N dispatches).
+    /// Returns `(sync_ms, graph_ms)` for `t_steps` control steps; `graph_ms` is
+    /// `None` on non-CUDA backends. A fixed zero-action target is staged once so
+    /// the captured sequence has stable inputs (and `BIPED_FIXED_GRID=1` must be
+    /// set so there are no indirect-dispatch host readbacks to break capture).
+    #[cfg(feature = "cuda_backend")]
+    pub async fn bench_physics_modes(&mut self, t_steps: usize) -> (f64, Option<f64>) {
+        // Stage one fixed (zero-action) motor target + flush — stable physics
+        // input, no per-step staging in the timed loops.
+        let targets = self.task.joint_targets(&[0.0; NUM_JOINTS]);
+        for e in 0..self.n {
+            for k in 0..NUM_JOINTS {
+                let link = self.idx.actuated[k].0;
+                self.state.multibodies_mut().stage_motor_position(
+                    e as u32,
+                    link,
+                    JointAxis::AngZ,
+                    targets[k],
+                );
+            }
+        }
+        self.state
+            .multibodies_mut()
+            .flush_links_static(&self.gpu)
+            .expect("flush");
+        let decim = self.task.decimation;
+
+        // Warmup so the color count / buffers stabilise (capture must not realloc).
+        for _ in 0..32 {
+            for _ in 0..decim {
+                let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+            }
+        }
+        self.gpu.synchronize().expect("warmup sync");
+
+        // ---- SYNC: host synchronize() per control step ----
+        let t0 = Instant::now();
+        for _ in 0..t_steps {
+            for _ in 0..decim {
+                let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+            }
+            self.gpu.synchronize().expect("sync");
+        }
+        let sync_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        // ---- GRAPH: capture one decimation loop, replay it per step ----
+        let graph_ms = if let Some(cuda) = self.gpu.as_cuda() {
+            cuda.begin_capture().expect("begin_capture");
+            for _ in 0..decim {
+                let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+            }
+            let graph = cuda.end_capture().expect("end_capture");
+            graph.upload().ok();
+            graph.launch().expect("first graph launch"); // capture records, run once
+            self.gpu.synchronize().expect("sync after first launch");
+            let t0 = Instant::now();
+            for _ in 0..t_steps {
+                graph.launch().expect("graph replay");
+            }
+            self.gpu.synchronize().expect("graph sync");
+            Some(t0.elapsed().as_secs_f64() * 1e3)
+        } else {
+            None
+        };
+
+        (sync_ms, graph_ms)
+    }
+
     pub async fn step(&mut self, actions: &[[f32; NUM_JOINTS]]) -> Vec<StepOut> {
         assert_eq!(actions.len(), self.n);
 
@@ -993,12 +2196,55 @@ impl BipedNexusBatchEnv {
             .expect("flush motor targets");
         self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
 
-        // (2) Advance physics at the control decimation. Each `pipeline.step`
-        // is async — the await may include queue submit + any implicit GPU
-        // sync the backend needs between sub-steps.
+        // (1b) Push perturbation: every `push_interval` control steps, kick each
+        // torso with a random horizontal velocity so the policy learns robust,
+        // engine-agnostic balance recovery (sim-to-real). Applied BEFORE the
+        // physics advance so the kick propagates this step. Off when push_vel=0.
+        self.global_step += 1;
+        if self.push_vel > 0.0 && self.global_step % self.push_interval == 0 {
+            self.apply_random_pushes().await;
+        }
+
+        // (2) Advance physics at the control decimation. With BIPED_GRAPH=1 on a
+        // CUDA backend, capture the `decimation × pipeline.step` dispatch sequence
+        // ONCE (after warmup) into a CUDA graph and replay it per step — removing
+        // the ~24 ms/step host re-encode (~half the physics cost). The graph
+        // records kernel launches, not data, so the per-step motor-buffer write
+        // (above) and resets are honoured on replay. Eager dispatch otherwise.
         let t = Instant::now();
-        for _ in 0..self.task.decimation {
-            let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+        let mut ran_physics = false;
+        #[cfg(feature = "cuda_backend")]
+        if std::env::var("BIPED_GRAPH").is_ok() {
+            if let Some(g) = self.physics_graph.as_ref() {
+                g.0.launch().expect("physics graph replay");
+                ran_physics = true;
+            } else if self.graph_warmup_steps >= GRAPH_CAPTURE_AT {
+                let cuda = self.gpu.as_cuda().expect("cuda backend for BIPED_GRAPH");
+                cuda.begin_capture().expect("begin_capture");
+                for _ in 0..self.task.decimation {
+                    let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+                }
+                let g = cuda.end_capture().expect("end_capture");
+                g.upload().ok();
+                g.launch().expect("first graph launch"); // capture only records; execute once
+                self.physics_graph = Some(SyncGraph(g));
+                ran_physics = true;
+            }
+            self.graph_warmup_steps += 1;
+        }
+        if !ran_physics {
+            // PHASE-A substep trace: when BIPED_SUBSTEP_TRACE is set, read env0's
+            // foot pose + contact load AFTER each pipeline.step. With
+            // BIPED_SOLVER_ITERS=1 each pipeline.step is one substep → per-substep
+            // foot trajectory. Forces the non-graph path (this branch) implicitly
+            // since the trace readback syncs per step.
+            let trace = std::env::var("BIPED_SUBSTEP_TRACE").is_ok();
+            for i in 0..self.task.decimation {
+                let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+                if trace {
+                    self.trace_foot_substep(self.global_step, i).await;
+                }
+            }
         }
         self.timings.pipeline_step_ns += t.elapsed().as_nanos() as u64;
 
@@ -1015,7 +2261,20 @@ impl BipedNexusBatchEnv {
         // for a static scene it stabilises after warmup and per-step calls
         // just add dispatch latency for no work.
         self.tick_since_resize += 1;
-        if self.tick_since_resize >= AUTO_RESIZE_PERIOD {
+        // Skip auto-resize once a physics graph is captured — reallocating the
+        // state buffers would invalidate the graph's recorded buffer addresses.
+        // (Buffers are already stable by capture time, so this is a no-op anyway.)
+        let graph_captured = {
+            #[cfg(feature = "cuda_backend")]
+            {
+                self.physics_graph.is_some()
+            }
+            #[cfg(not(feature = "cuda_backend"))]
+            {
+                false
+            }
+        };
+        if self.tick_since_resize >= AUTO_RESIZE_PERIOD && !graph_captured {
             let t = Instant::now();
             self.pipeline
                 .auto_resize_buffers(&self.gpu, &mut self.state)
@@ -1058,10 +2317,86 @@ impl BipedNexusBatchEnv {
             critic_obs: Vec<f32>,
             reward: f32,
             fell: bool,
+            illegal: bool,
+            // Per-term reward breakdown for logging (W&B). Indices:
+            // Per-term reward contributions, in `REWARD_COMP_NAMES` order.
+            comps: [f32; NUM_REWARD_COMPS],
             new_air: [f32; NUM_FEET],
             new_joint_pos: [f32; NUM_JOINTS],
+            // Foot index that touched down this step (-1 = none); committed to
+            // `self.last_td_foot` in the serial pass to track gait alternation.
+            td_foot: i8,
         }
         let t = Instant::now();
+        // WBC-AGILE-style illegal-ground-contact termination: only the feet have
+        // ground colliders in nexus, so the policy can clip thigh/shin/hip links
+        // through the floor for free support (we measured shins ~3 cm below the
+        // floor in an early policy). Terminate if any monitored link drops below
+        // `BIPED_ILLEGAL_Z`. Default 0.0 = actual floor penetration only: a
+        // trained policy's shins sit ~+0.046 m, so 0.0 catches real clipping
+        // (the −0.03 case) without over-terminating legitimate low stances —
+        // 0.06 was too tight and killed the learning gradient. Set large-negative
+        // to disable entirely.
+        let illegal_z = std::env::var("BIPED_ILLEGAL_Z")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        // WBC-AGILE-style self-collision avoidance, as a SOFT reward penalty
+        // (not a hard termination). nexus can't do physical leg-leg collision
+        // (inert leg colliders), and a hard distance-termination is the ONLY
+        // guard here so it fires every episode for a from-scratch policy and
+        // buries the gradient (measured: falls 6.8k→46k). Instead, smoothly
+        // penalize each left/right link pair (foot/shin/thigh) by how far it
+        // intrudes inside `sc_margin`: `penalty = w · Σ max(0, margin − dist)`.
+        // DEFAULT OFF (weight 0): the real per-joint angle limits already keep the
+        // legs apart — measured min L/R separation is 0.105 m (shins) with limits
+        // and no penalty, well above the ~0.07 crossing threshold. The joint
+        // ranges (esp. hipx ±20° ad/abduction) are designed so the reachable
+        // workspace doesn't self-collide, so an explicit distance penalty is
+        // redundant AND competes with learning. Kept as opt-in (`BIPED_SELF_COLL_W`)
+        // for cases the limits don't cover (e.g. foot↔torso). margin 0.12 m.
+        let sc_margin = std::env::var("BIPED_SELF_COLL_DIST")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.12);
+        let sc_weight = std::env::var("BIPED_SELF_COLL_W")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        let sc_dt = self.task.control_dt();
+        // Torque (effort) penalty: we're PD position-controlled and had NO cost
+        // on joint torque, so the policy reward-hacks strained high-torque poses
+        // (e.g. balancing on one leg at saturated effort). Reconstruct the
+        // applied PD torque τ = clamp(kp·(q_target−q) − kd·q̇, ±effort) and
+        // penalize Στ², mirroring WBC-AGILE's lerobot config: base -5e-4 on all
+        // leg joints, an extra -1e-3 on the (weaker) ankles, and an extra -5e-3
+        // on ankle-roll. Scaled by `self.torque_scale` (the trainer's curriculum
+        // hook, init from `BIPED_TORQUE_W`): full WBC weight from scratch breaks
+        // learning (falls 6k→12.6k) because a torque penalty fights "learn to
+        // stand at all", so the trainer ramps it in only after standing is
+        // learned (set_torque_scale 0→target). 0 disables.
+        let torque_w = self.torque_scale;
+        // Ankle torque is penalized at FULL strength AT ALL TIMES (not ramped by
+        // the curriculum) — the real ankle motor is fragile (~11 N·m diamond vs
+        // the sim's 44), so we discourage ankle torque from iter 0. Soft (a
+        // penalty, not a hard effort cap) to keep learning feasible. Scale via
+        // BIPED_ANKLE_TORQUE_W (default 1.0; raise if rollouts still show high
+        // ankle torque, 0 disables).
+        let ankle_torque_w = std::env::var("BIPED_ANKLE_TORQUE_W")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        // Mechanical-power (energy) penalty weight. Penalizes Σ|τᵢ·q̇ᵢ| — the rate
+        // of mechanical work, the principled cost-of-transport proxy. Unlike Στ²
+        // (effort, penalized even when static), this only charges for work done in
+        // motion, so energy-economical (natural) gaits are favored and degenerate
+        // high-energy modes (marching in place, frantic shuffling) are punished.
+        // BIPED_POWER_W tunes it (0 = off).
+        let power_w: f32 = std::env::var("BIPED_POWER_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2e-3);
+        let cpb_idx = self.idx.colliders_per_batch as usize;
         let computed: Vec<PerEnv> = (0..self.n)
             .into_par_iter()
             .with_min_len(64)
@@ -1069,23 +2404,117 @@ impl BipedNexusBatchEnv {
                 let (feet, new_air) = self.compute_feet_from_poses(e, &poses);
                 let (mut state, new_joint_pos) = self.read_state_from_poses(e, &poses);
                 state.feet = feet;
-                let fell = self.task.fell_over(&state.base) || !state.base.height.is_finite();
-                let mut reward = self.task.reward(&state, &self.cmd[e]).total();
+                state.phase = self.gait_phase[e];
+                let env_base = e * cpb_idx;
+                let illegal = self
+                    .idx
+                    .illegal_ground_links
+                    .iter()
+                    .any(|&l| poses[env_base + l as usize].translation.z < illegal_z);
+                let fell = illegal
+                    || self.task.fell_over(&state.base)
+                    || !state.base.height.is_finite();
+                let rb = self.task.reward(&state, &self.cmd[e]);
+                let mut reward = rb.total();
+                let mut comps = [0.0f32; NUM_REWARD_COMPS];
+                comps[0] = rb.track_lin_vel;
+                comps[1] = rb.track_ang_vel;
+                comps[2] = rb.upright;
+                comps[3] = rb.base_height;
+                comps[4] = rb.pose;
+                comps[5] = rb.bilateral_symmetry;
+                comps[6] = rb.action_rate;
+                comps[7] = rb.action_rate_hipz_hipx;
+                comps[8] = rb.body_ang_vel;
+                comps[9] = rb.lin_vel_z;
+                comps[10] = rb.dof_pos_limits;
+                comps[11] = rb.dof_vel;
+                comps[12] = rb.air_time;
+                comps[13] = rb.flight;
+                comps[14] = rb.single_support;
+                comps[15] = rb.foot_slip;
+                comps[16] = rb.foot_clearance;
+                comps[17] = rb.foot_orientation;
+                comps[18] = rb.feet_yaw_mean;
+                comps[19] = rb.feet_distance;
+                comps[25] = rb.gait_clock;
+                comps[26] = rb.com_centering;
                 if fell {
+                    comps[23] = self.task.weights.termination;
                     reward += self.task.weights.termination;
+                }
+                // Soft self-collision penalty: ramp up as any L/R pair intrudes
+                // inside `sc_margin` (legs crossing). ~0 for a clean stance.
+                if sc_weight > 0.0 {
+                    let intrusion: f32 = self
+                        .idx
+                        .self_collision_pairs
+                        .iter()
+                        .map(|&(a, b)| {
+                            let pa = poses[env_base + a as usize].translation;
+                            let pb = poses[env_base + b as usize].translation;
+                            (sc_margin - (pa - pb).length()).max(0.0)
+                        })
+                        .sum();
+                    let sc_pen = sc_weight * intrusion * sc_dt;
+                    comps[22] = -sc_pen;
+                    reward -= sc_pen;
+                }
+                // Torque (effort) penalty — reconstruct the applied PD torque per
+                // joint and penalize Στ². The ANKLE motors are fragile hardware
+                // (real diamond limit ~11 N·m vs the sim's 44), so the ankle term
+                // is FULL-STRENGTH AT ALL TIMES (`ankle_torque_w`, not ramped),
+                // while the leg term ramps with the curriculum (`torque_w`). WBC
+                // lerobot base weights: -5e-4 legs, -1.5e-3 ankle pitch, -6.5e-3
+                // ankle roll (coupled, weakest).
+                if torque_w > 0.0 || ankle_torque_w > 0.0 || power_w > 0.0 {
+                    let q_target = self.task.joint_targets(&actions[e]);
+                    let mut leg_pen = 0.0f32;
+                    let mut ankle_pen = 0.0f32;
+                    let mut power = 0.0f32; // Σ|τ·q̇| mechanical power (energy rate)
+                    for i in 0..NUM_JOINTS {
+                        let j = &self.task.robot.joints[i];
+                        let tau = (j.kp * (q_target[i] - state.joint_pos[i])
+                            - j.kd * state.joint_vel[i])
+                            .clamp(-j.effort_limit, j.effort_limit);
+                        let t2 = tau * tau;
+                        power += (tau * state.joint_vel[i]).abs();
+                        if j.name.contains("ankle") {
+                            let w = if j.name.contains("anklex") { 6.5e-3 } else { 1.5e-3 };
+                            ankle_pen += w * t2;
+                        } else {
+                            leg_pen += 5e-4 * t2;
+                        }
+                    }
+                    comps[20] = -(torque_w * leg_pen) * sc_dt;
+                    comps[21] = -(ankle_torque_w * ankle_pen) * sc_dt;
+                    comps[24] = -(power_w * power) * sc_dt;
+                    reward -=
+                        (torque_w * leg_pen + ankle_torque_w * ankle_pen + power_w * power) * sc_dt;
                 }
                 let mut obs = vec![0.0; OBS_DIM];
                 self.task.observe(&state, &self.cmd[e], &mut obs);
                 let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
                 self.task
                     .observe_critic(&state, &self.cmd[e], &mut critic_obs);
+                // Which foot touched down this step (last wins if both did) — used
+                // to advance the gait-alternation tracker in the serial pass.
+                let mut td_foot: i8 = -1;
+                for (i, f) in state.feet.iter().enumerate() {
+                    if f.first_contact {
+                        td_foot = i as i8;
+                    }
+                }
                 PerEnv {
                     obs,
                     critic_obs,
                     reward,
                     fell,
+                    illegal,
+                    comps,
                     new_air,
                     new_joint_pos,
+                    td_foot,
                 }
             })
             .collect();
@@ -1094,9 +2523,39 @@ impl BipedNexusBatchEnv {
         // (5) Serial commit: per-env mutable state + StepOut assembly.
         let t = Instant::now();
         let cpb = self.idx.colliders_per_batch as usize;
+        // Observation noise (sensor DR): uniform additive noise on the ACTOR obs
+        // only (the critic keeps a clean privileged obs — asymmetric PPO). Models
+        // encoder quantization / IMU noise so the policy can't overfit to
+        // pixel-perfect proprioception. Amplitudes mirror Isaac Lab's UniformNoise
+        // for proprioceptive humanoid obs; BIPED_OBS_NOISE scales them (0 = off).
+        let obs_noise: f32 = std::env::var("BIPED_OBS_NOISE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         let mut outs = Vec::with_capacity(self.n);
-        for (e, c) in computed.into_iter().enumerate() {
+        for (e, mut c) in computed.into_iter().enumerate() {
+            if obs_noise > 0.0 {
+                let rng = &mut self.rng[e];
+                // joint_pos_rel [16..28]: ±0.01 rad
+                for v in &mut c.obs[NUM_JOINTS + 4..2 * NUM_JOINTS + 4] {
+                    *v += rng.range(-0.01, 0.01) * obs_noise;
+                }
+                // joint_vel [28..40]: ±1.5 rad/s
+                for v in &mut c.obs[2 * NUM_JOINTS + 4..3 * NUM_JOINTS + 4] {
+                    *v += rng.range(-1.5, 1.5) * obs_noise;
+                }
+                // projected_gravity [40..43]: ±0.05
+                for v in &mut c.obs[3 * NUM_JOINTS + 4..3 * NUM_JOINTS + 7] {
+                    *v += rng.range(-0.05, 0.05) * obs_noise;
+                }
+            }
             self.air_time[e] = c.new_air;
+            if c.td_foot >= 0 {
+                self.last_td_foot[e] = c.td_foot;
+            }
+            // Advance the gait clock (wraps at 1).
+            self.gait_phase[e] =
+                (self.gait_phase[e] + self.task.control_dt() / self.gait_period).fract();
             self.prev_joint_pos[e] = c.new_joint_pos;
             self.has_prev_joint_pos[e] = true;
             // Snapshot poses for this env into prev_body_poses for the next
@@ -1108,6 +2567,20 @@ impl BipedNexusBatchEnv {
             self.prev_action[e] = self.last_action[e];
             self.last_action[e] = actions[e];
             let timeout = self.step_count[e] >= self.task.max_steps();
+            // Accumulate per-component reward + termination causes for W&B
+            // (drained by `take_reward_log`). Every (env, step) contributes to
+            // the component means; termination counters tally episode ends.
+            for i in 0..NUM_REWARD_COMPS {
+                self.rlog_comps[i] += c.comps[i] as f64;
+            }
+            self.rlog_steps += 1;
+            if c.illegal {
+                self.rlog_illegal += 1;
+            } else if c.fell {
+                self.rlog_fell += 1;
+            } else if timeout {
+                self.rlog_timeout += 1;
+            }
             outs.push(StepOut {
                 obs: c.obs,
                 critic_obs: c.critic_obs,
@@ -1118,7 +2591,40 @@ impl BipedNexusBatchEnv {
         }
         self.timings.serial_commit_ns += t.elapsed().as_nanos() as u64;
         self.timings.steps += 1;
+        // Per-step so the stance-phase path/drift accumulation is real (each call
+        // does 2 readbacks — fine for a short diagnostic run, not for training).
+        if std::env::var("BIPED_DEBUG_CONTACT").is_ok() {
+            self.debug_contact_impulses().await;
+        }
         outs
+    }
+
+    /// Drain the accumulated per-component reward + termination stats since the
+    /// last call and reset the counters. Returns `None` if no steps were taken
+    /// (nothing to log). The trainer calls this once per PPO iteration to emit a
+    /// structured line the W&B sidecar logs.
+    pub fn take_reward_log(&mut self) -> Option<RewardLog> {
+        if self.rlog_steps == 0 {
+            return None;
+        }
+        let n = self.rlog_steps as f64;
+        let mut comps = [0.0f32; NUM_REWARD_COMPS];
+        for i in 0..NUM_REWARD_COMPS {
+            comps[i] = (self.rlog_comps[i] / n) as f32;
+        }
+        let out = RewardLog {
+            comps,
+            illegal: self.rlog_illegal,
+            fell: self.rlog_fell,
+            timeout: self.rlog_timeout,
+            samples: self.rlog_steps,
+        };
+        self.rlog_comps = [0.0; NUM_REWARD_COMPS];
+        self.rlog_steps = 0;
+        self.rlog_illegal = 0;
+        self.rlog_fell = 0;
+        self.rlog_timeout = 0;
+        Some(out)
     }
 
     /// Read the accumulated per-phase timings and reset the counters.
@@ -1136,12 +2642,10 @@ impl BipedNexusBatchEnv {
         let r = self.rng[env].range(0.0, 1.0);
         let t = ((r * self.templates.len() as f32) as usize).min(self.templates.len() - 1);
         self.state
-            .reset_env_from(&self.gpu, env as u32, &self.templates[t])
-            .await;
+            .reset_env_from_snapshot(&self.gpu, env as u32, &self.template_snapshots[t]);
         // Mirror the template's sole-normal so update_feet's tilt makes sense.
-        let dr = self.template_dr[t];
-        let (_, ix) = build_env_scene(&self.mjcf, &self.robot, &dr, self.task.sim_dt);
-        self.foot_sole_local[env] = ix.foot_sole_local;
+        // Cached per-template (constant) — NO per-reset rapier-scene rebuild.
+        self.foot_sole_local[env] = self.template_foot_sole[t];
 
         // Reset host state.
         self.cmd[env] = self.sampler.sample(&mut self.rng[env]);
@@ -1152,12 +2656,44 @@ impl BipedNexusBatchEnv {
         self.last_action[env] = [0.0; NUM_JOINTS];
         self.prev_action[env] = [0.0; NUM_JOINTS];
         self.air_time[env] = [0.0; NUM_FEET];
+        self.last_td_foot[env] = -1;
+        self.gait_phase[env] = 0.0;
 
         // Cached prev joint angles + poses are stale across a reset; clear so
         // the next step seeds them again with zero velocity.
         self.has_prev_joint_pos[env] = false;
         self.has_prev_pose[env] = false;
-        // Build the initial obs from the freshly-copied state.
+
+        // Fast path: serve the cached per-template spawn obs with the fresh
+        // command patched into [12:16] — NO `slurp_poses` readback (the dominant
+        // per-reset cost). The post-reset state is the template spawn state
+        // (joints 0, vel 0, last_action 0); the command is the only thing that
+        // varies and it enters obs ONLY at [12:16] (see VelocityFlatTask::observe).
+        if !self.template_spawn_obs.is_empty() {
+            let mut obs = self.template_spawn_obs[t].clone();
+            let mut critic_obs = self.template_spawn_critic_obs[t].clone();
+            let c = self.cmd[env].obs(); // [vx, vy, yaw, 0]
+            obs[NUM_JOINTS..NUM_JOINTS + 4].copy_from_slice(&c);
+            critic_obs[NUM_JOINTS..NUM_JOINTS + 4].copy_from_slice(&c);
+            // Opt-in self-check: confirm the cached obs equals the live readback
+            // path bit-for-bit (run once with BIPED_VERIFY_RESET=1 to validate).
+            if std::env::var("BIPED_VERIFY_RESET").is_ok() {
+                let poses = self.slurp_poses().await;
+                let (feet, _) = self.compute_feet_from_poses(env, &poses);
+                let (mut state, _) = self.read_state_from_poses(env, &poses);
+                state.feet = feet;
+                let mut ref_obs = vec![0.0; OBS_DIM];
+                self.task.observe(&state, &self.cmd[env], &mut ref_obs);
+                let mut ref_co = vec![0.0; CRITIC_OBS_DIM];
+                self.task.observe_critic(&state, &self.cmd[env], &mut ref_co);
+                let do_max = obs.iter().zip(&ref_obs).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                let dc_max = critic_obs.iter().zip(&ref_co).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                eprintln!("[verify_reset] env {env} tpl {t}: obs maxdiff={do_max:.3e} critic maxdiff={dc_max:.3e}");
+            }
+            return (obs, critic_obs);
+        }
+
+        // Fallback (cache not yet populated): build obs from a readback.
         let poses = self.slurp_poses().await;
         let (feet, _) = self.compute_feet_from_poses(env, &poses);
         let (mut state, _) = self.read_state_from_poses(env, &poses);
@@ -1187,6 +2723,14 @@ impl BipedNexusBatchEnv {
             obs.push(o);
             critic_obs.push(c);
         }
+        // Cache the per-template spawn obs: env `t` was seeded from template `t`
+        // at construction and no reset has happened yet, so obs[t] IS template
+        // t's spawn obs. reset_env serves these (with the command patched into
+        // [12:16]) instead of a per-reset readback. Command-agnostic: the baked-in
+        // command is overwritten on reset.
+        let nt = self.templates.len().min(self.n);
+        self.template_spawn_obs = obs[..nt].to_vec();
+        self.template_spawn_critic_obs = critic_obs[..nt].to_vec();
         (obs, critic_obs)
     }
 
@@ -1198,10 +2742,9 @@ impl BipedNexusBatchEnv {
     /// a rendering rollout so the recorded trajectory doesn't drift on the
     /// per-env DR sample the env was originally seeded with.
     pub async fn reset_env_to_default_template(&mut self, e: usize) -> (Vec<f32>, Vec<f32>) {
-        assert!(!self.templates.is_empty());
+        assert!(!self.template_snapshots.is_empty());
         self.state
-            .reset_env_from(&self.gpu, e as u32, &self.templates[0])
-            .await;
+            .reset_env_from_snapshot(&self.gpu, e as u32, &self.template_snapshots[0]);
         self.foot_sole_local[e] = self.idx.foot_sole_local;
         self.cmd[e] = VelocityCommand::default();
         self.step_count[e] = 0;
@@ -1210,6 +2753,8 @@ impl BipedNexusBatchEnv {
         self.last_action[e] = [0.0; NUM_JOINTS];
         self.prev_action[e] = [0.0; NUM_JOINTS];
         self.air_time[e] = [0.0; NUM_FEET];
+        self.last_td_foot[e] = -1;
+        self.gait_phase[e] = 0.0;
         self.has_prev_joint_pos[e] = false;
         self.has_prev_pose[e] = false;
         let poses = self.slurp_poses().await;
@@ -1321,9 +2866,99 @@ impl BipedNexusBatchEnv {
             })
             .collect()
     }
+
+    /// DEBUG: read back the narrow-phase contact manifolds (the shared
+    /// collision-detection output consumed by the multibody contact solver).
+    /// Returns `(reported_len[..], manifolds[..capacity])`. Used to diagnose
+    /// foot↔ground contact on WebGpu vs CUDA: contact COUNT (is narrow-phase
+    /// generating foot-ground pairs at all?) and the contact NORMAL direction.
+    pub async fn dbg_contacts(&mut self) -> (Vec<u32>, Vec<NexusIndexedContact>) {
+        let lbuf = self.state.dbg_contacts_len().buffer();
+        let mut len = vec![0u32; lbuf.len()];
+        self.gpu
+            .slow_read_buffer(lbuf, &mut len)
+            .await
+            .expect("contacts_len readback");
+        let cbuf = self.state.dbg_contacts().buffer();
+        let mut v = vec![NexusIndexedContact::default(); cbuf.len()];
+        self.gpu
+            .slow_read_buffer(cbuf, &mut v)
+            .await
+            .expect("contacts readback");
+        (len, v)
+    }
+
+    /// DEBUG: broad-phase pair count (how many collider pairs the LBVH found),
+    /// and the raw pair list. Splits "broad-phase finds nothing" from
+    /// "narrow-phase generates no manifold" when contacts come back empty.
+    pub async fn dbg_collision_pairs(&mut self) -> (Vec<u32>, Vec<[u32; 2]>) {
+        let lbuf = self.state.dbg_collision_pairs_len().buffer();
+        let mut len = vec![0u32; lbuf.len()];
+        self.gpu
+            .slow_read_buffer(lbuf, &mut len)
+            .await
+            .expect("pairs_len readback");
+        let pbuf = self.state.dbg_collision_pairs().buffer();
+        let mut v = vec![[0u32; 2]; pbuf.len()];
+        self.gpu
+            .slow_read_buffer(pbuf, &mut v)
+            .await
+            .expect("pairs readback");
+        (len, v)
+    }
+
+    /// DEBUG: read back the per-multibody contact-constraint bank
+    /// (`inv_lhs` = 1/(J·M⁻¹·Jᵀ), `rhs`, accumulated `impulse`, jacobians) and
+    /// the per-batch active counts. Diagnoses the WebGpu contact-solve blow-up.
+    pub async fn dbg_mb_contacts(&mut self) -> (Vec<u32>, Vec<NexusMbContact>) {
+        let mut cnt =
+            vec![0u32; self.state.multibodies_mut().dbg_contact_constraint_count().buffer().len()];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().dbg_contact_constraint_count().buffer(),
+                &mut cnt,
+            )
+            .await
+            .expect("cc count readback");
+        let mut ccs = vec![
+            NexusMbContact::default();
+            self.state.multibodies_mut().dbg_contact_constraints().buffer().len()
+        ];
+        self.gpu
+            .slow_read_buffer(
+                self.state.multibodies_mut().dbg_contact_constraints().buffer(),
+                &mut ccs,
+            )
+            .await
+            .expect("cc readback");
+        (cnt, ccs)
+    }
+
+    /// Global collider index of the ground in env `e` (last collider per env).
+    pub fn ground_collider(&self, e: usize) -> u32 {
+        // colliders_per_batch = robot bodies + 1 ground (ground inserted last).
+        (e as u32 + 1) * self.idx.colliders_per_batch - 1
+    }
 }
 
 // --- Helpers -----------------------------------------------------------------
+
+/// Pick the GPU backend for the batched physics. Defaults to WebGPU; when the
+/// `cuda_backend` feature is compiled in AND `BIPED_CUDA=1`, runs the native
+/// CUDA (cuda-oxide) backend instead — used by the all-native e2e benchmark.
+/// The nexus + vortx cubins are embedded at build time via the per-crate
+/// `CUDA_OXIDE_SHADERS_PTX_*` env vars (see khal-builder `build_ptx`).
+async fn make_backend() -> KhalGpuBackend {
+    #[cfg(feature = "cuda_backend")]
+    {
+        if std::env::var("BIPED_CUDA").as_deref() == Ok("1") {
+            use khal::backend::Cuda;
+            eprintln!("[biped] backend = native CUDA (cuda-oxide)");
+            return KhalGpuBackend::Cuda(Cuda::new(0).expect("init CUDA backend"));
+        }
+    }
+    webgpu_backend().await
+}
 
 async fn webgpu_backend() -> KhalGpuBackend {
     let limits = wgpu::Limits {
@@ -1345,12 +2980,55 @@ async fn webgpu_backend() -> KhalGpuBackend {
 /// Initial-pose jitter ranges are conservative — wider tilts make every
 /// episode start mid-fall, which the policy can't recover from at small T.
 fn sample_dr(rng: &mut Lcg) -> DrParams {
+    // BIPED_SPAWN_DR scales the initial-pose tilt/height randomization (default
+    // 1.0). Set to 0.0 to start every episode upright at nominal height — used to
+    // test whether aggressive spawn DR is what's preventing the policy from
+    // getting a learning gradient (the rng draws are still consumed, so dynamics
+    // DR and determinism are unchanged).
+    let sdr: f32 = std::env::var("BIPED_SPAWN_DR").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    // BIPED_FRICTION: force a fixed Coulomb μ on every env (overrides the random
+    // draw) — used to A/B-test that friction actually reaches the GPU contact
+    // solver. The rng draw is still consumed so other DR + determinism are
+    // unchanged.
+    // Friction range widened DOWN into the slip regime: 0.3–1.3 (was 0.5–1.5).
+    // The low tail (μ≈0.3) makes the foot actually slip, so the policy can't
+    // rely on a consistent grip to brace — this is the dominant "slippery
+    // contact" DR lever both MuJoCo (geom friction randomization) and Isaac
+    // (randomize_rigid_body_material) use. Center stays ≈ MuJoCo's default μ=1.
+    // (Per-foot and static-vs-dynamic friction would express stick-slip even
+    // better, but nexus stores a single Coulomb μ per multibody — engine-blocked.)
+    let friction = match std::env::var("BIPED_FRICTION").ok().and_then(|s| s.parse::<f32>().ok()) {
+        Some(f) => { let _ = rng.range(0.3, 1.3); f }
+        None => rng.range(0.3, 1.3),
+    };
+    // BIPED_MASS_DR scales the half-width of the per-link mass randomization
+    // (default 1.0 → ±20%). Set 0.0 to disable (mass fixed at nominal); the rng
+    // draw is still consumed so other DR + determinism are unchanged.
+    let mdr: f32 = std::env::var("BIPED_MASS_DR").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let mass_scale = 1.0 + rng.range(-0.2, 0.2) * mdr;
     DrParams {
-        friction: rng.range(0.5, 1.5),
+        friction,
         restitution: rng.range(0.0, 0.15),
-        pd_scale: rng.range(0.85, 1.15),
-        contact_natural_frequency: rng.range(10.0, 50.0),
-        contact_damping_ratio: rng.range(2.0, 8.0),
+        // Widened from ±15% to ±30%: PD-gain error is a major sim-to-real gap
+        // (the real actuators' effective kp/kd differ from the modelled values),
+        // and a policy that's robust to ±30% gain error transfers far better.
+        pd_scale: rng.range(0.7, 1.3),
+        mass_scale,
+        // Contact-stiffness DR — now LIVE on the multibody contact solver (the
+        // kernel reads per-env contact_natural_frequency / contact_damping_ratio
+        // from SimParams; it used to hardcode 30/5). This is the analog of
+        // MuJoCo's solref randomization. BIPED_CONTACT_FREQ / BIPED_CONTACT_DAMP
+        // pin every env to a fixed value (rng draw still consumed) — set both to
+        // 30 / 5 to reproduce the old hardcoded path and verify the new binding
+        // is bit-identical.
+        contact_natural_frequency: match std::env::var("BIPED_CONTACT_FREQ").ok().and_then(|s| s.parse::<f32>().ok()) {
+            Some(f) => { let _ = rng.range(10.0, 50.0); f }
+            None => rng.range(10.0, 50.0),
+        },
+        contact_damping_ratio: match std::env::var("BIPED_CONTACT_DAMP").ok().and_then(|s| s.parse::<f32>().ok()) {
+            Some(d) => { let _ = rng.range(2.0, 8.0); d }
+            None => rng.range(2.0, 8.0),
+        },
         // Initial-pose DR — aggressive ranges so the policy sees a wide
         // distribution of starts and learns to recover from non-trivial
         // perturbations. Comparable to WBC-AGILE / Isaac Lab humanoid
@@ -1359,8 +3037,24 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
         // can't get a useful gradient with the curriculum's early
         // command-velocity scale.
         spawn_yaw: rng.range(-std::f32::consts::PI, std::f32::consts::PI),
-        spawn_roll: rng.range(-0.35, 0.35),     // ±~20°
-        spawn_pitch: rng.range(-0.35, 0.35),    // ±~20°
-        spawn_z_offset: rng.range(-0.08, 0.08), // ±8 cm (~10% of torso height)
+        spawn_roll: rng.range(-0.35, 0.35) * sdr,     // ±~20° (× BIPED_SPAWN_DR)
+        spawn_pitch: rng.range(-0.35, 0.35) * sdr,    // ±~20° (× BIPED_SPAWN_DR)
+        spawn_z_offset: rng.range(-0.08, 0.08) * sdr, // ±8 cm (× BIPED_SPAWN_DR)
+        // Per-joint actuator-strength asymmetry (BIPED_ASYM_DR = half-width,
+        // default ±15%; 0 disables). Each joint draws independently → left/right
+        // gains differ, modelling "one motor stronger than the other". Drawn LAST
+        // so enabling it doesn't perturb the rng order of the other DR fields.
+        // A symmetric policy handles this REACTIVELY: the weaker side tracks its
+        // target worse → shows up in the joint-pos/vel obs → the (symmetric) map
+        // responds; the distribution is L/R-balanced, so the mirror prior stays
+        // valid in expectation.
+        pd_scale_per_joint: {
+            let hw: f32 = std::env::var("BIPED_ASYM_DR").ok().and_then(|s| s.parse().ok()).unwrap_or(0.15);
+            let mut a = [1.0f32; NUM_JOINTS];
+            for v in a.iter_mut() {
+                *v = 1.0 + rng.range(-hw, hw);
+            }
+            a
+        },
     }
 }

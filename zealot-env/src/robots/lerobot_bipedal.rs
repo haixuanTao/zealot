@@ -54,6 +54,19 @@ pub struct JointSpec {
     pub default_pos: f32,
     /// Hard joint position limits `(lower, upper)`, rad (from the URDF).
     pub pos_limit: (f32, f32),
+    /// Rotor/reflected inertia (kg·m²), system-identified by WBC-AGILE
+    /// (`config.yaml` `joint_armature`). Added to the joint's dof inertia — what
+    /// makes stiff PD-controlled joints numerically stable in sim.
+    pub armature: f32,
+    /// Passive joint damping (N·m·s/rad), from the MJCF `damping`. The real
+    /// joints are significantly damped (0.5–2.3); without it the sim joints slew
+    /// far too fast (~50 rad/s). Folded into the motor's velocity gain since the
+    /// nexus passive-damping buffer is otherwise a hardcoded 0.1 default.
+    pub damping: f32,
+    /// Coulomb joint friction (N·m), from the MJCF `frictionloss` — a constant
+    /// torque opposing motion. Applied as `-frictionloss·sign(q̇)` via the nexus
+    /// `dof_frictionloss` buffer (energy dissipation / stiction).
+    pub frictionloss: f32,
 }
 
 const PI: f32 = std::f32::consts::PI;
@@ -80,29 +93,83 @@ pub const JOINT_NAMES: [&str; NUM_JOINTS] = [
 /// of the same family share values). Effort limits: hips & knees 88 N·m, ankles
 /// 44 N·m. Action scales and PD gains are from the deployed policy's `gain.md` /
 /// action config.
+/// Stiffness/damping correction applied to the WBC-AGILE gains below. Those gains
+/// (kp 20–60) were tuned for an AccelerationBased actuator (inertia-decoupled: it
+/// realizes a position response independent of link inertia). Our actuator is a
+/// physical FORCE-based PD (`τ = kp·err − kd·q̇`, torque-saturated), where kp is a
+/// real torque/rad gain — and at the WBC values it's far too soft: ~10° of sag per
+/// joint under the robot's weight, so it can't hold a stand (measured: passive
+/// stand tips; rock-solid only at ~4× kp / 2× kd). These factors make the gains
+/// physically correct torque-PD gains. They are FIXED here (one source of truth) —
+/// used identically by nexus, the MuJoCo transfer model, and the real robot — not
+/// a runtime knob. The ±effort clamp still caps torque at the real (fragile-ankle)
+/// limit, so a high kp just means a stiff position servo that saturates at its
+/// current limit — exactly real hardware behaviour.
+const STIFFNESS_SCALE: f32 = 4.0;
+const DAMPING_SCALE: f32 = 2.0; // ≈ √(STIFFNESS_SCALE) — keeps damping ratio ~constant
+// The ANKLE is scaled GENTLER. The legs (hip/knee) need ×4 to hold the body in
+// single-support, but the ankle's torque is hard-capped at the fragile 15 N·m
+// limit, so a high kp there just makes it BANG-BANG: ×4 commanded up to 37 N·m of
+// correction → pinned at the 15 N·m clamp 57% of the time (measured), which cooks
+// the real motor. A lower ankle kp delivers the same ≤15 N·m but PROPORTIONALLY
+// (smooth), only saturating on large errors. ×2 ≈ kp 40, so it uses the full ankle
+// range (≈0.375 rad to reach 15 N·m) without constant saturation.
+const ANKLE_STIFFNESS_SCALE: f32 = 2.0;
+const ANKLE_DAMPING_SCALE: f32 = 1.5;
+
 const fn family(name: &'static str) -> JointSpec {
-    // (kp, kd, effort, action_scale) per joint family.
-    let (kp, kd, effort, scale) = if starts_with(name, "hipz") {
-        (30.0, 3.0, 88.0, 0.733)
+    // (kp, kd, effort, action_scale, armature, pos_limit) per joint family. kp/kd
+    // are the raw WBC-AGILE values; the physical torque-PD correction
+    // (STIFFNESS_SCALE / DAMPING_SCALE) is applied in the JointSpec below.
+    // Armature is WBC-AGILE's system-identified rotor inertia. `pos_limit` is the
+    // real per-joint range from the MJCF (mjlab `range`, rad) — NOT the old ±π
+    // placeholder, which let the ankle fold the foot into its own shin. The model
+    // ranges are mildly L/R-asymmetric; we use the symmetric magnitude (enough to
+    // stop the over-flex). The nexus env prefers an explicit MJCF `range` when the
+    // model provides one (`MjBody::joint_range`) and falls back to this.
+    // ...also the MJCF per-joint passive `damping` (N·m·s/rad) — real joints are
+    // damped 0.5–2.3; the sim default (0.1) leaves them slewing at ~50 rad/s.
+    // ...and the MJCF per-joint `frictionloss` (N·m, Coulomb) — last tuple slot.
+    let (kp, kd, effort, scale, armature, lim, damping, frictionloss) = if starts_with(name, "hipz") {
+        (30.0, 3.0, 88.0, 0.733, 0.0227, (-0.349, 0.349), 0.514, 1.351)
     } else if starts_with(name, "hipx") {
-        (40.0, 3.0, 88.0, 0.55)
+        (40.0, 3.0, 88.0, 0.55, 0.1333, (-0.349, 0.349), 0.738, 1.158)
     } else if starts_with(name, "hipy") {
-        (60.0, 4.0, 88.0, 0.367)
+        (60.0, 4.0, 88.0, 0.367, 0.1408, (-1.047, 1.047), 1.455, 1.312)
     } else if starts_with(name, "knee") {
-        (60.0, 4.0, 88.0, 0.367)
+        (60.0, 4.0, 88.0, 0.367, 0.1233, (-0.524, 0.524), 2.264, 0.998)
+    } else if starts_with(name, "anklex") {
+        // Ankle EFFORT capped at 15 N·m (was 44): the real ankle motor is fragile
+        // (~11 N·m diamond/peak) and overheats under sustained load. 44 let the
+        // policy hold lateral balance with ~16 N·m sustained on the ankle roll —
+        // it would cook the real motor. 15 caps the motor saturation (and the
+        // reward torque-clamp), forcing a lower-ankle-torque stance; the ankle
+        // torque penalty (BIPED_ANKLE_TORQUE_W) drives sustained usage lower still.
+        (20.0, 1.5, 15.0, 0.55, 0.0299, (-0.175, 0.175), 0.214, 0.262) // ankle-roll
     } else {
-        // ankley / anklex
-        (20.0, 1.5, 44.0, 0.55)
+        // ankley (ankle pitch) — the one that folds the foot into the shin.
+        (20.0, 1.5, 15.0, 0.55, 0.0299, (-0.349, 0.349), 0.0286, 0.171)
+    };
+    // Ankle scaled gentler than the legs (avoids bang-bang saturation of the
+    // fragile 15 N·m motor — see ANKLE_STIFFNESS_SCALE).
+    let is_ankle = starts_with(name, "ankle");
+    let (sk, dk) = if is_ankle {
+        (ANKLE_STIFFNESS_SCALE, ANKLE_DAMPING_SCALE)
+    } else {
+        (STIFFNESS_SCALE, DAMPING_SCALE)
     };
     JointSpec {
         name,
-        kp,
-        kd,
+        kp: kp * sk,
+        kd: kd * dk,
         effort_limit: effort,
         vel_limit: 10.0,
         action_scale: scale,
         default_pos: 0.0,
-        pos_limit: (-PI, PI),
+        pos_limit: lim,
+        armature,
+        damping,
+        frictionloss,
     }
 }
 
@@ -212,12 +279,14 @@ mod tests {
     fn gains_match_families() {
         let r = LeRobotBipedal::new();
         let by = |name: &str| r.joints.iter().find(|j| j.name == name).copied().unwrap();
-        assert_eq!(by("hipz_left").kp, 30.0);
-        assert_eq!(by("hipx_right").kp, 40.0);
-        assert_eq!(by("hipy_left").kp, 60.0);
-        assert_eq!(by("knee_right").kp, 60.0);
-        assert_eq!(by("ankley_left").kp, 20.0);
-        assert_eq!(by("anklex_right").effort_limit, 44.0);
+        // kp = WBC value × STIFFNESS_SCALE (4×); kd = WBC × DAMPING_SCALE (2×).
+        assert_eq!(by("hipz_left").kp, 120.0);
+        assert_eq!(by("hipx_right").kp, 160.0);
+        assert_eq!(by("hipy_left").kp, 240.0);
+        assert_eq!(by("knee_right").kp, 240.0);
+        assert_eq!(by("ankley_left").kp, 40.0); // ankle scaled ×2 (gentler than legs)
+        assert_eq!(by("ankley_left").kd, 1.5 * 1.5);
+        assert_eq!(by("anklex_right").effort_limit, 15.0); // capped (fragile ankle motor)
         assert_eq!(by("knee_left").effort_limit, 88.0);
         // Action scales per family.
         assert_eq!(by("hipz_left").action_scale, 0.733);

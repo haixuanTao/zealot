@@ -287,6 +287,14 @@ async fn main() -> anyhow::Result<()> {
     let sd_adv = var_adv.sqrt().max(1e-6);
 
     // ---- GPU update ----
+    #[cfg(feature = "cuda_backend")]
+    let bk = if std::env::var("BIPED_CUDA").as_deref() == Ok("1") {
+        eprintln!("[gpu_update_check] backend = native CUDA");
+        GpuBackend::Cuda(khal::backend::Cuda::new(0)?)
+    } else {
+        GpuBackend::WebGpu(WebGpu::new(Features::default(), Limits::default()).await?)
+    };
+    #[cfg(not(feature = "cuda_backend"))]
     let bk = GpuBackend::WebGpu(WebGpu::new(Features::default(), Limits::default()).await?);
     let g = Gemm::from_backend(&bk)?;
     let op = OpAssign::from_backend(&bk)?;

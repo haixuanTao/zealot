@@ -78,8 +78,20 @@ fn build_scene(robot: &LeRobotBipedal, spawn_height: f32) -> Scene {
     for (i, uj) in urdf_robot.joints.iter_mut().enumerate() {
         let name = &urdf.joints[i].name;
         if let Some((kp, kd, max_force)) = gain_for(robot, name) {
-            uj.joint
-                .set_motor_model(JointAxis::AngX, MotorModel::ForceBased);
+            // Stiffen constraint motors so the rapier multibody can actually STAND
+            // (it lacks nexus's explicit-PD). BIPED_KP_SCALE (default 1).
+            let ks: f32 = std::env::var("BIPED_KP_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            let (kp, kd, max_force) = (kp * ks, kd * ks.sqrt(), max_force * ks);
+            // Constraint-based ForceBased under-realizes kp → robot buckles (the
+            // nexus saga). For the rapier contact-drift reference we need it to
+            // STAND, so default to AccelerationBased (holds); BIPED_FORCE_MOTOR=1
+            // reverts. (Either way it's rapier's contact solver under test.)
+            let model = if std::env::var("BIPED_FORCE_MOTOR").is_ok() {
+                MotorModel::ForceBased
+            } else {
+                MotorModel::AccelerationBased
+            };
+            uj.joint.set_motor_model(JointAxis::AngX, model);
             uj.joint.set_motor_position(JointAxis::AngX, 0.0, kp, kd);
             uj.joint.set_motor_max_force(JointAxis::AngX, max_force);
         }
@@ -214,8 +226,22 @@ fn main() {
     let gravity = Vec3::new(0.0, 0.0, -9.81);
     let mut ip = IntegrationParameters::default();
     ip.dt = DT;
-    ip.num_solver_iterations = SOLVER_ITERS;
+    ip.num_solver_iterations = std::env::var("BIPED_SOLVER_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SOLVER_ITERS);
+    println!("num_solver_iterations = {}", ip.num_solver_iterations);
     let mut pipeline = PhysicsPipeline::new();
+    // RAPIER reference for the foot-slip/drift-∝-substeps bug: track each foot's
+    // horizontal travel while planted (low). If rapier ALSO drifts ∝ substeps,
+    // nexus faithfully ports a rapier TGS characteristic; if not, nexus diverged.
+    let foot_xy = |bodies: &RigidBodySet, h: RigidBodyHandle| {
+        let t = bodies[h].translation();
+        (t.x, t.y)
+    };
+    let mut prev_xy: Vec<(f32, f32)> = scene.feet.iter().map(|&h| foot_xy(&scene.bodies, h)).collect();
+    let mut path_len: Vec<f32> = vec![0.0; scene.feet.len()];
+    let mut planted_steps: Vec<u32> = vec![0; scene.feet.len()];
     let mut islands = IslandManager::new();
     let mut broad_phase = BroadPhaseBvh::new();
     let mut narrow_phase = NarrowPhase::new();
@@ -241,6 +267,17 @@ fn main() {
             &(),
         );
 
+        // Per-foot horizontal drift while planted (foot body z < 0.10 ≈ on ground).
+        for (i, &h) in scene.feet.iter().enumerate() {
+            let (x, y) = foot_xy(&scene.bodies, h);
+            if scene.bodies[h].translation().z < 0.10 {
+                let (px, py) = prev_xy[i];
+                path_len[i] += ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+                planted_steps[i] += 1;
+            }
+            prev_xy[i] = (x, y);
+        }
+
         if step % 50 == 0 || step == steps - 1 {
             let tz = body_z(&scene.bodies, scene.torso);
             let fz = foot_z(&scene.bodies);
@@ -260,6 +297,20 @@ fn main() {
                 return;
             }
         }
+    }
+
+    // Foot-drift report: mean planted-foot horizontal speed (m/s). If this grows
+    // with num_solver_iterations like nexus does, the bug is a rapier-TGS trait.
+    println!("\n[rapier foot drift] planted-foot mean horizontal speed:");
+    for (i, &h) in scene.feet.iter().enumerate() {
+        let secs = planted_steps[i] as f32 * DT;
+        let speed = if secs > 1e-3 { path_len[i] / secs } else { 0.0 };
+        println!(
+            "  foot{i}: path={:.1}cm  planted={:.2}s  drift_rate={speed:.3} m/s",
+            path_len[i] * 100.0,
+            secs,
+        );
+        let _ = h;
     }
 
     let tz = body_z(&scene.bodies, scene.torso);
