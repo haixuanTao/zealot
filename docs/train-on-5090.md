@@ -7,7 +7,7 @@ backend — physics *and* the PPO update on the GPU, no PhysX / no Isaac.
 This is the all-Rust path: nexus physics + vortx PPO shaders compiled Rust→PTX via
 [cuda-oxide](https://github.com/haixuanTao/cuda-oxide) and loaded as `sm_120`
 cubins. The Mac is Metal-only and its contact path is broken — **train on CUDA
-boxes only** (`baguette` / `champagne` = the two 5090s; the vast 5060 also works).
+boxes only** (any RTX 5090 box; the vast 5060 also works).
 
 ## Conventions
 
@@ -28,7 +28,7 @@ export PTX="$HOME/nexus_ptx"   # where the compiled cubins land
 ## TL;DR (box already provisioned)
 
 If the toolchain, wheels, and cubins already exist on the box (the usual case on
-`baguette`/`champagne`), you only need three things: fresh cubins, the two env
+a provisioned 5090), you only need three things: fresh cubins, the two env
 vars, and the run command.
 
 ```bash
@@ -88,12 +88,12 @@ Clone the forks at these branches, all as siblings under `$WORK`.
 **Fastest path — copy a built environment from an existing 5090:**
 
 ```bash
-rsync -a baguette:'~/{cuda-oxide-src,make_cubin,nvvm-wheel,nvjit-wheel,llvm21}' "$HOME/"
-rsync -a baguette:'~/work/{nexus-cuda,khal,vortx,zealot}' "$WORK/"
+rsync -a <5090-host>:'~/{cuda-oxide-src,make_cubin,nvvm-wheel,nvjit-wheel,llvm21}' "$HOME/"
+rsync -a <5090-host>:'~/work/{nexus-cuda,khal,vortx,zealot}' "$WORK/"
 ```
 
 This skips sections 2–4 entirely. Prefer it when a 5090 is reachable. (Adjust the
-remote source paths to wherever baguette keeps its checkout.)
+remote source paths to wherever that host keeps its checkout.)
 
 ---
 
@@ -156,7 +156,7 @@ bash build_cuda/build_vortx_cubin_llc.sh   # vortx PPO     -> $PTX/vortx_shaders
 ```
 
 > **Edit the paths in the scripts first.** They still contain absolute
-> `/home/baguette/...` paths and a stale `nightly-2025-08-04` llvm-tools path.
+> absolute home paths (e.g. `/home/<user>/...`) and a stale `nightly-2025-08-04` llvm-tools path.
 > Point `TOOL`/`LIBDEV`/`PTXAS`/`BACKEND` at *this* box's toolchain, wheels, and
 > the `.so` from section 4, and `CUDA_OXIDE_PTX_DIR` at `$PTX`. The `.ll` is
 > LLVM-21 IR, so the assembler must be LLVM 21.
