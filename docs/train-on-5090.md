@@ -67,18 +67,23 @@ Run it inside `tmux` so it survives the SSH session. Skip to
 
 Clone the forks at these branches, all as siblings under `$WORK`.
 
-| repo | branch | path |
-|------|--------|------|
+| GitHub repo | branch | clone into |
+|-------------|--------|------------|
 | `haixuanTao/zealot` | `feat/native-cuda-e2e-bench` | `$WORK/zealot` |
-| `haixuanTao/nexus-cuda` | `master` | `$WORK/nexus-cuda` |
-| `haixuanTao/khal` | `feat/cuda-oxide-backend` | `$WORK/khal` |
-| `haixuanTao/vortx` | `feat/gpu-policy-shaders` | `$WORK/vortx` |
+| `haixuanTao/nexus-rl` **(private)** | `feat/per-env-parallelism` | `$WORK/nexus-cuda` |
+| `haixuanTao/khal` | `fix/cuda-slice-arg-element-count` | `$WORK/khal` |
+| `haixuanTao/vortx` | `fix/reduce-generic-followup` | `$WORK/vortx` |
 | `haixuanTao/cuda-oxide` | `feat/nexus3d-vortx-native-cuda` | `$HOME/cuda-oxide-src` |
 
-> `cuda-oxide` is public (clone over https); the others may need `gh auth login`
-> or an rsync from the Mac if the box has no GitHub access. Its checkout lives
-> outside `$WORK` (the build scripts reference `$HOME/cuda-oxide-src`); adjust if
-> you keep it elsewhere.
+> **Gotchas that bite a fresh clone:**
+> - **Repo name ≠ dir name for nexus:** the physics repo is `haixuanTao/nexus-rl`
+>   but zealot resolves it by the relative path `../nexus-cuda`, so clone it into
+>   a dir literally named `nexus-cuda` (`git clone …/nexus-rl.git nexus-cuda`).
+> - **`nexus-rl` is private** — a new machine needs GitHub auth (`gh auth login`
+>   / an authorized SSH key) to clone it. `zealot`/`khal`/`vortx`/`cuda-oxide`
+>   are public over https.
+> - `cuda-oxide` lives **outside `$WORK`** at `$HOME/cuda-oxide-src` (the build
+>   scripts reference that path); adjust if you keep it elsewhere.
 
 **Fastest path — copy a built environment from an existing 5090:**
 
