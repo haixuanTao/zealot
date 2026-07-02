@@ -20,7 +20,7 @@
 //!   BIPED_CUDA=1 cargo run --release --example resident_rollout_bench \
 //!       --features "gpu biped_gpu cuda_backend"
 
-use khal::backend::{Backend, Encoder, GpuBackend, WebGpu};
+use khal::backend::{Backend, Encoder, GpuBackend};
 use khal::{BufferUsages, Shader};
 use nalgebra::DMatrix;
 use std::time::Instant;
@@ -117,20 +117,9 @@ impl Net {
 }
 
 async fn make_backend() -> GpuBackend {
-    #[cfg(feature = "cuda_backend")]
-    {
-        if std::env::var("BIPED_CUDA").as_deref() == Ok("1") {
-            use khal::backend::Cuda;
-            eprintln!("[resident_rollout] backend = native CUDA (cuda-oxide)");
-            return GpuBackend::Cuda(Cuda::new(0).expect("init CUDA backend"));
-        }
-    }
-    eprintln!("[resident_rollout] backend = WebGPU");
-    GpuBackend::WebGpu(
-        WebGpu::new(wgpu::Features::default(), wgpu::Limits::default())
-            .await
-            .expect("webgpu"),
-    )
+    GpuBackend::auto(wgpu::Features::default(), wgpu::Limits::default())
+        .await
+        .expect("init GPU backend")
 }
 
 #[async_std::main]

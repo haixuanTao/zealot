@@ -7,27 +7,16 @@
 
 use khal::BufferUsages;
 use khal::Shader;
-use khal::backend::{Backend, GpuBackend as KhalGpuBackend, WebGpu};
+use khal::backend::{Backend, GpuBackend as KhalGpuBackend};
 use nalgebra::DMatrix;
 use vortx::linalg::Contiguous;
 use vortx::shapes::TensorLayoutBuffers;
 use vortx::tensor::Tensor;
 
 async fn make_backend() -> KhalGpuBackend {
-    #[cfg(feature = "cuda_backend")]
-    {
-        if std::env::var("BIPED_CUDA").as_deref() == Ok("1") {
-            use khal::backend::Cuda;
-            eprintln!("backend = native CUDA");
-            return KhalGpuBackend::Cuda(Cuda::new(0).expect("cuda"));
-        }
-    }
-    eprintln!("backend = WebGPU");
-    KhalGpuBackend::WebGpu(
-        WebGpu::new(wgpu::Features::default(), wgpu::Limits::default())
-            .await
-            .expect("webgpu"),
-    )
+    KhalGpuBackend::auto(wgpu::Features::default(), wgpu::Limits::default())
+        .await
+        .expect("init GPU backend")
 }
 
 fn main() {

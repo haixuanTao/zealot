@@ -25,7 +25,7 @@ mod gpu_policy;
 use gpu_policy::GpuPolicy;
 use khal::BufferUsages;
 use khal::Shader;
-use khal::backend::{Backend, Encoder, GpuBackend as KhalGpuBackend, WebGpu};
+use khal::backend::{Backend, Encoder, GpuBackend as KhalGpuBackend};
 use nalgebra::DMatrix;
 use nexus3d::rbd::math::Pose;
 use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
@@ -101,14 +101,6 @@ fn build_boxes() -> (RigidBodySet, ColliderSet) {
 /// Pick the GPU backend (WebGPU by default; native CUDA when compiled with
 /// `cuda_backend` AND `BIPED_CUDA=1`).
 async fn make_backend() -> KhalGpuBackend {
-    #[cfg(feature = "cuda_backend")]
-    {
-        if std::env::var("BIPED_CUDA").as_deref() == Ok("1") {
-            use khal::backend::Cuda;
-            eprintln!("[boxes-e2e] backend = native CUDA (cuda-oxide)");
-            return KhalGpuBackend::Cuda(Cuda::new(0).expect("init CUDA backend"));
-        }
-    }
     let limits = wgpu::Limits {
         max_buffer_size: 1_200_000_000,
         max_storage_buffer_binding_size: 1_200_000_000,
@@ -116,12 +108,13 @@ async fn make_backend() -> KhalGpuBackend {
         max_compute_workgroup_storage_size: 19_904,
         ..Default::default()
     };
-    let mut w = WebGpu::new(wgpu::Features::default(), limits)
+    let mut bk = KhalGpuBackend::auto(wgpu::Features::default(), limits)
         .await
-        .expect("webgpu");
-    w.force_buffer_copy_src = true;
-    eprintln!("[boxes-e2e] backend = WebGPU");
-    KhalGpuBackend::WebGpu(w)
+        .expect("init GPU backend");
+    if let KhalGpuBackend::WebGpu(w) = &mut bk {
+        w.force_buffer_copy_src = true;
+    }
+    bk
 }
 
 /// Build a per-env obs vector of length `dim` from the env's body poses.
@@ -341,7 +334,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(16);
 
-    let gpu_iter_ms = pollster::block_on(async {
+    let (gpu_iter_ms, backend_is_cuda) = pollster::block_on(async {
         let mut rng = Lcg::new(7);
         let (od, cd) = (OBS_DIM, CRITIC_OBS_DIM);
         let bodies_per_env = num_boxes() + 1; // dynamic boxes + floor
@@ -646,12 +639,12 @@ fn main() {
                 ms(t_upd_start)
             );
         }
-        tg.elapsed().as_secs_f64() * 1e3
+        (tg.elapsed().as_secs_f64() * 1e3, bk.is_cuda())
     });
 
     let ctrl = (n * t_steps) as f64;
     let gpu_eps = ctrl / (gpu_iter_ms / 1e3) / 1e3;
-    let backend = if std::env::var("BIPED_CUDA").as_deref() == Ok("1") {
+    let backend = if backend_is_cuda {
         "native CUDA (cuda-oxide)"
     } else {
         "WebGPU"
