@@ -155,11 +155,16 @@ bash build_cuda/build_nexus_cubin.sh       # nexus physics -> $PTX/nexus_rbd_sha
 bash build_cuda/build_vortx_cubin_llc.sh   # vortx PPO     -> $PTX/vortx_shaders.cubin
 ```
 
-> **Edit the paths in the scripts first.** They still contain absolute
-> absolute home paths (e.g. `/home/<user>/...`) and a stale `nightly-2025-08-04` llvm-tools path.
-> Point `TOOL`/`LIBDEV`/`PTXAS`/`BACKEND` at *this* box's toolchain, wheels, and
-> the `.so` from section 4, and `CUDA_OXIDE_PTX_DIR` at `$PTX`. The `.ll` is
-> LLVM-21 IR, so the assembler must be LLVM 21.
+> **No hand-editing needed.** The scripts source `build_cuda/detect_env.sh`, which
+> auto-detects the toolchain, LLVM-21 tools, CUDA-12.9 wheel artifacts (libdevice
+> / libnvvm / nvjitlink / ptxas), the backend `.so`, and the sibling repo paths —
+> all derived from the script location + `$HOME`. Override any of them by
+> exporting the var first, e.g.:
+> ```bash
+> SM=sm_89 PTXAS=/path/to/ptxas bash build_cuda/build_nexus_cubin.sh   # 4090 example
+> ```
+> Target arch defaults to `SM=sm_120` (Blackwell). Set `CUDA_OXIDE_PTX_DIR=$PTX`
+> if you want the cubins somewhere other than `~/nexus_ptx`.
 
 ### Critical flags (already baked into the scripts — do not drop them)
 
