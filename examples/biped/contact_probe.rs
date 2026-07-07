@@ -16,11 +16,14 @@ mod biped_env_nexus;
 #[path = "gpu_policy.rs"]
 mod gpu_policy;
 
-use biped_env_nexus::{default_mjcf_path, BipedNexusBatchEnv};
+use biped_env_nexus::{BipedNexusBatchEnv, default_mjcf_path};
 use zealot_env::robots::lerobot_bipedal::NUM_JOINTS;
 
 fn main() {
-    let steps: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2);
+    let steps: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
     let n = 4usize;
     let xml = std::fs::read_to_string(default_mjcf_path()).expect("mjcf");
 
@@ -29,6 +32,19 @@ fn main() {
         let zero = vec![[0.0f32; NUM_JOINTS]; n];
         let ground0 = env.ground_collider(0);
         println!("env0 ground collider index = {ground0}");
+
+        // Spawn poses BEFORE the first step: with the deterministic seed these
+        // must be identical across backends (Debug float printing is
+        // roundtrip-exact). If they already differ, the divergence is in the
+        // spawn/reset path, not the physics kernels.
+        {
+            let poses = env.dbg_body_poses().await;
+            let bodies_per_env = poses.len() / n;
+            println!("spawn body poses env0 ({bodies_per_env} bodies):");
+            for (i, p) in poses[..bodies_per_env].iter().enumerate() {
+                println!("   body {i:2}: {p:?}");
+            }
+        }
 
         for s in 0..steps {
             let outs = env.step(&zero).await;
@@ -84,26 +100,69 @@ fn main() {
                 outs.iter().filter(|o| o.fell).count()
             );
             println!(
-                "   broad-phase: pairs_len_sum={plen_sum} total_pairs={} ground_pairs={ground_pairs}",
+                "   broad-phase: pairs_len={plen:?} sum={plen_sum} total_pairs={} ground_pairs={ground_pairs}",
                 pairs.iter().filter(|p| p[0] != 0 || p[1] != 0).count()
             );
+            println!("   narrow-phase per-batch contacts_len={len:?}");
             println!(
                 "   narrow-phase: contacts_len_sum={len_sum} active_manifolds={active} (normal_z: +z={up} -z={down} ~0={flat})"
             );
             // Multibody contact constraints: effective inv-mass inv_lhs, rhs, impulse.
             let (cc_cnt, ccs) = env.dbg_mb_contacts().await;
-            let cc_active = ccs.iter().filter(|c| c.inv_lhs != 0.0 || c.impulse != 0.0).count();
+            let cc_active = ccs
+                .iter()
+                .filter(|c| c.inv_lhs != 0.0 || c.impulse != 0.0)
+                .count();
             println!(
                 "   mb-contact-constraints: counts={:?} active={cc_active}",
                 &cc_cnt[..cc_cnt.len().min(8)]
             );
-            for c in ccs.iter().filter(|c| c.inv_lhs != 0.0 || c.impulse != 0.0).take(6) {
+            for c in ccs
+                .iter()
+                .filter(|c| c.inv_lhs != 0.0 || c.impulse != 0.0)
+                .take(6)
+            {
                 println!(
-                    "      mb={} link={} kind={} inv_lhs={:.3e} rhs={:.3e} impulse={:.3e} free_im={:.3} lin_jac=({:.2},{:.2},{:.2})",
-                    c.multibody_id, c.link_id, c.kind, c.inv_lhs, c.rhs, c.impulse, c.free_body_im,
-                    c.lin_jac.x, c.lin_jac.y, c.lin_jac.z
+                    "      mb={} link={} kind={} inv_lhs={:.3e} rhs={:.3e} rhs_wo_bias={:.3e} cfm_coeff={:.3e} cfm_gain={:.3e} impulse={:.3e} lin_jac=({:.2},{:.2},{:.2})",
+                    c.multibody_id,
+                    c.link_id,
+                    c.kind,
+                    c.inv_lhs,
+                    c.rhs,
+                    c.rhs_wo_bias,
+                    c.cfm_coeff,
+                    c.cfm_gain,
+                    c.impulse,
+                    c.lin_jac.x,
+                    c.lin_jac.y,
+                    c.lin_jac.z
                 );
             }
+            // The step-2 diff (docs/metal-contact-bug-proposal.md): full Jᵀ rows
+            // and M⁻¹·Jᵀ columns for env0's active constraints, plus dof_state.
+            // These are the values not yet compared CUDA-vs-WebGpu; a wrong
+            // column propagates a wrong velocity delta to every DOF per sweep.
+            let (jacs, cols, (cols_pb, dofs_pb, _cons_pb)) = env.dbg_mb_jac_columns().await;
+            let (dofs, _mm) = env.dbg_mb_dof_state_and_lu().await;
+            let nd = dofs_pb as usize;
+            let fmt = |v: &[f32]| {
+                v.iter()
+                    .map(|x| format!("{x:+.4e}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            println!(
+                "   dof_state env0 (vel, {nd} dofs): {}",
+                fmt(&dofs[..nd.min(dofs.len())])
+            );
+            let active0 = *cc_cnt.first().unwrap_or(&0) as usize;
+            for s in 0..active0.min(4) {
+                let off = s * nd; // batch 0 ⇒ no cols_pb offset
+                let _ = cols_pb;
+                println!("      slot {s} Jt : {}", fmt(&jacs[off..off + nd]));
+                println!("      slot {s} MiJ: {}", fmt(&cols[off..off + nd]));
+            }
+
             // DEBUG markers (colliders==7777): normal_a=(capacity, pairs_len, num_wg.y)
             for m in &manifolds {
                 if m.colliders.x == 7777 && m.colliders.y == 7777 {
@@ -138,6 +197,31 @@ fn main() {
                         "   ground pair: ({ca},{cb}) len={} normal_local=({:.2},{:.2},{:.2}) WORLD=({:.2},{:.2},{:.2}) dist0={:.4}",
                         m.contact.len, nrm.x, nrm.y, nrm.z, wn.0, wn.1, wn.2, p0.dist
                     );
+                    // Full-precision detail for the divergence hunt: every
+                    // manifold point + the two collider world poses feeding it.
+                    if s == 0 && shown < 2 {
+                        for (pi, pt) in m
+                            .contact
+                            .points_a
+                            .iter()
+                            .take(m.contact.len as usize)
+                            .enumerate()
+                        {
+                            println!(
+                                "      point {pi}: local_a=({:+.6e},{:+.6e},{:+.6e}) dist={:+.6e}",
+                                pt.pt.x, pt.pt.y, pt.pt.z, pt.dist
+                            );
+                        }
+                        println!(
+                            "      normal_a full: ({:+.6e},{:+.6e},{:+.6e})",
+                            nrm.x, nrm.y, nrm.z
+                        );
+                        for c in [ca, cb] {
+                            if let Some(p) = poses.get(c as usize) {
+                                println!("      collider {c} world pose: {p:?}");
+                            }
+                        }
+                    }
                     shown += 1;
                     if shown >= 6 {
                         break;

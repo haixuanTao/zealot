@@ -27,11 +27,11 @@ mod biped_env_nexus;
 #[path = "gpu_policy.rs"]
 mod gpu_policy;
 
-use biped_env_nexus::{default_mjcf_path, BipedNexusBatchEnv, REWARD_COMP_NAMES};
+use biped_env_nexus::{BipedNexusBatchEnv, REWARD_COMP_NAMES, default_mjcf_path};
 use gpu_policy::GpuPolicy;
-use khal::backend::{Backend, Encoder, GpuBackend};
 use khal::BufferUsages;
 use khal::Shader;
+use khal::backend::{Backend, Encoder, GpuBackend};
 use nalgebra::DMatrix;
 use std::time::Instant;
 use vortx::linalg::{
@@ -41,10 +41,10 @@ use vortx::linalg::{
 use vortx::shapes::TensorLayoutBuffers;
 use vortx::tensor::Tensor;
 use zealot_env::robots::lerobot_bipedal::NUM_JOINTS;
-use zealot_rl::net::Mlp;
-use zealot_rl::ppo::{gae, Sample};
-use zealot_rl::rng::Lcg;
 use zealot_rl::ActorCritic;
+use zealot_rl::net::Mlp;
+use zealot_rl::ppo::{Sample, gae};
+use zealot_rl::rng::Lcg;
 
 const LOG_SQRT_2PI: f32 = 0.918_938_5;
 const T: usize = 24; // rollout horizon
@@ -149,7 +149,10 @@ struct SPerm {
 }
 impl SPerm {
     fn identity(d: usize) -> Self {
-        SPerm { perm: (0..d).collect(), sign: vec![1.0; d] }
+        SPerm {
+            perm: (0..d).collect(),
+            sign: vec![1.0; d],
+        }
     }
     /// Pure adjacent-pair swap 2k↔2k+1 (sign +1) — a permutation involution that
     /// commutes with elementwise ELU. `d` must be even (our hidden dims are).
@@ -161,11 +164,17 @@ impl SPerm {
             perm[k + 1] = k;
             k += 2;
         }
-        SPerm { perm, sign: vec![1.0; d] }
+        SPerm {
+            perm,
+            sign: vec![1.0; d],
+        }
     }
 }
 fn action_sperm() -> SPerm {
-    SPerm { perm: JMIRROR.to_vec(), sign: JSIGN.to_vec() }
+    SPerm {
+        perm: JMIRROR.to_vec(),
+        sign: JSIGN.to_vec(),
+    }
 }
 // obs(45) signed perm — exactly the index/sign pattern of `mirror_obs`.
 fn obs_sperm() -> SPerm {
@@ -267,12 +276,19 @@ struct GpuMlp {
 impl GpuMlp {
     fn new(bk: &GpuBackend, net: &Mlp, m: usize) -> Self {
         let d = net.dims.clone();
-        let (st, rw) = (BufferUsages::STORAGE, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+        let (st, rw) = (
+            BufferUsages::STORAGE,
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        );
         let l = net.w.len();
         let z = |r: usize, c: usize| DMatrix::<f32>::zeros(r, c);
         GpuMlp {
-            w: (0..l).map(|i| mk(bk, &wmat(&net.w[i], d[i + 1], d[i]), rw)).collect(),
-            b: (0..l).map(|i| mk(bk, &DMatrix::from_fn(d[i + 1], 1, |r, _| net.b[i][r]), rw)).collect(),
+            w: (0..l)
+                .map(|i| mk(bk, &wmat(&net.w[i], d[i + 1], d[i]), rw))
+                .collect(),
+            b: (0..l)
+                .map(|i| mk(bk, &DMatrix::from_fn(d[i + 1], 1, |r, _| net.b[i][r]), rw))
+                .collect(),
             mw: (0..l).map(|i| mk(bk, &z(d[i + 1], d[i]), st)).collect(),
             vw: (0..l).map(|i| mk(bk, &z(d[i + 1], d[i]), st)).collect(),
             mb: (0..l).map(|i| mk(bk, &z(d[i + 1], 1), st)).collect(),
@@ -290,7 +306,16 @@ impl GpuMlp {
         self.w.len()
     }
     #[allow(clippy::too_many_arguments)]
-    fn forward(&mut self, bk: &GpuBackend, g: &Gemm, op: &OpAssign, act: &Activation, sh: &mut TensorLayoutBuffers, enc: &mut <GpuBackend as Backend>::Encoder, o1m: &Tensor<f32>) -> anyhow::Result<()> {
+    fn forward(
+        &mut self,
+        bk: &GpuBackend,
+        g: &Gemm,
+        op: &OpAssign,
+        act: &Activation,
+        sh: &mut TensorLayoutBuffers,
+        enc: &mut <GpuBackend as Backend>::Encoder,
+        o1m: &Tensor<f32>,
+    ) -> anyhow::Result<()> {
         let l = self.layers();
         for i in 0..l {
             let (lf, rt) = self.a.split_at_mut(i + 1);
@@ -299,27 +324,104 @@ impl GpuMlp {
                 let mut p = enc.begin_pass("z", None);
                 g.dispatch_tiled(bk, sh, &mut p, &mut *aout, &self.w[i], ain)?;
             }
-            { let mut p = enc.begin_pass("bb", None); g.dispatch_naive(bk, sh, &mut p, &mut self.bb[i], &self.b[i], o1m)?; }
-            { let mut p = enc.begin_pass("bias", None); op.launch(bk, sh, &mut p, OpAssignVariant::Add, &mut *aout, &self.bb[i])?; }
-            if i < l - 1 { let mut p = enc.begin_pass("elu", None); act.elu(bk, sh, &mut p, &mut *aout)?; }
-        }
-        Ok(())
-    }
-    fn backward(&mut self, bk: &GpuBackend, g: &Gemm, act: &Activation, sh: &mut TensorLayoutBuffers, enc: &mut <GpuBackend as Backend>::Encoder, om1: &Tensor<f32>) -> anyhow::Result<()> {
-        for i in (0..self.layers()).rev() {
-            { let mut p = enc.begin_pass("dw", None); g.dispatch_tiled(bk, sh, &mut p, &mut self.dw[i], &self.delta[i], self.a[i].transpose_last_dims())?; }
-            { let mut p = enc.begin_pass("db", None); g.dispatch_naive(bk, sh, &mut p, &mut self.db[i], &self.delta[i], om1)?; }
-            if i > 0 {
-                { let (lf, rt) = self.delta.split_at_mut(i); let dp = &mut lf[i - 1]; let dc = &rt[0]; let mut p = enc.begin_pass("da", None); g.dispatch_tiled(bk, sh, &mut p, dp, self.w[i].transpose_last_dims(), dc)?; }
-                { let mut p = enc.begin_pass("eb", None); act.elu_backward(bk, sh, &mut p, &mut self.delta[i - 1], &self.a[i])?; }
+            {
+                let mut p = enc.begin_pass("bb", None);
+                g.dispatch_naive(bk, sh, &mut p, &mut self.bb[i], &self.b[i], o1m)?;
+            }
+            {
+                let mut p = enc.begin_pass("bias", None);
+                op.launch(
+                    bk,
+                    sh,
+                    &mut p,
+                    OpAssignVariant::Add,
+                    &mut *aout,
+                    &self.bb[i],
+                )?;
+            }
+            if i < l - 1 {
+                let mut p = enc.begin_pass("elu", None);
+                act.elu(bk, sh, &mut p, &mut *aout)?;
             }
         }
         Ok(())
     }
-    fn adam(&mut self, bk: &GpuBackend, ad: &Adam, sh: &mut TensorLayoutBuffers, enc: &mut <GpuBackend as Backend>::Encoder, ap: &Tensor<AdamParams>) -> anyhow::Result<()> {
+    fn backward(
+        &mut self,
+        bk: &GpuBackend,
+        g: &Gemm,
+        act: &Activation,
+        sh: &mut TensorLayoutBuffers,
+        enc: &mut <GpuBackend as Backend>::Encoder,
+        om1: &Tensor<f32>,
+    ) -> anyhow::Result<()> {
+        for i in (0..self.layers()).rev() {
+            {
+                let mut p = enc.begin_pass("dw", None);
+                g.dispatch_tiled(
+                    bk,
+                    sh,
+                    &mut p,
+                    &mut self.dw[i],
+                    &self.delta[i],
+                    self.a[i].transpose_last_dims(),
+                )?;
+            }
+            {
+                let mut p = enc.begin_pass("db", None);
+                g.dispatch_naive(bk, sh, &mut p, &mut self.db[i], &self.delta[i], om1)?;
+            }
+            if i > 0 {
+                {
+                    let (lf, rt) = self.delta.split_at_mut(i);
+                    let dp = &mut lf[i - 1];
+                    let dc = &rt[0];
+                    let mut p = enc.begin_pass("da", None);
+                    g.dispatch_tiled(bk, sh, &mut p, dp, self.w[i].transpose_last_dims(), dc)?;
+                }
+                {
+                    let mut p = enc.begin_pass("eb", None);
+                    act.elu_backward(bk, sh, &mut p, &mut self.delta[i - 1], &self.a[i])?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn adam(
+        &mut self,
+        bk: &GpuBackend,
+        ad: &Adam,
+        sh: &mut TensorLayoutBuffers,
+        enc: &mut <GpuBackend as Backend>::Encoder,
+        ap: &Tensor<AdamParams>,
+    ) -> anyhow::Result<()> {
         for i in 0..self.layers() {
-            { let mut p = enc.begin_pass("aw", None); ad.step(bk, sh, &mut p, ap, &mut self.w[i], &self.dw[i], &mut self.mw[i], &mut self.vw[i])?; }
-            { let mut p = enc.begin_pass("ab", None); ad.step(bk, sh, &mut p, ap, &mut self.b[i], &self.db[i], &mut self.mb[i], &mut self.vb[i])?; }
+            {
+                let mut p = enc.begin_pass("aw", None);
+                ad.step(
+                    bk,
+                    sh,
+                    &mut p,
+                    ap,
+                    &mut self.w[i],
+                    &self.dw[i],
+                    &mut self.mw[i],
+                    &mut self.vw[i],
+                )?;
+            }
+            {
+                let mut p = enc.begin_pass("ab", None);
+                ad.step(
+                    bk,
+                    sh,
+                    &mut p,
+                    ap,
+                    &mut self.b[i],
+                    &self.db[i],
+                    &mut self.mb[i],
+                    &mut self.vb[i],
+                )?;
+            }
         }
         Ok(())
     }
@@ -351,9 +453,17 @@ impl GpuMlp {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200);
-    let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(2048);
-    let ckpt = std::env::args().nth(3).unwrap_or_else(|| "/tmp/biped_policy_gpu.safetensors".to_string());
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    let n: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2048);
+    let ckpt = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "/tmp/biped_policy_gpu.safetensors".to_string());
     let xml = std::fs::read_to_string(default_mjcf_path()).expect("read mjcf");
 
     pollster::block_on(async {
@@ -361,11 +471,18 @@ fn main() {
         let mut env = BipedNexusBatchEnv::new(&xml, n, 32, 0xC0FFEE).await;
         let (od, cd) = (env.obs_dim(), env.critic_obs_dim());
         let mut rng = Lcg::new(7);
-        let mut ac = if !ckpt.is_empty() && std::path::Path::new(&ckpt).exists() {
+        let resumed = !ckpt.is_empty() && std::path::Path::new(&ckpt).exists();
+        let mut ac = if resumed {
             println!("resuming from {ckpt}...");
             ActorCritic::load(&ckpt).expect("load checkpoint")
         } else {
-            ActorCritic::new(&[od, 256, 256, 128, NUM_JOINTS], &[cd, 512, 256, 128, 1], 1.0, 1e-3, &mut rng)
+            ActorCritic::new(
+                &[od, 256, 256, 128, NUM_JOINTS],
+                &[cd, 512, 256, 128, 1],
+                1.0,
+                1e-3,
+                &mut rng,
+            )
         };
         // Symmetry method 4 — NET (BIPED_MIRROR_NET): project the actor+critic
         // weights onto the equivariant subspace so the policy is symmetric BY
@@ -411,12 +528,18 @@ fn main() {
         let ppo = Ppo::from_backend(&bk).unwrap();
         let cont = Contiguous::from_backend(&bk).unwrap();
         let mut sh = TensorLayoutBuffers::new(&bk);
-        let (st, rw) = (BufferUsages::STORAGE, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+        let (st, rw) = (
+            BufferUsages::STORAGE,
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        );
         let mut a_net = GpuMlp::new(&bk, &ac.actor, mb);
         let mut c_net = GpuMlp::new(&bk, &ac.critic, mb);
         let ad_ = NUM_JOINTS;
         let mut lst = mk(&bk, &DMatrix::from_fn(ad_, 1, |r, _| ac.log_std[r]), rw);
-        let (mut mls, mut vls) = (mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), st), mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), st));
+        let (mut mls, mut vls) = (
+            mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), st),
+            mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), st),
+        );
         // Reused mb-sized scratch.
         let mut action_t = mk(&bk, &DMatrix::<f32>::zeros(ad_, mb), rw);
         let mut adv_t = mk(&bk, &DMatrix::<f32>::zeros(1, mb), rw);
@@ -434,11 +557,27 @@ fn main() {
         // matrix `pa` (so `pa·μ = jmirror(μ)` via GEMM), per-minibatch scratch
         // `tgt`/`res`, and a constant gradient-scale tensor `gw` = w/mb (matches
         // the PPO grad's own 1/mb averaging).
-        let mut s_net = if mirror_loss > 0.0 { Some(GpuMlp::new(&bk, &ac.actor, mb)) } else { None };
-        let pa = mk(&bk, &DMatrix::from_fn(ad_, ad_, |o, j| if j == JMIRROR[o] { JSIGN[o] } else { 0.0 }), st);
+        let mut s_net = if mirror_loss > 0.0 {
+            Some(GpuMlp::new(&bk, &ac.actor, mb))
+        } else {
+            None
+        };
+        let pa = mk(
+            &bk,
+            &DMatrix::from_fn(
+                ad_,
+                ad_,
+                |o, j| if j == JMIRROR[o] { JSIGN[o] } else { 0.0 },
+            ),
+            st,
+        );
         let mut tgt = mk(&bk, &DMatrix::<f32>::zeros(ad_, mb), rw);
         let mut res = mk(&bk, &DMatrix::<f32>::zeros(ad_, mb), rw);
-        let gw = mk(&bk, &DMatrix::<f32>::from_element(ad_, mb, mirror_loss * scale_mb), st);
+        let gw = mk(
+            &bk,
+            &DMatrix::<f32>::from_element(ad_, mb, mirror_loss * scale_mb),
+            st,
+        );
         let mut gstep: u64 = 0;
         let mut lr = LR; // adaptive-KL LR, persists across iterations
 
@@ -450,20 +589,26 @@ fn main() {
         // the command from iter 0, so it was asked to move before it could stand —
         // it never escaped the falling/ignore-command regime. Now that the motor
         // fix makes the zero pose stable, a dedicated standing phase is learnable.
+        // Defaults are RESUME-AWARE: a warm-started run (checkpoint existed)
+        // skips the stand phase and re-ramps the command over the first 20% —
+        // re-running the full stand→walk schedule on a resumed policy wastes
+        // most of the run and resets the command curriculum out from under a
+        // policy that already walks (the historical "KL runaway on resume").
+        // Env vars always win.
         let stand_frac: f32 = std::env::var("BIPED_STAND_FRAC")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.3);
+            .unwrap_or(if resumed { 0.0 } else { 0.3 });
         // Fraction of training by which the velocity command reaches full scale
-        // (command ramps 0→1 over [stand_frac, ramp_end]). BIPED_RAMP_END lets a
-        // WARM-STARTED run (resuming a competent standing policy with
-        // BIPED_STAND_FRAC=0) reach walking speed quickly instead of over the
-        // default 70% of training.
+        // (command ramps 0→1 over [stand_frac, ramp_end]).
         let ramp_end: f32 = std::env::var("BIPED_RAMP_END")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.7);
-        println!("\n{:>4}  {:>5}  {:>9}  {:>7}  {:>8}  {:>9}  {:>7}  {:>6}", "iter", "curr", "step_rew", "falls", "torso_z", "lr", "kl", "sec");
+            .unwrap_or(if resumed { 0.2 } else { 0.7 });
+        println!(
+            "\n{:>4}  {:>5}  {:>9}  {:>7}  {:>8}  {:>9}  {:>7}  {:>6}",
+            "iter", "curr", "step_rew", "falls", "torso_z", "lr", "kl", "sec"
+        );
 
         // Torque-penalty curriculum target (full WBC weight = 1.0). Ramped 0→max
         // over iters 40%→90% so the effort penalty engages only AFTER the policy
@@ -472,15 +617,16 @@ fn main() {
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(1.0);
-        // Cap the command scale (BIPED_MAX_CSCALE, default 1.0). The sampler's full
-        // range is ±0.5 m/s; capping at e.g. 0.4 → max ±0.2 m/s = a SLOW walk, so
+        // Cap the command scale (BIPED_MAX_CSCALE, default 0.4). The sampler's full
+        // range is ±0.5 m/s; the 0.4 cap → max ±0.2 m/s = a SLOW walk, so
         // the policy learns a deliberate low-cadence gait (step → stabilize → step)
-        // instead of fast continuous tiny stepping. Slow + quasi-static also
-        // transfers far better (no reliance on dynamic contact timing).
+        // instead of fast continuous tiny stepping that leans on ankle torque.
+        // Slow + quasi-static also transfers far better (no reliance on dynamic
+        // contact timing). Set 1.0 for the full ±0.5 m/s range.
         let max_cscale: f32 = std::env::var("BIPED_MAX_CSCALE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0);
+            .unwrap_or(0.4);
         for it in 0..iters {
             let t_iter = Instant::now();
             let frac = it as f32 / iters as f32;
@@ -495,8 +641,11 @@ fn main() {
 
             // ---------------- ROLLOUT (GPU policy forward, host sample) ----------------
             let mut samp: Vec<Vec<Sample>> = (0..n).map(|_| Vec::with_capacity(T)).collect();
-            let (mut rs, mut vs, mut ds): (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<bool>>) =
-                ((0..n).map(|_| vec![]).collect(), (0..n).map(|_| vec![]).collect(), (0..n).map(|_| vec![]).collect());
+            let (mut rs, mut vs, mut ds): (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<bool>>) = (
+                (0..n).map(|_| vec![]).collect(),
+                (0..n).map(|_| vec![]).collect(),
+                (0..n).map(|_| vec![]).collect(),
+            );
             let (mut total_reward, mut falls) = (0.0f32, 0u32);
             let t_roll = Instant::now();
             let mut reset_dur = std::time::Duration::ZERO;
@@ -589,7 +738,8 @@ fn main() {
             // `adv`, so without this the PPO gradients are mis-scaled and the policy
             // plateaus instead of learning.
             let amean: f32 = batch.iter().map(|s| s.adv).sum::<f32>() / total as f32;
-            let avar: f32 = batch.iter().map(|s| (s.adv - amean).powi(2)).sum::<f32>() / total as f32;
+            let avar: f32 =
+                batch.iter().map(|s| (s.adv - amean).powi(2)).sum::<f32>() / total as f32;
             let asd = avar.sqrt().max(1e-6);
             for s in batch.iter_mut() {
                 s.adv = (s.adv - amean) / asd;
@@ -598,15 +748,24 @@ fn main() {
             let gae_s = t_gae.elapsed().as_secs_f64();
             // ---------------- GPU PPO UPDATE (persistent nets, advancing Adam) -------
             let t_upd = Instant::now();
-            let on: Vec<Vec<f32>> = batch.iter().map(|s| ac.obs_norm.normalize(&s.obs)).collect();
-            let cn: Vec<Vec<f32>> = batch.iter().map(|s| ac.critic_norm.normalize(&s.critic_obs)).collect();
+            let on: Vec<Vec<f32>> = batch
+                .iter()
+                .map(|s| ac.obs_norm.normalize(&s.obs))
+                .collect();
+            let cn: Vec<Vec<f32>> = batch
+                .iter()
+                .map(|s| ac.critic_norm.normalize(&s.critic_obs))
+                .collect();
             let f_obs = mk(&bk, &DMatrix::from_fn(od, total, |r, c| on[c][r]), st);
             let f_cobs = mk(&bk, &DMatrix::from_fn(cd, total, |r, c| cn[c][r]), st);
             // LOSS: normalized MIRRORED obs (normalize ∘ mirror — exact, not
             // mirror ∘ normalize), and refresh the stop-grad target net to the
             // current (iter-start) actor weights.
             let f_obs_mir = if mirror_loss > 0.0 {
-                let onm: Vec<Vec<f32>> = batch.iter().map(|s| ac.obs_norm.normalize(&mirror_obs(&s.obs))).collect();
+                let onm: Vec<Vec<f32>> = batch
+                    .iter()
+                    .map(|s| ac.obs_norm.normalize(&mirror_obs(&s.obs)))
+                    .collect();
                 if let Some(sn) = s_net.as_mut() {
                     sn.write_w(&bk, &ac.actor);
                 }
@@ -614,61 +773,261 @@ fn main() {
             } else {
                 None
             };
-            let f_act = mk(&bk, &DMatrix::from_fn(ad_, total, |r, c| batch[c].action[r]), st);
+            let f_act = mk(
+                &bk,
+                &DMatrix::from_fn(ad_, total, |r, c| batch[c].action[r]),
+                st,
+            );
             let f_adv = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].adv), st);
-            let f_lpo = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].logp_old), st);
-            let f_vo = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].value_old), st);
+            let f_lpo = mk(
+                &bk,
+                &DMatrix::from_fn(1, total, |_, c| batch[c].logp_old),
+                st,
+            );
+            let f_vo = mk(
+                &bk,
+                &DMatrix::from_fn(1, total, |_, c| batch[c].value_old),
+                st,
+            );
             let f_ret = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].ret), st);
-            let ap = Tensor::scalar(&bk, PpoActorParams { clip: CLIP, entropy_coef: ENTROPY, scale: scale_mb, log_sqrt_2pi: LOG_SQRT_2PI, action_dim: ad_ as u32, num_cols: mb as u32, pad0: 0, pad1: 0 }, BufferUsages::UNIFORM).unwrap();
-            let vp = Tensor::scalar(&bk, PpoValueParams { clip: CLIP, value_coef: VALUE_COEF, scale: scale_mb, num_cols: mb as u32, pad0: 0, pad1: 0, pad2: 0, pad3: 0 }, BufferUsages::UNIFORM).unwrap();
+            let ap = Tensor::scalar(
+                &bk,
+                PpoActorParams {
+                    clip: CLIP,
+                    entropy_coef: ENTROPY,
+                    scale: scale_mb,
+                    log_sqrt_2pi: LOG_SQRT_2PI,
+                    action_dim: ad_ as u32,
+                    num_cols: mb as u32,
+                    pad0: 0,
+                    pad1: 0,
+                },
+                BufferUsages::UNIFORM,
+            )
+            .unwrap();
+            let vp = Tensor::scalar(
+                &bk,
+                PpoValueParams {
+                    clip: CLIP,
+                    value_coef: VALUE_COEF,
+                    scale: scale_mb,
+                    num_cols: mb as u32,
+                    pad0: 0,
+                    pad1: 0,
+                    pad2: 0,
+                    pad3: 0,
+                },
+                BufferUsages::UNIFORM,
+            )
+            .unwrap();
 
             // Old-policy means for the LAST minibatch — drives the per-epoch KL
             // for the adaptive-KL LR schedule (mirrors CPU `minibatch_step`'s
             // `self.kl`, here at per-epoch rather than per-minibatch granularity).
             let last_off = (n_mb - 1) * mb;
-            let mean_old_last: Vec<Vec<f32>> =
-                (0..mb).map(|c| batch[last_off + c].mean_old.clone()).collect();
+            let mean_old_last: Vec<Vec<f32>> = (0..mb)
+                .map(|c| batch[last_off + c].mean_old.clone())
+                .collect();
             let mut last_kl = 0.0f32;
             for _epoch in 0..EPOCHS {
                 gstep += n_mb as u64;
                 let bc1 = 1.0 - 0.9f32.powi(gstep.min(1 << 30) as i32);
                 let bc2 = 1.0 - 0.999f32.powi(gstep.min(1 << 30) as i32);
-                let adp = Tensor::scalar(&bk, AdamParams { lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, bias_correction1: bc1, bias_correction2: bc2, pad0: 0.0, pad1: 0.0 }, BufferUsages::UNIFORM).unwrap();
+                let adp = Tensor::scalar(
+                    &bk,
+                    AdamParams {
+                        lr,
+                        beta1: 0.9,
+                        beta2: 0.999,
+                        eps: 1e-8,
+                        bias_correction1: bc1,
+                        bias_correction2: bc2,
+                        pad0: 0.0,
+                        pad1: 0.0,
+                    },
+                    BufferUsages::UNIFORM,
+                )
+                .unwrap();
                 let mut enc = bk.begin_encoding();
                 for k in 0..n_mb {
                     let off = (k * mb) as u32;
                     let nb = mb as u32;
-                    { let mut p = enc.begin_pass("g_obs", None); cont.launch(&bk, &mut sh, &mut p, &mut a_net.a[0], f_obs.columns(off, nb), None).unwrap(); }
-                    { let mut p = enc.begin_pass("g_cobs", None); cont.launch(&bk, &mut sh, &mut p, &mut c_net.a[0], f_cobs.columns(off, nb), None).unwrap(); }
-                    { let mut p = enc.begin_pass("g_act", None); cont.launch(&bk, &mut sh, &mut p, &mut action_t, f_act.columns(off, nb), None).unwrap(); }
-                    { let mut p = enc.begin_pass("g_adv", None); cont.launch(&bk, &mut sh, &mut p, &mut adv_t, f_adv.columns(off, nb), None).unwrap(); }
-                    { let mut p = enc.begin_pass("g_lpo", None); cont.launch(&bk, &mut sh, &mut p, &mut lpo, f_lpo.columns(off, nb), None).unwrap(); }
-                    { let mut p = enc.begin_pass("g_vo", None); cont.launch(&bk, &mut sh, &mut p, &mut vo, f_vo.columns(off, nb), None).unwrap(); }
-                    { let mut p = enc.begin_pass("g_ret", None); cont.launch(&bk, &mut sh, &mut p, &mut ret, f_ret.columns(off, nb), None).unwrap(); }
-                    a_net.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m).unwrap();
-                    c_net.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m).unwrap();
-                    { let mut p = enc.begin_pass("ag", None); ppo.actor_grad(&mut p, &ap, &a_net.a[la + 1], &action_t, &lst, &adv_t, &lpo, &mut a_net.delta[la], &mut gls).unwrap(); }
+                    {
+                        let mut p = enc.begin_pass("g_obs", None);
+                        cont.launch(
+                            &bk,
+                            &mut sh,
+                            &mut p,
+                            &mut a_net.a[0],
+                            f_obs.columns(off, nb),
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    {
+                        let mut p = enc.begin_pass("g_cobs", None);
+                        cont.launch(
+                            &bk,
+                            &mut sh,
+                            &mut p,
+                            &mut c_net.a[0],
+                            f_cobs.columns(off, nb),
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    {
+                        let mut p = enc.begin_pass("g_act", None);
+                        cont.launch(
+                            &bk,
+                            &mut sh,
+                            &mut p,
+                            &mut action_t,
+                            f_act.columns(off, nb),
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    {
+                        let mut p = enc.begin_pass("g_adv", None);
+                        cont.launch(
+                            &bk,
+                            &mut sh,
+                            &mut p,
+                            &mut adv_t,
+                            f_adv.columns(off, nb),
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    {
+                        let mut p = enc.begin_pass("g_lpo", None);
+                        cont.launch(&bk, &mut sh, &mut p, &mut lpo, f_lpo.columns(off, nb), None)
+                            .unwrap();
+                    }
+                    {
+                        let mut p = enc.begin_pass("g_vo", None);
+                        cont.launch(&bk, &mut sh, &mut p, &mut vo, f_vo.columns(off, nb), None)
+                            .unwrap();
+                    }
+                    {
+                        let mut p = enc.begin_pass("g_ret", None);
+                        cont.launch(&bk, &mut sh, &mut p, &mut ret, f_ret.columns(off, nb), None)
+                            .unwrap();
+                    }
+                    a_net
+                        .forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m)
+                        .unwrap();
+                    c_net
+                        .forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m)
+                        .unwrap();
+                    {
+                        let mut p = enc.begin_pass("ag", None);
+                        ppo.actor_grad(
+                            &mut p,
+                            &ap,
+                            &a_net.a[la + 1],
+                            &action_t,
+                            &lst,
+                            &adv_t,
+                            &lpo,
+                            &mut a_net.delta[la],
+                            &mut gls,
+                        )
+                        .unwrap();
+                    }
                     // LOSS: add the symmetry-penalty gradient to the actor output
                     // delta BEFORE backward — `delta[la] += gw·(μ(s) − pa·μ(Ms))`,
                     // with `pa·μ(Ms)` the mirror of the (stop-grad) mirrored-obs
                     // forward. One extra forward + a signed-perm GEMM + 4 op-assigns.
                     if let Some(sn) = s_net.as_mut() {
                         let fom = f_obs_mir.as_ref().unwrap();
-                        { let mut p = enc.begin_pass("s_obs", None); cont.launch(&bk, &mut sh, &mut p, &mut sn.a[0], fom.columns(off, nb), None).unwrap(); }
-                        sn.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m).unwrap();
-                        { let mut p = enc.begin_pass("s_tgt", None); g.dispatch_tiled(&bk, &mut sh, &mut p, &mut tgt, &pa, &sn.a[la + 1]).unwrap(); }
-                        { let mut p = enc.begin_pass("s_cp", None); op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Copy, &mut res, &a_net.a[la + 1]).unwrap(); }
-                        { let mut p = enc.begin_pass("s_sub", None); op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Sub, &mut res, &tgt).unwrap(); }
-                        { let mut p = enc.begin_pass("s_mul", None); op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Mul, &mut res, &gw).unwrap(); }
-                        { let mut p = enc.begin_pass("s_add", None); op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Add, &mut a_net.delta[la], &res).unwrap(); }
+                        {
+                            let mut p = enc.begin_pass("s_obs", None);
+                            cont.launch(
+                                &bk,
+                                &mut sh,
+                                &mut p,
+                                &mut sn.a[0],
+                                fom.columns(off, nb),
+                                None,
+                            )
+                            .unwrap();
+                        }
+                        sn.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m)
+                            .unwrap();
+                        {
+                            let mut p = enc.begin_pass("s_tgt", None);
+                            g.dispatch_tiled(&bk, &mut sh, &mut p, &mut tgt, &pa, &sn.a[la + 1])
+                                .unwrap();
+                        }
+                        {
+                            let mut p = enc.begin_pass("s_cp", None);
+                            op.launch(
+                                &bk,
+                                &mut sh,
+                                &mut p,
+                                OpAssignVariant::Copy,
+                                &mut res,
+                                &a_net.a[la + 1],
+                            )
+                            .unwrap();
+                        }
+                        {
+                            let mut p = enc.begin_pass("s_sub", None);
+                            op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Sub, &mut res, &tgt)
+                                .unwrap();
+                        }
+                        {
+                            let mut p = enc.begin_pass("s_mul", None);
+                            op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Mul, &mut res, &gw)
+                                .unwrap();
+                        }
+                        {
+                            let mut p = enc.begin_pass("s_add", None);
+                            op.launch(
+                                &bk,
+                                &mut sh,
+                                &mut p,
+                                OpAssignVariant::Add,
+                                &mut a_net.delta[la],
+                                &res,
+                            )
+                            .unwrap();
+                        }
                     }
-                    { let mut p = enc.begin_pass("vg", None); ppo.value_grad(&mut p, &vp, &c_net.a[lc + 1], &vo, &ret, &mut c_net.delta[lc]).unwrap(); }
-                    a_net.backward(&bk, &g, &act, &mut sh, &mut enc, &om1).unwrap();
-                    c_net.backward(&bk, &g, &act, &mut sh, &mut enc, &om1).unwrap();
-                    { let mut p = enc.begin_pass("dl", None); g.dispatch_naive(&bk, &mut sh, &mut p, &mut dls, &gls, &om1).unwrap(); }
+                    {
+                        let mut p = enc.begin_pass("vg", None);
+                        ppo.value_grad(
+                            &mut p,
+                            &vp,
+                            &c_net.a[lc + 1],
+                            &vo,
+                            &ret,
+                            &mut c_net.delta[lc],
+                        )
+                        .unwrap();
+                    }
+                    a_net
+                        .backward(&bk, &g, &act, &mut sh, &mut enc, &om1)
+                        .unwrap();
+                    c_net
+                        .backward(&bk, &g, &act, &mut sh, &mut enc, &om1)
+                        .unwrap();
+                    {
+                        let mut p = enc.begin_pass("dl", None);
+                        g.dispatch_naive(&bk, &mut sh, &mut p, &mut dls, &gls, &om1)
+                            .unwrap();
+                    }
                     a_net.adam(&bk, &ad, &mut sh, &mut enc, &adp).unwrap();
                     c_net.adam(&bk, &ad, &mut sh, &mut enc, &adp).unwrap();
-                    { let mut p = enc.begin_pass("al", None); ad.step(&bk, &mut sh, &mut p, &adp, &mut lst, &dls, &mut mls, &mut vls).unwrap(); }
+                    {
+                        let mut p = enc.begin_pass("al", None);
+                        ad.step(
+                            &bk, &mut sh, &mut p, &adp, &mut lst, &dls, &mut mls, &mut vls,
+                        )
+                        .unwrap();
+                    }
                 }
                 bk.submit(enc).unwrap();
                 bk.synchronize().unwrap();
@@ -746,7 +1105,14 @@ fn main() {
                 let torso = zs.iter().sum::<f32>() / n as f32;
                 println!(
                     "{:>4}  {:>5.2}  {:>9.4}  {:>7}  {:>8.3}  {:>9.2e}  {:>7.4}  {:>6.1}",
-                    it, cscale, total_reward / total as f32, falls, torso, lr, last_kl, t_iter.elapsed().as_secs_f64()
+                    it,
+                    cscale,
+                    total_reward / total as f32,
+                    falls,
+                    torso,
+                    lr,
+                    last_kl,
+                    t_iter.elapsed().as_secs_f64()
                 );
                 // [prof] coarse iteration split + rollout per-phase ms/step
                 // (env.take_step_timings drains the StepTimings accumulator).
@@ -754,9 +1120,17 @@ fn main() {
                 let ns2ms = |x: u64| (x as f64) / (st.steps.max(1) as f64) / 1e6;
                 println!(
                     "[prof] roll={:.2}s (reset={:.2}s) gae={:.2}s upd={:.2}s | per-step ms: pipe={:.1} gpuwait={:.1} readback={:.1} reward={:.1} stage={:.1} flush={:.1} commit={:.1}",
-                    roll_s, reset_dur.as_secs_f64(), gae_s, upd_s,
-                    ns2ms(st.pipeline_step_ns), ns2ms(st.gpu_wait_ns), ns2ms(st.readback_ns),
-                    ns2ms(st.par_compute_ns), ns2ms(st.stage_motors_ns), ns2ms(st.flush_static_ns), ns2ms(st.serial_commit_ns),
+                    roll_s,
+                    reset_dur.as_secs_f64(),
+                    gae_s,
+                    upd_s,
+                    ns2ms(st.pipeline_step_ns),
+                    ns2ms(st.gpu_wait_ns),
+                    ns2ms(st.readback_ns),
+                    ns2ms(st.par_compute_ns),
+                    ns2ms(st.stage_motors_ns),
+                    ns2ms(st.flush_static_ns),
+                    ns2ms(st.serial_commit_ns),
                 );
                 // Structured per-component reward + termination-cause line for the
                 // W&B sidecar (`wandb_logger.py` parses the `[rb]` prefix). Mean of

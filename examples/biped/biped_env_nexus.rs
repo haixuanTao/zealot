@@ -511,7 +511,10 @@ fn build_env_scene(
     // TRUE contact-free free-fall — the clean g/M-consistency test (pre-contact
     // generalized accel `a` must equal pure free-fall: base linear = g, all joints
     // ≈ 0). Diagnostic only.
-    let ff_z: f32 = std::env::var("BIPED_FREEFALL_Z").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let ff_z: f32 = std::env::var("BIPED_FREEFALL_Z")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let root_pos = Vec3::new(0.0, 0.0, SPAWN_Z + dr.spawn_z_offset + ff_z);
     let root_pose = Pose::from_parts(root_pos, root_rot);
     let mut world: Vec<Pose> = Vec::with_capacity(mjcf.len());
@@ -539,7 +542,11 @@ fn build_env_scene(
         let (d, o) = (b.inertia_diag, b.inertia_offdiag);
         // DIAG-INERTIA A/B (diagnostic): zero the off-diagonals to isolate the
         // principal-frame inertia from other effects.
-        let o = if std::env::var("BIPED_DIAG_INERTIA").is_ok() { Vec3::ZERO } else { o };
+        let o = if std::env::var("BIPED_DIAG_INERTIA").is_ok() {
+            Vec3::ZERO
+        } else {
+            o
+        };
         let inertia_mat = Mat3::from_cols(
             Vec3::new(d.x, o.x, o.y), // col 0: Ixx, Ixy, Ixz
             Vec3::new(o.x, d.y, o.z), // col 1: Ixy, Iyy, Iyz
@@ -621,7 +628,8 @@ fn build_env_scene(
             // box/capsule, which sit at the computed `center`). NOTE the rounded-
             // capsule rationale above: a hull reintroduces sharp foot-strike edges,
             // so this is opt-in for fidelity experiments, not the tuned default.
-            let foot_shape = std::env::var("BIPED_FOOT_SHAPE").unwrap_or_else(|_| "capsule".to_string());
+            let foot_shape =
+                std::env::var("BIPED_FOOT_SHAPE").unwrap_or_else(|_| "capsule".to_string());
             let convex_cb = if foot_shape == "convex" && !b.mesh_pts.is_empty() {
                 ColliderBuilder::convex_hull(&b.mesh_pts)
             } else {
@@ -637,7 +645,13 @@ fn build_env_scene(
             } else {
                 let he_arr = [he.x, he.y, he.z];
                 // Thickness axis = where the radius pad was added (capsules ~coplanar).
-                let tax = if pad.x > 0.0 { 0 } else if pad.y > 0.0 { 1 } else { 2 };
+                let tax = if pad.x > 0.0 {
+                    0
+                } else if pad.y > 0.0 {
+                    1
+                } else {
+                    2
+                };
                 let foot_axes: Vec<usize> = (0..3).filter(|&a| a != tax).collect();
                 // long = larger-extent footprint axis (capsule axis); wide = the other.
                 let (long_ax, wide_ax) = if he_arr[foot_axes[0]] >= he_arr[foot_axes[1]] {
@@ -762,8 +776,14 @@ fn build_env_scene(
         // the MuJoCo transfer model and the real robot use. No runtime scaling.
         // BIPED_KP_SCALE / BIPED_KD_SCALE remain only as optional diagnostics
         // (default 1.0); leave them unset for the production gains.
-        let kp_scale: f32 = std::env::var("BIPED_KP_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-        let kd_scale: f32 = std::env::var("BIPED_KD_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let kp_scale: f32 = std::env::var("BIPED_KP_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
+        let kd_scale: f32 = std::env::var("BIPED_KD_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         joint.set_motor_position(JointAxis::AngZ, 0.0, kp * kp_scale, kd * kd_scale);
         joint.set_motor_max_force(JointAxis::AngZ, effort);
         // Enforce the free axis's position limits — OFF by default (set
@@ -814,7 +834,8 @@ fn build_env_scene(
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(SOLVER_ITERS);
-    sp.contact_natural_frequency = env_f32("BIPED_CONTACT_NF").unwrap_or(dr.contact_natural_frequency);
+    sp.contact_natural_frequency =
+        env_f32("BIPED_CONTACT_NF").unwrap_or(dr.contact_natural_frequency);
     sp.contact_damping_ratio = env_f32("BIPED_CONTACT_DR").unwrap_or(dr.contact_damping_ratio);
 
     // Build the index table from the canonical joint ordering.
@@ -1115,8 +1136,8 @@ pub const REWARD_COMP_NAMES: [&str; NUM_REWARD_COMPS] = [
     "torque_ankle",
     "self_coll",
     "termination",
-    "power", // Σ|τ·q̇| mechanical-power (energy / cost-of-transport) penalty
-    "gait_clock", // dense periodic swing/stance-matching reward
+    "power",         // Σ|τ·q̇| mechanical-power (energy / cost-of-transport) penalty
+    "gait_clock",    // dense periodic swing/stance-matching reward
     "com_centering", // CoM-over-support-foot (low-ankle-torque single-support)
 ];
 
@@ -1155,7 +1176,10 @@ impl BipedNexusBatchEnv {
         // vary ONLY how often the contact manifold is refreshed — the
         // deconfounding test for the "stale multibody contact across substeps"
         // hypothesis. Diagnostic only.
-        if let Some(d) = std::env::var("BIPED_DECIMATION").ok().and_then(|s| s.parse::<u32>().ok()) {
+        if let Some(d) = std::env::var("BIPED_DECIMATION")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
             task.decimation = d;
             task.sim_dt = 0.02 / d as f32;
         }
@@ -1173,7 +1197,10 @@ impl BipedNexusBatchEnv {
         // pins its contact μ (the render uses this template, so the knob must reach
         // it — otherwise friction A/B on the rendered env is a no-op).
         template_dr[0] = DrParams::default();
-        if let Some(f) = std::env::var("BIPED_FRICTION").ok().and_then(|s| s.parse::<f32>().ok()) {
+        if let Some(f) = std::env::var("BIPED_FRICTION")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
             template_dr[0].friction = f;
         }
 
@@ -1231,7 +1258,9 @@ impl BipedNexusBatchEnv {
                     }
                 }
             }
-            let fl_flat: Vec<f32> = (0..num_envs).flat_map(|_| fl_per_dof.iter().copied()).collect();
+            let fl_flat: Vec<f32> = (0..num_envs)
+                .flat_map(|_| fl_per_dof.iter().copied())
+                .collect();
             state.multibodies_mut().set_dof_frictionloss(&gpu, &fl_flat);
         }
 
@@ -1257,7 +1286,9 @@ impl BipedNexusBatchEnv {
                     }
                 }
             }
-            let arm_flat: Vec<f32> = (0..num_envs).flat_map(|_| arm_per_dof.iter().copied()).collect();
+            let arm_flat: Vec<f32> = (0..num_envs)
+                .flat_map(|_| arm_per_dof.iter().copied())
+                .collect();
             state.multibodies_mut().set_dof_armature(&gpu, &arm_flat);
         }
 
@@ -1297,8 +1328,9 @@ impl BipedNexusBatchEnv {
         // Per-env initial sole-normal: every env starts from the corresponding
         // template, so its foot_sole_local matches that template's. Look up the
         // cached per-template value (no rebuild).
-        let foot_sole_local: Vec<[Vec3; NUM_FEET]> =
-            (0..num_envs).map(|e| template_foot_sole[e % num_templates]).collect();
+        let foot_sole_local: Vec<[Vec3; NUM_FEET]> = (0..num_envs)
+            .map(|e| template_foot_sole[e % num_templates])
+            .collect();
 
         let cmd = vec![VelocityCommand::default(); num_envs];
         let step_count = vec![0u32; num_envs];
@@ -1489,22 +1521,34 @@ impl BipedNexusBatchEnv {
     /// (F < μ·N → solver issue) or unloaded (N≈0 → no contact / hovering).
     pub async fn debug_contact_impulses(&mut self) {
         use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint;
-        let total = self.state.multibodies_mut().contact_constraints().buffer().len();
+        let total = self
+            .state
+            .multibodies_mut()
+            .contact_constraints()
+            .buffer()
+            .len();
         let cnt_total = self
             .state
             .multibodies_mut()
             .contact_constraint_count()
             .buffer()
             .len();
-        let mut cons: Vec<MultibodyContactConstraint> = vec![MultibodyContactConstraint::default(); total];
+        let mut cons: Vec<MultibodyContactConstraint> =
+            vec![MultibodyContactConstraint::default(); total];
         self.gpu
-            .slow_read_buffer(self.state.multibodies_mut().contact_constraints().buffer(), &mut cons)
+            .slow_read_buffer(
+                self.state.multibodies_mut().contact_constraints().buffer(),
+                &mut cons,
+            )
             .await
             .expect("contact_constraints readback");
         let mut cnt = vec![0u32; cnt_total];
         self.gpu
             .slow_read_buffer(
-                self.state.multibodies_mut().contact_constraint_count().buffer(),
+                self.state
+                    .multibodies_mut()
+                    .contact_constraint_count()
+                    .buffer(),
                 &mut cnt,
             )
             .await
@@ -1523,11 +1567,19 @@ impl BipedNexusBatchEnv {
             .slow_read_buffer(self.state.multibodies_mut().dof_state().buffer(), &mut dof)
             .await
             .expect("dof_state readback");
-        let jtot = self.state.multibodies_mut().contact_constraint_jacs().buffer().len();
+        let jtot = self
+            .state
+            .multibodies_mut()
+            .contact_constraint_jacs()
+            .buffer()
+            .len();
         let mut jacs = vec![0.0f32; jtot];
         self.gpu
             .slow_read_buffer(
-                self.state.multibodies_mut().contact_constraint_jacs().buffer(),
+                self.state
+                    .multibodies_mut()
+                    .contact_constraint_jacs()
+                    .buffer(),
                 &mut jacs,
             )
             .await
@@ -1596,10 +1648,18 @@ impl BipedNexusBatchEnv {
         // SLIDES has net drift growing across the phase. We also test the
         // rolling-without-slip relation directly: v_origin ≈ ω·R ⇒ rolling;
         // v_origin ≫ ω·R ⇒ translating (sliding). Requires per-step calls.
-        let wtotal = self.state.multibodies_mut().links_workspace().buffer().len();
+        let wtotal = self
+            .state
+            .multibodies_mut()
+            .links_workspace()
+            .buffer()
+            .len();
         let mut ws: Vec<MultibodyLinkWorkspace> = vec![unsafe { std::mem::zeroed() }; wtotal];
         self.gpu
-            .slow_read_buffer(self.state.multibodies_mut().links_workspace().buffer(), &mut ws)
+            .slow_read_buffer(
+                self.state.multibodies_mut().links_workspace().buffer(),
+                &mut ws,
+            )
             .await
             .expect("links_workspace readback");
         if self.dbg_stance.len() < self.idx.foot_links.len() {
@@ -1682,10 +1742,18 @@ impl BipedNexusBatchEnv {
         // PASSIVE standing robot under vertical gravity the HORIZONTAL base accel
         // (DOF 0,1) and base angular accel should be ~0; a spurious value here is
         // the task #27 g/M inconsistency that drives the foot creep.
-        let atot = self.state.multibodies_mut().gen_accelerations().buffer().len();
+        let atot = self
+            .state
+            .multibodies_mut()
+            .gen_accelerations()
+            .buffer()
+            .len();
         let mut acc = vec![0.0f32; atot];
         self.gpu
-            .slow_read_buffer(self.state.multibodies_mut().gen_accelerations().buffer(), &mut acc)
+            .slow_read_buffer(
+                self.state.multibodies_mut().gen_accelerations().buffer(),
+                &mut acc,
+            )
             .await
             .expect("gen_accelerations readback");
         if dpb <= atot {
@@ -1710,28 +1778,52 @@ impl BipedNexusBatchEnv {
     /// `debug_contact_impulses` readback pattern (links_workspace + contacts).
     pub async fn trace_foot_substep(&mut self, gstep: u64, sub: u32) {
         use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint;
-        let total = self.state.multibodies_mut().contact_constraints().buffer().len();
-        let cnt_total = self.state.multibodies_mut().contact_constraint_count().buffer().len();
+        let total = self
+            .state
+            .multibodies_mut()
+            .contact_constraints()
+            .buffer()
+            .len();
+        let cnt_total = self
+            .state
+            .multibodies_mut()
+            .contact_constraint_count()
+            .buffer()
+            .len();
         let mut cons: Vec<MultibodyContactConstraint> =
             vec![MultibodyContactConstraint::default(); total];
         self.gpu
-            .slow_read_buffer(self.state.multibodies_mut().contact_constraints().buffer(), &mut cons)
+            .slow_read_buffer(
+                self.state.multibodies_mut().contact_constraints().buffer(),
+                &mut cons,
+            )
             .await
             .expect("contact_constraints readback");
         let mut cnt = vec![0u32; cnt_total];
         self.gpu
             .slow_read_buffer(
-                self.state.multibodies_mut().contact_constraint_count().buffer(),
+                self.state
+                    .multibodies_mut()
+                    .contact_constraint_count()
+                    .buffer(),
                 &mut cnt,
             )
             .await
             .expect("contact count readback");
         let stride = total / cnt_total.max(1);
         let n0 = (cnt[0] as usize).min(stride);
-        let wtotal = self.state.multibodies_mut().links_workspace().buffer().len();
+        let wtotal = self
+            .state
+            .multibodies_mut()
+            .links_workspace()
+            .buffer()
+            .len();
         let mut ws: Vec<MultibodyLinkWorkspace> = vec![unsafe { std::mem::zeroed() }; wtotal];
         self.gpu
-            .slow_read_buffer(self.state.multibodies_mut().links_workspace().buffer(), &mut ws)
+            .slow_read_buffer(
+                self.state.multibodies_mut().links_workspace().buffer(),
+                &mut ws,
+            )
             .await
             .expect("links_workspace readback");
         let mut out = format!("[sub] g={gstep} s={sub}");
@@ -1834,7 +1926,12 @@ impl BipedNexusBatchEnv {
     pub async fn debug_dump_motors(&mut self, e: usize) {
         use nexus3d::rbd::shaders::dynamics::MultibodyLinkStatic;
         let lpb = self.state.multibodies_mut().links_per_batch() as usize;
-        let n = self.state.multibodies_mut().links_static_mut().buffer().len();
+        let n = self
+            .state
+            .multibodies_mut()
+            .links_static_mut()
+            .buffer()
+            .len();
         let mut st: Vec<MultibodyLinkStatic> = vec![unsafe { std::mem::zeroed() }; n];
         self.gpu
             .slow_read_buffer(
@@ -1892,7 +1989,12 @@ impl BipedNexusBatchEnv {
         // the bug is in the solve/apply.
         use nexus3d::rbd::shaders::dynamics::MultibodyJointConstraint;
         let cpb = self.state.multibodies_mut().joint_constraints_per_batch() as usize;
-        let nc = self.state.multibodies_mut().joint_constraints().buffer().len();
+        let nc = self
+            .state
+            .multibodies_mut()
+            .joint_constraints()
+            .buffer()
+            .len();
         let mut cons: Vec<MultibodyJointConstraint> = vec![unsafe { std::mem::zeroed() }; nc];
         self.gpu
             .slow_read_buffer(
@@ -2380,22 +2482,25 @@ impl BipedNexusBatchEnv {
         // the curriculum) — the real ankle motor is fragile (~11 N·m diamond vs
         // the sim's 44), so we discourage ankle torque from iter 0. Soft (a
         // penalty, not a hard effort cap) to keep learning feasible. Scale via
-        // BIPED_ANKLE_TORQUE_W (default 1.0; raise if rollouts still show high
-        // ankle torque, 0 disables).
+        // BIPED_ANKLE_TORQUE_W (0 disables). Default 4.0: at 1.0 the penalty
+        // (~-0.003/step) was too cheap against the tracking reward and the
+        // learned gait balanced by torquing the ankles (flat-footed shuffle).
         let ankle_torque_w = std::env::var("BIPED_ANKLE_TORQUE_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(1.0);
+            .unwrap_or(4.0);
         // Mechanical-power (energy) penalty weight. Penalizes Σ|τᵢ·q̇ᵢ| — the rate
         // of mechanical work, the principled cost-of-transport proxy. Unlike Στ²
         // (effort, penalized even when static), this only charges for work done in
         // motion, so energy-economical (natural) gaits are favored and degenerate
         // high-energy modes (marching in place, frantic shuffling) are punished.
-        // BIPED_POWER_W tunes it (0 = off).
+        // BIPED_POWER_W tunes it (0 = off). Default 4e-3 (was 2e-3): the
+        // higher energy price further biases against shuffle/ankle-balance
+        // gaits in favor of discrete weight-transferring steps.
         let power_w: f32 = std::env::var("BIPED_POWER_W")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2e-3);
+            .unwrap_or(4e-3);
         let cpb_idx = self.idx.colliders_per_batch as usize;
         let computed: Vec<PerEnv> = (0..self.n)
             .into_par_iter()
@@ -2411,9 +2516,8 @@ impl BipedNexusBatchEnv {
                     .illegal_ground_links
                     .iter()
                     .any(|&l| poses[env_base + l as usize].translation.z < illegal_z);
-                let fell = illegal
-                    || self.task.fell_over(&state.base)
-                    || !state.base.height.is_finite();
+                let fell =
+                    illegal || self.task.fell_over(&state.base) || !state.base.height.is_finite();
                 let rb = self.task.reward(&state, &self.cmd[e]);
                 let mut reward = rb.total();
                 let mut comps = [0.0f32; NUM_REWARD_COMPS];
@@ -2480,7 +2584,11 @@ impl BipedNexusBatchEnv {
                         let t2 = tau * tau;
                         power += (tau * state.joint_vel[i]).abs();
                         if j.name.contains("ankle") {
-                            let w = if j.name.contains("anklex") { 6.5e-3 } else { 1.5e-3 };
+                            let w = if j.name.contains("anklex") {
+                                6.5e-3
+                            } else {
+                                1.5e-3
+                            };
                             ankle_pen += w * t2;
                         } else {
                             leg_pen += 5e-4 * t2;
@@ -2685,10 +2793,21 @@ impl BipedNexusBatchEnv {
                 let mut ref_obs = vec![0.0; OBS_DIM];
                 self.task.observe(&state, &self.cmd[env], &mut ref_obs);
                 let mut ref_co = vec![0.0; CRITIC_OBS_DIM];
-                self.task.observe_critic(&state, &self.cmd[env], &mut ref_co);
-                let do_max = obs.iter().zip(&ref_obs).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-                let dc_max = critic_obs.iter().zip(&ref_co).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-                eprintln!("[verify_reset] env {env} tpl {t}: obs maxdiff={do_max:.3e} critic maxdiff={dc_max:.3e}");
+                self.task
+                    .observe_critic(&state, &self.cmd[env], &mut ref_co);
+                let do_max = obs
+                    .iter()
+                    .zip(&ref_obs)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                let dc_max = critic_obs
+                    .iter()
+                    .zip(&ref_co)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "[verify_reset] env {env} tpl {t}: obs maxdiff={do_max:.3e} critic maxdiff={dc_max:.3e}"
+                );
             }
             return (obs, critic_obs);
         }
@@ -2911,27 +3030,100 @@ impl BipedNexusBatchEnv {
     /// (`inv_lhs` = 1/(J·M⁻¹·Jᵀ), `rhs`, accumulated `impulse`, jacobians) and
     /// the per-batch active counts. Diagnoses the WebGpu contact-solve blow-up.
     pub async fn dbg_mb_contacts(&mut self) -> (Vec<u32>, Vec<NexusMbContact>) {
-        let mut cnt =
-            vec![0u32; self.state.multibodies_mut().dbg_contact_constraint_count().buffer().len()];
+        let mut cnt = vec![
+            0u32;
+            self.state
+                .multibodies_mut()
+                .dbg_contact_constraint_count()
+                .buffer()
+                .len()
+        ];
         self.gpu
             .slow_read_buffer(
-                self.state.multibodies_mut().dbg_contact_constraint_count().buffer(),
+                self.state
+                    .multibodies_mut()
+                    .dbg_contact_constraint_count()
+                    .buffer(),
                 &mut cnt,
             )
             .await
             .expect("cc count readback");
         let mut ccs = vec![
             NexusMbContact::default();
-            self.state.multibodies_mut().dbg_contact_constraints().buffer().len()
+            self.state
+                .multibodies_mut()
+                .dbg_contact_constraints()
+                .buffer()
+                .len()
         ];
         self.gpu
             .slow_read_buffer(
-                self.state.multibodies_mut().dbg_contact_constraints().buffer(),
+                self.state
+                    .multibodies_mut()
+                    .dbg_contact_constraints()
+                    .buffer(),
                 &mut ccs,
             )
             .await
             .expect("cc readback");
         (cnt, ccs)
+    }
+
+    /// DEBUG: world pose of every body for all envs (spawn-divergence check:
+    /// print these BEFORE the first step on each backend and diff).
+    pub async fn dbg_body_poses(&mut self) -> Vec<NexusPose> {
+        self.slurp_poses().await
+    }
+
+    /// DEBUG: read back the per-constraint `Jᵀ` rows and `M⁻¹·Jᵀ` columns plus
+    /// the strides to slice them: `(jacs, columns, (columns_per_batch,
+    /// dofs_per_batch, constraints_per_batch))`. Slot `s` of batch `b` is
+    /// `[b*columns_per_batch + s*dofs_per_batch ..][..ndofs]` in both banks.
+    /// The columns are the prime suspect for the WebGpu contact divergence.
+    pub async fn dbg_mb_jac_columns(&mut self) -> (Vec<f32>, Vec<f32>, (u32, u32, u32)) {
+        let strides = self
+            .state
+            .multibodies_mut()
+            .dbg_contact_constraint_strides();
+        let jbuf = self
+            .state
+            .multibodies_mut()
+            .dbg_contact_constraint_jacs()
+            .buffer();
+        let mut jacs = vec![0f32; jbuf.len()];
+        self.gpu
+            .slow_read_buffer(jbuf, &mut jacs)
+            .await
+            .expect("jacs readback");
+        let cbuf = self
+            .state
+            .multibodies_mut()
+            .dbg_contact_constraint_columns()
+            .buffer();
+        let mut cols = vec![0f32; cbuf.len()];
+        self.gpu
+            .slow_read_buffer(cbuf, &mut cols)
+            .await
+            .expect("columns readback");
+        (jacs, cols, strides)
+    }
+
+    /// DEBUG: read back the packed dof state (velocities first,
+    /// `dofs_per_batch` per batch) and the LU-factored mass matrices.
+    pub async fn dbg_mb_dof_state_and_lu(&mut self) -> (Vec<f32>, Vec<f32>) {
+        let dbuf = self.state.multibodies_mut().dbg_dof_state().buffer();
+        let mut dofs = vec![0f32; dbuf.len()];
+        self.gpu
+            .slow_read_buffer(dbuf, &mut dofs)
+            .await
+            .expect("dof_state readback");
+        let mbuf = self.state.multibodies_mut().dbg_mass_matrices().buffer();
+        let mut mm = vec![0f32; mbuf.len()];
+        self.gpu
+            .slow_read_buffer(mbuf, &mut mm)
+            .await
+            .expect("mass_matrices readback");
+        (dofs, mm)
     }
 
     /// Global collider index of the ground in env `e` (last collider per env).
@@ -2975,7 +3167,10 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
     // test whether aggressive spawn DR is what's preventing the policy from
     // getting a learning gradient (the rng draws are still consumed, so dynamics
     // DR and determinism are unchanged).
-    let sdr: f32 = std::env::var("BIPED_SPAWN_DR").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let sdr: f32 = std::env::var("BIPED_SPAWN_DR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
     // BIPED_FRICTION: force a fixed Coulomb μ on every env (overrides the random
     // draw) — used to A/B-test that friction actually reaches the GPU contact
     // solver. The rng draw is still consumed so other DR + determinism are
@@ -2987,14 +3182,23 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
     // (randomize_rigid_body_material) use. Center stays ≈ MuJoCo's default μ=1.
     // (Per-foot and static-vs-dynamic friction would express stick-slip even
     // better, but nexus stores a single Coulomb μ per multibody — engine-blocked.)
-    let friction = match std::env::var("BIPED_FRICTION").ok().and_then(|s| s.parse::<f32>().ok()) {
-        Some(f) => { let _ = rng.range(0.3, 1.3); f }
+    let friction = match std::env::var("BIPED_FRICTION")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+    {
+        Some(f) => {
+            let _ = rng.range(0.3, 1.3);
+            f
+        }
         None => rng.range(0.3, 1.3),
     };
     // BIPED_MASS_DR scales the half-width of the per-link mass randomization
     // (default 1.0 → ±20%). Set 0.0 to disable (mass fixed at nominal); the rng
     // draw is still consumed so other DR + determinism are unchanged.
-    let mdr: f32 = std::env::var("BIPED_MASS_DR").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let mdr: f32 = std::env::var("BIPED_MASS_DR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
     let mass_scale = 1.0 + rng.range(-0.2, 0.2) * mdr;
     DrParams {
         friction,
@@ -3011,12 +3215,24 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
         // pin every env to a fixed value (rng draw still consumed) — set both to
         // 30 / 5 to reproduce the old hardcoded path and verify the new binding
         // is bit-identical.
-        contact_natural_frequency: match std::env::var("BIPED_CONTACT_FREQ").ok().and_then(|s| s.parse::<f32>().ok()) {
-            Some(f) => { let _ = rng.range(10.0, 50.0); f }
+        contact_natural_frequency: match std::env::var("BIPED_CONTACT_FREQ")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            Some(f) => {
+                let _ = rng.range(10.0, 50.0);
+                f
+            }
             None => rng.range(10.0, 50.0),
         },
-        contact_damping_ratio: match std::env::var("BIPED_CONTACT_DAMP").ok().and_then(|s| s.parse::<f32>().ok()) {
-            Some(d) => { let _ = rng.range(2.0, 8.0); d }
+        contact_damping_ratio: match std::env::var("BIPED_CONTACT_DAMP")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            Some(d) => {
+                let _ = rng.range(2.0, 8.0);
+                d
+            }
             None => rng.range(2.0, 8.0),
         },
         // Initial-pose DR — aggressive ranges so the policy sees a wide
@@ -3027,8 +3243,8 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
         // can't get a useful gradient with the curriculum's early
         // command-velocity scale.
         spawn_yaw: rng.range(-std::f32::consts::PI, std::f32::consts::PI),
-        spawn_roll: rng.range(-0.35, 0.35) * sdr,     // ±~20° (× BIPED_SPAWN_DR)
-        spawn_pitch: rng.range(-0.35, 0.35) * sdr,    // ±~20° (× BIPED_SPAWN_DR)
+        spawn_roll: rng.range(-0.35, 0.35) * sdr, // ±~20° (× BIPED_SPAWN_DR)
+        spawn_pitch: rng.range(-0.35, 0.35) * sdr, // ±~20° (× BIPED_SPAWN_DR)
         spawn_z_offset: rng.range(-0.08, 0.08) * sdr, // ±8 cm (× BIPED_SPAWN_DR)
         // Per-joint actuator-strength asymmetry (BIPED_ASYM_DR = half-width,
         // default ±15%; 0 disables). Each joint draws independently → left/right
@@ -3039,7 +3255,10 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
         // responds; the distribution is L/R-balanced, so the mirror prior stays
         // valid in expectation.
         pd_scale_per_joint: {
-            let hw: f32 = std::env::var("BIPED_ASYM_DR").ok().and_then(|s| s.parse().ok()).unwrap_or(0.15);
+            let hw: f32 = std::env::var("BIPED_ASYM_DR")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.15);
             let mut a = [1.0f32; NUM_JOINTS];
             for v in a.iter_mut() {
                 *v = 1.0 + rng.range(-hw, hw);
