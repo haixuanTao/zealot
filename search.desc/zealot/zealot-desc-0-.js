@@ -1,0 +1,1 @@
+searchState.loadedDescShard("zealot", 0, "zealot — GPU-resident RL for the LeRobot bipedal\nPlatform setup + training guides (one page per platform).\nTraining on an RTX 5090 box with the native CUDA backend.\nTraining on macOS (Apple Silicon / Metal) — includes the …")

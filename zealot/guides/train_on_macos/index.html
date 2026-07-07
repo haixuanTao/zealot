@@ -1,0 +1,103 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Training on macOS (Apple Silicon / Metal) — includes the mandatory naga patch and verification goldens."><title>zealot::guides::train_on_macos - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2" crossorigin href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-aa0817cf.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zealot" data-themes="" data-resource-suffix="" data-rustdoc-version="1.90.0 (1159e78c4 2025-09-14)" data-channel="1.90.0" data-search-js="search-fa3e91e5.js" data-settings-js="settings-5514c975.js" ><script src="../../../static.files/storage-68b7e25d.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-eebb9057.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-32bb7600.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-6580c154.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="mobile-topbar"><button class="sidebar-menu-toggle" title="show sidebar"></button></nav><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../zealot/index.html">zealot</a><span class="version">0.1.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module train_<wbr>on_<wbr>macos</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#training-the-biped-on-macos-apple-silicon--metal" title="Training the biped on macOS (Apple Silicon / Metal)">Training the biped on macOS (Apple Silicon / Metal)</a><ul><li><a href="#tldr-siblings-already-cloned" title="TL;DR (siblings already cloned)">TL;DR (siblings already cloned)</a></li><li><a href="#1-repos-sibling-layout" title="1. Repos (sibling layout)">1. Repos (sibling layout)</a></li><li><a href="#2-the-naga-bug-why-the-patch-is-not-optional" title="2. The naga bug (why the patch is not optional)">2. The naga bug (why the patch is not optional)</a></li><li><a href="#3-toolchain" title="3. Toolchain">3. Toolchain</a></li><li><a href="#4-verify-the-sim-before-training" title="4. Verify the sim before training">4. Verify the sim before training</a></li><li><a href="#5-run-training" title="5. Run training">5. Run training</a></li><li><a href="#6-render-a-rollout-video" title="6. Render a rollout video">6. Render a rollout video</a></li><li><a href="#performance-reference-measured-2026-07-06" title="Performance reference (measured 2026-07-06)">Performance reference (measured 2026-07-06)</a></li><li><a href="#sanity-checks--gotchas" title="Sanity checks / gotchas">Sanity checks / gotchas</a></li></ul></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In zealot::<wbr>guides</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><rustdoc-search></rustdoc-search><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">zealot</a>::<wbr><a href="../index.html">guides</a></div><h1>Module <span>train_on_macos</span><button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../../src/zealot/lib.rs.html#41">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Training on macOS (Apple Silicon / Metal) — includes the mandatory
+naga patch and verification goldens.</p>
+<h2 id="training-the-biped-on-macos-apple-silicon--metal"><a class="doc-anchor" href="#training-the-biped-on-macos-apple-silicon--metal">§</a>Training the biped on macOS (Apple Silicon / Metal)</h2>
+<p>macOS is a first-class training target since 2026-07-06: at 1024 envs an
+M-series Mac matches an RTX 5060 wall-clock (~4.1 s/iter, ~6.1k samples/s).
+Before that date the sim was broken on Metal by a shader-compiler bug — the
+robot free-fell through the floor and nothing could learn. The fix is a
+patched naga; everything below assumes it (and the repo already wires it in).</p>
+<h3 id="tldr-siblings-already-cloned"><a class="doc-anchor" href="#tldr-siblings-already-cloned">§</a>TL;DR (siblings already cloned)</h3><div class="example-wrap"><pre class="language-bash"><code>cd ~/Documents/work/zealot
+# WebGPU/Metal is the auto-selected backend on a Mac — no flag needed.
+#                                       iters  num_envs  checkpoint
+cargo run --release --example biped_train_gpu \
+    --features &quot;gpu biped_gpu&quot; --       2000   1024      walking_policy.safetensors</code></pre></div>
+<p>Resuming from an existing checkpoint automatically skips the stand-phase
+curriculum and fast-ramps the velocity command (see “curriculum” below).</p>
+<h3 id="1-repos-sibling-layout"><a class="doc-anchor" href="#1-repos-sibling-layout">§</a>1. Repos (sibling layout)</h3>
+<p>Same sibling layout as the 5090 guide, plus one extra clone:</p>
+<div class="example-wrap"><pre class="language-text"><code>work/
+├── zealot          # this repo
+├── nexus-cuda      # dimforge nexus fork, branch feat/per-env-parallelism
+├── khal            # branch fix/cuda-slice-arg-element-count
+├── vortx           # branch fix/reduce-generic-followup
+├── rapier          # branch world
+├── parry           # branch spirv-compat
+└── naga-fixed      # github.com/haixuanTao/naga-fixed  ← macOS-critical</code></pre></div>
+<p><code>naga-fixed</code> is a vendored naga 29.0.4 carrying the MSL <code>break_if</code> fix.
+zealot’s <code>[patch.crates-io]</code> already points at it; you only need the clone.</p>
+<h3 id="2-the-naga-bug-why-the-patch-is-not-optional"><a class="doc-anchor" href="#2-the-naga-bug-why-the-patch-is-not-optional">§</a>2. The naga bug (why the patch is not optional)</h3>
+<p>naga 29’s MSL backend re-evaluates a loop’s <code>break if</code> condition <em>after</em> the
+hoisted <code>continuing</code> block has advanced the loop variables, so every
+rust-gpu <code>while</code> loop exits one body-execution early on Metal
+(<a href="https://github.com/gfx-rs/wgpu/issues/4558">gfx-rs/wgpu#4558</a>, fix in <a href="https://github.com/gfx-rs/wgpu/pull/9815">gfx-rs/wgpu#9815</a>). The multibody solver’s
+per-lane <code>J·v</code> reductions are one-iteration-per-lane loops → they run
+<strong>zero</strong> times → zero contact/PD impulses → the biped free-falls, then the
+accumulated-penetration bias launches it into NaN. <code>BIPED_SOLVER_ITERS=16</code>
+making it <em>16× worse</em> was this bug (gravity integrates per TGS iteration
+with nothing cancelling it), not a tuning problem.</p>
+<p>CUDA and Vulkan never go through naga (PTX / SPIR-V passthrough), which is
+why only macOS was broken. Drop the patch once wgpu ships the fix — and
+re-run the verification below when you do.</p>
+<p>If you ever see <code>[[patch.unused]] naga</code> in <code>Cargo.lock</code>, the patch is being
+ignored: run <code>cargo update -p naga</code>.</p>
+<h3 id="3-toolchain"><a class="doc-anchor" href="#3-toolchain">§</a>3. Toolchain</h3>
+<p>Only the rust-gpu shader toolchain (cargo-gpu) from the 5090 guide §2 —
+no CUDA wheels, no cubins, no <code>.so</code>. The SPIR-V shaders build on first
+<code>cargo build</code> and are translated to MSL by (patched) naga at runtime.</p>
+<p>After editing shader source, remember cargo doesn’t track path-included
+files:</p>
+<div class="example-wrap"><pre class="language-bash"><code>touch ../nexus-cuda/src_rbd_shaders/lib.rs   # force SPIR-V rebuild</code></pre></div><h3 id="4-verify-the-sim-before-training"><a class="doc-anchor" href="#4-verify-the-sim-before-training">§</a>4. Verify the sim before training</h3><div class="example-wrap"><pre class="language-bash"><code>BIPED_SPAWN_DR=0 cargo run --release --example contact_probe \
+    --features &quot;gpu biped_gpu&quot; -- 3</code></pre></div>
+<p>Healthy (matches the CUDA golden bit-for-bit at these print precisions):</p>
+<div class="example-wrap"><pre class="language-text"><code>step 0: torso_z=0.718   step 1: torso_z=0.716   step 2: torso_z=0.715</code></pre></div>
+<p>and with <code>BIPED_DECIMATION=1</code>, the step-0 normal-contact impulse is
+<code>1.697e-1</code> (CUDA: <code>1.698e-1</code>). Broken naga instead shows <code>impulse=0.000e0</code>,
+a dof_state of pure free-fall (all ≈0 except base-z = −n·g·dt), and torso
+launching upward within a few steps.</p>
+<h3 id="5-run-training"><a class="doc-anchor" href="#5-run-training">§</a>5. Run training</h3><div class="example-wrap"><pre class="language-bash"><code># Long runs: use nohup — session-managed background jobs may get reaped.
+nohup cargo run --release --example biped_train_gpu \
+    --features &quot;gpu biped_gpu&quot; -- 2000 1024 walking_policy.safetensors \
+    &gt; walk_train.log 2&gt;&amp;1 &amp;</code></pre></div>
+<ul>
+<li>Checkpoints save every 50 iters; the trainer auto-resumes if the
+checkpoint file exists.</li>
+<li><strong>Curriculum is resume-aware</strong>: fresh runs do stand-before-walk
+(stand until 30%, full command by 70%); warm starts skip the stand phase
+and re-ramp the command over the first 20%. Override with
+<code>BIPED_STAND_FRAC</code> / <code>BIPED_RAMP_END</code>.</li>
+<li>Gait-quality defaults (tuned for the real robot’s fragile ~11 N·m
+ankles): <code>BIPED_ANKLE_TORQUE_W=4</code>, <code>BIPED_POWER_W=4e-3</code>,
+<code>BIPED_MAX_CSCALE=0.4</code> (±0.2 m/s deliberate gait). All overridable.</li>
+<li>Expected learning curve at 1024 envs: reward −0.36 → positive by
+~iter 250, falls 1400 → single digits once walking stabilizes.</li>
+</ul>
+<h3 id="6-render-a-rollout-video"><a class="doc-anchor" href="#6-render-a-rollout-video">§</a>6. Render a rollout video</h3><div class="example-wrap"><pre class="language-bash"><code>cargo run --release --example biped_render_nexus \
+    --features &quot;gpu biped_gpu&quot; -- 0 500 /tmp/rollout.json walking_policy.safetensors
+MUJOCO_GL=cgl python3 examples/biped/render_biped_mujoco.py \
+    /tmp/rollout.json /tmp/walk.mp4</code></pre></div>
+<p>The MuJoCo renderer needs <code>mujoco</code>, <code>trimesh</code>, <code>numpy</code> (pip) and <code>ffmpeg</code>
+on PATH, plus <code>BIPED_ROBOT_XML</code> / <code>BIPED_ASSETS</code> pointing at the robot MJCF
+and its STL directory if they are not at the defaults.</p>
+<h3 id="performance-reference-measured-2026-07-06"><a class="doc-anchor" href="#performance-reference-measured-2026-07-06">§</a>Performance reference (measured 2026-07-06)</h3><div><table><thead><tr><th>1024 envs, ~24.6k samples/iter</th><th>M-series Mac (Metal)</th><th>RTX 5060 (CUDA)</th></tr></thead><tbody>
+<tr><td>wall clock / iter</td><td>4.0–4.2 s</td><td>4.0 s</td></tr>
+<tr><td>physics GPU wait / step</td><td>~96–105 ms</td><td>~52 ms</td></tr>
+<tr><td>CPU encode+launch / step</td><td>~6.5 ms</td><td>~48 ms</td></tr>
+<tr><td>PPO update</td><td>0.87 s</td><td>1.20 s</td></tr>
+</tbody></table>
+</div>
+<p>The 5060’s GPU is ~2× faster on raw physics but pays ~7× the per-dispatch
+CPU overhead; at this batch size they tie. Training trajectories match the
+CUDA reference run-for-run (rewards, KL, fall rates).</p>
+<h3 id="sanity-checks--gotchas"><a class="doc-anchor" href="#sanity-checks--gotchas">§</a>Sanity checks / gotchas</h3>
+<ul>
+<li><strong>Robot falls through floor / launches / NaN</strong> → unpatched naga
+(§2: clone <code>naga-fixed</code>, <code>cargo update -p naga</code>).</li>
+<li><strong><code>[[patch.unused]] naga</code> in Cargo.lock</strong> → <code>cargo update -p naga</code>.</li>
+<li><strong>Shader edits don’t take effect</strong> → <code>touch src_rbd_shaders/lib.rs</code> (§3).</li>
+<li><strong>Long background runs die silently</strong> → launch with <code>nohup</code>, not a
+terminal-session job.</li>
+<li><strong>passive_stand falls over at ~step 40</strong> → expected on every backend
+(zero-action PD hold is not a stable stand); it’s only a bug if it falls
+<em>through</em> the floor.</li>
+</ul>
+</div></details></section></div></main></body></html>

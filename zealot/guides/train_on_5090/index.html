@@ -1,0 +1,207 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Training on an RTX 5090 box with the native CUDA backend."><title>zealot::guides::train_on_5090 - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2" crossorigin href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-aa0817cf.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zealot" data-themes="" data-resource-suffix="" data-rustdoc-version="1.90.0 (1159e78c4 2025-09-14)" data-channel="1.90.0" data-search-js="search-fa3e91e5.js" data-settings-js="settings-5514c975.js" ><script src="../../../static.files/storage-68b7e25d.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-eebb9057.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-32bb7600.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-6580c154.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="mobile-topbar"><button class="sidebar-menu-toggle" title="show sidebar"></button></nav><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../zealot/index.html">zealot</a><span class="version">0.1.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module train_<wbr>on_<wbr>5090</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#training-the-biped-on-an-rtx-5090-native-cuda" title="Training the biped on an RTX 5090 (native CUDA)">Training the biped on an RTX 5090 (native CUDA)</a><ul><li><a href="#conventions" title="Conventions">Conventions</a></li><li><a href="#tldr-box-already-provisioned" title="TL;DR (box already provisioned)">TL;DR (box already provisioned)</a></li><li><a href="#0-box-requirements" title="0. Box requirements">0. Box requirements</a></li><li><a href="#1-repos-sibling-layout" title="1. Repos (sibling layout)">1. Repos (sibling layout)</a></li><li><a href="#2-toolchain" title="2. Toolchain">2. Toolchain</a></li><li><a href="#3-cuda-129-wheels-userspace" title="3. CUDA 12.9 wheels (userspace)">3. CUDA 12.9 wheels (userspace)</a></li><li><a href="#4-build-the-cuda-oxide-backend-so" title="4. Build the cuda-oxide backend `.so`">4. Build the cuda-oxide backend <code>.so</code></a></li><li><a href="#5-build-the-cubins" title="5. Build the cubins">5. Build the cubins</a></li><li><a href="#6-run-training" title="6. Run training">6. Run training</a></li><li><a href="#7-monitor--retrieve-checkpoints" title="7. Monitor &#38; retrieve checkpoints">7. Monitor &amp; retrieve checkpoints</a></li><li><a href="#sanity-checks--gotchas" title="Sanity checks / gotchas">Sanity checks / gotchas</a></li></ul></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In zealot::<wbr>guides</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><rustdoc-search></rustdoc-search><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">zealot</a>::<wbr><a href="../index.html">guides</a></div><h1>Module <span>train_on_5090</span><button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../../src/zealot/lib.rs.html#36">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Training on an RTX 5090 box with the native CUDA backend.</p>
+<h2 id="training-the-biped-on-an-rtx-5090-native-cuda"><a class="doc-anchor" href="#training-the-biped-on-an-rtx-5090-native-cuda">§</a>Training the biped on an RTX 5090 (native CUDA)</h2>
+<p>How to stand up a fresh Blackwell box (RTX 5090 <code>sm_120</code>, or the 5060 vast box)
+and run the GPU-resident PPO biped trainer end-to-end on the <strong>native-CUDA</strong>
+backend — physics <em>and</em> the PPO update on the GPU, no PhysX / no Isaac.</p>
+<p>This is the all-Rust path: nexus physics + vortx PPO shaders compiled Rust→PTX via
+<a href="https://github.com/haixuanTao/cuda-oxide">cuda-oxide</a> and loaded as <code>sm_120</code>
+cubins. The Mac is Metal-only and its contact path is broken — <strong>train on CUDA
+boxes only</strong> (any RTX 5090 box; the vast 5060 also works).</p>
+<h3 id="conventions"><a class="doc-anchor" href="#conventions">§</a>Conventions</h3>
+<p>Every path below is derived from two variables — set them once and the rest of
+the guide is copy-paste:</p>
+<div class="example-wrap"><pre class="language-bash"><code>export WORK=&quot;$HOME/work&quot;       # parent dir for the repos (pick anything)
+export PTX=&quot;$HOME/nexus_ptx&quot;   # where the compiled cubins land</code></pre></div>
+<blockquote>
+<p><strong>The repos must be siblings under <code>$WORK</code>.</strong> zealot resolves <code>khal</code>, <code>vortx</code>,
+and <code>nexus3d</code> by <em>relative</em> path (<code>../nexus-cuda</code>, …), so the directory layout
+is load-bearing — keep them side by side. <code>$WORK</code> itself can be anywhere.</p>
+</blockquote>
+<hr />
+<h3 id="tldr-box-already-provisioned"><a class="doc-anchor" href="#tldr-box-already-provisioned">§</a>TL;DR (box already provisioned)</h3>
+<p>If the toolchain, wheels, and cubins already exist on the box (the usual case on
+a provisioned 5090), you only need three things: fresh cubins, the two env
+vars, and the run command.</p>
+<div class="example-wrap"><pre class="language-bash"><code>cd &quot;$WORK/nexus-cuda&quot;
+bash build_cuda/build_nexus_cubin.sh        # -&gt; $PTX/nexus_rbd_shaders3d.cubin
+bash build_cuda/build_vortx_cubin_llc.sh    # -&gt; $PTX/vortx_shaders.cubin
+
+cd &quot;$WORK/zealot&quot;
+export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D=&quot;$PTX/nexus_rbd_shaders3d.cubin&quot;
+export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS=&quot;$PTX/vortx_shaders.cubin&quot;
+
+# Native CUDA is auto-selected on sm_120 — no flag needed.
+# iters  num_envs  checkpoint
+cargo run --release --example biped_train_gpu \
+    --features &quot;gpu biped_gpu cuda_backend&quot; -- 2000 4096 &quot;$HOME/biped_convex.safetensors&quot;</code></pre></div>
+<p>Run it inside <code>tmux</code> so it survives the SSH session. Skip to
+<a href="#6-run-training">Run training</a> for the knobs.</p>
+<hr />
+<h3 id="0-box-requirements"><a class="doc-anchor" href="#0-box-requirements">§</a>0. Box requirements</h3>
+<ul>
+<li><strong>GPU:</strong> Blackwell <code>sm_120</code> (RTX 5090 = 32 GB; 5060 = 8 GB — trains fine, just
+fewer envs). Driver must support <code>sm_120</code> (≥ 570-series).</li>
+<li><strong>Disk:</strong> the tight constraint. LLVM 21 (~5 G) + toolchain + sibling repos +
+target dirs (~15 G) + CUDA wheels (~2 G) ≈ 25 G. The vast 5060 has only 32 G —
+watch <code>df -h /</code>.</li>
+<li>System CUDA version does <strong>not</strong> matter for the build: we download CUDA 12.9
+wheels into userspace and only rely on the driver at runtime.</li>
+</ul>
+<hr />
+<h3 id="1-repos-sibling-layout"><a class="doc-anchor" href="#1-repos-sibling-layout">§</a>1. Repos (sibling layout)</h3>
+<p>Clone the forks at these branches, all as siblings under <code>$WORK</code>.</p>
+<div><table><thead><tr><th>GitHub repo</th><th>branch</th><th>clone into</th></tr></thead><tbody>
+<tr><td><code>haixuanTao/zealot</code></td><td><code>feat/native-cuda-e2e-bench</code></td><td><code>$WORK/zealot</code></td></tr>
+<tr><td><code>haixuanTao/nexus-rl</code> <strong>(private)</strong></td><td><code>feat/per-env-parallelism</code></td><td><code>$WORK/nexus-cuda</code></td></tr>
+<tr><td><code>haixuanTao/khal</code></td><td><code>fix/cuda-slice-arg-element-count</code></td><td><code>$WORK/khal</code></td></tr>
+<tr><td><code>haixuanTao/vortx</code></td><td><code>fix/reduce-generic-followup</code></td><td><code>$WORK/vortx</code></td></tr>
+<tr><td><code>haixuanTao/cuda-oxide</code></td><td><code>feat/nexus3d-vortx-native-cuda</code></td><td><code>$HOME/cuda-oxide-src</code></td></tr>
+</tbody></table>
+</div>
+<blockquote>
+<p><strong>Gotchas that bite a fresh clone:</strong></p>
+<ul>
+<li><strong>Repo name ≠ dir name for nexus:</strong> the physics repo is <code>haixuanTao/nexus-rl</code>
+but zealot resolves it by the relative path <code>../nexus-cuda</code>, so clone it into
+a dir literally named <code>nexus-cuda</code> (<code>git clone …/nexus-rl.git nexus-cuda</code>).</li>
+<li><strong><code>nexus-rl</code> is private</strong> — a new machine needs GitHub auth (<code>gh auth login</code>
+/ an authorized SSH key) to clone it. <code>zealot</code>/<code>khal</code>/<code>vortx</code>/<code>cuda-oxide</code>
+are public over https.</li>
+<li><code>cuda-oxide</code> lives <strong>outside <code>$WORK</code></strong> at <code>$HOME/cuda-oxide-src</code> (the build
+scripts reference that path); adjust if you keep it elsewhere.</li>
+</ul>
+</blockquote>
+<p><strong>Fastest path — copy a built environment from an existing 5090:</strong></p>
+<div class="example-wrap"><pre class="language-bash"><code>rsync -a &lt;5090-host&gt;:&#39;~/{cuda-oxide-src,make_cubin,nvvm-wheel,nvjit-wheel,llvm21}&#39; &quot;$HOME/&quot;
+rsync -a &lt;5090-host&gt;:&#39;~/work/{nexus-cuda,khal,vortx,zealot}&#39; &quot;$WORK/&quot;</code></pre></div>
+<p>This skips sections 2–4 entirely. Prefer it when a 5090 is reachable. (Adjust the
+remote source paths to wherever that host keeps its checkout.)</p>
+<hr />
+<h3 id="2-toolchain"><a class="doc-anchor" href="#2-toolchain">§</a>2. Toolchain</h3><div class="example-wrap"><pre class="language-bash"><code>rustup toolchain install nightly-2026-04-03
+rustup component add rust-src rustc-dev llvm-tools --toolchain nightly-2026-04-03</code></pre></div>
+<ul>
+<li><code>rust-src</code> — needed for <code>-Zbuild-std=core</code> (shaders target <code>nvptx64</code> bare).</li>
+<li><code>rustc-dev</code> + <code>llvm-tools</code> — the cuda-oxide codegen backend links rustc
+internals and uses <code>llvm-as</code>/<code>llvm-link</code>/<code>opt</code>/<code>llc</code> from the toolchain.</li>
+<li><strong>LLVM 21.1.0</strong> at <code>$HOME/llvm21</code> (the backend links it; scripts reference
+<code>$HOME/llvm21/bin/llc</code> as <code>CUDA_OXIDE_LLC</code>).</li>
+</ul>
+<hr />
+<h3 id="3-cuda-129-wheels-userspace"><a class="doc-anchor" href="#3-cuda-129-wheels-userspace">§</a>3. CUDA 12.9 wheels (userspace)</h3>
+<p>The box’s system CUDA is usually too old. Download 12.9 into userspace — it ships
+<code>libnvvm</code>, <code>libdevice</code>, and an <code>sm_120</code>-capable <code>ptxas</code>:</p>
+<div class="example-wrap"><pre class="language-bash"><code>pip download nvidia-cuda-nvcc-cu12==12.9.86   # -&gt; nvvm/lib64/libnvvm.so
+                                              #    nvvm/libdevice/libdevice.10.bc
+                                              #    bin/ptxas
+pip download nvidia-nvjitlink-cu12==12.9.86   # -&gt; libnvJitLink.so.12</code></pre></div>
+<p>Extract each wheel and point the build scripts at the resulting paths (see the
+<code>LIBDEV</code>, <code>PTXAS</code>, <code>LIBNVVM_PATH</code>, <code>LIBNVJITLINK_PATH</code> vars in
+<code>$WORK/nexus-cuda/build_cuda/*.sh</code>). For <code>sm_120</code> SASS inspection you also want
+the 12.9 <code>cuobjdump</code> / <code>nvdisasm</code> redist tarballs.</p>
+<hr />
+<h3 id="4-build-the-cuda-oxide-backend-so"><a class="doc-anchor" href="#4-build-the-cuda-oxide-backend-so">§</a>4. Build the cuda-oxide backend <code>.so</code></h3><div class="example-wrap"><pre class="language-bash"><code>cd &quot;$HOME/cuda-oxide-src/crates/rustc-codegen-cuda&quot;
+cargo +nightly-2026-04-03 build          # -&gt; target/debug/librustc_codegen_cuda.so</code></pre></div>
+<p>Build it from its own directory — it is <strong>not</strong> a workspace member.</p>
+<hr />
+<h3 id="5-build-the-cubins"><a class="doc-anchor" href="#5-build-the-cubins">§</a>5. Build the cubins</h3>
+<p>Two cubins get compiled Rust→PTX and embedded into the zealot host:</p>
+<ul>
+<li><strong><code>nexus_rbd_shaders3d.cubin</code></strong> — rigid-body / contact physics (rapier-derived).</li>
+<li><strong><code>vortx_shaders.cubin</code></strong> — the PPO GEMM/Adam/actor-value gradient shaders.</li>
+</ul>
+<div class="example-wrap"><pre class="language-bash"><code>cd &quot;$WORK/nexus-cuda&quot;
+bash build_cuda/build_nexus_cubin.sh       # nexus physics -&gt; $PTX/nexus_rbd_shaders3d.cubin
+bash build_cuda/build_vortx_cubin_llc.sh   # vortx PPO     -&gt; $PTX/vortx_shaders.cubin</code></pre></div>
+<blockquote>
+<p><strong>No hand-editing needed.</strong> The scripts source <code>build_cuda/detect_env.sh</code>, which
+auto-detects the toolchain, LLVM-21 tools, CUDA-12.9 wheel artifacts (libdevice
+/ libnvvm / nvjitlink / ptxas), the backend <code>.so</code>, and the sibling repo paths —
+all derived from the script location + <code>$HOME</code>. Override any of them by
+exporting the var first, e.g.:</p>
+<div class="example-wrap"><pre class="language-bash"><code>SM=sm_89 PTXAS=/path/to/ptxas bash build_cuda/build_nexus_cubin.sh   # 4090 example</code></pre></div>
+<p>Target arch defaults to <code>SM=sm_120</code> (Blackwell). Set <code>CUDA_OXIDE_PTX_DIR=$PTX</code>
+if you want the cubins somewhere other than <code>~/nexus_ptx</code>.</p>
+</blockquote>
+<h4 id="critical-flags-already-baked-into-the-scripts--do-not-drop-them"><a class="doc-anchor" href="#critical-flags-already-baked-into-the-scripts--do-not-drop-them">§</a>Critical flags (already baked into the scripts — do not drop them)</h4>
+<ul>
+<li><strong><code>-Zmir-enable-passes=-JumpThreading</code></strong> — <em>REQUIRED</em>. JumpThreading correlates
+repeated <code>if lane==0 {..}</code> conditions and duplicates the intervening
+<code>workgroup_barrier()</code> across the if-arms → asymmetric per-lane <code>bar.sync</code>
+arrivals → <strong>CTA deadlock at the first barrier (the step-1 hang)</strong>.</li>
+<li><strong><code>-Zalways-encode-mir</code></strong> — makes external-crate (<code>parry3d</code>/<code>rapier3d</code>) MIR
+collectable.</li>
+<li>Clean build (<code>cargo clean -p &lt;shader-crate&gt;</code>) before each cubin build.</li>
+<li><code>--no-default-features --features "cuda-oxide dim3 unsafe_remove_boundchecks" --target nvptx64-nvidia-cuda -Z build-std=core</code>.</li>
+</ul>
+<p><code>build_nexus_cubin.sh</code> asserts the device-side symbol hash matches the hash
+embedded in the host binary (<code>EMBED HASH MATCH OK</code>). If you see
+<code>EMBED MISMATCH</code>, the host is linking a stale cubin — <code>touch crates/nexus_rbd3d/build.rs</code> and rebuild.</p>
+<blockquote>
+<p><strong>Shortcut — download prebuilt <code>sm_120</code> cubins</strong> instead of building (only valid
+on Blackwell, and only for the matching source commit — see the release notes):</p>
+<div class="example-wrap"><pre class="language-bash"><code>mkdir -p &quot;$PTX&quot; &amp;&amp; base=https://github.com/haixuanTao/zealot/releases/download/cubins-sm120-20260624
+curl -L &quot;$base/nexus_rbd_shaders3d.cubin&quot; -o &quot;$PTX/nexus_rbd_shaders3d.cubin&quot;
+curl -L &quot;$base/vortx_shaders.cubin&quot;       -o &quot;$PTX/vortx_shaders.cubin&quot;</code></pre></div></blockquote>
+<hr />
+<h3 id="6-run-training"><a class="doc-anchor" href="#6-run-training">§</a>6. Run training</h3><div class="example-wrap"><pre class="language-bash"><code>cd &quot;$WORK/zealot&quot;
+export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D=&quot;$PTX/nexus_rbd_shaders3d.cubin&quot;
+export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS=&quot;$PTX/vortx_shaders.cubin&quot;
+
+cargo run --release --example biped_train_gpu \
+    --features &quot;gpu biped_gpu cuda_backend&quot; -- &lt;iters&gt; &lt;num_envs&gt; &lt;checkpoint&gt;</code></pre></div>
+<blockquote>
+<p><strong>Backend selection.</strong> Built with <code>cuda_backend</code>, the trainer <strong>auto-selects
+native CUDA on <code>sm_120</code></strong> (Blackwell) and falls back to WebGPU otherwise — no
+flag needed. Force it with <code>KHAL_BACKEND=cuda</code> or <code>KHAL_BACKEND=webgpu</code>.
+(<code>BIPED_CUDA=1</code> still works as a deprecated alias.)</p>
+</blockquote>
+<p><strong>Positional args</strong> (after <code>--</code>):</p>
+<div><table><thead><tr><th>pos</th><th>arg</th><th>default</th><th>notes</th></tr></thead><tbody>
+<tr><td>1</td><td><code>iters</code></td><td>—</td><td>PPO iterations</td></tr>
+<tr><td>2</td><td><code>num_envs</code></td><td>—</td><td>parallel envs. 5090 → 4096–8192; 5060 → ~1024–2048</td></tr>
+<tr><td>3</td><td><code>checkpoint</code></td><td><code>/tmp/biped_policy_gpu.safetensors</code></td><td>resumes if it exists, else fresh init; saved here periodically</td></tr>
+</tbody></table>
+</div>
+<p>Everything runs on the GPU except action sampling, GAE, and reward/obs (host).
+Fixed hyperparameters (match WBC-AGILE T1 velocity policy): horizon <code>T=24</code>, 5
+epochs, 4 minibatches, <code>lr=1e-3</code> (adaptive-KL scheduled), clip 0.2, entropy 0.01,
+γ 0.99, λ 0.95, velocity curriculum 0→1 over the first 40 % of iters.</p>
+<h4 id="useful-env-knobs-read-at-startup-by-biped_train_gpurs"><a class="doc-anchor" href="#useful-env-knobs-read-at-startup-by-biped_train_gpurs">§</a>Useful env knobs (read at startup by <code>biped_train_gpu.rs</code>)</h4><div><table><thead><tr><th>env var</th><th>effect</th></tr></thead><tbody>
+<tr><td><code>KHAL_BACKEND=cuda</code>|<code>webgpu</code></td><td>force the backend; unset auto-selects native CUDA on sm_120 (<code>BIPED_CUDA=1</code> = deprecated alias)</td></tr>
+<tr><td><code>BIPED_STAND_FRAC=&lt;f&gt;</code></td><td>fraction of the curriculum spent standing before the command ramps</td></tr>
+<tr><td><code>BIPED_RAMP_END=&lt;f&gt;</code></td><td>curriculum point where the command reaches full speed</td></tr>
+<tr><td><code>BIPED_TORQUE_MAX=&lt;nm&gt;</code></td><td>motor torque clamp</td></tr>
+<tr><td><code>BIPED_MAX_CSCALE=&lt;s&gt;</code></td><td>cap the sampled command magnitude (default 1.0)</td></tr>
+</tbody></table>
+</div>
+<p>Always launch under <code>tmux</code> so training survives disconnects:</p>
+<div class="example-wrap"><pre class="language-bash"><code>tmux new -s train
+cargo run --release --example biped_train_gpu \
+    --features &quot;gpu biped_gpu cuda_backend&quot; -- 2000 4096 &quot;$HOME/biped_convex.safetensors&quot;
+# detach: Ctrl-b d   |   reattach: tmux attach -t train</code></pre></div>
+<hr />
+<h3 id="7-monitor--retrieve-checkpoints"><a class="doc-anchor" href="#7-monitor--retrieve-checkpoints">§</a>7. Monitor &amp; retrieve checkpoints</h3>
+<ul>
+<li>Per-iter reward-component breakdown prints to stdout (<code>REWARD_COMP_NAMES</code>).</li>
+<li>TensorBoard is served on the vast box at port <code>16006</code> (logdir <code>/workspace</code>);
+forward it with <code>-L</code> on your SSH command if you want the UI.</li>
+<li>Checkpoints are <code>.safetensors</code> at the path you passed. Pull them to the Mac:<div class="example-wrap"><pre class="language-bash"><code>rsync -avP -e &#39;ssh -p 16199&#39; root@ssh1.vast.ai:&#39;~/biped_convex*.safetensors&#39; &quot;$WORK/zealot/&quot;</code></pre></div></li>
+<li>Back up the cubins too (<code>$PTX/*.cubin</code>) — they cost a full toolchain rebuild to
+regenerate (or grab them from the release linked in section 5).</li>
+</ul>
+<hr />
+<h3 id="sanity-checks--gotchas"><a class="doc-anchor" href="#sanity-checks--gotchas">§</a>Sanity checks / gotchas</h3>
+<ul>
+<li><strong>Trainer correctness is proven.</strong> <code>ppo_grad_parity</code> shows the GPU PPO update
+matches CPU to 1e-7. If a run fails to learn, it is env/reward/curriculum, not
+the optimizer — don’t re-hunt trainer bugs.</li>
+<li><strong>KL “runaway”</strong> on a fresh launch is almost always a launch-config bug
+(curriculum reset / wrong <code>num_envs</code>), not the trainer. Check the adaptive-KL
+LR is actually adapting.</li>
+<li><strong><code>glam</code>/<code>spirv-std</code> drift</strong> breaks the GPU build periodically — pin <code>glam</code> to
+<code>0.32.1</code> if <code>spirv-std</code> rejects <code>0.33</code>. Use <code>fix/*</code> sibling branches, not
+<code>upstream/*</code>.</li>
+<li><strong>5060 vs 5090:</strong> identical code path; just scale <code>num_envs</code> down (8 GB vs
+32 GB) and expect proportionally lower throughput.</li>
+</ul>
+</div></details></section></div></main></body></html>
