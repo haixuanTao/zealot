@@ -1,5 +1,53 @@
 # Proposal: fix the WebGpu/Metal nexus contact bugs (so the biped sim works off-CUDA)
 
+> ## ✅ RESOLVED (2026-07-06)
+>
+> **Root cause: a naga 29 MSL-backend loop miscompile — not the solver, not
+> dispatch ordering.** naga's MSL writer hoists a loop's `continuing` block to
+> the top of the next iteration and *re-evaluates* the `break_if` condition
+> expression there — after the continuing block has already advanced the loop
+> phis. rust-gpu `while` loops therefore exit one body-execution early on
+> Metal, dropping the final iteration's stores. In the multibody solve
+> kernels the per-lane `J·v` loops (`while i < ndofs { …; i += 32 }`, exactly
+> one iteration per lane) executed **zero** times, so `J·v = 0` → zero
+> impulses from BOTH the contact PGS sweep and the joint/PD sweep, while
+> gravity still integrated per TGS iteration (hence −2·g·dt after one step,
+> and `BIPED_SOLVER_ITERS=16` → 16× worse). The robot free-fell ~8 mm/step,
+> then the accumulated-penetration bias launched it → bounce → NaN.
+>
+> **Diagnosis trail** (all with `BIPED_DECIMATION=1`, seed `0xC0FFEE`,
+> `BIPED_SPAWN_DR=0`, CUDA on the vast 5060 box as golden):
+> spawn poses matched to 1–2 ulp → narrow-phase dist matched (−5e-7) →
+> Jᵀ / M⁻¹·Jᵀ / inv_lhs matched to ~1e-3 → but impulse was 0.1698 (CUDA) vs
+> 0.0000 (Metal). An in-kernel lane-liveness stamp (each lane writes lane+1
+> to shared memory, lane 0 sums) read 496 = Σ1..31 — the summation loop's
+> last iteration was gone; a *direct* read of the "missing" slot returned the
+> value. Translating the same SPIR-V with naga to WGSL (correct: `break if`
+> uses the baked body value) vs MSL (broken: re-evaluates after phi update)
+> pinpointed the writer bug.
+>
+> **Fix: `../naga-fixed`** (vendored naga 29.0.4, applied via
+> `[patch.crates-io]` in zealot's Cargo.toml): the MSL writer now snapshots
+> the `break_if` condition value into a pre-declared bool at every `continue`
+> site / body fall-through and tests the snapshot in the hoisted gate
+> (`src/back/msl/writer.rs`, `Statement::Loop` + `Statement::Continue`).
+> Upstream-worthy (gfx-rs/wgpu).
+>
+> **Verified on Metal:** contact_probe step-0 impulse 0.1697 vs CUDA 0.1698;
+> dof_state matches CUDA to ~1e-4; torso 0.718/0.716/0.715 identical to
+> CUDA; broad-phase pairs stable [2,2,2,2] (the "flicker" was fallout of the
+> wrong dynamics, not a broad-phase bug). `passive_stand` now behaves
+> IDENTICALLY to CUDA (both fall over at ~step 40 — that's the model's real
+> zero-action behavior, not a backend bug).
+>
+> **Bug #1 (indirect dispatch → 0 workgroups) was very likely the same
+> miscompile** (the indirect-args kernels' loops), as were the LBVH
+> "pass-ordering" symptoms. All khal/nexus-side workarounds from those
+> misdiagnoses were reverted after the naga fix; the fixed-grid dispatch
+> default stays (CUDA needs it regardless). Upstream fix:
+> https://github.com/gfx-rs/wgpu/pull/9815 — the local `../naga-fixed`
+> `[patch.crates-io]` vendor can be dropped once it ships in a wgpu release.
+
 **Audience:** an agent on a 5090 box (baguette/champagne) with a working CUDA nexus build.
 **Why you:** the bug is a WebGpu-vs-CUDA divergence; CUDA is the known-good reference. You can generate golden intermediates I can't from a Mac.
 

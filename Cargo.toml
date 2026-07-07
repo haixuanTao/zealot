@@ -56,7 +56,7 @@ cuda_backend = ["gpu", "biped_gpu", "khal/cuda", "nexus3d/cuda", "vortx/cuda"]
 
 [dependencies]
 vortx = { version = "0.1", optional = true }
-khal = { version = "0.1", features = ["derive", "webgpu"], optional = true }
+khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
 nexus3d = { path = "../nexus-cuda/crates/nexus3d", features = ["rbd", "from_rapier"], optional = true }
 rapier3d = { version = "0.32", optional = true }
 rapier3d-urdf = { path = "../rapier/crates/rapier3d-urdf", features = ["stl"], optional = true }
@@ -288,6 +288,14 @@ required-features = ["gpu", "biped_gpu"]
 # and nexus-rl are sibling checkouts under the same parent dir, so the relative
 # paths match. Only consulted when a GPU feature pulls these crates into the graph.
 [patch.crates-io]
+# naga 29 MSL backend miscompiles rust-gpu `while` loops on Metal: the
+# hoisted continuing block re-evaluates the `break_if` condition after the
+# loop phis were already advanced, exiting one body-execution early (drops
+# final accumulator stores → the multibody contact/joint solve produced zero
+# impulses, so the biped free-fell then launched on macOS). ../naga-fixed
+# (vendored naga 29.0.4) snapshots the condition value at its Emit point
+# instead. See docs/metal-contact-bug-proposal.md.
+naga = { path = "../naga-fixed" }
 khal = { path = "../khal/crates/khal" }
 khal-derive = { path = "../khal/crates/khal-derive" }
 khal-std = { path = "../khal/crates/khal-std" }

@@ -709,6 +709,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.33.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f22fb22f065b308be0d8724e3706c7fa3fc2a6c7d6899df4cad7860e7a75436"
+dependencies = [
+ "bytemuck",
+ "libm",
+]
+
+[[package]]
 name = "glamx"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -719,7 +729,19 @@ dependencies = [
  "glam 0.32.1",
  "nalgebra",
  "num-traits",
- "simba",
+ "simba 0.9.1",
+]
+
+[[package]]
+name = "glamx"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9847f980afb0628849bcd6a406cdffd29eb9d53fca83e1646005901a9acd4c5c"
+dependencies = [
+ "bytemuck",
+ "glam 0.33.2",
+ "num-traits",
+ "simba 0.10.0",
 ]
 
 [[package]]
@@ -944,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "khal"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -962,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "khal-builder"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "walkdir",
@@ -970,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "khal-derive"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -980,9 +1002,10 @@ dependencies = [
 
 [[package]]
 name = "khal-std"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
- "glamx",
+ "glam 0.32.1",
+ "glamx 0.3.0",
  "khal-derive",
  "spirv-std",
  "spirv-std-macros",
@@ -1103,9 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "naga"
-version = "29.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dd91265cc2454558f659b3b4b9640f0ddb8cc6521277f166b8a8c181c898079"
+version = "29.0.4"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -1158,7 +1179,7 @@ dependencies = [
  "num-complex",
  "num-rational",
  "num-traits",
- "simba",
+ "simba 0.9.1",
  "typenum",
 ]
 
@@ -1196,7 +1217,7 @@ name = "nexus_fem3d"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "glamx",
+ "glamx 0.2.0",
  "include_dir",
  "khal",
  "khal-builder",
@@ -1210,7 +1231,7 @@ name = "nexus_fem_shaders3d"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "glamx",
+ "glamx 0.2.0",
  "khal",
  "khal-std",
  "vortx-shaders",
@@ -1222,7 +1243,7 @@ version = "0.1.0"
 dependencies = [
  "bvh",
  "bytemuck",
- "glamx",
+ "glamx 0.2.0",
  "include_dir",
  "khal",
  "khal-builder",
@@ -1241,7 +1262,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "crunchy",
- "glamx",
+ "glamx 0.2.0",
  "khal",
  "khal-std",
  "nexus_rbd_shaders3d",
@@ -1256,7 +1277,7 @@ version = "0.1.0"
 dependencies = [
  "bvh",
  "bytemuck",
- "glamx",
+ "glamx 0.2.0",
  "include_dir",
  "khal",
  "khal-builder",
@@ -1274,7 +1295,7 @@ dependencies = [
  "bytemuck",
  "crunchy",
  "glam 0.32.1",
- "glamx",
+ "glamx 0.2.0",
  "khal",
  "khal-std",
  "parry3d",
@@ -1485,14 +1506,14 @@ dependencies = [
  "either",
  "ena",
  "foldhash 0.2.0",
- "glamx",
+ "glamx 0.2.0",
  "hashbrown 0.17.1",
  "log",
  "num-derive",
  "num-traits",
  "ordered-float",
  "rstar",
- "simba",
+ "simba 0.9.1",
  "slab",
  "smallvec",
  "spade",
@@ -1686,14 +1707,14 @@ dependencies = [
  "approx",
  "bitflags 2.11.1",
  "bytemuck",
- "glamx",
+ "glamx 0.2.0",
  "log",
  "nalgebra",
  "num-traits",
  "parry3d",
  "profiling",
  "serde",
- "simba",
+ "simba 0.9.1",
  "static_assertions",
  "thiserror 2.0.18",
  "wide",
@@ -1960,6 +1981,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "simba"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f45c644a9f3a386f9288625d9f0c1e999e1acf07a37df35d0516c7f199d9cb2"
+dependencies = [
+ "approx",
+ "num-complex",
+ "num-traits",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2181,7 +2213,7 @@ name = "vortx"
 version = "0.1.1"
 dependencies = [
  "bytemuck",
- "glamx",
+ "glamx 0.2.0",
  "include_dir",
  "khal",
  "khal-builder",
@@ -2196,7 +2228,7 @@ version = "0.1.1"
 dependencies = [
  "bytemuck",
  "glam 0.32.1",
- "glamx",
+ "glamx 0.2.0",
  "khal",
  "khal-std",
 ]
