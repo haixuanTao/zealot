@@ -1183,6 +1183,23 @@ impl BipedNexusBatchEnv {
             task.decimation = d;
             task.sim_dt = 0.02 / d as f32;
         }
+        // Gait-cadence knobs. The left/right alternation itself comes from
+        // the gait clock (foot 1 runs half a cycle behind foot 0); its
+        // PERIOD is BIPED_GAIT_PERIOD (read below — larger = slower,
+        // lower-frequency weight transfer). These two shape how hard the
+        // policy locks to that clock and the swing/stance split:
+        if let Some(w) = std::env::var("BIPED_GAIT_CLOCK_W")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.gait_clock = w;
+        }
+        if let Some(sr) = std::env::var("BIPED_GAIT_SWING_RATIO")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.gait_swing_ratio = sr;
+        }
 
         let gpu = make_backend().await;
         let pipeline = GpuPhysicsPipeline::from_backend(&gpu);
