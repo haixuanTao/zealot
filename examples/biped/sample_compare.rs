@@ -16,7 +16,7 @@
 
 use khal::backend::{Backend, Encoder, GpuBackend};
 use khal::{BufferUsages, Shader};
-use vortx::linalg::{cpu_sample, SampleParams, Sampler};
+use vortx::linalg::{SampleParams, Sampler, cpu_sample};
 use vortx::tensor::Tensor;
 
 const N: usize = 2048; // envs
@@ -78,8 +78,14 @@ async fn run_mode(
         backend.synchronize().expect("sync");
     }
 
-    let a_gpu = backend.slow_read_vec(actions_t.buffer()).await.expect("read actions");
-    let lp_gpu = backend.slow_read_vec(logp_t.buffer()).await.expect("read logp");
+    let a_gpu = backend
+        .slow_read_vec(actions_t.buffer())
+        .await
+        .expect("read actions");
+    let lp_gpu = backend
+        .slow_read_vec(logp_t.buffer())
+        .await
+        .expect("read logp");
 
     let mut a_cpu = vec![0f32; N * ADIM];
     let mut lp_cpu = vec![0f32; N];
@@ -115,7 +121,8 @@ async fn main() -> anyhow::Result<()> {
     println!("\nGPU sampler vs CPU reference  (N={N} envs, action_dim={ADIM})");
     println!("  seed={seed:#x} step={step}\n");
     for (mode, name) in [(1u32, "MEAN   "), (2, "UNIFORM"), (0, "GAUSSIAN")] {
-        let (a_err, lp_err) = run_mode(&backend, &sampler, &means, &log_std, seed, step, mode).await;
+        let (a_err, lp_err) =
+            run_mode(&backend, &sampler, &means, &log_std, seed, step, mode).await;
         // logp is the pure-RNG check (no exp/transcendental): logp_err == 0 proves
         // the counter-based noise `z` is bit-identical host<->device. The action
         // path additionally applies `std = exp(log_std)`, whose last ULP can differ
@@ -131,7 +138,9 @@ async fn main() -> anyhow::Result<()> {
         } else {
             format!("MISMATCH ✗ (a={a_err:.2e} lp={lp_err:.2e})")
         };
-        println!("  pin_mode={mode} {name}  action err {a_err:.3e}   logp err {lp_err:.3e}   {verdict}");
+        println!(
+            "  pin_mode={mode} {name}  action err {a_err:.3e}   logp err {lp_err:.3e}   {verdict}"
+        );
     }
     println!();
     Ok(())

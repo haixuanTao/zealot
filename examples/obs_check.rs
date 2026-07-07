@@ -154,10 +154,18 @@ async fn main() -> anyhow::Result<()> {
         if has_prev_pose {
             let pr = rot(&prev, e, TORSO);
             let pt = tr(&prev, e, TORSO);
-            lin_w = [(t[0] - pt[0]) / DT, (t[1] - pt[1]) / DT, (t[2] - pt[2]) / DT];
+            lin_w = [
+                (t[0] - pt[0]) / DT,
+                (t[1] - pt[1]) / DT,
+                (t[2] - pt[2]) / DT,
+            ];
             let dq = r * pr.conjugate();
             let s = if dq.w >= 0.0 { 1.0 } else { -1.0 };
-            ang_w = [2.0 * s * dq.x / DT, 2.0 * s * dq.y / DT, 2.0 * s * dq.z / DT];
+            ang_w = [
+                2.0 * s * dq.x / DT,
+                2.0 * s * dq.y / DT,
+                2.0 * s * dq.z / DT,
+            ];
         }
         let grav = quat_rotate_inv(rq, [0.0, 0.0, -1.0]);
 
@@ -246,8 +254,18 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut p = enc.begin_pass("obs", None);
         obs_op.assemble(
-            &mut p, &params, &poses_t, &prev_t, &cfg_t, &cmd_t, &la_t, &pjp_t, &flags_t,
-            &mut obs_t, &mut critic_t, &mut jp_t,
+            &mut p,
+            &params,
+            &poses_t,
+            &prev_t,
+            &cfg_t,
+            &cmd_t,
+            &la_t,
+            &pjp_t,
+            &flags_t,
+            &mut obs_t,
+            &mut critic_t,
+            &mut jp_t,
         )?;
     }
     backend.submit(enc)?;
@@ -305,6 +323,8 @@ async fn main() -> anyhow::Result<()> {
         e_vel < 3e-3,
         "obs velocity rows diverged beyond 1/dt-amplified ULP ({e_vel:.3e})"
     );
-    println!("OK — gpu_obs matches the CPU observe/observe_critic reference (velocity rows within 1/dt·ULP).");
+    println!(
+        "OK — gpu_obs matches the CPU observe/observe_critic reference (velocity rows within 1/dt·ULP)."
+    );
     Ok(())
 }

@@ -141,16 +141,29 @@ fn main() {
         // → collapsed/exploded torsos (height out of [0.3,1.0]) or NaN. Report
         // the spread so a fidelity/speed tradeoff isn't accepted blind.
         let h = gpu_env.torso_heights().await;
-        let (mut nan, mut blow, mut lo, mut hi, mut sum) = (0usize, 0usize, f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
+        let (mut nan, mut blow, mut lo, mut hi, mut sum) =
+            (0usize, 0usize, f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
         for &z in &h {
-            if !z.is_finite() { nan += 1; continue; }
-            if z.abs() > 5.0 { blow += 1; }   // exploded out of the arena
-            lo = lo.min(z); hi = hi.max(z); sum += z as f64;
+            if !z.is_finite() {
+                nan += 1;
+                continue;
+            }
+            if z.abs() > 5.0 {
+                blow += 1;
+            } // exploded out of the arena
+            lo = lo.min(z);
+            hi = hi.max(z);
+            sum += z as f64;
         }
         let ok = h.len() - nan;
         println!(
             "  stability ({} envs): mean z {:.3}  range [{:.3}, {:.3}]  blowup(|z|>5) {}  NaN {}",
-            h.len(), sum / ok.max(1) as f64, lo, hi, blow, nan,
+            h.len(),
+            sum / ok.max(1) as f64,
+            lo,
+            hi,
+            blow,
+            nan,
         );
 
         let ratio = gpu_ctrl_fps / cpu_ctrl_fps;

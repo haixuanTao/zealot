@@ -69,8 +69,6 @@ pub struct JointSpec {
     pub frictionloss: f32,
 }
 
-const PI: f32 = std::f32::consts::PI;
-
 /// Canonical policy joint order (see module docs). Alphabetical by URDF joint
 /// name — the order the mjlab trainer resolves to with `preserve_order = false`,
 /// chosen so eventual ONNX export lines up with the deployment adapter.
@@ -130,14 +128,42 @@ const fn family(name: &'static str) -> JointSpec {
     // ...also the MJCF per-joint passive `damping` (N·m·s/rad) — real joints are
     // damped 0.5–2.3; the sim default (0.1) leaves them slewing at ~50 rad/s.
     // ...and the MJCF per-joint `frictionloss` (N·m, Coulomb) — last tuple slot.
-    let (kp, kd, effort, scale, armature, lim, damping, frictionloss) = if starts_with(name, "hipz") {
-        (30.0, 3.0, 88.0, 0.733, 0.0227, (-0.349, 0.349), 0.514, 1.351)
+    let (kp, kd, effort, scale, armature, lim, damping, frictionloss) = if starts_with(name, "hipz")
+    {
+        (
+            30.0,
+            3.0,
+            88.0,
+            0.733,
+            0.0227,
+            (-0.349, 0.349),
+            0.514,
+            1.351,
+        )
     } else if starts_with(name, "hipx") {
         (40.0, 3.0, 88.0, 0.55, 0.1333, (-0.349, 0.349), 0.738, 1.158)
     } else if starts_with(name, "hipy") {
-        (60.0, 4.0, 88.0, 0.367, 0.1408, (-1.047, 1.047), 1.455, 1.312)
+        (
+            60.0,
+            4.0,
+            88.0,
+            0.367,
+            0.1408,
+            (-1.047, 1.047),
+            1.455,
+            1.312,
+        )
     } else if starts_with(name, "knee") {
-        (60.0, 4.0, 88.0, 0.367, 0.1233, (-0.524, 0.524), 2.264, 0.998)
+        (
+            60.0,
+            4.0,
+            88.0,
+            0.367,
+            0.1233,
+            (-0.524, 0.524),
+            2.264,
+            0.998,
+        )
     } else if starts_with(name, "anklex") {
         // Ankle EFFORT capped at 15 N·m (was 44): the real ankle motor is fragile
         // (~11 N·m diamond/peak) and overheats under sustained load. 44 let the
@@ -148,7 +174,16 @@ const fn family(name: &'static str) -> JointSpec {
         (20.0, 1.5, 15.0, 0.55, 0.0299, (-0.175, 0.175), 0.214, 0.262) // ankle-roll
     } else {
         // ankley (ankle pitch) — the one that folds the foot into the shin.
-        (20.0, 1.5, 15.0, 0.55, 0.0299, (-0.349, 0.349), 0.0286, 0.171)
+        (
+            20.0,
+            1.5,
+            15.0,
+            0.55,
+            0.0299,
+            (-0.349, 0.349),
+            0.0286,
+            0.171,
+        )
     };
     // Ankle scaled gentler than the legs (avoids bang-bang saturation of the
     // fragile 15 N·m motor — see ANKLE_STIFFNESS_SCALE).

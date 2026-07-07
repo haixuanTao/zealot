@@ -68,12 +68,22 @@ impl Net {
         for l in 0..layers {
             let (out, inp) = (dims[l + 1], dims[l]);
             let scale = (2.0 / inp as f32).sqrt();
-            w.push(matrix(backend, &DMatrix::from_fn(out, inp, |_, _| rnd() * scale), st));
+            w.push(matrix(
+                backend,
+                &DMatrix::from_fn(out, inp, |_, _| rnd() * scale),
+                st,
+            ));
             b.push(matrix(backend, &DMatrix::from_fn(out, n, |_, _| 0.0), st));
         }
         // Persistent activation buffers; a[0] is the (fixed placeholder) obs input.
         let a: Vec<_> = (0..=layers)
-            .map(|l| matrix(backend, &DMatrix::from_fn(dims[l], n, |r, c| ((r + c) as f32).sin() * 0.1), rw))
+            .map(|l| {
+                matrix(
+                    backend,
+                    &DMatrix::from_fn(dims[l], n, |r, c| ((r + c) as f32).sin() * 0.1),
+                    rw,
+                )
+            })
             .collect();
         Self { w, b, a, dims }
     }
@@ -98,7 +108,14 @@ impl Net {
             }
             {
                 let mut p = enc.begin_pass("bias", None);
-                op.launch(backend, shapes, &mut p, OpAssignVariant::Add, &mut *a_out, &self.b[l])?;
+                op.launch(
+                    backend,
+                    shapes,
+                    &mut p,
+                    OpAssignVariant::Add,
+                    &mut *a_out,
+                    &self.b[l],
+                )?;
             }
             if l < layers - 1 {
                 let mut p = enc.begin_pass("elu", None);
@@ -131,7 +148,9 @@ async fn main() -> anyhow::Result<()> {
     let sampler = Sampler::from_backend(&backend)?;
     let log_std: Vec<f32> = (0..ACT).map(|d| -1.0 + 0.05 * d as f32).collect();
 
-    println!("\nResident-rollout vs host-bound rollout  (policy [{OBS},256,256,128,{ACT}] + sampler, T={T_STEPS})");
+    println!(
+        "\nResident-rollout vs host-bound rollout  (policy [{OBS},256,256,128,{ACT}] + sampler, T={T_STEPS})"
+    );
     println!(
         "{:>7} | {:>14} | {:>14} | {:>7}",
         "N", "SYNC k env/s", "RESIDENT k env/s", "speedup"

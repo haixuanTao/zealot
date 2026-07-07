@@ -56,7 +56,11 @@ impl Lcg {
 }
 
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }
 fn qrot(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
     let u = [q[0], q[1], q[2]];
@@ -80,7 +84,12 @@ fn tr(buf: &[f32], e: usize, link: usize) -> [f32; 3] {
 fn angle(buf: &[f32], e: usize, cfg: &RewardJointCfg) -> f32 {
     let qp = rot(buf, e, cfg.parent_link as usize);
     let qc = rot(buf, e, cfg.child_link as usize);
-    let rest = Quat::from_xyzw(cfg.rest_quat[0], cfg.rest_quat[1], cfg.rest_quat[2], cfg.rest_quat[3]);
+    let rest = Quat::from_xyzw(
+        cfg.rest_quat[0],
+        cfg.rest_quat[1],
+        cfg.rest_quat[2],
+        cfg.rest_quat[3],
+    );
     let rel = rest.conjugate() * qp.conjugate() * qc;
     2.0 * rel.z.atan2(rel.w)
 }
@@ -205,8 +214,12 @@ async fn main() -> anyhow::Result<()> {
     let mut sole = vec![0f32; NF * 3 * N];
     for e in 0..N {
         for i in 0..NF {
-            let v = Vec3::new(rng.range(-0.2, 0.2), rng.range(-0.2, 0.2), rng.range(0.8, 1.0))
-                .normalize();
+            let v = Vec3::new(
+                rng.range(-0.2, 0.2),
+                rng.range(-0.2, 0.2),
+                rng.range(0.8, 1.0),
+            )
+            .normalize();
             sole[(i * 3) * N + e] = v.x;
             sole[(i * 3 + 1) * N + e] = v.y;
             sole[(i * 3 + 2) * N + e] = v.z;
@@ -229,10 +242,18 @@ async fn main() -> anyhow::Result<()> {
         if has_prev_pose {
             let pr = rot(&prev, e, TORSO);
             let pt = tr(&prev, e, TORSO);
-            lin_w = [(t[0] - pt[0]) / DT, (t[1] - pt[1]) / DT, (t[2] - pt[2]) / DT];
+            lin_w = [
+                (t[0] - pt[0]) / DT,
+                (t[1] - pt[1]) / DT,
+                (t[2] - pt[2]) / DT,
+            ];
             let dq = r * pr.conjugate();
             let s = if dq.w >= 0.0 { 1.0 } else { -1.0 };
-            ang_w = [2.0 * s * dq.x / DT, 2.0 * s * dq.y / DT, 2.0 * s * dq.z / DT];
+            ang_w = [
+                2.0 * s * dq.x / DT,
+                2.0 * s * dq.y / DT,
+                2.0 * s * dq.z / DT,
+            ];
         }
         let v = qrot_inv(rq, lin_w);
         let w = qrot_inv(rq, ang_w);
@@ -344,9 +365,17 @@ async fn main() -> anyhow::Result<()> {
             fx[i] = fpos[0];
             fy[i] = fpos[1];
         }
-        let air_time = if moving { w_air_time * air_sum * DT } else { 0.0 };
+        let air_time = if moving {
+            w_air_time * air_sum * DT
+        } else {
+            0.0
+        };
         let flight = if all_air { w_flight * DT } else { 0.0 };
-        let single_support = if moving && contacts == 1 { w_single_support * DT } else { 0.0 };
+        let single_support = if moving && contacts == 1 {
+            w_single_support * DT
+        } else {
+            0.0
+        };
         let foot_slip = w_foot_slip * slip * DT;
         let foot_clearance = w_foot_clearance * clr * DT;
         let foot_orientation = w_foot_orientation * tilt_sq * DT;
@@ -464,8 +493,19 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut p = enc.begin_pass("reward", None);
         op.evaluate(
-            &mut p, &params, &poses_t, &prev_t, &cfg_t, &cmd_t, &a2_t, &air_t, &sole_t, &flags_t,
-            &mut reward_t, &mut fell_t, &mut newair_t,
+            &mut p,
+            &params,
+            &poses_t,
+            &prev_t,
+            &cfg_t,
+            &cmd_t,
+            &a2_t,
+            &air_t,
+            &sole_t,
+            &flags_t,
+            &mut reward_t,
+            &mut fell_t,
+            &mut newair_t,
         )?;
     }
     backend.submit(enc)?;
@@ -495,7 +535,10 @@ async fn main() -> anyhow::Result<()> {
     println!("  reward   max rel          = {e_rel:.3e}");
     println!("  new_air  max|gpu-cpu|     = {e_air:.3e}");
     println!("  fell     mismatches       = {fell_mismatch}");
-    anyhow::ensure!(fell_mismatch == 0, "fall-termination flag mismatch on {fell_mismatch} envs");
+    anyhow::ensure!(
+        fell_mismatch == 0,
+        "fall-termination flag mismatch on {fell_mismatch} envs"
+    );
     anyhow::ensure!(e_air < 1e-6, "new_air diverged ({e_air:.3e})");
     anyhow::ensure!(e_rel < 1e-4, "reward diverged from CPU (rel {e_rel:.3e})");
     println!("OK — gpu_reward matches the CPU reward/feet/fell reference.");

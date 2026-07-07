@@ -80,7 +80,10 @@ fn build_scene(robot: &LeRobotBipedal, spawn_height: f32) -> Scene {
         if let Some((kp, kd, max_force)) = gain_for(robot, name) {
             // Stiffen constraint motors so the rapier multibody can actually STAND
             // (it lacks nexus's explicit-PD). BIPED_KP_SCALE (default 1).
-            let ks: f32 = std::env::var("BIPED_KP_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            let ks: f32 = std::env::var("BIPED_KP_SCALE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0);
             let (kp, kd, max_force) = (kp * ks, kd * ks.sqrt(), max_force * ks);
             // Constraint-based ForceBased under-realizes kp → robot buckles (the
             // nexus saga). For the rapier contact-drift reference we need it to
@@ -239,7 +242,11 @@ fn main() {
         let t = bodies[h].translation();
         (t.x, t.y)
     };
-    let mut prev_xy: Vec<(f32, f32)> = scene.feet.iter().map(|&h| foot_xy(&scene.bodies, h)).collect();
+    let mut prev_xy: Vec<(f32, f32)> = scene
+        .feet
+        .iter()
+        .map(|&h| foot_xy(&scene.bodies, h))
+        .collect();
     let mut path_len: Vec<f32> = vec![0.0; scene.feet.len()];
     let mut planted_steps: Vec<u32> = vec![0; scene.feet.len()];
     let mut islands = IslandManager::new();

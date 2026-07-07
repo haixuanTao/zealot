@@ -14,26 +14,47 @@ mod biped_env_nexus;
 #[path = "gpu_policy.rs"]
 mod gpu_policy;
 
-use biped_env_nexus::{default_mjcf_path, BipedNexusBatchEnv};
+use biped_env_nexus::{BipedNexusBatchEnv, default_mjcf_path};
 use zealot_env::robots::lerobot_bipedal::NUM_JOINTS;
 
 fn main() {
-    let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(256);
-    let steps: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(200);
+    let n: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let steps: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     // BIPED_ACT: constant action on every joint. 0.0 = hold the all-zero pose;
     // 1.0 = hold the bent "home" crouch (action_scale == WBC-AGILE's nominal
     // angles, so q_target = default_pos + scale·1 = the bent stance).
-    let act: f32 = std::env::var("BIPED_ACT").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let act: f32 = std::env::var("BIPED_ACT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let xml = std::fs::read_to_string(default_mjcf_path()).expect("mjcf");
 
     pollster::block_on(async {
         let mut env = BipedNexusBatchEnv::new(&xml, n, 32, 0xC0FFEE).await;
         let zero = vec![[act; NUM_JOINTS]; n];
-        println!("(action level = {act}: {})", if act == 0.0 { "all-zero pose" } else { "bent home crouch" });
+        println!(
+            "(action level = {act}: {})",
+            if act == 0.0 {
+                "all-zero pose"
+            } else {
+                "bent home crouch"
+            }
+        );
         let z0 = env.torso_heights().await;
         let mean0 = z0.iter().sum::<f32>() / n as f32;
-        println!("\npassive stand (zero action, no reset): {n} envs, spawn mean torso_z={mean0:.3}");
-        println!("{:>5}  {:>10}  {:>9}  {:>9}  {:>9}", "step", "mean_torso", "min_torso", "max_torso", "fell_frac");
+        println!(
+            "\npassive stand (zero action, no reset): {n} envs, spawn mean torso_z={mean0:.3}"
+        );
+        println!(
+            "{:>5}  {:>10}  {:>9}  {:>9}  {:>9}",
+            "step", "mean_torso", "min_torso", "max_torso", "fell_frac"
+        );
         let dump_motors = std::env::var("BIPED_DEBUG_MOTORS").is_ok();
         for s in 0..steps {
             let outs = env.step(&zero).await;

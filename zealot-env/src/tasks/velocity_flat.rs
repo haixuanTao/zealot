@@ -243,7 +243,11 @@ impl Default for CommandSampler {
                 .ok()
                 .and_then(|s| {
                     let p: Vec<f32> = s.split(',').filter_map(|x| x.parse().ok()).collect();
-                    if p.len() == 2 { Some((p[0], p[1])) } else { None }
+                    if p.len() == 2 {
+                        Some((p[0], p[1]))
+                    } else {
+                        None
+                    }
                 })
                 .unwrap_or((3.0, 8.0)),
         }
@@ -382,26 +386,26 @@ impl Default for RewardWeights {
             // replaces the brittle "force stepping" gait machinery: walking emerges
             // because the robot MUST track velocity, and it may settle on two feet
             // between steps (double-support no longer penalized).
-            track_lin_vel: 10.0,        // was 5.0 — make following velocity the point
-            forward_progress: 8.0,      // linear forward-velocity gradient (breaks march-in-place)
-            track_ang_vel: 8.0,         // was 5.0
+            track_lin_vel: 10.0,   // was 5.0 — make following velocity the point
+            forward_progress: 8.0, // linear forward-velocity gradient (breaks march-in-place)
+            track_ang_vel: 8.0,    // was 5.0
             // Stay-up lowered so it can't out-earn tracking (it used to: upright+
             // height ≈0.13/step > tracking ≈0.07 → the policy preferred to STAND).
-            upright: 3.0,               // was 5.0
-            base_height: 2.0,           // restored to WBC value (was 1.0): at 1.0 the
-                                        // pure-stand phase let the torso slowly crouch
-                                        // 0.72→0.64 (lower CoM = more stable static stance).
-                                        // 2.0 keeps it tall in BOTH stand and walk.
-            base_height_target: 0.72,   // WBC DEFAULT_TRUNK_HEIGHT (was 0.62 — crouch bug)
-            pose: -8.0, // hip yaw/roll deviation penalty (anti-limit-ride)
-            bilateral_symmetry: 2.0, // reward L/R-mirrored gait (natural, fixes lopsidedness)
-            action_rate: -0.1,          // WBC -0.1 (was -0.25)
+            upright: 3.0,     // was 5.0
+            base_height: 2.0, // restored to WBC value (was 1.0): at 1.0 the
+            // pure-stand phase let the torso slowly crouch
+            // 0.72→0.64 (lower CoM = more stable static stance).
+            // 2.0 keeps it tall in BOTH stand and walk.
+            base_height_target: 0.72, // WBC DEFAULT_TRUNK_HEIGHT (was 0.62 — crouch bug)
+            pose: -8.0,               // hip yaw/roll deviation penalty (anti-limit-ride)
+            bilateral_symmetry: 2.0,  // reward L/R-mirrored gait (natural, fixes lopsidedness)
+            action_rate: -0.1,        // WBC -0.1 (was -0.25)
             action_rate_hipz_hipx: 0.0,
-            body_ang_vel: -0.05,        // WBC ang_vel_xy -0.05 (was -0.25)
-            lin_vel_z: -0.05,           // WBC -0.05 (was -0.25)
-            dof_pos_limits: -0.5,       // WBC -0.1; strengthened to discourage limit-bracing
-            dof_vel: -2e-4,             // WBC -2e-4 (was -1e-4)
-            termination: -2.0,          // WBC is_terminated -100 ×dt(0.02) (was -25 one-shot)
+            body_ang_vel: -0.05,  // WBC ang_vel_xy -0.05 (was -0.25)
+            lin_vel_z: -0.05,     // WBC -0.05 (was -0.25)
+            dof_pos_limits: -0.5, // WBC -0.1; strengthened to discourage limit-bracing
+            dof_vel: -2e-4,       // WBC -2e-4 (was -1e-4)
+            termination: -2.0,    // WBC is_terminated -100 ×dt(0.02) (was -25 one-shot)
             // Gait shaping — turned ON to drive a clean, TRANSFERABLE alternating
             // stride. The un-shaped reward let the policy track velocity with a
             // nexus-specific foot-shuffle (ankle-slam propulsion) that didn't
@@ -417,39 +421,39 @@ impl Default for RewardWeights {
             // sliding is blocked (foot_slip) and settling on two feet is allowed
             // (double-support unpenalized). Keep only: no-hop (flight), no-slide
             // (foot_slip), lift the swing foot cleanly (foot_clearance).
-            air_time: 1.0,              // RE-ENABLED (was 0): pure emergence + a static
-                                        // foot-lift reward got HACKED into a one-foot statue
-                                        // (one foot held up 100% → farms clearance, never
-                                        // steps; 0 transfer, MuJoCo fell in 0.66s). air_time
-                                        // pays the completed-swing duration ONLY at touchdown,
-                                        // so a permanently-raised foot earns nothing → forces
-                                        // real alternating step cycles. Progress+command gated.
-            flight: -1.0,               // keep: no hopping (both feet airborne)
-            single_support: 0.5,        // REPURPOSED → double-support SETTLE bonus (both feet
-                                        // planted while moving). Modest, so it shapes a
-                                        // "swing → settle → swing" cycle without farmable waddle.
-            foot_slip: -1.0,            // dialed back from -3.0: -3.0 suppressed motion
-                                        // (slip penalty satisfied by NOT moving → backward
-                                        // drift) rather than inducing lift. The positive
-                                        // foot_clearance reward below now supplies the
-                                        // "pick your feet up" incentive directly.
-            foot_clearance: 0.0,        // DROPPED. A static foot-height reward is farmable —
-                                        // it got hacked into a one-foot statue (foot held up
-                                        // 100% to farm clearance; 0 transfer, MuJoCo fell in
-                                        // 0.66s). Step height now comes for free once steps are
-                                        // real (alternation-gated air_time below).
+            air_time: 1.0, // RE-ENABLED (was 0): pure emergence + a static
+            // foot-lift reward got HACKED into a one-foot statue
+            // (one foot held up 100% → farms clearance, never
+            // steps; 0 transfer, MuJoCo fell in 0.66s). air_time
+            // pays the completed-swing duration ONLY at touchdown,
+            // so a permanently-raised foot earns nothing → forces
+            // real alternating step cycles. Progress+command gated.
+            flight: -1.0,        // keep: no hopping (both feet airborne)
+            single_support: 0.5, // REPURPOSED → double-support SETTLE bonus (both feet
+            // planted while moving). Modest, so it shapes a
+            // "swing → settle → swing" cycle without farmable waddle.
+            foot_slip: -1.0, // dialed back from -3.0: -3.0 suppressed motion
+            // (slip penalty satisfied by NOT moving → backward
+            // drift) rather than inducing lift. The positive
+            // foot_clearance reward below now supplies the
+            // "pick your feet up" incentive directly.
+            foot_clearance: 0.0, // DROPPED. A static foot-height reward is farmable —
+            // it got hacked into a one-foot statue (foot held up
+            // 100% to farm clearance; 0 transfer, MuJoCo fell in
+            // 0.66s). Step height now comes for free once steps are
+            // real (alternation-gated air_time below).
             foot_clearance_target: 0.03, // (unused at weight 0; kept for the gated compute)
-            foot_orientation: -0.01,    // WBC feet_roll_l2 -0.01 (was -0.5)
-            feet_yaw_mean: -0.4,        // WBC feet_yaw_mean_vs_base -0.4 (was -2.0)
-            feet_distance: -0.02,       // WBC feet_distance_from_ref -0.02 (was -0.1)
+            foot_orientation: -0.01,     // WBC feet_roll_l2 -0.01 (was -0.5)
+            feet_yaw_mean: -0.4,         // WBC feet_yaw_mean_vs_base -0.4 (was -2.0)
+            feet_distance: -0.02,        // WBC feet_distance_from_ref -0.02 (was -0.1)
             feet_distance_ref: 0.2,
-            gait_clock: 3.0,            // dense periodic gait reward (the load-bearing
-                                        // stepping signal). Symmetric ±: standing during a
-                                        // swing window is penalized, so lifting on schedule
-                                        // is clearly worth more than staying planted.
-            gait_swing_ratio: 0.4,      // 40% swing per foot → 20% double-support overlap
-            com_centering: 2.0,         // keep CoM over the support foot → ~0 ankle torque
-                                        // in single-support (fragile 15 N·m ankle can hold it)
+            gait_clock: 3.0, // dense periodic gait reward (the load-bearing
+            // stepping signal). Symmetric ±: standing during a
+            // swing window is penalized, so lifting on schedule
+            // is clearly worth more than staying planted.
+            gait_swing_ratio: 0.4, // 40% swing per foot → 20% double-support overlap
+            com_centering: 2.0,    // keep CoM over the support foot → ~0 ankle torque
+                                   // in single-support (fragile 15 N·m ankle can hold it)
         }
     }
 }
@@ -786,10 +790,9 @@ impl VelocityFlatTask {
         } else {
             0.0
         };
-        let track_lin_vel = self.weights.track_lin_vel
-            * (-lin_err / self.stds.lin_vel.powi(2)).exp()
-            * dt
-            + self.weights.forward_progress * v_along.clamp(0.0, cmd_speed) * dt;
+        let track_lin_vel =
+            self.weights.track_lin_vel * (-lin_err / self.stds.lin_vel.powi(2)).exp() * dt
+                + self.weights.forward_progress * v_along.clamp(0.0, cmd_speed) * dt;
 
         let ang_err = (cmd.yaw_rate - w[UP]).powi(2);
         let track_ang_vel =
@@ -939,7 +942,7 @@ impl VelocityFlatTask {
             // since nothing rewarded standing still). Now "step when told to move,
             // plant when told to stand" is symmetric.
             match contacts {
-                2 => self.weights.single_support * dt,  // both feet planted = good
+                2 => self.weights.single_support * dt, // both feet planted = good
                 1 => -self.weights.single_support * dt, // stepping while told to stand = bad
                 _ => 0.0,
             }

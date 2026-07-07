@@ -12,9 +12,9 @@
 //! Run:
 //!   cargo run --release --example ppo_grad_parity --features "gpu biped_gpu"
 
-use khal::backend::{Backend, Encoder, GpuBackend, WebGpu};
 use khal::BufferUsages;
 use khal::Shader;
+use khal::backend::{Backend, Encoder, GpuBackend, WebGpu};
 use nalgebra::DMatrix;
 use vortx::linalg::{Ppo, PpoActorParams, PpoValueParams};
 use vortx::tensor::Tensor;
@@ -105,8 +105,7 @@ fn main() {
             }
             let ratio = (logp - logp_old[m]).exp();
             let a = adv[m];
-            let clipped =
-                (a >= 0.0 && ratio > 1.0 + CLIP) || (a < 0.0 && ratio < 1.0 - CLIP);
+            let clipped = (a >= 0.0 && ratio > 1.0 + CLIP) || (a < 0.0 && ratio < 1.0 - CLIP);
             if clipped {
                 n_clip += 1;
             }
@@ -193,7 +192,14 @@ fn main() {
         {
             let mut p = enc.begin_pass("ag", None);
             ppo.actor_grad(
-                &mut p, &ap, &mean_t, &action_t, &logstd_t, &adv_t, &lpo_t, &mut gmean_t,
+                &mut p,
+                &ap,
+                &mean_t,
+                &action_t,
+                &logstd_t,
+                &adv_t,
+                &lpo_t,
+                &mut gmean_t,
                 &mut glogstd_t,
             )
             .unwrap();

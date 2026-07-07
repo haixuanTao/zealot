@@ -17,7 +17,7 @@ mod biped_env_nexus;
 #[path = "gpu_policy.rs"]
 mod gpu_policy;
 
-use biped_env_nexus::{default_mjcf_path, BipedNexusBatchEnv};
+use biped_env_nexus::{BipedNexusBatchEnv, default_mjcf_path};
 
 const T_STEPS: usize = 32;
 const SWEEP: [usize; 5] = [512, 1024, 2048, 4096, 8192];
@@ -31,7 +31,9 @@ async fn main() {
     }
     let xml = std::fs::read_to_string(default_mjcf_path()).expect("mjcf");
 
-    println!("\nPhysics decimation loop: per-step sync vs CUDA-graph replay  (T={T_STEPS} control steps)");
+    println!(
+        "\nPhysics decimation loop: per-step sync vs CUDA-graph replay  (T={T_STEPS} control steps)"
+    );
     println!(
         "{:>7} | {:>12} | {:>12} | {:>9} | {:>9} | {:>7}",
         "N", "sync ms", "graph ms", "sync k/s", "graph k/s", "speedup"
@@ -47,7 +49,12 @@ async fn main() {
                 let g_eps = (n * T_STEPS) as f64 / (g_ms / 1e3) / 1e3;
                 println!(
                     "{:>7} | {:>12.1} | {:>12.1} | {:>9.1} | {:>9.1} | {:>6.2}x",
-                    n, sync_ms, g_ms, sync_eps, g_eps, sync_ms / g_ms
+                    n,
+                    sync_ms,
+                    g_ms,
+                    sync_eps,
+                    g_eps,
+                    sync_ms / g_ms
                 );
             }
             None => {

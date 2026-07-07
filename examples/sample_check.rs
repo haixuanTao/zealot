@@ -119,16 +119,31 @@ async fn main() -> anyhow::Result<()> {
     let backend = make_backend().await;
     let sampler = Sample::from_backend(&backend)?;
 
-    let (action_g, target_g, noise_g) =
-        run(&backend, &sampler, &mean, &log_std, &default_pos, &action_scale, SEED).await?;
+    let (action_g, target_g, noise_g) = run(
+        &backend,
+        &sampler,
+        &mean,
+        &log_std,
+        &default_pos,
+        &action_scale,
+        SEED,
+    )
+    .await?;
 
     // ---- 1. statistical: noise ~ N(0,1) ----
     let total = (A * N) as f64;
     let sum: f64 = noise_g.iter().map(|&z| z as f64).sum();
     let mu = sum / total;
-    let var: f64 = noise_g.iter().map(|&z| (z as f64 - mu).powi(2)).sum::<f64>() / total;
+    let var: f64 = noise_g
+        .iter()
+        .map(|&z| (z as f64 - mu).powi(2))
+        .sum::<f64>()
+        / total;
     let sd = var.sqrt();
-    println!("noise stats over {} draws: mean={mu:+.4} std={sd:.4}", A * N);
+    println!(
+        "noise stats over {} draws: mean={mu:+.4} std={sd:.4}",
+        A * N
+    );
     anyhow::ensure!(mu.abs() < 0.02, "noise mean off zero: {mu}");
     anyhow::ensure!((sd - 1.0).abs() < 0.03, "noise std off one: {sd}");
 
@@ -147,8 +162,16 @@ async fn main() -> anyhow::Result<()> {
     anyhow::ensure!(e_act < 1e-5 && e_tgt < 1e-5, "fused arithmetic diverged");
 
     // ---- 3. determinism: same seed -> identical noise ----
-    let (_, _, noise_g2) =
-        run(&backend, &sampler, &mean, &log_std, &default_pos, &action_scale, SEED).await?;
+    let (_, _, noise_g2) = run(
+        &backend,
+        &sampler,
+        &mean,
+        &log_std,
+        &default_pos,
+        &action_scale,
+        SEED,
+    )
+    .await?;
     let max_d = noise_g
         .iter()
         .zip(&noise_g2)
@@ -159,10 +182,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Different seed must move the noise.
     let (_, _, noise_g3) = run(
-        &backend, &sampler, &mean, &log_std, &default_pos, &action_scale, SEED.wrapping_add(1),
+        &backend,
+        &sampler,
+        &mean,
+        &log_std,
+        &default_pos,
+        &action_scale,
+        SEED.wrapping_add(1),
     )
     .await?;
-    let moved = noise_g.iter().zip(&noise_g3).filter(|(a, b)| a != b).count();
+    let moved = noise_g
+        .iter()
+        .zip(&noise_g3)
+        .filter(|(a, b)| a != b)
+        .count();
     println!("fresh-seed changed {moved}/{} draws", A * N);
     anyhow::ensure!(moved > A * N / 2, "fresh seed barely changed the noise");
 

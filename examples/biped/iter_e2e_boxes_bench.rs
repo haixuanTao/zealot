@@ -444,7 +444,10 @@ fn main() {
                     finite += 1;
                 }
             }
-            eprintln!("[fingerprint] sum_y={sy:.5} finite={finite}/{}", poses.len());
+            eprintln!(
+                "[fingerprint] sum_y={sy:.5} finite={finite}/{}",
+                poses.len()
+            );
         }
 
         // ---- GAE + batch ---------------------------------------------------
@@ -477,7 +480,10 @@ fn main() {
         let mut a_net = GpuMlp::new(&bk, &ac.actor, mb);
         let mut c_net = GpuMlp::new(&bk, &ac.critic, mb);
         let ad_ = NUM_JOINTS;
-        let on: Vec<Vec<f32>> = batch.iter().map(|s| ac.obs_norm.normalize(&s.obs)).collect();
+        let on: Vec<Vec<f32>> = batch
+            .iter()
+            .map(|s| ac.obs_norm.normalize(&s.obs))
+            .collect();
         let cn: Vec<Vec<f32>> = batch
             .iter()
             .map(|s| ac.critic_norm.normalize(&s.critic_obs))
@@ -490,8 +496,16 @@ fn main() {
             st,
         );
         let f_adv = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].adv), st);
-        let f_lpo = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].logp_old), st);
-        let f_vo = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].value_old), st);
+        let f_lpo = mk(
+            &bk,
+            &DMatrix::from_fn(1, total, |_, c| batch[c].logp_old),
+            st,
+        );
+        let f_vo = mk(
+            &bk,
+            &DMatrix::from_fn(1, total, |_, c| batch[c].value_old),
+            st,
+        );
         let f_ret = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].ret), st);
         let mut action_t = mk(&bk, &DMatrix::<f32>::zeros(ad_, mb), rw);
         let mut adv_t = mk(&bk, &DMatrix::<f32>::zeros(1, mb), rw);
@@ -561,23 +575,51 @@ fn main() {
                 let nb = mb as u32;
                 {
                     let mut p = enc.begin_pass("g_obs", None);
-                    cont.launch(&bk, &mut sh, &mut p, &mut a_net.a[0], f_obs.columns(off, nb), None)
-                        .unwrap();
+                    cont.launch(
+                        &bk,
+                        &mut sh,
+                        &mut p,
+                        &mut a_net.a[0],
+                        f_obs.columns(off, nb),
+                        None,
+                    )
+                    .unwrap();
                 }
                 {
                     let mut p = enc.begin_pass("g_cobs", None);
-                    cont.launch(&bk, &mut sh, &mut p, &mut c_net.a[0], f_cobs.columns(off, nb), None)
-                        .unwrap();
+                    cont.launch(
+                        &bk,
+                        &mut sh,
+                        &mut p,
+                        &mut c_net.a[0],
+                        f_cobs.columns(off, nb),
+                        None,
+                    )
+                    .unwrap();
                 }
                 {
                     let mut p = enc.begin_pass("g_act", None);
-                    cont.launch(&bk, &mut sh, &mut p, &mut action_t, f_act.columns(off, nb), None)
-                        .unwrap();
+                    cont.launch(
+                        &bk,
+                        &mut sh,
+                        &mut p,
+                        &mut action_t,
+                        f_act.columns(off, nb),
+                        None,
+                    )
+                    .unwrap();
                 }
                 {
                     let mut p = enc.begin_pass("g_adv", None);
-                    cont.launch(&bk, &mut sh, &mut p, &mut adv_t, f_adv.columns(off, nb), None)
-                        .unwrap();
+                    cont.launch(
+                        &bk,
+                        &mut sh,
+                        &mut p,
+                        &mut adv_t,
+                        f_adv.columns(off, nb),
+                        None,
+                    )
+                    .unwrap();
                 }
                 {
                     let mut p = enc.begin_pass("g_lpo", None);
@@ -594,8 +636,12 @@ fn main() {
                     cont.launch(&bk, &mut sh, &mut p, &mut ret, f_ret.columns(off, nb), None)
                         .unwrap();
                 }
-                a_net.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m).unwrap();
-                c_net.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m).unwrap();
+                a_net
+                    .forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m)
+                    .unwrap();
+                c_net
+                    .forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m)
+                    .unwrap();
                 {
                     let mut p = enc.begin_pass("ag", None);
                     ppo.actor_grad(
@@ -613,21 +659,35 @@ fn main() {
                 }
                 {
                     let mut p = enc.begin_pass("vg", None);
-                    ppo.value_grad(&mut p, &vp, &c_net.a[lc + 1], &vo, &ret, &mut c_net.delta[lc])
-                        .unwrap();
+                    ppo.value_grad(
+                        &mut p,
+                        &vp,
+                        &c_net.a[lc + 1],
+                        &vo,
+                        &ret,
+                        &mut c_net.delta[lc],
+                    )
+                    .unwrap();
                 }
-                a_net.backward(&bk, &g, &act, &mut sh, &mut enc, &om1).unwrap();
-                c_net.backward(&bk, &g, &act, &mut sh, &mut enc, &om1).unwrap();
+                a_net
+                    .backward(&bk, &g, &act, &mut sh, &mut enc, &om1)
+                    .unwrap();
+                c_net
+                    .backward(&bk, &g, &act, &mut sh, &mut enc, &om1)
+                    .unwrap();
                 {
                     let mut p = enc.begin_pass("dl", None);
-                    g.dispatch_naive(&bk, &mut sh, &mut p, &mut dls, &gls, &om1).unwrap();
+                    g.dispatch_naive(&bk, &mut sh, &mut p, &mut dls, &gls, &om1)
+                        .unwrap();
                 }
                 a_net.adam(&bk, &ad, &mut sh, &mut enc, &adp).unwrap();
                 c_net.adam(&bk, &ad, &mut sh, &mut enc, &adp).unwrap();
                 {
                     let mut p = enc.begin_pass("al", None);
-                    ad.step(&bk, &mut sh, &mut p, &adp, &mut lst, &dls, &mut mls, &mut vls)
-                        .unwrap();
+                    ad.step(
+                        &bk, &mut sh, &mut p, &adp, &mut lst, &dls, &mut mls, &mut vls,
+                    )
+                    .unwrap();
                 }
             }
             bk.submit(enc).unwrap();

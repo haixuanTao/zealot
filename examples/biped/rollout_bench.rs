@@ -20,12 +20,18 @@ use biped_env_nexus::{BipedNexusBatchEnv, default_mjcf_path};
 use gpu_policy::GpuPolicy;
 use std::time::Instant;
 use zealot_env::robots::lerobot_bipedal::NUM_JOINTS;
-use zealot_rl::rng::Lcg;
 use zealot_rl::ActorCritic;
+use zealot_rl::rng::Lcg;
 
 fn main() {
-    let num_envs: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(4096);
-    let steps: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(32);
+    let num_envs: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096);
+    let steps: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
 
     let xml = std::fs::read_to_string(default_mjcf_path()).expect("read mjcf");
     let mut rng = Lcg::new(7);
@@ -33,7 +39,8 @@ fn main() {
     pollster::block_on(async {
         println!("building {num_envs} envs...");
         let mut env = BipedNexusBatchEnv::new(&xml, num_envs, 32, 0xC0FFEE).await;
-        let (obs_dim, critic_dim, act_dim) = (env.obs_dim(), env.critic_obs_dim(), env.action_dim());
+        let (obs_dim, critic_dim, act_dim) =
+            (env.obs_dim(), env.critic_obs_dim(), env.action_dim());
         let mut ac = ActorCritic::new(
             &[obs_dim, 256, 256, 128, act_dim],
             &[critic_dim, 512, 256, 128, 1],
@@ -88,9 +95,15 @@ fn main() {
         println!("  CPU serial sample+value : {cpu_ms:8.3} ms/step");
         println!("  GPU batched + readback  : {gpu_ms:8.3} ms/step");
         if gpu_ms < cpu_ms {
-            println!("  -> GPU {:.2}x faster end-to-end (readback included)", cpu_ms / gpu_ms);
+            println!(
+                "  -> GPU {:.2}x faster end-to-end (readback included)",
+                cpu_ms / gpu_ms
+            );
         } else {
-            println!("  -> GPU {:.2}x SLOWER end-to-end (readback dominates)", gpu_ms / cpu_ms);
+            println!(
+                "  -> GPU {:.2}x SLOWER end-to-end (readback dominates)",
+                gpu_ms / cpu_ms
+            );
         }
     });
 }

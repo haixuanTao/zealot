@@ -684,7 +684,11 @@ impl BipedEnv {
         for k in 0..NUM_JOINTS {
             let jr = &self.world.joints[k];
             // With explicit PD, zero the constraint motor so it doesn't double-act.
-            let (kp, kd) = if explicit_pd { (0.0, 0.0) } else { (jr.kp, jr.kd) };
+            let (kp, kd) = if explicit_pd {
+                (0.0, 0.0)
+            } else {
+                (jr.kp, jr.kd)
+            };
             if let Some((mb, link_id)) = self.world.multibody.get_mut(jr.handle) {
                 if let Some(link) = mb.link_mut(link_id) {
                     link.joint
@@ -1032,7 +1036,7 @@ impl BipedEnv {
             last_action: self.last_action,
             prev_action: self.prev_action,
             feet: [FootObs::default(); NUM_FEET], // overwritten by the caller
-            phase: 0.0, // CPU env doesn't use the gait clock
+            phase: 0.0,                           // CPU env doesn't use the gait clock
         }
     }
 }

@@ -19,8 +19,8 @@ use gpu_policy::GpuPolicy;
 use rayon::prelude::*;
 use std::time::Instant;
 use zealot_env::robots::lerobot_bipedal::NUM_JOINTS;
-use zealot_rl::rng::Lcg;
 use zealot_rl::ActorCritic;
+use zealot_rl::rng::Lcg;
 
 fn to_action(v: &[f32]) -> [f32; NUM_JOINTS] {
     let mut a = [0.0; NUM_JOINTS];
@@ -70,7 +70,10 @@ async fn gpu_step(
         ac.record_obs(&cur[e], &cur_c[e]);
     }
     let (means, _) = gpu.forward(env.backend(), ac, cur, cur_c).await.unwrap();
-    T_FWD.fetch_add(tf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    T_FWD.fetch_add(
+        tf.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let ts = std::time::Instant::now();
     let mut actions = Vec::with_capacity(n);
     for e in 0..n {
@@ -81,14 +84,20 @@ async fn gpu_step(
         }
         actions.push(a);
     }
-    T_SAMPLE.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    T_SAMPLE.fetch_add(
+        ts.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let tp = std::time::Instant::now();
     let outs = env.step(&actions).await;
     for e in 0..n {
         cur[e].clone_from(&outs[e].obs);
         cur_c[e].clone_from(&outs[e].critic_obs);
     }
-    T_STEP.fetch_add(tp.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    T_STEP.fetch_add(
+        tp.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 static T_FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -96,8 +105,14 @@ static T_SAMPLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static T_STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn main() {
-    let num_envs: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(4096);
-    let steps: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(16);
+    let num_envs: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096);
+    let steps: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let xml = std::fs::read_to_string(default_mjcf_path()).expect("read mjcf");
     let n = num_envs;
     let mut rng = Lcg::new(7);
@@ -138,7 +153,15 @@ fn main() {
         let mut gpu = GpuPolicy::new(env.backend(), &ac, n).expect("gpu policy");
         let (mut gcur, mut gcur_c) = env.initial_obs().await;
         for _ in 0..2 {
-            gpu_step(&mut ac, &mut env, &mut gpu, &mut gcur, &mut gcur_c, &mut rng).await;
+            gpu_step(
+                &mut ac,
+                &mut env,
+                &mut gpu,
+                &mut gcur,
+                &mut gcur_c,
+                &mut rng,
+            )
+            .await;
         }
         use std::sync::atomic::Ordering::Relaxed;
         T_FWD.store(0, Relaxed);
@@ -146,7 +169,15 @@ fn main() {
         T_STEP.store(0, Relaxed);
         let t1 = Instant::now();
         for _ in 0..steps {
-            gpu_step(&mut ac, &mut env, &mut gpu, &mut gcur, &mut gcur_c, &mut rng).await;
+            gpu_step(
+                &mut ac,
+                &mut env,
+                &mut gpu,
+                &mut gcur,
+                &mut gcur_c,
+                &mut rng,
+            )
+            .await;
         }
         let el = t1.elapsed();
         let ps = |a: &std::sync::atomic::AtomicU64| a.load(Relaxed) as f64 / steps as f64 / 1e6;

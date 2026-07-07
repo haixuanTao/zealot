@@ -245,7 +245,10 @@ fn main() {
                 let ms = |x: u128| x as f64 / 1e6;
                 println!(
                     "  [time] policy_cpu {:.0}ms | gpu_step {:.0}ms | resets {:.0}ms | ppo_update {:.0}ms",
-                    ms(t_pol), ms(t_step), ms(t_commit), ms(t_upd)
+                    ms(t_pol),
+                    ms(t_step),
+                    ms(t_commit),
+                    ms(t_upd)
                 );
             }
             if it % 10 == 0 || it == iters - 1 {

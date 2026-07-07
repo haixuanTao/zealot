@@ -71,7 +71,8 @@ impl GpuNet {
 
     /// Upload the input matrix `[in x N]` into `a[0]`.
     fn set_input(&mut self, backend: &GpuBackend, x: &DMatrix<f32>) -> anyhow::Result<()> {
-        self.a[0] = Tensor::matrix_from_na(backend, x, BufferUsages::STORAGE | BufferUsages::COPY_SRC)?;
+        self.a[0] =
+            Tensor::matrix_from_na(backend, x, BufferUsages::STORAGE | BufferUsages::COPY_SRC)?;
         Ok(())
     }
 
@@ -96,7 +97,14 @@ impl GpuNet {
             }
             {
                 let mut p = enc.begin_pass("bias", None);
-                op.launch(backend, shapes, &mut p, OpAssignVariant::Add, &mut *a_out, &self.b[l])?;
+                op.launch(
+                    backend,
+                    shapes,
+                    &mut p,
+                    OpAssignVariant::Add,
+                    &mut *a_out,
+                    &self.b[l],
+                )?;
             }
             if l < layers - 1 {
                 let mut p = enc.begin_pass("elu", None);
@@ -216,9 +224,15 @@ async fn main() -> anyhow::Result<()> {
     println!("  actor {ACTOR:?}  critic {CRITIC:?}  (ELU hidden, linear out)");
     println!("  GPU vs CPU max|out| err = {max_err:.3e}");
     anyhow::ensure!(max_err < 2e-3, "GPU forward diverged from CPU reference");
-    println!("  CPU serial loop : {cpu_per:8.3} ms/step  ({:.2} us/env)", cpu_per * 1e3 / N as f64);
+    println!(
+        "  CPU serial loop : {cpu_per:8.3} ms/step  ({:.2} us/env)",
+        cpu_per * 1e3 / N as f64
+    );
     println!("  GPU batched     : {gpu_per:8.3} ms/step  (no readback)");
-    println!("  GPU + readback  : {gpu_rb_per:8.3} ms/step  (R1 = {:.3} ms/step)", gpu_rb_per - gpu_per);
+    println!(
+        "  GPU + readback  : {gpu_rb_per:8.3} ms/step  (R1 = {:.3} ms/step)",
+        gpu_rb_per - gpu_per
+    );
     println!("  speedup         : {:.1}x", cpu_per / gpu_per);
     println!("  (sink={sink:.3})");
     Ok(())
