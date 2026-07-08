@@ -4,6 +4,67 @@ Reinforcement-learning locomotion on top of [nexus](https://github.com/dimforge/
 dimforge's cross-platform GPU physics engine — aiming to be, roughly, "the
 WBC-AGILE of nexus" but all-Rust and WebGPU-native.
 
+## Getting started — train the legged robot
+
+The headline path is training the **biped** end-to-end on a GPU:
+`examples/biped/biped_train_gpu.rs` runs the full PPO loop to a learned locomotion
+policy with physics *and* the PPO update GPU-resident (nexus physics + vortx PPO
+shaders, weights persisted across iterations).
+
+The fast path is **native CUDA on a Blackwell box** (RTX 5090 / 5060). Standing one
+up from scratch — toolchain, CUDA 12.9 wheels, LLVM 21, building the cubins — is
+documented step-by-step in **[`docs/train-on-5090.md`](docs/train-on-5090.md)**;
+**start there**, this is only the shape of it.
+
+Check the forks out as **siblings** under one parent dir (`zealot`, `nexus-rl`,
+`khal`, `vortx` — zealot resolves them by relative path). The biped examples also
+need the robot's MJCF model at
+`~/Documents/work/lerobot-humanoid-design/to_real_robot/RL_policy/robot.xml`
+(the curated standing model from the `lerobot-humanoid-design` repo). Then:
+
+```sh
+# 0. skip the cargo-gpu (SPIR-V) shader build — on CUDA all shaders come from the
+#    cuda-oxide cubins below, so the WebGPU/SPIR-V compile is pure redundancy.
+#    This makes cargo-gpu a non-dependency (the WebGPU backend then fails hard at
+#    runtime for lack of shaders — intended; this is a CUDA-only build).
+export KHAL_SKIP_SPIRV=1
+
+# 1. the two native-CUDA cubins the host embeds (physics + PPO shaders → PTX).
+#    Prebuilt sm_120, or build them with build_cuda/build_*_cubin.sh per the guide.
+export PTX="$HOME/nexus_ptx"; mkdir -p "$PTX"
+base=https://github.com/haixuanTao/zealot/releases/download/cubins-sm120-20260624
+curl -L "$base/nexus_rbd_shaders3d.cubin" -o "$PTX/nexus_rbd_shaders3d.cubin"
+curl -L "$base/vortx_shaders.cubin"       -o "$PTX/vortx_shaders.cubin"
+export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D="$PTX/nexus_rbd_shaders3d.cubin"
+export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS="$PTX/vortx_shaders.cubin"
+
+# 2. tell cudarc which CUDA version to target, so its build script skips the
+#    `nvcc --version` probe (nvcc need not be on PATH — cuda-oxide already
+#    produced the cubins, and cudarc only loads/launches them via the driver).
+#    Format is MAJOR0MINOR0: CUDA 13.0 → 13000, CUDA 12.9 → 12090. Match `nvidia-smi`.
+export CUDARC_CUDA_VERSION=13000
+
+# 3. train — native CUDA auto-selects on sm_120, no flag needed
+#                                                       iters  num_envs  checkpoint
+cargo run --release --example biped_train_gpu \
+    --features "gpu biped_gpu cuda_backend" -- 2000 4096 "$HOME/biped.safetensors"
+```
+
+With `KHAL_SKIP_SPIRV=1` the only precompiled artifact you need is the pair of
+**cuda-oxide cubins** (step 1) — no cargo-gpu toolchain. The prebuilt cubins are
+valid only on Blackwell and only for the matching source commit; building them from
+scratch (LLVM 21, CUDA 12.9 wheels, the cuda-oxide backend) is what
+[`docs/train-on-5090.md`](docs/train-on-5090.md) walks through.
+
+**Smaller warm-up / no CUDA box?** The pendulum examples are the minimal RL loop
+(GPU rigid-body swing-up, any WebGPU backend, no robot asset) —
+`cargo run --release --example pendulum_ppo --features pendulum`, full walkthrough
+in [`examples/pendulum/README.md`](examples/pendulum/README.md). To reproduce the
+throughput numbers instead, see [Quick start — reproduce the GPU
+benchmark](#quick-start--reproduce-the-gpu-benchmark-agent-runnable) below.
+Additional deep-dive notes (CUDA build logs, the Metal contact bug) live under
+[`docs/`](docs/).
+
 ## Workspace layout
 
 | Crate | Role | Analogy |

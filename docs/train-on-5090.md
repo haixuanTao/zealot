@@ -37,6 +37,7 @@ bash build_cuda/build_nexus_cubin.sh        # -> $PTX/nexus_rbd_shaders3d.cubin
 bash build_cuda/build_vortx_cubin_llc.sh    # -> $PTX/vortx_shaders.cubin
 
 cd "$WORK/zealot"
+export KHAL_SKIP_SPIRV=1     # CUDA-only: skip the cargo-gpu SPIR-V build (shaders come from the cubins)
 export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D="$PTX/nexus_rbd_shaders3d.cubin"
 export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS="$PTX/vortx_shaders.cubin"
 
@@ -187,6 +188,7 @@ crates/nexus_rbd3d/build.rs` and rebuild.
 
 ```bash
 cd "$WORK/zealot"
+export KHAL_SKIP_SPIRV=1     # CUDA-only: skip the cargo-gpu SPIR-V build
 export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D="$PTX/nexus_rbd_shaders3d.cubin"
 export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS="$PTX/vortx_shaders.cubin"
 
@@ -194,10 +196,17 @@ cargo run --release --example biped_train_gpu \
     --features "gpu biped_gpu cuda_backend" -- <iters> <num_envs> <checkpoint>
 ```
 
+> **`KHAL_SKIP_SPIRV=1`** skips the cargo-gpu (SPIR-V) shader compile at build time
+> — on CUDA every shader comes from the cuda-oxide cubins, so cargo-gpu is not a
+> build dependency. Leave it unset only if you also want a working WebGPU backend
+> (which then needs cargo-gpu installed). It's read at `cargo build` time, so it
+> must be exported before the build, not just the run.
+
 > **Backend selection.** Built with `cuda_backend`, the trainer **auto-selects
 > native CUDA on `sm_120`** (Blackwell) and falls back to WebGPU otherwise — no
 > flag needed. Force it with `KHAL_BACKEND=cuda` or `KHAL_BACKEND=webgpu`.
-> (`BIPED_CUDA=1` still works as a deprecated alias.)
+> (`BIPED_CUDA=1` still works as a deprecated alias.) With `KHAL_SKIP_SPIRV=1` the
+> WebGPU fallback has no shaders and will fail hard — intended on a CUDA-only box.
 
 **Positional args** (after `--`):
 

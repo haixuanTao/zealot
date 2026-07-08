@@ -55,11 +55,14 @@ biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "de
 cuda_backend = ["gpu", "biped_gpu", "khal/cuda", "nexus3d/cuda", "vortx/cuda"]
 
 [dependencies]
-vortx = { version = "0.1", optional = true }
-khal = { version = "0.1", features = ["derive", "webgpu"], optional = true }
-nexus3d = { path = "../nexus-cuda/crates/nexus3d", features = ["rbd", "from_rapier"], optional = true }
-rapier3d = { version = "0.32", optional = true }
-rapier3d-urdf = { path = "../rapier/crates/rapier3d-urdf", features = ["stl"], optional = true }
+vortx = { version = "0.3", optional = true }
+khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
+# Upstream nexus 0.4 base + a focused fork (rebase/nexus-0.4) adding the ~12 biped
+# accessor/setter methods zealot needs (GPU contact/link readback, MJCF dof props)
+# and the cuda-oxide device layer — neither is upstream. from_rapier IS upstream.
+nexus3d = { path = "../nexus-rl/crates/nexus3d", features = ["rbd", "from_rapier"], optional = true }
+rapier3d = { version = "0.34", optional = true }
+rapier3d-urdf = { version = "0.34", features = ["stl"], optional = true }
 roxmltree = { version = "0.20", optional = true }
 rayon = { version = "1", optional = true }
 pollster = { version = "0.4", optional = true }
@@ -67,7 +70,7 @@ zealot-env = { workspace = true, optional = true }
 zealot-rl = { workspace = true, optional = true }
 
 [dev-dependencies]
-nalgebra = "0.34"
+nalgebra = "0.35"
 wgpu = "29"
 async-std = { version = "1", features = ["attributes"] }
 anyhow = "1"
@@ -101,9 +104,13 @@ required-features = ["gpu"]
 name = "ppo_grad_check"
 required-features = ["gpu"]
 
-[[example]]
-name = "sample_check"
-required-features = ["gpu"]
+# sample_check exercised the old target/noise sampler kernel, which the current
+# vortx Gaussian sampler (GpuSampleGaussian) replaced; sample_compare is its
+# successor (bit-exact GPU-vs-cpu_sample check). Kept out of the build until
+# ported or removed.
+#[[example]]
+#name = "sample_check"
+#required-features = ["gpu"]
 
 [[example]]
 name = "obs_check"
@@ -134,7 +141,9 @@ required-features = ["gpu", "biped_gpu"]
 [[example]]
 name = "iter_e2e_bench"
 path = "examples/biped/iter_e2e_bench.rs"
-required-features = ["gpu", "biped_gpu"]
+# Uses GpuBackend::as_cuda (CUDA-graph capture), which khal only exposes with
+# its `cuda` feature — so this bench needs the native-CUDA backend compiled in.
+required-features = ["gpu", "biped_gpu", "cuda_backend"]
 
 [[example]]
 name = "sample_compare"
@@ -287,6 +296,10 @@ required-features = ["gpu", "biped_gpu"]
 # (and vortx) resolve to the exact sources they're built against there. zealot
 # and nexus-rl are sibling checkouts under the same parent dir, so the relative
 # paths match. Only consulted when a GPU feature pulls these crates into the graph.
+# Only khal + vortx are real forks: khal carries the cuda-oxide device backend,
+# vortx carries the RL ops (Adam/tanh/GEMM/PPO shaders) zealot's policy needs —
+# neither is upstream. parry 0.29 / rapier 0.34 forks had zero custom commits, so
+# zealot uses those published directly. All on the rebase/nexus-0.4 branches.
 [patch.crates-io]
 khal = { path = "../khal/crates/khal" }
 khal-derive = { path = "../khal/crates/khal-derive" }
@@ -294,8 +307,6 @@ khal-std = { path = "../khal/crates/khal-std" }
 khal-builder = { path = "../khal/crates/khal-builder" }
 vortx = { path = "../vortx" }
 vortx-shaders = { path = "../vortx/vortx-shaders" }
-parry3d = { path = "../parry/crates/parry3d" }
-rapier3d = { path = "../rapier/crates/rapier3d" }
 
 # Probe rapier foot–ground contact (`--features cpu`).
 [[example]]
