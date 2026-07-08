@@ -217,11 +217,15 @@ async fn webgpu_backend() -> KhalGpuBackend {
         max_compute_workgroup_storage_size: 19_904,
         ..Default::default()
     };
-    let mut w = WebGpu::new(wgpu::Features::default(), limits)
+    let mut bk = KhalGpuBackend::auto(wgpu::Features::default(), limits)
         .await
-        .expect("webgpu");
-    w.force_buffer_copy_src = true;
-    KhalGpuBackend::WebGpu(w)
+        .expect("backend");
+    // force_buffer_copy_src is a WebGPU-only readback workaround; no-op on CUDA.
+    #[allow(irrefutable_let_patterns)]
+    if let KhalGpuBackend::WebGpu(w) = &mut bk {
+        w.force_buffer_copy_src = true;
+    }
+    bk
 }
 
 async fn read_poses(gpu: &KhalGpuBackend, state: &GpuPhysicsState) -> Vec<Pose> {
