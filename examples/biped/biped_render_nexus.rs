@@ -214,8 +214,14 @@ fn main() {
         // scale / contact softness / spawn pose) and N_envs/N_templates =
         // 128 envs share each template at construction time, then mix
         // freely as `reset_env` cycles them.
-        let num_envs = 4096;
-        let num_templates = 32;
+        // BIPED_RENDER_ENVS: shrink for rollout-only runs (train_iters=0) — a
+        // 1-env eval doesn't need the deployed-scale batch, and a small build
+        // coexists with a training run on the same GPU.
+        let num_envs = std::env::var("BIPED_RENDER_ENVS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
+        let num_templates = 32.min(num_envs);
         println!("building {num_envs} envs on nexus ({num_templates} DR templates)...");
         let mut env = BipedNexusBatchEnv::new(&xml, num_envs, num_templates, 0xC0FFEE).await;
 

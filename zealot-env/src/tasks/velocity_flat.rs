@@ -219,6 +219,17 @@ pub struct CommandSampler {
     pub resample_s: (f32, f32),
 }
 
+/// Parse an env var holding a `"lo,hi"` range, e.g. `BIPED_YAW="-0.5,0.5"`.
+fn range_env(var: &str, default: (f32, f32)) -> (f32, f32) {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| {
+            let p: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            (p.len() == 2).then(|| (p[0], p[1]))
+        })
+        .unwrap_or(default)
+}
+
 impl Default for CommandSampler {
     fn default() -> Self {
         // From the deployed Mjlab-Velocity-Flat-LeRobot config.
@@ -226,9 +237,12 @@ impl Default for CommandSampler {
             // Reachable at our budget: 0.5 m/s is achievable, 0.8 is not. With an
             // unreachable max command the curriculum forces the policy into a
             // regime where tracking reward is uniformly tiny → it gives up.
-            lin_vel_x: (-0.5, 0.5),
-            lin_vel_y: (-0.3, 0.3),
-            ang_vel_z: (-0.2, 0.2),
+            // Override per-axis with BIPED_VX / BIPED_VY / BIPED_YAW ("lo,hi").
+            // Note the yaw default (±0.2) is 5× narrower than WBC-AGILE T1's
+            // ±1.0 — widen via BIPED_YAW when training for heading control.
+            lin_vel_x: range_env("BIPED_VX", (-0.5, 0.5)),
+            lin_vel_y: range_env("BIPED_VY", (-0.3, 0.3)),
+            ang_vel_z: range_env("BIPED_YAW", (-0.2, 0.2)),
             // Fraction of command resamples that are a pure STAND (zero). Raising
             // it (BIPED_STAND_PROB) makes the robot stop more often → trains
             // explicit walk→stand→walk (go-stop-go) transitions and gives frequent
@@ -324,6 +338,13 @@ pub struct RewardWeights {
     /// Single-support is the defining phase of walking — rewarding it directly
     /// makes stepping beat both standing (double-support) and hopping (flight).
     pub single_support: f32,
+    /// Penalty (per airborne foot, per step) while the command is STANDING.
+    /// Makes the policy absorb small pushes with ankle/hip torque (feet
+    /// planted, CoM shifted — see `com_centering`) instead of dance-stepping
+    /// in place. MODERATE by design: for a big shove a protective step (brief
+    /// penalty) must stay cheaper than falling (termination), mirroring the
+    /// human ankle→hip→step strategy ladder. 0 = off.
+    pub stand_planted: f32,
     /// Foot-slip penalty (horizontal foot speed while in contact).
     pub foot_slip: f32,
     /// Foot-clearance penalty (swing-foot height vs target).
@@ -428,7 +449,10 @@ impl Default for RewardWeights {
             // pays the completed-swing duration ONLY at touchdown,
             // so a permanently-raised foot earns nothing → forces
             // real alternating step cycles. Progress+command gated.
-            flight: -1.0,        // keep: no hopping (both feet airborne)
+            flight: -1.0,       // keep: no hopping (both feet airborne)
+            stand_planted: 0.0, // OFF by default (A/B via BIPED_STAND_PLANTED_W):
+            // per-airborne-foot penalty while the command is
+            // standing → balance with ankles/hips, not dance-steps.
             single_support: 0.5, // REPURPOSED → double-support SETTLE bonus (both feet
             // planted while moving). Modest, so it shapes a
             // "swing → settle → swing" cycle without farmable waddle.
@@ -530,6 +554,8 @@ pub struct RewardBreakdown {
     pub flight: f32,
     /// Single-support (exactly-one-foot-down) bonus contribution.
     pub single_support: f32,
+    /// Feet-planted-while-standing penalty contribution.
+    pub stand_planted: f32,
     /// Foot-slip penalty contribution.
     pub foot_slip: f32,
     /// Foot-clearance penalty contribution.
@@ -566,6 +592,7 @@ impl RewardBreakdown {
             + self.air_time
             + self.flight
             + self.single_support
+            + self.stand_planted
             + self.foot_slip
             + self.foot_clearance
             + self.foot_orientation
@@ -948,6 +975,19 @@ impl VelocityFlatTask {
             }
         };
 
+        // Extra "balance, don't step" pressure at stand (NEGATIVE weight, 0 = off;
+        // BIPED_STAND_PLANTED_W): per airborne foot per step while the command is
+        // standing. Stacks on the binary standing branch of `single_support`
+        // above. Sized so quiet ankle/hip balancing beats fidget-stepping under
+        // small pushes, while a genuine protective step (a few penalized steps)
+        // stays far cheaper than falling (termination) under big ones.
+        let stand_planted = if standing {
+            let airborne = state.feet.iter().filter(|f| !f.contact).count() as f32;
+            self.weights.stand_planted * airborne * dt
+        } else {
+            0.0
+        };
+
         // Slip: penalize horizontal foot speed while the foot is in contact.
         let mut slip = 0.0;
         for f in &state.feet {
@@ -1098,6 +1138,7 @@ impl VelocityFlatTask {
             air_time,
             flight,
             single_support,
+            stand_planted,
             foot_slip,
             foot_clearance,
             foot_orientation,

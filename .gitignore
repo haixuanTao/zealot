@@ -7,3 +7,4 @@ MUJOCO_LOG.TXT
 __pycache__/
 .claude/
 wandb/
+vast_nexus_ptx/

@@ -14,8 +14,12 @@
 //! - Episode-end reset via pre-built spawn templates + `state.reset_env_from`.
 //!
 //! What's NOT mirrored (nexus host API doesn't expose them):
-//! - Push perturbations (no `apply_impulse` API on the GPU side).
 //! - True foot-ground contact pairs (synthesized via foot Z < threshold).
+//!
+//! Push perturbations ARE supported (Isaac's `push_by_setting_velocity`
+//! equivalent): a read-modify-write of the root free-joint velocity DOFs in
+//! `dof_state` — see `apply_random_pushes` (BIPED_PUSH_VEL / BIPED_PUSH_ANGVEL
+//! / BIPED_PUSH_INTERVAL).
 //!
 //! Joint angles / velocities, base linear / angular velocity all come from
 //! `links_workspace[k].{coords, joint_rot, rb_vels}` (rb_vels is world-space).
@@ -1010,13 +1014,21 @@ pub struct BipedNexusBatchEnv {
     /// we can tell a planted-but-vaulting foot (origin ~fixed) from a SLIDING one
     /// (origin drifts across the floor). Lazily init'd in debug_contact_impulses.
     dbg_stance: Vec<DbgStance>,
-    /// Random torso-push magnitude, m/s (BIPED_PUSH_VEL, 0 = off) and interval in
-    /// control steps (BIPED_PUSH_INTERVAL). Every `push_interval` steps each env
-    /// gets a random horizontal velocity kick to the torso, forcing the policy to
-    /// learn genuine balance recovery (sim-to-real robustness) rather than a
-    /// brittle nexus-specific reflex.
+    /// Random torso-push magnitude, m/s (BIPED_PUSH_VEL, 0 = off) and mean
+    /// interval in control steps (BIPED_PUSH_INTERVAL, default 175 ≈ 3.5 s —
+    /// the midpoint of WBC-AGILE's 2–5 s). On each push every env gets an
+    /// independent random horizontal velocity kick to the torso, forcing the
+    /// policy to learn genuine balance recovery (sim-to-real robustness)
+    /// rather than a brittle nexus-specific reflex.
     push_vel: f32,
     push_interval: u64,
+    /// Angular kick magnitude, rad/s (BIPED_PUSH_ANGVEL, default 0 = linear-only
+    /// pushes). WBC-AGILE uses ±0.25 on roll/pitch/yaw.
+    push_angvel: f32,
+    /// Next `global_step` at which to push. Rescheduled after each push with
+    /// ±50% jitter around `push_interval` so the policy can't phase-lock a
+    /// recovery reflex to a fixed cadence.
+    next_push_at: u64,
     /// Previous control-step joint angles per env. Used to compute joint
     /// velocities by finite-diff `(q_now - q_prev) / control_dt` instead of
     /// reading nexus's `dof_state` buffer — saves one slow_read per step.
@@ -1105,7 +1117,7 @@ pub struct BipedNexusBatchEnv {
 }
 
 /// Number of logged reward components (see [`REWARD_COMP_NAMES`]).
-pub const NUM_REWARD_COMPS: usize = 27;
+pub const NUM_REWARD_COMPS: usize = 28;
 
 /// Names of the per-component reward terms, in `rlog_comps` / `RewardLog::comps`
 /// order. The first 20 mirror `RewardBreakdown`'s live terms; the last four are
@@ -1139,6 +1151,7 @@ pub const REWARD_COMP_NAMES: [&str; NUM_REWARD_COMPS] = [
     "power",         // Σ|τ·q̇| mechanical-power (energy / cost-of-transport) penalty
     "gait_clock",    // dense periodic swing/stance-matching reward
     "com_centering", // CoM-over-support-foot (low-ankle-torque single-support)
+    "stand_planted", // per-airborne-foot penalty at standing command (balance, don't step)
 ];
 
 /// One window of accumulated reward/termination stats (see `take_reward_log`).
@@ -1199,6 +1212,26 @@ impl BipedNexusBatchEnv {
             .and_then(|s| s.parse::<f32>().ok())
         {
             task.weights.gait_swing_ratio = sr;
+        }
+        // CoM-over-support-foot reward weight. Long single-support holds
+        // (slow gait clocks) are only cheap for the fragile ankles if the
+        // CoM rides over the stance foot — raise this together with
+        // BIPED_GAIT_PERIOD.
+        if let Some(w) = std::env::var("BIPED_COM_CENTERING_W")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.com_centering = w;
+        }
+        // Balance-don't-step at stand: per-airborne-foot penalty while the
+        // command is standing (NEGATIVE, e.g. -1.0; 0 = off). Pair with a
+        // raised BIPED_STAND_PROB so the policy actually trains the quiet
+        // stance, and with pushes on so it learns the ankle/hip strategy.
+        if let Some(w) = std::env::var("BIPED_STAND_PLANTED_W")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.stand_planted = w;
         }
 
         let gpu = make_backend().await;
@@ -1368,7 +1401,11 @@ impl BipedNexusBatchEnv {
         let push_interval = std::env::var("BIPED_PUSH_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(50);
+            .unwrap_or(175);
+        let push_angvel = std::env::var("BIPED_PUSH_ANGVEL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
         let prev_joint_pos = vec![[0.0f32; NUM_JOINTS]; num_envs];
         let has_prev_joint_pos = vec![false; num_envs];
         // One pose entry per collider per env (matches `body_poses` layout).
@@ -1402,6 +1439,8 @@ impl BipedNexusBatchEnv {
             dbg_stance: Vec::new(),
             push_vel,
             push_interval,
+            push_angvel,
+            next_push_at: push_interval,
             prev_joint_pos,
             has_prev_joint_pos,
             prev_body_poses,
@@ -1902,12 +1941,15 @@ impl BipedNexusBatchEnv {
         eprintln!("{out}");
     }
 
-    /// Inject a random horizontal velocity kick to every env's torso (root link's
-    /// linear-velocity DOFs 0,1) — a push perturbation. The policy must re-establish
-    /// balance over its feet after each shove, which is what makes the learned
-    /// equilibrium ROBUST and engine-agnostic (sim-to-real) rather than a brittle
+    /// Inject a random velocity kick to every env's torso — a push perturbation,
+    /// the GPU equivalent of Isaac's `push_by_setting_velocity`: ±push_vel m/s on
+    /// the root's linear x/y DOFs and (when BIPED_PUSH_ANGVEL > 0) ±push_angvel
+    /// rad/s on its angular x/y/z DOFs. The policy must re-establish balance over
+    /// its feet after each shove, which is what makes the learned equilibrium
+    /// ROBUST and engine-agnostic (sim-to-real) rather than a brittle
     /// nexus-specific reflex. Read-modify-write the generalized-velocity section of
-    /// `dof_state` (env-major, `dofs_per_batch` DOFs per env; root linear = 0..3).
+    /// `dof_state` (env-major, `dofs_per_batch` DOFs per env; root linear = 0..3,
+    /// root angular = 3..6, world frame — rapier free-joint DOF order).
     async fn apply_random_pushes(&mut self) {
         let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
         let n = self.n;
@@ -1918,11 +1960,18 @@ impl BipedNexusBatchEnv {
             .await
             .expect("dof_state readback for push");
         let pv = self.push_vel;
+        let pa = self.push_angvel;
         for e in 0..n {
             let dvx = self.rng[e].range(-pv, pv);
             let dvy = self.rng[e].range(-pv, pv);
             buf[e * dpb] += dvx; // root linear x velocity
             buf[e * dpb + 1] += dvy; // root linear y velocity
+            if pa > 0.0 {
+                for d in 3..6 {
+                    // root angular x/y/z velocity (world frame)
+                    buf[e * dpb + d] += self.rng[e].range(-pa, pa);
+                }
+            }
         }
         let vel_len = dpb * n; // velocity section only (don't touch the damping section)
         self.gpu
@@ -2315,13 +2364,16 @@ impl BipedNexusBatchEnv {
             .expect("flush motor targets");
         self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
 
-        // (1b) Push perturbation: every `push_interval` control steps, kick each
-        // torso with a random horizontal velocity so the policy learns robust,
-        // engine-agnostic balance recovery (sim-to-real). Applied BEFORE the
-        // physics advance so the kick propagates this step. Off when push_vel=0.
+        // (1b) Push perturbation: roughly every `push_interval` control steps
+        // (±50% jitter), kick each torso with a random velocity so the policy
+        // learns robust, engine-agnostic balance recovery (sim-to-real).
+        // Applied BEFORE the physics advance so the kick propagates this step.
+        // Off when push_vel=0.
         self.global_step += 1;
-        if self.push_vel > 0.0 && self.global_step % self.push_interval == 0 {
+        if self.push_vel > 0.0 && self.global_step >= self.next_push_at {
             self.apply_random_pushes().await;
+            let base = self.push_interval as f32;
+            self.next_push_at = self.global_step + self.rng[0].range(0.5 * base, 1.5 * base) as u64;
         }
 
         // (2) Advance physics at the control decimation. With BIPED_GRAPH=1 on a
@@ -2560,6 +2612,7 @@ impl BipedNexusBatchEnv {
                 comps[19] = rb.feet_distance;
                 comps[25] = rb.gait_clock;
                 comps[26] = rb.com_centering;
+                comps[27] = rb.stand_planted;
                 if fell {
                     comps[23] = self.task.weights.termination;
                     reward += self.task.weights.termination;
