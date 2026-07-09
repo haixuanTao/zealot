@@ -271,6 +271,13 @@ name = "biped_render_nexus"
 path = "examples/biped/biped_render_nexus.rs"
 required-features = ["biped_gpu", "gpu"]
 
+# Drive a trained policy with a constant velocity command and report where the
+# robot goes (per-second pose, commanded-vs-achieved summary, ASCII path map).
+[[example]]
+name = "biped_drive"
+path = "examples/biped/biped_drive.rs"
+required-features = ["biped_gpu"]
+
 # Numerical parity: GPU PPO output-grad kernels (vortx) vs scalar-CPU reference.
 [[example]]
 name = "ppo_grad_parity"
