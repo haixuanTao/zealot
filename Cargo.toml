@@ -86,6 +86,11 @@ name = "elu_check"
 required-features = ["gpu"]
 
 [[example]]
+name = "gemm_shapes_bench"
+path = "examples/gemm_shapes_bench.rs"
+required-features = ["gpu"]
+
+[[example]]
 name = "policy_forward_bench"
 required-features = ["gpu", "biped_gpu"]
 
