@@ -20,7 +20,7 @@ mod biped_env_nexus;
 
 use biped_env_nexus::{BipedNexusBatchEnv, StepOut, default_mjcf_path};
 use std::time::Instant;
-use zealot_env::robots::lerobot_bipedal::NUM_JOINTS;
+use zealot_env::robots::{RobotSpec, NUM_JOINTS};
 use zealot_rl::rng::Lcg;
 use zealot_rl::{ActorCritic, PpoConfig, Sample, gae};
 
@@ -36,11 +36,13 @@ fn to_action(v: &[f32]) -> [f32; NUM_JOINTS] {
 // non-veering gait; the instantaneous bilateral_symmetry reward can't, since a
 // walking gait is half-a-cycle out of phase). The mirror is an isometry of the
 // action space (joint L/R swap + sign flips), so logp_old/adv are preserved when
-// mean_old is mirrored too — the policy loss is EXACT. JOINT_NAMES order:
-// 0/1 anklex, 2/3 ankley, 4/5 hipx, 6/7 hipy, 8/9 hipz, 10/11 knee. Lateral
-// families (anklex/hipx/hipz) negate; sagittal (ankley/hipy/knee) keep.
-const JMIRROR: [usize; NUM_JOINTS] = [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10];
-const JSIGN: [f32; NUM_JOINTS] = [-1., -1., 1., 1., -1., -1., 1., 1., -1., -1., 1., 1.];
+// mean_old is mirrored too — the policy loss is EXACT. The joint mirror
+// permutation/signs are per-robot (canonical joint orders differ): lateral
+// families (roll/yaw) negate; sagittal (pitch/knee) keep.
+static JMIRROR: std::sync::LazyLock<[usize; NUM_JOINTS]> =
+    std::sync::LazyLock::new(|| RobotSpec::from_env().mirror);
+static JSIGN: std::sync::LazyLock<[f32; NUM_JOINTS]> =
+    std::sync::LazyLock::new(|| RobotSpec::from_env().mirror_sign);
 
 fn jmirror(v: &[f32]) -> Vec<f32> {
     (0..NUM_JOINTS).map(|i| JSIGN[i] * v[JMIRROR[i]]).collect()

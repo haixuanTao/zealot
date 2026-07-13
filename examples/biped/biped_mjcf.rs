@@ -16,7 +16,7 @@
 
 use rapier3d::prelude::*;
 use roxmltree::Node;
-use zealot_env::robots::LeRobotBipedal;
+use zealot_env::robots::{LeRobotBipedal, RobotSpec};
 
 const DT: f32 = 1.0 / 200.0;
 const SOLVER_ITERS: usize = 8;
@@ -139,7 +139,7 @@ fn parse_mjcf(xml: &str) -> Vec<MjBody> {
     out
 }
 
-fn gain_for(robot: &LeRobotBipedal, name: &str) -> (f32, f32, f32) {
+fn gain_for(robot: &RobotSpec, name: &str) -> (f32, f32, f32) {
     robot
         .joints
         .iter()
@@ -158,7 +158,7 @@ struct Built {
     feet: Vec<usize>,
 }
 
-fn build(mjcf: &[MjBody], robot: &LeRobotBipedal, spawn_z: f32) -> Built {
+fn build(mjcf: &[MjBody], robot: &RobotSpec, spawn_z: f32) -> Built {
     let mut bodies = RigidBodySet::new();
     let mut colliders = ColliderSet::new();
     let impulse = ImpulseJointSet::new();
@@ -269,7 +269,7 @@ fn main() {
         std::fs::read_to_string(&mjcf_path).unwrap_or_else(|e| panic!("read {mjcf_path}: {e}"));
 
     let mjcf = parse_mjcf(&xml);
-    let robot = LeRobotBipedal::new();
+    let robot = RobotSpec::from_env();
     println!("parsed {} bodies from MJCF:", mjcf.len());
     for b in &mjcf {
         println!(

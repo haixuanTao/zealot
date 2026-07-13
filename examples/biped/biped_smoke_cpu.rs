@@ -12,13 +12,13 @@
 
 use rapier3d::prelude::*;
 use rapier3d_urdf::{UrdfLoaderOptions, UrdfMultibodyOptions, UrdfRobot};
-use zealot_env::robots::LeRobotBipedal;
+use zealot_env::robots::{LeRobotBipedal, RobotSpec};
 
 const DT: f32 = 1.0 / 200.0;
 const SOLVER_ITERS: usize = 8;
 
 /// PD gain + torque cap for one of the 12 actuated joints, by name.
-fn gain_for(robot: &LeRobotBipedal, name: &str) -> Option<(f32, f32, f32)> {
+fn gain_for(robot: &RobotSpec, name: &str) -> Option<(f32, f32, f32)> {
     robot
         .joints
         .iter()
@@ -47,7 +47,7 @@ fn body_lowest_z(bodies: &RigidBodySet, colliders: &ColliderSet, h: RigidBodyHan
     lo
 }
 
-fn build_scene(robot: &LeRobotBipedal, spawn_height: f32) -> Scene {
+fn build_scene(robot: &RobotSpec, spawn_height: f32) -> Scene {
     let mut bodies = RigidBodySet::new();
     let mut colliders = ColliderSet::new();
     let impulse = ImpulseJointSet::new();
@@ -175,7 +175,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
 
-    let robot = LeRobotBipedal::new();
+    let robot = RobotSpec::from_env();
     let mut scene = build_scene(&robot, spawn_height);
 
     // Z-up convention (matching MuJoCo / the real robot): up = +Z.

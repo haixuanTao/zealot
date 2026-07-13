@@ -10,7 +10,8 @@
 //! - `config` — the generic [`EnvConfig`] task interface (the MDP contract).
 //! - `math`   — dependency-free vec/quat helpers used by the MDP.
 //! - `rng`    — a small deterministic LCG for command / domain sampling.
-//! - `robots` — robot asset specs (pure data); currently the LeRobot bipedal.
+//! - `robots` — robot asset specs (pure data): LeRobot bipedal, Unitree G1,
+//!               Unitree H2 Plus (select with `BIPED_ROBOT`).
 //! - `tasks`  — concrete task MDPs; currently flat velocity tracking.
 //!
 //! Planned (built incrementally):
@@ -24,7 +25,7 @@ pub mod robots;
 pub mod tasks;
 
 pub use config::{BodyState, EnvConfig};
-pub use robots::LeRobotBipedal;
+pub use robots::{JointSpec, LeRobotBipedal, RobotSpec, NUM_JOINTS};
 pub use tasks::VelocityFlatTask;
 
 /// Crate version — used to sanity-check that the workspace links.

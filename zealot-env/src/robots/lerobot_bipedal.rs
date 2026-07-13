@@ -19,7 +19,7 @@
 //!
 //! ## Joint ordering
 //!
-//! [`JOINT_NAMES`] is the **canonical policy order** for this crate: the order in
+//! [`JOINT_NAMES`] is this robot's **canonical policy order**: the order in
 //! which joint quantities appear in observations and actions. It is provisional —
 //! it will be reconciled in two places as later stages land:
 //! 1. the nexus/rapier multibody DOF order produced from the URDF (the env loop
@@ -28,46 +28,7 @@
 //!    export / sim-to-real). The adapter already remaps orders, so this choice
 //!    only fixes *our* internal convention, not the physics.
 
-/// Number of actuated leg DOFs (6 per leg).
-pub const NUM_JOINTS: usize = 12;
-
-/// Per-joint specification: gains, limits, action scale, and home pose.
-///
-/// One entry per actuated DOF. `kp`/`kd` are the position/velocity gains of the
-/// joint's PD controller (stiffness / damping); the env applies
-/// `τ = kp·(q_target − q) − kd·q̇`, saturated at `effort_limit`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct JointSpec {
-    /// URDF joint name (e.g. `"hipy_left"`).
-    pub name: &'static str,
-    /// Position gain (stiffness), N·m/rad.
-    pub kp: f32,
-    /// Velocity gain (damping), N·m·s/rad.
-    pub kd: f32,
-    /// Torque saturation, N·m.
-    pub effort_limit: f32,
-    /// Velocity limit, rad/s (soft-limit penalties reference this).
-    pub vel_limit: f32,
-    /// Action scale: `q_target = default_pos + scale · action`, action ∈ ~[-1, 1].
-    pub action_scale: f32,
-    /// Default ("home") joint position, rad.
-    pub default_pos: f32,
-    /// Hard joint position limits `(lower, upper)`, rad (from the URDF).
-    pub pos_limit: (f32, f32),
-    /// Rotor/reflected inertia (kg·m²), system-identified by WBC-AGILE
-    /// (`config.yaml` `joint_armature`). Added to the joint's dof inertia — what
-    /// makes stiff PD-controlled joints numerically stable in sim.
-    pub armature: f32,
-    /// Passive joint damping (N·m·s/rad), from the MJCF `damping`. The real
-    /// joints are significantly damped (0.5–2.3); without it the sim joints slew
-    /// far too fast (~50 rad/s). Folded into the motor's velocity gain since the
-    /// nexus passive-damping buffer is otherwise a hardcoded 0.1 default.
-    pub damping: f32,
-    /// Coulomb joint friction (N·m), from the MJCF `frictionloss` — a constant
-    /// torque opposing motion. Applied as `-frictionloss·sign(q̇)` via the nexus
-    /// `dof_frictionloss` buffer (energy dissipation / stiction).
-    pub frictionloss: f32,
-}
+pub use super::{JointSpec, RobotSpec, NUM_JOINTS};
 
 /// Canonical policy joint order (see module docs). Alphabetical by URDF joint
 /// name — the order the mjlab trainer resolves to with `preserve_order = false`,
@@ -225,75 +186,58 @@ const fn starts_with(s: &str, prefix: &str) -> bool {
     true
 }
 
-/// The LeRobot bipedal platform spec.
-#[derive(Clone, Copy, Debug)]
-pub struct LeRobotBipedal {
-    /// Per-joint specs, in [`JOINT_NAMES`] order.
-    pub joints: [JointSpec; NUM_JOINTS],
-    /// Root/base link name in the URDF.
-    pub base_link: &'static str,
-    /// Left / right foot link names (contact + foot-reward references).
-    pub foot_links: [&'static str; 2],
-    /// Nominal base height above ground in the home pose, metres. Used for the
-    /// initial spawn pose and as a height-reward reference.
-    pub base_height: f32,
-    /// Total robot mass, kg (≈ sum of URDF link masses).
-    pub total_mass: f32,
-    /// URDF path, relative to `$HOME` (the asset lives outside this repo, in the
-    /// sibling `lerobot-humanoid-design` checkout).
-    pub urdf_rel_path: &'static str,
-}
+/// Deprecated name for the pre-[`RobotSpec`] era; use [`lerobot`].
+pub type LeRobotBipedal = RobotSpec;
 
-impl Default for LeRobotBipedal {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl LeRobotBipedal {
-    /// Build the spec with the values from the deployed velocity policy.
-    pub const fn new() -> Self {
-        // `JOINT_NAMES` is const, so unroll the family lookup per index.
-        let joints = [
-            family(JOINT_NAMES[0]),
-            family(JOINT_NAMES[1]),
-            family(JOINT_NAMES[2]),
-            family(JOINT_NAMES[3]),
-            family(JOINT_NAMES[4]),
-            family(JOINT_NAMES[5]),
-            family(JOINT_NAMES[6]),
-            family(JOINT_NAMES[7]),
-            family(JOINT_NAMES[8]),
-            family(JOINT_NAMES[9]),
-            family(JOINT_NAMES[10]),
-            family(JOINT_NAMES[11]),
-        ];
-        Self {
-            joints,
-            base_link: "torso_subassembly",
-            foot_links: ["foot_left", "foot_right"],
-            // Lower-body platform stands ~0.5 m at the torso mount; refined once
-            // the URDF is dropped on the ground in the physics smoke test.
-            base_height: 0.5,
-            total_mass: 10.18,
-            urdf_rel_path: "Documents/work/lerobot-humanoid-design/urdf/bipedal_plateform/urdf/robot.urdf",
-        }
-    }
-
-    /// Default joint positions in [`JOINT_NAMES`] order (the home pose targets).
-    pub fn default_pose(&self) -> [f32; NUM_JOINTS] {
-        std::array::from_fn(|i| self.joints[i].default_pos)
-    }
-
-    /// Per-joint action scales in [`JOINT_NAMES`] order.
-    pub fn action_scales(&self) -> [f32; NUM_JOINTS] {
-        std::array::from_fn(|i| self.joints[i].action_scale)
-    }
-
-    /// Absolute path to the URDF, resolved against `$HOME`.
-    pub fn urdf_path(&self) -> std::path::PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        std::path::Path::new(&home).join(self.urdf_rel_path)
+/// The LeRobot bipedal platform spec, with the values from the deployed
+/// velocity policy.
+pub const fn lerobot() -> RobotSpec {
+    // `JOINT_NAMES` is const, so unroll the family lookup per index.
+    let joints = [
+        family(JOINT_NAMES[0]),
+        family(JOINT_NAMES[1]),
+        family(JOINT_NAMES[2]),
+        family(JOINT_NAMES[3]),
+        family(JOINT_NAMES[4]),
+        family(JOINT_NAMES[5]),
+        family(JOINT_NAMES[6]),
+        family(JOINT_NAMES[7]),
+        family(JOINT_NAMES[8]),
+        family(JOINT_NAMES[9]),
+        family(JOINT_NAMES[10]),
+        family(JOINT_NAMES[11]),
+    ];
+    RobotSpec {
+        name: "lerobot",
+        joints,
+        base_link: "torso_subassembly",
+        // MJCF body names carrying the sole collision capsules, in the
+        // (right, left) document order the model uses — the model's right side
+        // is the bare name and the left side gets a `_2`/`_sym` suffix.
+        foot_links: ["foot_subassembly", "foot_subassembly_2"],
+        foot_forward_local: [1.0, 0.0, 0.0],
+        foot_contact_z: 0.05,
+        // WBC DEFAULT_TRUNK_HEIGHT — also the straight-leg spawn height (the
+        // home pose IS neutral/straight for this robot).
+        base_height: 0.72,
+        spawn_z: 0.72,
+        min_base_height: 0.4,
+        total_mass: 10.18,
+        mjcf_rel_path: "Documents/work/lerobot-humanoid-design/to_real_robot/RL_policy/robot.xml",
+        urdf_rel_path: "Documents/work/lerobot-humanoid-design/urdf/bipedal_plateform/urdf/robot.urdf",
+        // JOINT_NAMES order: 0/1 anklex, 2/3 ankley, 4/5 hipx, 6/7 hipy,
+        // 8/9 hipz, 10/11 knee — mirror swaps L/R within each family; sagittal
+        // families (ankley/hipy/knee) mirror equal, lateral (anklex/hipx/hipz)
+        // mirror opposite.
+        mirror: [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10],
+        mirror_sign: [-1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0],
+        hip_yawroll: [4, 5, 8, 9], // hipx_left, hipx_right, hipz_left, hipz_right
+        illegal_ground_fragments: &["shin", "tigh", "hip"],
+        self_collision_pairs: &[
+            ("foot_subassembly", "foot_subassembly_2"),
+            ("shin_subassembly", "shin_subassembly_sym"),
+            ("tigh_subassembly", "tigh_subassembly_sym"),
+        ],
     }
 }
 
@@ -312,7 +256,7 @@ mod tests {
 
     #[test]
     fn gains_match_families() {
-        let r = LeRobotBipedal::new();
+        let r = lerobot();
         let by = |name: &str| r.joints.iter().find(|j| j.name == name).copied().unwrap();
         // kp = WBC value × STIFFNESS_SCALE (4×); kd = WBC × DAMPING_SCALE (2×).
         assert_eq!(by("hipz_left").kp, 120.0);
@@ -331,7 +275,7 @@ mod tests {
 
     #[test]
     fn default_pose_is_neutral() {
-        let r = LeRobotBipedal::new();
+        let r = lerobot();
         assert_eq!(r.default_pose(), [0.0; NUM_JOINTS]);
     }
 

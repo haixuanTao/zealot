@@ -26,14 +26,14 @@ use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
 use rapier3d::prelude::*;
 use rapier3d_urdf::{UrdfLoaderOptions, UrdfMultibodyOptions, UrdfRobot};
 use std::collections::HashMap;
-use zealot_env::robots::LeRobotBipedal;
+use zealot_env::robots::{LeRobotBipedal, RobotSpec};
 
 const DT: f32 = 1.0 / 200.0;
 const SOLVER_ITERS: u32 = 16;
 
 /// PD gain + torque cap for one of the 12 actuated joints, looked up by name from
 /// the robot spec. Returns `None` for non-actuated joints (base, fixed frames).
-fn gain_for(robot: &LeRobotBipedal, name: &str) -> Option<(f32, f32, f32)> {
+fn gain_for(robot: &RobotSpec, name: &str) -> Option<(f32, f32, f32)> {
     robot
         .joints
         .iter()
@@ -113,7 +113,7 @@ struct Scene {
     foot_idx: Vec<u32>,
 }
 
-fn build_scene(robot: &LeRobotBipedal, spawn_height: f32) -> Scene {
+fn build_scene(robot: &RobotSpec, spawn_height: f32) -> Scene {
     let mut bodies = RigidBodySet::new();
     let mut colliders = ColliderSet::new();
     let impulse_joints = ImpulseJointSet::new();
@@ -261,7 +261,7 @@ fn main() {
         .unwrap_or(500);
 
     pollster::block_on(async {
-        let robot = LeRobotBipedal::new();
+        let robot = RobotSpec::from_env();
         let gpu = webgpu_backend().await;
         let pipeline = GpuPhysicsPipeline::from_backend(&gpu);
 

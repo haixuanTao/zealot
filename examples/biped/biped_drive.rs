@@ -20,7 +20,7 @@ mod biped_env_nexus;
 
 use biped_env_nexus::{BipedNexusBatchEnv, default_mjcf_path};
 use std::fmt::Write as _;
-use zealot_env::robots::lerobot_bipedal::{JOINT_NAMES, NUM_JOINTS};
+use zealot_env::robots::{RobotSpec, NUM_JOINTS};
 use zealot_rl::ActorCritic;
 
 /// Control-step period — matches `VelocityFlatTask` (50 Hz).
@@ -255,7 +255,7 @@ fn main() {
         let _ = write!(s, "  \"feet\": [{}],\n", feet_json.join(", "));
         let resets_json: Vec<String> = resets.iter().map(|i| i.to_string()).collect();
         let _ = write!(s, "  \"resets\": [{}],\n", resets_json.join(", "));
-        let jn: Vec<String> = JOINT_NAMES.iter().map(|n| format!("\"{n}\"")).collect();
+        let jn: Vec<String> = RobotSpec::from_env().joints.iter().map(|j| format!("\"{}\"", j.name)).collect();
         let _ = write!(s, "  \"joint_names\": [{}],\n", jn.join(", "));
         let base_json: Vec<String> = bases
             .iter()

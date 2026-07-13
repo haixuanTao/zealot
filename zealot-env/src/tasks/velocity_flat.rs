@@ -29,7 +29,7 @@
 
 use crate::math::{quat_rotate, quat_rotate_inv};
 use crate::rng::Lcg;
-use crate::robots::lerobot_bipedal::{LeRobotBipedal, NUM_JOINTS};
+use crate::robots::{RobotSpec, NUM_JOINTS};
 
 /// Body axis indices under the Z-up convention (see module docs).
 pub const FWD: usize = 0;
@@ -607,7 +607,7 @@ impl RewardBreakdown {
 #[derive(Clone, Debug)]
 pub struct VelocityFlatTask {
     /// The robot spec (gains, default pose, limits, joint order).
-    pub robot: LeRobotBipedal,
+    pub robot: RobotSpec,
     /// Reward term weights.
     pub weights: RewardWeights,
     /// Tracking-kernel stds.
@@ -635,20 +635,17 @@ impl Default for VelocityFlatTask {
 }
 
 impl VelocityFlatTask {
-    /// Build the task with the deployed policy's settings.
+    /// Build the task with the deployed policy's settings, for the robot
+    /// selected by `BIPED_ROBOT` (see [`RobotSpec::from_env`]).
     pub fn new() -> Self {
-        let robot = LeRobotBipedal::new();
-        // Locate the hipz/hipx DOFs in canonical order for the targeted action-rate
-        // penalty (these lateral-hip joints are the jittery ones).
-        let mut hip_yawroll_idx = [0usize; 4];
-        let mut k = 0;
-        for (i, j) in robot.joints.iter().enumerate() {
-            if j.name.starts_with("hipz") || j.name.starts_with("hipx") {
-                hip_yawroll_idx[k] = i;
-                k += 1;
-            }
-        }
-        debug_assert_eq!(k, 4);
+        Self::for_robot(RobotSpec::from_env())
+    }
+
+    /// Build the task for an explicit robot spec.
+    pub fn for_robot(robot: RobotSpec) -> Self {
+        // The hip yaw/roll DOFs for the targeted action-rate penalty (these
+        // lateral-hip joints are the jittery ones) come from the spec.
+        let hip_yawroll_idx = robot.hip_yawroll;
         // Reward-weight overrides for fast retuning without a rebuild. The
         // stand-still local optimum (policy collects upright + base_height +
         // free track_ang at zero command, ignores the velocity command) is the
@@ -656,6 +653,10 @@ impl VelocityFlatTask {
         // the standing magnets (upright / base_height). Set e.g.
         // `BIPED_W_TRACK_LIN=10 BIPED_W_UPRIGHT=3 BIPED_W_BASE_H=1.5` at launch.
         let mut weights = RewardWeights::default();
+        // The base-height target is per-robot (lerobot trunk 0.72 m, G1 pelvis
+        // 0.78 m, H2 Plus pelvis 1.03 m); the RewardWeights default keeps the
+        // lerobot value for struct-literal users.
+        weights.base_height_target = robot.base_height;
         let env_f32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
         if let Some(v) = env_f32("BIPED_W_TRACK_LIN") {
             weights.track_lin_vel = v;
@@ -681,7 +682,7 @@ impl VelocityFlatTask {
             decimation: 4,
             episode_s: 20.0,
             tilt_limit: 70.0_f32.to_radians(),
-            min_base_height: 0.4,
+            min_base_height: robot.min_base_height,
             hip_yawroll_idx,
         }
     }
@@ -1149,27 +1150,17 @@ impl VelocityFlatTask {
         }
     }
 
-    /// Mirror error: pairs same-family left/right joints and accumulates the
-    /// squared difference under the family's mirror sign.
+    /// Mirror error: pairs left/right joints via the spec's mirror permutation
+    /// and accumulates the squared difference under the family's mirror sign
+    /// (sagittal joints mirror equal, lateral joints mirror opposite).
     fn symmetry_error(&self, q: &[f32; NUM_JOINTS]) -> f32 {
         let mut err = 0.0;
         for i in 0..NUM_JOINTS {
-            let name = self.robot.joints[i].name;
-            let Some(stem) = name.strip_suffix("_left") else {
-                continue;
-            };
-            // Find the right counterpart.
-            let right = format!("{stem}_right");
-            let Some(jr) = self.robot.joints.iter().position(|j| j.name == right) else {
-                continue;
-            };
-            // Sagittal joints mirror equal; lateral joints mirror opposite.
-            let sign = if stem == "hipy" || stem == "knee" || stem == "ankley" {
-                1.0
-            } else {
-                -1.0
-            };
-            err += (q[i] - sign * q[jr]).powi(2);
+            let jr = self.robot.mirror[i];
+            if jr <= i {
+                continue; // count each L/R pair once
+            }
+            err += (q[i] - self.robot.mirror_sign[i] * q[jr]).powi(2);
         }
         err
     }

@@ -34,7 +34,7 @@ use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
 use rapier3d::prelude::*;
 use roxmltree::Node;
 use std::collections::HashMap;
-use zealot_env::robots::LeRobotBipedal;
+use zealot_env::robots::{LeRobotBipedal, RobotSpec};
 
 const DT: f32 = 1.0 / 200.0;
 const SOLVER_ITERS: u32 = 16;
@@ -154,7 +154,7 @@ struct Scene {
     actuated: Vec<(u32, String)>,
 }
 
-fn gain(robot: &LeRobotBipedal, name: &str) -> (f32, f32, f32) {
+fn gain(robot: &RobotSpec, name: &str) -> (f32, f32, f32) {
     robot
         .joints
         .iter()
@@ -163,7 +163,7 @@ fn gain(robot: &LeRobotBipedal, name: &str) -> (f32, f32, f32) {
         .unwrap_or((50.0, 1.0, 20.0))
 }
 
-fn build_scene(mjcf: &[MjBody], robot: &LeRobotBipedal) -> Scene {
+fn build_scene(mjcf: &[MjBody], robot: &RobotSpec) -> Scene {
     let mut bodies = RigidBodySet::new();
     let mut colliders = ColliderSet::new();
     let impulse = ImpulseJointSet::new();
@@ -368,7 +368,7 @@ fn main() {
         .expect("read mjcf")
     };
     let mjcf = parse_mjcf(&xml);
-    let robot = LeRobotBipedal::new();
+    let robot = RobotSpec::from_env();
 
     pollster::block_on(async {
         let gpu = webgpu_backend().await;

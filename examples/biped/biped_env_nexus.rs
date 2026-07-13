@@ -38,14 +38,14 @@ use roxmltree::Node;
 use std::collections::HashMap;
 use std::time::Instant;
 use zealot_env::rng::Lcg;
-use zealot_env::robots::LeRobotBipedal;
-use zealot_env::robots::lerobot_bipedal::{JOINT_NAMES, NUM_JOINTS};
+use zealot_env::robots::{RobotSpec, NUM_JOINTS};
 use zealot_env::tasks::velocity_flat::{
     BaseState, CRITIC_OBS_DIM, CommandSampler, FootObs, NUM_FEET, OBS_DIM, RobotState,
     VelocityCommand, VelocityFlatTask,
 };
 
-const SPAWN_Z: f32 = 0.72;
+// Spawn height comes from the robot spec (`RobotSpec::spawn_z` — the
+// straight-leg sole-on-ground height; the multibody rest pose is q = 0).
 // Match the CPU env's `IntegrationParameters::num_solver_iterations = 8` — at 16
 // the inner solver loop doubles the per-step kernel work for marginal stability
 // gain at our timescales.
@@ -266,9 +266,13 @@ pub fn parse_mjcf(xml: &str) -> Vec<MjBody> {
     out
 }
 
+/// MJCF path for the robot selected by `BIPED_ROBOT` (see
+/// [`RobotSpec::from_env`]); `BIPED_MJCF` overrides it with an explicit path.
 pub fn default_mjcf_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/Documents/work/lerobot-humanoid-design/to_real_robot/RL_policy/robot.xml")
+    if let Ok(p) = std::env::var("BIPED_MJCF") {
+        return p;
+    }
+    RobotSpec::from_env().mjcf_path().to_string_lossy().into_owned()
 }
 
 /// Minimal binary-STL vertex loader. Returns every triangle vertex (unindexed) —
@@ -394,7 +398,7 @@ pub struct DrParams {
     pub spawn_yaw: f32,
     pub spawn_roll: f32,
     pub spawn_pitch: f32,
-    /// Sampled additive jitter on `SPAWN_Z`, m. May be negative.
+    /// Sampled additive jitter on the spawn height, m. May be negative.
     pub spawn_z_offset: f32,
     /// Per-actuated-joint gain/torque multiplier (independent draw per joint).
     /// Models actuator-strength asymmetry — e.g. one hip motor stronger than its
@@ -495,7 +499,7 @@ pub struct LinkIndices {
 /// need nexus_id lookups here — link indices are stable across envs).
 fn build_env_scene(
     mjcf: &[MjBody],
-    robot: &LeRobotBipedal,
+    robot: &RobotSpec,
     dr: &DrParams,
     task_dt: f32,
 ) -> (EnvScene, LinkIndices) {
@@ -519,7 +523,7 @@ fn build_env_scene(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
-    let root_pos = Vec3::new(0.0, 0.0, SPAWN_Z + dr.spawn_z_offset + ff_z);
+    let root_pos = Vec3::new(0.0, 0.0, robot.spawn_z + dr.spawn_z_offset + ff_z);
     let root_pose = Pose::from_parts(root_pos, root_rot);
     let mut world: Vec<Pose> = Vec::with_capacity(mjcf.len());
     for b in mjcf {
@@ -724,9 +728,10 @@ fn build_env_scene(
         // Per-joint actuator-strength DR (asymmetry): look up this joint's action
         // index and apply its independent gain/torque multiplier on top of the
         // global `pd_scale`. `1.0` for joints not in the canonical action set.
-        let pj = JOINT_NAMES
+        let pj = robot
+            .joints
             .iter()
-            .position(|&n| n == jname.as_str())
+            .position(|j| j.name == jname.as_str())
             .map(|k| dr.pd_scale_per_joint[k])
             .unwrap_or(1.0);
         let (kp, kd, effort, pos_limit, spec_damping) = spec
@@ -774,7 +779,7 @@ fn build_env_scene(
             MotorModel::ForceBased
         };
         joint.set_motor_model(JointAxis::AngZ, motor_model);
-        // Motor gains come straight from the robot spec (LeRobotBipedal::family),
+        // Motor gains come straight from the robot spec (RobotSpec::joints),
         // which already bakes in the physical torque-PD correction (STIFFNESS_SCALE
         // / DAMPING_SCALE) — kp is a real torque/rad gain, FIXED, identical to what
         // the MuJoCo transfer model and the real robot use. No runtime scaling.
@@ -845,7 +850,7 @@ fn build_env_scene(
     // Build the index table from the canonical joint ordering.
     let mut actuated: Vec<(u32, String)> = Vec::with_capacity(NUM_JOINTS);
     let mut joint_dof_offset = [0u32; NUM_JOINTS];
-    for (k, &name) in JOINT_NAMES.iter().enumerate() {
+    for (k, name) in robot.joints.iter().map(|j| j.name).enumerate() {
         let link = *name_to_link
             .get(name)
             .unwrap_or_else(|| panic!("missing joint {name} in MJCF"));
@@ -856,12 +861,17 @@ fn build_env_scene(
     }
 
     // Sole-normal in foot-local frame at spawn (sole = world +Z, so the local
-    // sole-normal is R_spawn⁻¹·Z).
+    // sole-normal is R_spawn⁻¹·Z). Feet are matched BY NAME against the spec's
+    // `foot_links` so index 0/1 order is the spec's, not MJCF document order
+    // (lerobot lists right-then-left, the Unitree models left-then-right).
     let mut foot_sole_local = [Vec3::Z; NUM_FEET];
     let mut foot_links = [0u32; NUM_FEET];
-    for (i, (mjcf_idx, h)) in foot_handles.iter().enumerate() {
-        let link = *mb_link_of_mjcf.get(mjcf_idx).unwrap_or(&0);
-        foot_links[i] = link;
+    for (i, want) in robot.foot_links.iter().enumerate() {
+        let (mjcf_idx, h) = foot_handles
+            .iter()
+            .find(|(m, _)| mjcf[*m].name == *want)
+            .unwrap_or_else(|| panic!("foot link {want} carries no sole capsules in the MJCF"));
+        foot_links[i] = *mb_link_of_mjcf.get(mjcf_idx).unwrap_or(&0);
         foot_sole_local[i] = bodies[*h].rotation().conjugate() * Vec3::Z;
     }
 
@@ -870,39 +880,35 @@ fn build_env_scene(
         .collect();
 
     // Thigh / shin / hip links — the parts that have NO ground collider (only
-    // the feet do), so they must never legitimately touch the floor. (Names use
-    // the model's spelling: `tigh_subassembly`, `shin_subassembly`, `hip*`.)
-    // Ankle + foot are excluded (they sit legitimately low next to the sole).
+    // the feet do), so they must never legitimately touch the floor. The
+    // name fragments are per-robot (`RobotSpec::illegal_ground_fragments`);
+    // ankle + foot links never match (they sit legitimately low next to the sole).
     let illegal_ground_links: Vec<u32> = (0..mjcf.len())
         .filter(|&i| {
             let n = &mjcf[i].name;
-            n.contains("shin") || n.contains("tigh") || n.contains("hip")
+            robot.illegal_ground_fragments.iter().any(|f| n.contains(f))
         })
         .filter_map(|i| mb_link_of_mjcf.get(&i).copied())
         .collect();
 
-    // Left/right link pairs for the self-collision (leg-crossing) guard. The
-    // model's right side is the bare name and the left side gets a `_sym`/`_2`
-    // suffix, so pair each base body with its mirrored twin.
+    // Left/right link pairs for the self-collision (leg-crossing) guard —
+    // per-robot (`RobotSpec::self_collision_pairs`): feet, shins, thighs.
     let link_of_name = |name: &str| -> Option<u32> {
         mjcf.iter()
             .position(|b| b.name == name)
             .and_then(|i| mb_link_of_mjcf.get(&i).copied())
     };
-    let self_collision_pairs: Vec<(u32, u32)> = [
-        ("foot_subassembly", "foot_subassembly_2"),
-        ("shin_subassembly", "shin_subassembly_sym"),
-        ("tigh_subassembly", "tigh_subassembly_sym"),
-    ]
-    .iter()
-    .filter_map(|(r, l)| Some((link_of_name(r)?, link_of_name(l)?)))
-    .collect();
+    let self_collision_pairs: Vec<(u32, u32)> = robot
+        .self_collision_pairs
+        .iter()
+        .filter_map(|(r, l)| Some((link_of_name(r)?, link_of_name(l)?)))
+        .collect();
 
     // Per-joint parent link + rest quat, used by the ws-free joint-angle
     // extraction (`q_child = q_parent · rest_quat · R_z(θ)`).
     let mut actuated_parent_links = [0u32; NUM_JOINTS];
     let mut actuated_rest_quat = [Rotation::IDENTITY; NUM_JOINTS];
-    for (k, &name) in JOINT_NAMES.iter().enumerate() {
+    for (k, name) in robot.joints.iter().map(|j| j.name).enumerate() {
         let mjcf_idx = mjcf
             .iter()
             .position(|b| b.joint.as_deref() == Some(name))
@@ -983,7 +989,7 @@ struct DbgStance {
 pub struct BipedNexusBatchEnv {
     // Topology + indexing
     mjcf: Vec<MjBody>,
-    robot: LeRobotBipedal,
+    robot: RobotSpec,
     task: VelocityFlatTask,
     idx: LinkIndices,
 
@@ -1180,8 +1186,8 @@ impl BipedNexusBatchEnv {
         if std::env::var("BIPED_FOOT_SHAPE").as_deref() == Ok("convex") {
             load_mesh_hulls(&mut mjcf, mjcf_xml);
         }
-        let robot = LeRobotBipedal::new();
-        let mut task = VelocityFlatTask::new();
+        let robot = RobotSpec::from_env();
+        let mut task = VelocityFlatTask::for_robot(robot);
         // BIPED_DECIMATION: shift physics work between narrow-phase refreshes
         // (decimation) and solver substeps while KEEPING control_dt=0.02 fixed
         // (sim_dt = 0.02/decimation = the contact-staleness window). Used with
@@ -2198,7 +2204,7 @@ impl BipedNexusBatchEnv {
         let contact_z: f32 = std::env::var("BIPED_CONTACT_Z")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.05);
+            .unwrap_or(self.robot.foot_contact_z);
         #[allow(non_snake_case)]
         let CONTACT_Z = contact_z;
         let dt = self.task.control_dt();
@@ -2225,8 +2231,11 @@ impl BipedNexusBatchEnv {
             };
             let world_normal = foot_pose.rotation * sole_local[i];
             let tilt = world_normal.z.abs().clamp(0.0, 1.0).acos();
-            let foot_x_in_base = (base_rot_inv * foot_pose.rotation) * Vec3::X;
-            let yaw_rel_base = foot_x_in_base.y.atan2(foot_x_in_base.x);
+            // Foot "forward" is a per-robot local axis (the G1's foot frame is
+            // axis-normalized, putting its forward at +Z instead of +X).
+            let fwd = Vec3::from(self.robot.foot_forward_local);
+            let foot_fwd_in_base = (base_rot_inv * foot_pose.rotation) * fwd;
+            let yaw_rel_base = foot_fwd_in_base.y.atan2(foot_fwd_in_base.x);
             let contact = pos.z < CONTACT_Z;
             let prev_air = self.air_time[env][i];
             let first_contact = contact && prev_air > 0.0;

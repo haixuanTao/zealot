@@ -14,8 +14,7 @@ use rapier3d::prelude::*;
 use rayon::prelude::*;
 use roxmltree::Node;
 use zealot_env::rng::Lcg;
-use zealot_env::robots::LeRobotBipedal;
-use zealot_env::robots::lerobot_bipedal::{JOINT_NAMES, NUM_JOINTS};
+use zealot_env::robots::{RobotSpec, NUM_JOINTS};
 use zealot_env::tasks::velocity_flat::{
     BaseState, CRITIC_OBS_DIM, CommandSampler, FootObs, NUM_FEET, OBS_DIM, RobotState,
     VelocityCommand, VelocityFlatTask,
@@ -130,10 +129,13 @@ fn parse_mjcf(xml: &str) -> Vec<MjBody> {
     out
 }
 
-/// Default MJCF path for the LeRobot bipedal (the deployed policy's model).
+/// MJCF path for the robot selected by `BIPED_ROBOT` (see
+/// [`RobotSpec::from_env`]); `BIPED_MJCF` overrides it with an explicit path.
 pub fn default_mjcf_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/Documents/work/lerobot-humanoid-design/to_real_robot/RL_policy/robot.xml")
+    if let Ok(p) = std::env::var("BIPED_MJCF") {
+        return p;
+    }
+    RobotSpec::from_env().mjcf_path().to_string_lossy().into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -169,20 +171,19 @@ struct World {
     all_handles: Vec<RigidBodyHandle>,
 }
 
-const SPAWN_Z: f32 = 0.72;
-
-fn build_world(mjcf: &[MjBody], robot: &LeRobotBipedal, base_yaw: f32) -> World {
+fn build_world(mjcf: &[MjBody], robot: &RobotSpec, base_yaw: f32) -> World {
+    let spawn_z = robot.spawn_z;
     let mut bodies = RigidBodySet::new();
     let mut colliders = ColliderSet::new();
     let impulse = ImpulseJointSet::new();
     let mut multibody = MultibodyJointSet::new();
 
-    // FK world poses (root lifted to SPAWN_Z with a yaw about +Z).
+    // FK world poses (root lifted to the spec's spawn height with a yaw about +Z).
     let mut world: Vec<Pose> = Vec::with_capacity(mjcf.len());
     for b in mjcf {
         let w = match b.parent {
             None => Pose::from_parts(
-                Vec3::new(0.0, 0.0, SPAWN_Z),
+                Vec3::new(0.0, 0.0, spawn_z),
                 Rotation::from_rotation_z(base_yaw),
             ),
             Some(p) => world[p] * Pose::from_parts(b.local_pos, b.local_quat),
@@ -272,13 +273,14 @@ fn build_world(mjcf: &[MjBody], robot: &LeRobotBipedal, base_yaw: f32) -> World 
         );
     }
 
-    // Order the joint refs into policy (JOINT_NAMES) order.
-    let joints: Vec<JointRef> = JOINT_NAMES
+    // Order the joint refs into canonical policy order (the spec's).
+    let joints: Vec<JointRef> = robot
+        .joints
         .iter()
-        .map(|n| {
+        .map(|j| {
             by_name
-                .remove(*n)
-                .unwrap_or_else(|| panic!("missing joint {n}"))
+                .remove(j.name)
+                .unwrap_or_else(|| panic!("missing joint {}", j.name))
         })
         .collect();
 
@@ -328,7 +330,7 @@ pub struct StepOut {
 /// One flat-velocity environment instance.
 pub struct BipedEnv {
     mjcf: Vec<MjBody>,
-    robot: LeRobotBipedal,
+    robot: RobotSpec,
     task: VelocityFlatTask,
     sampler: CommandSampler,
     rng: Lcg,
@@ -442,7 +444,7 @@ impl Randomization {
 impl BipedEnv {
     pub fn new(mjcf_xml: &str, seed: u64) -> Self {
         let mjcf = parse_mjcf(mjcf_xml);
-        let robot = LeRobotBipedal::new();
+        let robot = RobotSpec::from_env();
         let task = VelocityFlatTask::new();
         let mut ip = IntegrationParameters::default();
         ip.dt = task.sim_dt;
