@@ -734,6 +734,15 @@ fn build_env_scene(
             .position(|j| j.name == jname.as_str())
             .map(|k| dr.pd_scale_per_joint[k])
             .unwrap_or(1.0);
+        // Non-action joints (e.g. the G1 29-DOF body's waist/arms) are PD-held
+        // at the rest pose with the spec's `held_joints` gains (first matching
+        // name fragment wins), falling back to generic holding gains.
+        let held = robot
+            .held_joints
+            .iter()
+            .find(|(frag, ..)| jname.contains(frag))
+            .map(|&(_, kp, kd, effort)| (kp, kd, effort, (-pi, pi), 0.0))
+            .unwrap_or((50.0 * pj, 1.0 * pj, 20.0 * pj, (-pi, pi), 0.0));
         let (kp, kd, effort, pos_limit, spec_damping) = spec
             .map(|s| {
                 (
@@ -744,7 +753,7 @@ fn build_env_scene(
                     s.damping,
                 )
             })
-            .unwrap_or((50.0 * pj, 1.0 * pj, 20.0 * pj, (-pi, pi), 0.0));
+            .unwrap_or(held);
         // Passive joint damping (N·m·s/rad): the real joints are damped 0.5–2.3,
         // but nexus's passive-damping buffer is a hardcoded 0.1 default, so the
         // sim joints slew at ~50 rad/s. Fold the real damping into the motor's
@@ -925,8 +934,10 @@ fn build_env_scene(
     }
 
     let idx = LinkIndices {
-        links_per_batch: next_mb_link, // 1 (torso) + 12 (legs) = 13
-        dofs_per_batch: 6 + NUM_JOINTS as u32,
+        links_per_batch: next_mb_link, // 1 (root) + jointed links
+        // 6 root DOFs + one per hinge — counts ALL model joints, not just the
+        // actuated ones (the G1 29-DOF body carries 13 extra held joints).
+        dofs_per_batch: 6 + mjcf.iter().filter(|b| b.joint.is_some()).count() as u32,
         colliders_per_batch: (mjcf.len() + 1) as u32, // robot bodies + ground
         torso_link: 0,
         foot_links,

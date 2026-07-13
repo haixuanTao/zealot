@@ -238,6 +238,7 @@ pub const fn lerobot() -> RobotSpec {
             ("shin_subassembly", "shin_subassembly_sym"),
             ("tigh_subassembly", "tigh_subassembly_sym"),
         ],
+        held_joints: &[],
     }
 }
 

@@ -148,6 +148,7 @@ pub const fn unitree_h2_plus() -> RobotSpec {
             ("right_knee_link", "left_knee_link"),
             ("right_hip_yaw_link", "left_hip_yaw_link"),
         ],
+        held_joints: &[],
     }
 }
 

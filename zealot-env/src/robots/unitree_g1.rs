@@ -143,7 +143,45 @@ pub const fn unitree_g1() -> RobotSpec {
             ("right_knee_link", "left_knee_link"),
             ("right_hip_yaw_link", "left_hip_yaw_link"),
         ],
+        held_joints: &[],
     }
+}
+
+/// The Unitree G1 **rev 1.0 full body** (29-DOF model, 25 live joints): the
+/// same 12 leg actions as [`unitree_g1`], but the waist (3), shoulders (3×2),
+/// elbows and wrist rolls are REAL PD-held joints instead of mass welded into
+/// the pelvis — the arms swing, react to pushes, and load the balance exactly
+/// as on hardware. This is the GR00T/HOVER-style *body*; the action space
+/// stays legs-only (Unitree's own deployable walking convention).
+///
+/// Model: `assets/robots/unitree_g1_29dof.xml`, generated from the official
+/// `g1_29dof_rev_1_0.xml` with ONLY the four 5 N·m wrist pitch/yaw toy joints
+/// welded away — nexus's GPU multibody caps at `MAX_MB_DOFS = 32` (one warp
+/// lane per mass-matrix column), and 6 root + 25 hinges = 31 fits while the
+/// full 35 does not.
+///
+/// Leg gains/limits are identical to [`unitree_g1`] (the rev 1.0 leg ranges
+/// match the 12-DOF model's). `held_joints` gains hold the upper body at the
+/// rest pose: waist like a hip (kp 100), arms kp 40 / kd 1 — holding gains,
+/// not deployment sysid. Efforts are the model's actuator limits (waist yaw
+/// 88 / waist roll+pitch 50 / arm joints 25 N·m).
+pub const fn unitree_g1_29dof() -> RobotSpec {
+    let mut spec = unitree_g1();
+    spec.name = "unitree_g1_29dof";
+    spec.mjcf_rel_path = "Documents/work/zealot/assets/robots/unitree_g1_29dof.xml";
+    spec.urdf_rel_path = "Documents/work/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf";
+    spec.total_mass = 33.34;
+    // A fallen robot contacts the ground with its (collider-less) upper body —
+    // count torso/waist/arm links as illegal ground contact alongside hips/knees.
+    spec.illegal_ground_fragments = &["hip", "knee", "torso", "waist", "shoulder", "elbow", "wrist"];
+    spec.held_joints = &[
+        ("waist_yaw", 100.0, 2.0, 88.0),
+        ("waist", 100.0, 2.0, 50.0), // waist_roll / waist_pitch
+        ("shoulder", 40.0, 1.0, 25.0),
+        ("elbow", 40.0, 1.0, 25.0),
+        ("wrist", 40.0, 1.0, 25.0), // wrist_roll (pitch/yaw are welded)
+    ];
+    spec
 }
 
 #[cfg(test)]

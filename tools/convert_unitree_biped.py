@@ -107,16 +107,59 @@ def fmt_vec(v):
 
 
 # ------------------------------------------------------------------- sources
-def load_g1():
-    """G1: official legs-only 12-DOF MJCF (unitree_rl_gym), meshes stripped."""
-    src = UNITREE / "g1_description/g1_12dof.xml"
-    root = ET.parse(src).getroot()
+def _strip_meshes(root):
     for asset in root.findall("asset"):
         root.remove(asset)
     for parent in root.iter():
         for geom in list(parent.findall("geom")):
             if geom.get("type") == "mesh":
                 parent.remove(geom)
+    # Scene furniture (ground plane, lights) references stripped assets and
+    # isn't part of the robot — drop direct worldbody children that aren't
+    # bodies. (Some files carry TWO worldbody elements; MuJoCo merges them.)
+    for wb in root.findall("worldbody"):
+        for el in list(wb):
+            if el.tag != "body":
+                wb.remove(el)
+    # Actuators/sensors reference joints we may weld away, and we only extract
+    # kinematics + inertia here — drop them.
+    for tag in ("actuator", "sensor"):
+        for el in root.findall(tag):
+            root.remove(el)
+
+
+def load_g1():
+    """G1: official legs-only 12-DOF MJCF (unitree_rl_gym), meshes stripped."""
+    src = UNITREE / "g1_description/g1_12dof.xml"
+    root = ET.parse(src).getroot()
+    _strip_meshes(root)
+    model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    return model, src
+
+
+def load_g1_29dof():
+    """G1 rev 1.0 full body: the official 29-DOF MJCF with ONLY the four 5 N·m
+    wrist pitch/yaw toy joints welded away (25 live joints + free root = 31
+    DOFs — nexus's GPU multibody solver caps at MAX_MB_DOFS = 32, one warp
+    lane per mass-matrix column, so the full 35 doesn't fit). Waist (3),
+    shoulders, elbows and wrist rolls stay as real PD-held joints."""
+    src = UNITREE / "g1_description/g1_29dof_rev_1_0.xml"
+    root = ET.parse(src).getroot()
+    _strip_meshes(root)
+    welded = 0
+    for parent in root.iter():
+        for j in list(parent.findall("joint")):
+            n = j.get("name", "")
+            if "wrist_pitch" in n or "wrist_yaw" in n:
+                parent.remove(j)
+                welded += 1
+    assert welded == 4, f"expected to weld 4 wrist joints, got {welded}"
+    # Fuse the now-jointless wrist bodies (and anything hanging off them) into
+    # their parents, composing mass/inertia exactly.
+    comp = root.find("compiler")
+    if comp is None:
+        comp = ET.SubElement(root, "compiler")
+    comp.set("fusestatic", "true")
     model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
     return model, src
 
@@ -443,6 +486,16 @@ def main():
         OUT_DIR / "unitree_g1_12dof.xml",
         "unitree_g1_12dof",
         foot_suffix="ankle_roll_link",  # G1 chain: knee → ankle_pitch → ankle_roll
+        default_pose=default_pose,
+    )
+
+    model, _ = load_g1_29dof()
+    convert(
+        model,
+        g1_sole_capsules,
+        OUT_DIR / "unitree_g1_29dof.xml",
+        "unitree_g1_29dof",
+        foot_suffix="ankle_roll_link",
         default_pose=default_pose,
     )
 

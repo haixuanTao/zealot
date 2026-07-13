@@ -124,6 +124,12 @@ pub struct RobotSpec {
     /// self-collision guard: terminate if any pair gets closer than
     /// `BIPED_SELF_COLL_DIST`.
     pub self_collision_pairs: &'static [(&'static str, &'static str)],
+    /// PD gains for NON-action joints the model may carry (e.g. the G1
+    /// 29-DOF body's waist/arms, which the sim holds at the rest pose while
+    /// the policy drives the legs): `(name_fragment, kp, kd, effort_limit)`,
+    /// first matching fragment wins. Joints matching nothing fall back to the
+    /// env's generic holding gains. Empty for legs-only models.
+    pub held_joints: &'static [(&'static str, f32, f32, f32)],
 }
 
 impl RobotSpec {
@@ -133,8 +139,11 @@ impl RobotSpec {
         match name.as_str() {
             "" | "lerobot" => lerobot_bipedal::lerobot(),
             "g1" | "unitree_g1" => unitree_g1::unitree_g1(),
+            "g1_29dof" | "g1_29" | "g1full" => unitree_g1::unitree_g1_29dof(),
             "h2plus" | "h2_plus" | "unitree_h2_plus" => unitree_h2_plus::unitree_h2_plus(),
-            other => panic!("unknown BIPED_ROBOT '{other}' (expected lerobot | g1 | h2plus)"),
+            other => {
+                panic!("unknown BIPED_ROBOT '{other}' (expected lerobot | g1 | g1_29dof | h2plus)")
+            }
         }
     }
 
@@ -204,6 +213,7 @@ mod tests {
     fn all_robots_consistent() {
         check_invariants(&lerobot_bipedal::lerobot());
         check_invariants(&unitree_g1::unitree_g1());
+        check_invariants(&unitree_g1::unitree_g1_29dof());
         check_invariants(&unitree_h2_plus::unitree_h2_plus());
     }
 }
