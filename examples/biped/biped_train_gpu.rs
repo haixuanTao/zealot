@@ -30,7 +30,7 @@ mod cutile_gemm;
 mod gpu_policy;
 
 use biped_env_nexus::{BipedNexusBatchEnv, REWARD_COMP_NAMES, default_mjcf_path};
-use cutile_gemm::CutileGemm;
+use cutile_gemm::{CutileGemm, EncCursor};
 use gpu_policy::GpuPolicy;
 use khal::BufferUsages;
 use khal::Shader;
@@ -263,34 +263,6 @@ fn symmetrize_ac(ac: &mut ActorCritic) {
     }
 }
 
-/// Encoder cursor: khal command recording that can be SPLIT at any point so a
-/// cuTile GEMM can be launched directly on the (shared) CUDA stream between
-/// khal passes. `pass()` lazily opens an encoder; `flush()` submits whatever
-/// is recorded (no synchronize — same stream keeps ordering by issue order).
-/// With the cuTile path off, the whole epoch still records into one encoder
-/// and behaves exactly as before.
-struct EncCursor<'b> {
-    bk: &'b GpuBackend,
-    enc: Option<<GpuBackend as Backend>::Encoder>,
-}
-impl<'b> EncCursor<'b> {
-    fn new(bk: &'b GpuBackend) -> Self {
-        Self { bk, enc: None }
-    }
-    fn pass(&mut self, name: &str) -> khal::backend::GpuPass {
-        if self.enc.is_none() {
-            self.enc = Some(self.bk.begin_encoding());
-        }
-        self.enc.as_mut().unwrap().begin_pass(name, None)
-    }
-    /// Submit pending khal work to the stream (required before a cuTile launch).
-    fn flush(&mut self) {
-        if let Some(e) = self.enc.take() {
-            self.bk.submit(e).unwrap();
-        }
-    }
-}
-
 /// GPU MLP with persistent weights + Adam moments (copied from iter_e2e_bench,
 /// plus `read_into` to write the trained weights back to a CPU `Mlp`).
 struct GpuMlp {
@@ -356,41 +328,46 @@ impl GpuMlp {
         for i in 0..l {
             let (lf, rt) = self.a.split_at_mut(i + 1);
             let (ain, aout) = (&lf[i], &mut rt[0]);
-            // z = W[i]·a[i] — the tf32 cuTile path when enabled, else vortx.
+            // z = act(W[i]·a[i] + b[i]) — ONE fused tf32 cuTile launch when
+            // enabled (gemm + bias broadcast + ELU epilogue); else the vortx
+            // gemm / bias-GEMV / add / ELU pass chain.
             if let Some(ct) = ct {
                 cur.flush(); // pending khal work must hit the stream first
-                ct.gemm(
+                ct.gemm_bias_act(
                     aout,
                     &self.w[i],
-                    false,
                     ain,
-                    false,
                     self.dims[i + 1],
                     self.batch,
                     self.dims[i],
+                    &self.b[i],
+                    1,
+                    i < l - 1,
                 )?;
             } else {
-                let mut p = cur.pass("z");
-                g.dispatch_tiled(bk, sh, &mut p, &mut *aout, &self.w[i], ain)?;
-            }
-            {
-                let mut p = cur.pass("bb");
-                g.dispatch_naive(bk, sh, &mut p, &mut self.bb[i], &self.b[i], o1m)?;
-            }
-            {
-                let mut p = cur.pass("bias");
-                op.launch(
-                    bk,
-                    sh,
-                    &mut p,
-                    OpAssignVariant::Add,
-                    &mut *aout,
-                    &self.bb[i],
-                )?;
-            }
-            if i < l - 1 {
-                let mut p = cur.pass("elu");
-                act.elu(bk, sh, &mut p, &mut *aout)?;
+                {
+                    let mut p = cur.pass("z");
+                    g.dispatch_tiled(bk, sh, &mut p, &mut *aout, &self.w[i], ain)?;
+                }
+                {
+                    let mut p = cur.pass("bb");
+                    g.dispatch_naive(bk, sh, &mut p, &mut self.bb[i], &self.b[i], o1m)?;
+                }
+                {
+                    let mut p = cur.pass("bias");
+                    op.launch(
+                        bk,
+                        sh,
+                        &mut p,
+                        OpAssignVariant::Add,
+                        &mut *aout,
+                        &self.bb[i],
+                    )?;
+                }
+                if i < l - 1 {
+                    let mut p = cur.pass("elu");
+                    act.elu(bk, sh, &mut p, &mut *aout)?;
+                }
             }
         }
         Ok(())
@@ -458,7 +435,10 @@ impl GpuMlp {
                         g.dispatch_tiled(bk, sh, &mut p, dp, self.w[i].transpose_last_dims(), dc)?;
                     }
                 }
-                {
+                if let Some(ct) = ct {
+                    cur.flush();
+                    ct.elu_backward(&self.delta[i - 1], &self.a[i], self.dims[i], self.batch)?;
+                } else {
                     let mut p = cur.pass("eb");
                     act.elu_backward(bk, sh, &mut p, &mut self.delta[i - 1], &self.a[i])?;
                 }
@@ -576,10 +556,11 @@ fn main() {
         let bk = env.backend().clone();
         let mut gpu = GpuPolicy::new(&bk, &ac, n).expect("gpu policy");
 
-        // cuTile tf32 tensor-core GEMMs for the update (BIPED_CUTILE_GEMM=1;
-        // needs --features cutile). Self-tests against a CPU reference at init;
-        // None → the unchanged vortx GEMM path.
+        // cuTile tf32 tensor-core GEMMs for the update AND the rollout policy
+        // forward (BIPED_CUTILE_GEMM=1; needs --features cutile). Self-tests
+        // against a CPU reference at init; None → the unchanged vortx path.
         let ct: Option<&'static CutileGemm> = CutileGemm::init(&bk).await;
+        gpu.set_cutile(ct);
 
         // Persistent GPU update state (weights + Adam moments survive all iters).
         let total = n * T;

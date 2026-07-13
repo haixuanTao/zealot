@@ -12,6 +12,7 @@
 //! update too). After each `ac.update()` the weights change, so call
 //! [`GpuPolicy::sync_weights`] once per PPO iteration to re-upload them.
 
+use crate::cutile_gemm::{CutileGemm, EncCursor};
 use khal::BufferUsages;
 use khal::Shader;
 use khal::backend::{Backend, Encoder, GpuBackend};
@@ -77,31 +78,62 @@ impl GpuNet {
         }
     }
 
-    /// Upload the input matrix `[in x n]` into `a[0]`.
+    /// Upload the input matrix `[in x n]` into `a[0]` (in place: the buffer is
+    /// allocated once in `new`, so its device pointer stays stable — required
+    /// by the cuTile view cache, and avoids a per-step allocation).
     fn set_input(&mut self, backend: &GpuBackend, x: &DMatrix<f32>) {
-        self.a[0] = matrix(backend, x, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+        // Row-major flatten (vortx layout; DMatrix is column-major).
+        let (rows, cols) = (x.nrows(), x.ncols());
+        let mut flat = vec![0f32; rows * cols];
+        for c in 0..cols {
+            for r in 0..rows {
+                flat[r * cols + c] = x[(r, c)];
+            }
+        }
+        backend
+            .write_buffer(self.a[0].buffer_mut(), 0, &flat)
+            .expect("write policy input");
     }
 
-    /// Encode GEMM -> bias -> ELU per hidden layer (linear output) into `enc`.
+    /// Encode GEMM -> bias -> ELU per hidden layer (linear output). With a
+    /// cuTile adapter, each layer is ONE fused tf32 launch (gemm + bias
+    /// broadcast + ELU) on khal's stream; the bias is read as column 0 of the
+    /// pre-broadcast `[out x n]` tensor (row stride n).
     fn encode(
         &mut self,
         backend: &GpuBackend,
         ops: &Ops,
         shapes: &mut TensorLayoutBuffers,
-        enc: &mut <GpuBackend as Backend>::Encoder,
+        cur: &mut EncCursor,
+        ct: Option<&CutileGemm>,
     ) -> anyhow::Result<()> {
         let layers = self.w.len();
         for l in 0..layers {
             let (left, right) = self.a.split_at_mut(l + 1);
             let a_in = &left[l];
             let a_out = &mut right[0];
+            if let Some(ct) = ct {
+                cur.flush();
+                ct.gemm_bias_act(
+                    a_out,
+                    &self.w[l],
+                    a_in,
+                    self.dims[l + 1],
+                    self.n,
+                    self.dims[l],
+                    &self.b[l],
+                    self.n,
+                    l < layers - 1,
+                )?;
+                continue;
+            }
             {
-                let mut p = enc.begin_pass("gemm", None);
+                let mut p = cur.pass("gemm");
                 ops.gemm
                     .dispatch_naive(backend, shapes, &mut p, &mut *a_out, &self.w[l], a_in)?;
             }
             {
-                let mut p = enc.begin_pass("bias", None);
+                let mut p = cur.pass("bias");
                 ops.op.launch(
                     backend,
                     shapes,
@@ -112,7 +144,7 @@ impl GpuNet {
                 )?;
             }
             if l < layers - 1 {
-                let mut p = enc.begin_pass("elu", None);
+                let mut p = cur.pass("elu");
                 ops.act.elu(backend, shapes, &mut p, &mut *a_out)?;
             }
         }
@@ -138,6 +170,8 @@ pub struct GpuPolicy {
     ops: Ops,
     shapes: TensorLayoutBuffers,
     n: usize,
+    /// cuTile tf32 fused-forward adapter (BIPED_CUTILE_GEMM=1); None = vortx.
+    ct: Option<&'static CutileGemm>,
 }
 
 impl GpuPolicy {
@@ -154,7 +188,13 @@ impl GpuPolicy {
             },
             shapes: TensorLayoutBuffers::new(backend),
             n,
+            ct: None,
         })
+    }
+
+    /// Route the per-layer forward through the cuTile tf32 fused kernels.
+    pub fn set_cutile(&mut self, ct: Option<&'static CutileGemm>) {
+        self.ct = ct;
     }
 
     /// Re-upload weights from `ac` after a PPO update mutated them.
@@ -186,12 +226,12 @@ impl GpuPolicy {
         self.actor.set_input(backend, &obs_m);
         self.critic.set_input(backend, &crit_m);
 
-        let mut enc = backend.begin_encoding();
+        let mut cur = EncCursor::new(backend);
         self.actor
-            .encode(backend, &self.ops, &mut self.shapes, &mut enc)?;
+            .encode(backend, &self.ops, &mut self.shapes, &mut cur, self.ct)?;
         self.critic
-            .encode(backend, &self.ops, &mut self.shapes, &mut enc)?;
-        backend.submit(enc)?;
+            .encode(backend, &self.ops, &mut self.shapes, &mut cur, self.ct)?;
+        cur.flush();
         backend.synchronize()?;
 
         // Outputs are row-major [out x n] -> element (r, e) at index r*n + e.

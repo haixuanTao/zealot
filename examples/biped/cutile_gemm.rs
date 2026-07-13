@@ -47,14 +47,45 @@
 #[cfg(feature = "cutile")]
 pub use real::CutileGemm;
 
+use khal::backend::{Backend, Encoder as _, GpuBackend};
+
+/// Encoder cursor: khal command recording that can be SPLIT at any point so a
+/// cuTile kernel can be launched directly on the (shared) CUDA stream between
+/// khal passes. `pass()` lazily opens an encoder; `flush()` submits whatever is
+/// recorded (no synchronize — same stream keeps ordering by issue order). With
+/// the cuTile path off, a whole phase still records into one encoder and
+/// behaves exactly like the pre-cuTile code.
+pub struct EncCursor<'b> {
+    bk: &'b GpuBackend,
+    enc: Option<<GpuBackend as Backend>::Encoder>,
+}
+impl<'b> EncCursor<'b> {
+    pub fn new(bk: &'b GpuBackend) -> Self {
+        Self { bk, enc: None }
+    }
+    pub fn pass(&mut self, name: &str) -> khal::backend::GpuPass {
+        if self.enc.is_none() {
+            self.enc = Some(self.bk.begin_encoding());
+        }
+        self.enc.as_mut().unwrap().begin_pass(name, None)
+    }
+    /// Submit pending khal work to the stream (required before a cuTile launch).
+    pub fn flush(&mut self) {
+        if let Some(e) = self.enc.take() {
+            self.bk.submit(e).unwrap();
+        }
+    }
+}
+
 /// Stub when the `cutile` feature is off: `init` always yields `None`, so the
 /// trainer's vortx path is untouched.
 #[cfg(not(feature = "cutile"))]
 pub struct CutileGemm;
 
 #[cfg(not(feature = "cutile"))]
+#[allow(clippy::too_many_arguments)]
 impl CutileGemm {
-    pub async fn init(_bk: &khal::backend::GpuBackend) -> Option<&'static CutileGemm> {
+    pub async fn init(_bk: &GpuBackend) -> Option<&'static CutileGemm> {
         if std::env::var("BIPED_CUTILE_GEMM").is_ok_and(|v| v == "1") {
             eprintln!(
                 "[cutile] BIPED_CUTILE_GEMM=1 but zealot was built without --features cutile; \
@@ -73,6 +104,29 @@ impl CutileGemm {
         _m: usize,
         _n: usize,
         _k: usize,
+    ) -> anyhow::Result<()> {
+        unreachable!("stub CutileGemm is never constructed")
+    }
+    pub fn gemm_bias_act(
+        &self,
+        _out: &vortx::tensor::Tensor<f32>,
+        _lhs: &vortx::tensor::Tensor<f32>,
+        _rhs: &vortx::tensor::Tensor<f32>,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _bias: &vortx::tensor::Tensor<f32>,
+        _bias_row_stride: usize,
+        _elu: bool,
+    ) -> anyhow::Result<()> {
+        unreachable!("stub CutileGemm is never constructed")
+    }
+    pub fn elu_backward(
+        &self,
+        _g: &vortx::tensor::Tensor<f32>,
+        _y: &vortx::tensor::Tensor<f32>,
+        _m: usize,
+        _n: usize,
     ) -> anyhow::Result<()> {
         unreachable!("stub CutileGemm is never constructed")
     }
@@ -156,6 +210,62 @@ mod real {
             z_parts.store(acc);
         }
 
+        /// Tiled GEMM with fused epilogue: `z = x·y + bias` (bias is a column
+        /// vector broadcast over N), optionally followed by ELU (alpha = 1:
+        /// `v > 0 ? v : exp(v) − 1`, matching vortx `gpu_elu`). Replaces the
+        /// forward pass's gemm + bias-broadcast-GEMV + add + ELU pass chain.
+        #[cutile::entry()]
+        unsafe fn gemm_bias_act_tf32<const BM: i32, const BN: i32, const BK: i32>(
+            z: &mut Tensor<f32, { [BM, BN] }>,
+            x: &Tensor<f32, { [-1, -1] }>,
+            y: &Tensor<f32, { [-1, -1] }>,
+            bias: &Tensor<f32, { [-1, -1] }>,
+            k: i32,
+            apply_elu: i32,
+        ) {
+            let part_x = x.partition(const_shape![BM, BK]);
+            let part_y = y.partition(const_shape![BK, BN]);
+            let part_b = bias.partition(const_shape![BM, 1]);
+            let pid: (i32, i32, i32) = get_tile_block_id();
+            let mut acc: Tile<f32, { [BM, BN] }> = 0.0f32.broadcast(const_shape![BM, BN]);
+            let kt = (k + BK - 1) / BK;
+            for i in 0i32..kt {
+                let tile_x: Tile<f32, { [BM, BK] }> = part_x.load([pid.0, i]);
+                let tile_y: Tile<f32, { [BK, BN] }> = part_y.load([i, pid.1]);
+                let tx: Tile<tf32, { [BM, BK] }> = convert_tile(tile_x);
+                let ty: Tile<tf32, { [BK, BN] }> = convert_tile(tile_y);
+                acc = mma(tx, ty, acc);
+            }
+            let bt: Tile<f32, { [BM, 1] }> = part_b.load([pid.0, 0]);
+            acc = acc + bt.broadcast(const_shape![BM, BN]);
+            if apply_elu != 0 {
+                let zero: Tile<f32, { [BM, BN] }> = 0.0f32.broadcast(const_shape![BM, BN]);
+                let one: Tile<f32, { [BM, BN] }> = 1.0f32.broadcast(const_shape![BM, BN]);
+                let mask = cmpf(acc, zero, predicate::GreaterThan, cmp_ordering::Ordered);
+                let em1 = exp(acc) - one;
+                acc = select(mask, acc, em1);
+            }
+            z.store(acc);
+        }
+
+        /// In-place ELU backward (alpha = 1): `g *= (y > 0 ? 1 : y + 1)` where
+        /// `y` is the cached POST-activation — matching vortx `gpu_elu_backward`.
+        #[cutile::entry()]
+        unsafe fn elu_backward_ct<const BM: i32, const BN: i32>(
+            g: &mut Tensor<f32, { [BM, BN] }>,
+            y: &Tensor<f32, { [-1, -1] }>,
+        ) {
+            let part_y = y.partition(const_shape![BM, BN]);
+            let pid: (i32, i32, i32) = get_tile_block_id();
+            let gt: Tile<f32, { [BM, BN] }> = g.load();
+            let yt: Tile<f32, { [BM, BN] }> = part_y.load([pid.0, pid.1]);
+            let zero: Tile<f32, { [BM, BN] }> = 0.0f32.broadcast(const_shape![BM, BN]);
+            let one: Tile<f32, { [BM, BN] }> = 1.0f32.broadcast(const_shape![BM, BN]);
+            let mask = cmpf(yt, zero, predicate::GreaterThan, cmp_ordering::Ordered);
+            let deriv = select(mask, one, yt + one);
+            g.store(gt * deriv);
+        }
+
         /// Sum the split-K partials: `out[mb, nb] = Σ_s parts[s·blocks_m + mb, nb]`.
         /// Overwrites `out`.
         #[cutile::entry()]
@@ -188,7 +298,8 @@ mod real {
         max
     }
 
-    type ViewKey = (u64, i32, i32, bool);
+    /// (device_ptr, shape[2], strides[2]) — element strides.
+    type ViewKey = (u64, [i32; 2], [i32; 2]);
 
     pub struct CutileGemm {
         stream: Arc<cuda_core::Stream>,
@@ -272,29 +383,46 @@ mod real {
         /// LOGICAL gemm-operand dims; `transposed` means the underlying vortx
         /// tensor is the (cols × rows) row-major matrix and we view its
         /// transpose via swapped strides.
-        fn view(&self, t: &vortx::tensor::Tensor<f32>, rows: usize, cols: usize, transposed: bool) -> Arc<CtTensor<f32>> {
-            let ptr = buf_ptr(t.buffer());
-            let key = (ptr, rows as i32, cols as i32, transposed);
+        fn view(
+            &self,
+            t: &vortx::tensor::Tensor<f32>,
+            rows: usize,
+            cols: usize,
+            transposed: bool,
+        ) -> Arc<CtTensor<f32>> {
+            let (shape, strides) = if transposed {
+                // Base allocation is row-major (cols × rows); its transpose is
+                // (rows × cols) with element strides (1, rows).
+                ([rows as i32, cols as i32], [1i32, rows as i32])
+            } else {
+                ([rows as i32, cols as i32], [cols as i32, 1i32])
+            };
+            self.view_strided(buf_ptr(t.buffer()), shape, strides)
+        }
+
+        /// Arbitrary-stride view — e.g. a bias column vector inside a
+        /// pre-broadcast [out × n] buffer: shape [m, 1], strides [n, 1].
+        fn view_strided(&self, ptr: u64, shape: [i32; 2], strides: [i32; 2]) -> Arc<CtTensor<f32>> {
+            let key = (ptr, shape, strides);
             if let Some(v) = self.inputs.borrow().get(&key) {
                 return v.clone();
             }
-            let v = Arc::new(self.raw_view(ptr, rows, cols, transposed));
+            let v = Arc::new(self.raw_view(ptr, shape, strides));
             self.inputs.borrow_mut().insert(key, v.clone());
             v
         }
 
-        fn raw_view(&self, ptr: u64, rows: usize, cols: usize, transposed: bool) -> CtTensor<f32> {
-            let len_bytes = rows * cols * 4;
-            let (shape, strides) = if transposed {
-                // Base allocation is row-major (cols × rows); its transpose is
-                // (rows × cols) with strides (1, rows... ) — element strides.
-                (vec![rows as i32, cols as i32], vec![1i32, rows as i32])
-            } else {
-                (vec![rows as i32, cols as i32], vec![cols as i32, 1i32])
-            };
-            // SAFETY: ptr is a live khal allocation of len_bytes; the view is
-            // cached in the leaked adapter and never dropped.
-            unsafe { CtTensor::from_raw_parts(ptr, len_bytes, self.device_id, shape, strides) }
+        fn raw_view(&self, ptr: u64, shape: [i32; 2], strides: [i32; 2]) -> CtTensor<f32> {
+            // cuTile asserts logical bytes == storage bytes at construction, so
+            // declare the LOGICAL size even for sparse (strided-column) views —
+            // the strided reads stay inside the real (larger) khal allocation.
+            let len_bytes = shape[0] as usize * shape[1] as usize * 4;
+            // SAFETY: ptr is a live khal allocation whose extent covers every
+            // strided element of the view; the view is cached in the leaked
+            // adapter and never dropped.
+            unsafe {
+                CtTensor::from_raw_parts(ptr, len_bytes, self.device_id, shape.to_vec(), strides.to_vec())
+            }
         }
 
         /// `out(m×n) = lhs(m×k) · rhs(k×n)`, all operands khal/vortx f32
@@ -319,12 +447,12 @@ mod real {
             let x = self.view(lhs, m, k, lhs_t);
             let y = self.view(rhs, k, n, rhs_t);
             let out_ptr = buf_ptr(out.buffer());
-            let out_key = (out_ptr, m as i32, n as i32, false);
+            let out_key = (out_ptr, [m as i32, n as i32], [n as i32, 1i32]);
             let out_t = self
                 .outputs
                 .borrow_mut()
                 .remove(&out_key)
-                .unwrap_or_else(|| self.raw_view(out_ptr, m, n, false));
+                .unwrap_or_else(|| self.raw_view(out_ptr, [m as i32, n as i32], [n as i32, 1i32]));
 
             let blocks_m = m.div_ceil(bm);
             let blocks_n = n.div_ceil(bn);
@@ -397,6 +525,92 @@ mod real {
             Ok(())
         }
 
+        /// Fused forward layer: `out(m×n) = act(lhs(m×k)·rhs(k×n) + bias)`,
+        /// where `bias` is a column vector read with `bias_row_stride` (1 for a
+        /// dense [m×1] tensor; n for column 0 of a pre-broadcast [m×n] one) and
+        /// `act` is ELU when `elu` (hidden layers) else identity. Replaces the
+        /// vortx gemm + bias-GEMV + add + ELU pass chain in one launch.
+        #[allow(clippy::too_many_arguments)]
+        pub fn gemm_bias_act(
+            &self,
+            out: &vortx::tensor::Tensor<f32>,
+            lhs: &vortx::tensor::Tensor<f32>,
+            rhs: &vortx::tensor::Tensor<f32>,
+            m: usize,
+            n: usize,
+            k: usize,
+            bias: &vortx::tensor::Tensor<f32>,
+            bias_row_stride: usize,
+            elu: bool,
+        ) -> anyhow::Result<()> {
+            let bm = tile_for(m, 128);
+            let bn = tile_for(n, 128);
+            let bk = tile_for(k, 64);
+            let x = self.view(lhs, m, k, false);
+            let y = self.view(rhs, k, n, false);
+            let b = self.view_strided(
+                buf_ptr(bias.buffer()),
+                [m as i32, 1],
+                [bias_row_stride as i32, 1],
+            );
+            let out_ptr = buf_ptr(out.buffer());
+            let out_key = (out_ptr, [m as i32, n as i32], [n as i32, 1i32]);
+            let out_t = self
+                .outputs
+                .borrow_mut()
+                .remove(&out_key)
+                .unwrap_or_else(|| self.raw_view(out_ptr, [m as i32, n as i32], [n as i32, 1i32]));
+            let g = vec![bm.to_string(), bn.to_string(), bk.to_string()];
+            let (out_back, _, _, _, _, _) = unsafe {
+                gemm_bias_act_tf32(
+                    out_t.partition([bm, bn]),
+                    x,
+                    y,
+                    b,
+                    k as i32,
+                    if elu { 1i32 } else { 0i32 },
+                )
+                .generics(g)
+                .async_on(&self.stream)
+                .map_err(anyhow_err)?
+            };
+            self.outputs
+                .borrow_mut()
+                .insert(out_key, out_back.unpartition());
+            Ok(())
+        }
+
+        /// In-place ELU backward over `g(m×n)`: `g *= (y > 0 ? 1 : y + 1)`,
+        /// `y` the cached post-activation (matches vortx `gpu_elu_backward`).
+        pub fn elu_backward(
+            &self,
+            g: &vortx::tensor::Tensor<f32>,
+            y: &vortx::tensor::Tensor<f32>,
+            m: usize,
+            n: usize,
+        ) -> anyhow::Result<()> {
+            let bm = tile_for(m, 128);
+            let bn = tile_for(n, 128);
+            let yv = self.view(y, m, n, false);
+            let g_ptr = buf_ptr(g.buffer());
+            let g_key = (g_ptr, [m as i32, n as i32], [n as i32, 1i32]);
+            let g_t = self
+                .outputs
+                .borrow_mut()
+                .remove(&g_key)
+                .unwrap_or_else(|| self.raw_view(g_ptr, [m as i32, n as i32], [n as i32, 1i32]));
+            let (g_back, _) = unsafe {
+                elu_backward_ct(g_t.partition([bm, bn]), yv)
+                    .generics(vec![bm.to_string(), bn.to_string()])
+                    .async_on(&self.stream)
+                    .map_err(anyhow_err)?
+            };
+            self.outputs
+                .borrow_mut()
+                .insert(g_key, g_back.unpartition());
+            Ok(())
+        }
+
         /// Numeric self-test through the REAL interop path (khal buffers,
         /// strided transposes, ragged dims, split-K): compares against a CPU
         /// reference. Returns the worst relative error (tf32 tolerance).
@@ -452,6 +666,61 @@ mod real {
                     );
                 }
                 worst = worst.max(err);
+            }
+
+            // Fused bias+ELU forward and the ELU backward, on ragged dims and a
+            // STRIDED bias column (row stride > 1, the GpuPolicy layout).
+            {
+                let elu = |v: f32| if v > 0.0 { v } else { v.exp() - 1.0 };
+                let (m, n, k) = (100usize, 300usize, 45usize);
+                let f = |r: usize, c: usize, seed: usize| {
+                    DMatrix::<f32>::from_fn(r, c, |i, j| {
+                        let h = (i * 29 + j * 13 + seed * 89) % 83;
+                        (h as f32) / 41.5 - 1.0
+                    })
+                };
+                let (lhs_m, rhs_m) = (f(m, k, 1), f(k, n, 2));
+                // Bias stored pre-broadcast [m × 8]: use column 0 with stride 8.
+                let bias_b = f(m, 8, 3);
+                let z = &lhs_m * &rhs_m;
+                let refr = DMatrix::<f32>::from_fn(m, n, |r, c| elu(z[(r, c)] + bias_b[(r, 0)]));
+                let gl = vortx::tensor::Tensor::matrix_from_na(bk, &lhs_m, rw)?;
+                let gr = vortx::tensor::Tensor::matrix_from_na(bk, &rhs_m, rw)?;
+                let gb = vortx::tensor::Tensor::matrix_from_na(bk, &bias_b, rw)?;
+                let go = vortx::tensor::Tensor::matrix_from_na(
+                    bk,
+                    &DMatrix::<f32>::from_element(m, n, 7.7),
+                    rw,
+                )?;
+                self.gemm_bias_act(&go, &gl, &gr, m, n, k, &gb, 8, true)?;
+                // ELU backward: g *= (y > 0 ? 1 : y + 1) with y = the fused output.
+                let g_m = f(m, n, 4);
+                let gg = vortx::tensor::Tensor::matrix_from_na(bk, &g_m, rw)?;
+                self.elu_backward(&gg, &go, m, n)?;
+                bk.synchronize().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                let got = bk
+                    .slow_read_vec(go.buffer())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                let got_g = bk
+                    .slow_read_vec(gg.buffer())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                let scale = refr.amax().max(1e-6);
+                let mut err = 0.0f64;
+                let mut err_g = 0.0f64;
+                for r in 0..m {
+                    for c in 0..n {
+                        let y = refr[(r, c)];
+                        err = err.max((got[r * n + c] - y).abs() as f64 / scale as f64);
+                        let gref = g_m[(r, c)] * if y > 0.0 { 1.0 } else { y + 1.0 };
+                        err_g = err_g.max((got_g[r * n + c] - gref).abs() as f64);
+                    }
+                }
+                if err > 5e-2 || err_g > 5e-2 {
+                    anyhow::bail!("fused bias+elu: rel err {err:.3e}, backward err {err_g:.3e}");
+                }
+                worst = worst.max(err).max(err_g);
             }
             Ok(worst)
         }

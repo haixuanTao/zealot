@@ -13,6 +13,8 @@
 
 #[path = "biped_env_nexus.rs"]
 mod biped_env_nexus;
+#[path = "cutile_gemm.rs"]
+mod cutile_gemm;
 #[path = "gpu_policy.rs"]
 mod gpu_policy;
 

@@ -19,6 +19,8 @@
 //! Run (WebGPU):                  cargo run --release --example iter_e2e_boxes_bench \
 //!                       --features "gpu biped_gpu cuda_backend" -- [N] [T] [epochs] [minibatches]
 
+#[path = "cutile_gemm.rs"]
+mod cutile_gemm;
 #[path = "gpu_policy.rs"]
 mod gpu_policy;
 
