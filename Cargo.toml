@@ -53,8 +53,19 @@ biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "de
 # Used for the all-native end-to-end benchmark (iter_e2e_bench). The cubins are
 # embedded at build time via CUDA_OXIDE_SHADERS_PTX_{NEXUS_RBD_SHADERS3D,VORTX_SHADERS}.
 cuda_backend = ["gpu", "biped_gpu", "khal/cuda", "nexus3d/cuda", "vortx/cuda"]
+# cutile — cuTile Rust (NVlabs cutile-rs, sibling checkout pinned at tag
+# v0.2.0): tf32 tensor-core GEMMs for the PPO update, opt-in at runtime with
+# BIPED_CUTILE_GEMM=1. BUILDING with this feature needs CUDA_TOOLKIT_PATH
+# pointing at CUDA 13.2+ headers (~/cuda-13-shim on this box); the RUNTIME JIT
+# needs tileiras + ptxas 13.3 first on PATH (~/cuda-13.3-tile/bin). See
+# examples/biped/cutile_gemm.rs for the interop details and measured numbers.
+cutile = ["cuda_backend", "dep:cutile", "dep:cutile-compiler", "dep:cuda-core", "dep:cuda-async"]
 
 [dependencies]
+cutile = { path = "../cutile-rs/cutile", optional = true }
+cutile-compiler = { path = "../cutile-rs/cutile-compiler", optional = true }
+cuda-core = { path = "../cutile-rs/cuda-core", optional = true }
+cuda-async = { path = "../cutile-rs/cuda-async", optional = true }
 vortx = { version = "0.1", optional = true }
 khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
 nexus3d = { path = "../nexus-cuda/crates/nexus3d", features = ["rbd", "from_rapier"], optional = true }

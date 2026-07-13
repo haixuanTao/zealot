@@ -24,10 +24,13 @@
 mod biped_env;
 #[path = "biped_env_nexus.rs"]
 mod biped_env_nexus;
+#[path = "cutile_gemm.rs"]
+mod cutile_gemm;
 #[path = "gpu_policy.rs"]
 mod gpu_policy;
 
 use biped_env_nexus::{BipedNexusBatchEnv, REWARD_COMP_NAMES, default_mjcf_path};
+use cutile_gemm::CutileGemm;
 use gpu_policy::GpuPolicy;
 use khal::BufferUsages;
 use khal::Shader;
@@ -260,6 +263,34 @@ fn symmetrize_ac(ac: &mut ActorCritic) {
     }
 }
 
+/// Encoder cursor: khal command recording that can be SPLIT at any point so a
+/// cuTile GEMM can be launched directly on the (shared) CUDA stream between
+/// khal passes. `pass()` lazily opens an encoder; `flush()` submits whatever
+/// is recorded (no synchronize — same stream keeps ordering by issue order).
+/// With the cuTile path off, the whole epoch still records into one encoder
+/// and behaves exactly as before.
+struct EncCursor<'b> {
+    bk: &'b GpuBackend,
+    enc: Option<<GpuBackend as Backend>::Encoder>,
+}
+impl<'b> EncCursor<'b> {
+    fn new(bk: &'b GpuBackend) -> Self {
+        Self { bk, enc: None }
+    }
+    fn pass(&mut self, name: &str) -> khal::backend::GpuPass {
+        if self.enc.is_none() {
+            self.enc = Some(self.bk.begin_encoding());
+        }
+        self.enc.as_mut().unwrap().begin_pass(name, None)
+    }
+    /// Submit pending khal work to the stream (required before a cuTile launch).
+    fn flush(&mut self) {
+        if let Some(e) = self.enc.take() {
+            self.bk.submit(e).unwrap();
+        }
+    }
+}
+
 /// GPU MLP with persistent weights + Adam moments (copied from iter_e2e_bench,
 /// plus `read_into` to write the trained weights back to a CPU `Mlp`).
 struct GpuMlp {
@@ -317,23 +348,37 @@ impl GpuMlp {
         op: &OpAssign,
         act: &Activation,
         sh: &mut TensorLayoutBuffers,
-        enc: &mut <GpuBackend as Backend>::Encoder,
+        cur: &mut EncCursor,
+        ct: Option<&CutileGemm>,
         o1m: &Tensor<f32>,
     ) -> anyhow::Result<()> {
         let l = self.layers();
         for i in 0..l {
             let (lf, rt) = self.a.split_at_mut(i + 1);
             let (ain, aout) = (&lf[i], &mut rt[0]);
-            {
-                let mut p = enc.begin_pass("z", None);
+            // z = W[i]·a[i] — the tf32 cuTile path when enabled, else vortx.
+            if let Some(ct) = ct {
+                cur.flush(); // pending khal work must hit the stream first
+                ct.gemm(
+                    aout,
+                    &self.w[i],
+                    false,
+                    ain,
+                    false,
+                    self.dims[i + 1],
+                    self.batch,
+                    self.dims[i],
+                )?;
+            } else {
+                let mut p = cur.pass("z");
                 g.dispatch_tiled(bk, sh, &mut p, &mut *aout, &self.w[i], ain)?;
             }
             {
-                let mut p = enc.begin_pass("bb", None);
+                let mut p = cur.pass("bb");
                 g.dispatch_naive(bk, sh, &mut p, &mut self.bb[i], &self.b[i], o1m)?;
             }
             {
-                let mut p = enc.begin_pass("bias", None);
+                let mut p = cur.pass("bias");
                 op.launch(
                     bk,
                     sh,
@@ -344,7 +389,7 @@ impl GpuMlp {
                 )?;
             }
             if i < l - 1 {
-                let mut p = enc.begin_pass("elu", None);
+                let mut p = cur.pass("elu");
                 act.elu(bk, sh, &mut p, &mut *aout)?;
             }
         }
@@ -356,12 +401,27 @@ impl GpuMlp {
         g: &Gemm,
         act: &Activation,
         sh: &mut TensorLayoutBuffers,
-        enc: &mut <GpuBackend as Backend>::Encoder,
+        cur: &mut EncCursor,
+        ct: Option<&CutileGemm>,
         om1: &Tensor<f32>,
     ) -> anyhow::Result<()> {
         for i in (0..self.layers()).rev() {
-            {
-                let mut p = enc.begin_pass("dw", None);
+            // dW[i] = delta[i] · a[i]ᵀ — the deep-K (K = batch) wgrad, where
+            // the cuTile split-K path matters most.
+            if let Some(ct) = ct {
+                cur.flush();
+                ct.gemm(
+                    &self.dw[i],
+                    &self.delta[i],
+                    false,
+                    &self.a[i],
+                    true,
+                    self.dims[i + 1],
+                    self.dims[i],
+                    self.batch,
+                )?;
+            } else {
+                let mut p = cur.pass("dw");
                 g.dispatch_tiled(
                     bk,
                     sh,
@@ -372,7 +432,7 @@ impl GpuMlp {
                 )?;
             }
             {
-                let mut p = enc.begin_pass("db", None);
+                let mut p = cur.pass("db");
                 g.dispatch_naive(bk, sh, &mut p, &mut self.db[i], &self.delta[i], om1)?;
             }
             if i > 0 {
@@ -380,11 +440,26 @@ impl GpuMlp {
                     let (lf, rt) = self.delta.split_at_mut(i);
                     let dp = &mut lf[i - 1];
                     let dc = &rt[0];
-                    let mut p = enc.begin_pass("da", None);
-                    g.dispatch_tiled(bk, sh, &mut p, dp, self.w[i].transpose_last_dims(), dc)?;
+                    // delta[i-1] = W[i]ᵀ · delta[i] (dgrad).
+                    if let Some(ct) = ct {
+                        cur.flush();
+                        ct.gemm(
+                            dp,
+                            &self.w[i],
+                            true,
+                            dc,
+                            false,
+                            self.dims[i],
+                            self.batch,
+                            self.dims[i + 1],
+                        )?;
+                    } else {
+                        let mut p = cur.pass("da");
+                        g.dispatch_tiled(bk, sh, &mut p, dp, self.w[i].transpose_last_dims(), dc)?;
+                    }
                 }
                 {
-                    let mut p = enc.begin_pass("eb", None);
+                    let mut p = cur.pass("eb");
                     act.elu_backward(bk, sh, &mut p, &mut self.delta[i - 1], &self.a[i])?;
                 }
             }
@@ -396,12 +471,12 @@ impl GpuMlp {
         bk: &GpuBackend,
         ad: &Adam,
         sh: &mut TensorLayoutBuffers,
-        enc: &mut <GpuBackend as Backend>::Encoder,
+        cur: &mut EncCursor,
         ap: &Tensor<AdamParams>,
     ) -> anyhow::Result<()> {
         for i in 0..self.layers() {
             {
-                let mut p = enc.begin_pass("aw", None);
+                let mut p = cur.pass("aw");
                 ad.step(
                     bk,
                     sh,
@@ -414,7 +489,7 @@ impl GpuMlp {
                 )?;
             }
             {
-                let mut p = enc.begin_pass("ab", None);
+                let mut p = cur.pass("ab");
                 ad.step(
                     bk,
                     sh,
@@ -500,6 +575,11 @@ fn main() {
         }
         let bk = env.backend().clone();
         let mut gpu = GpuPolicy::new(&bk, &ac, n).expect("gpu policy");
+
+        // cuTile tf32 tensor-core GEMMs for the update (BIPED_CUTILE_GEMM=1;
+        // needs --features cutile). Self-tests against a CPU reference at init;
+        // None → the unchanged vortx GEMM path.
+        let ct: Option<&'static CutileGemm> = CutileGemm::init(&bk).await;
 
         // Persistent GPU update state (weights + Adam moments survive all iters).
         let total = n * T;
@@ -864,12 +944,12 @@ fn main() {
                 )
                 .unwrap();
                 let t_enc = Instant::now();
-                let mut enc = bk.begin_encoding();
+                let mut cur = EncCursor::new(&bk);
                 for k in 0..n_mb {
                     let off = (k * mb) as u32;
                     let nb = mb as u32;
                     {
-                        let mut p = enc.begin_pass("g_obs", None);
+                        let mut p = cur.pass("g_obs");
                         cont.launch(
                             &bk,
                             &mut sh,
@@ -881,7 +961,7 @@ fn main() {
                         .unwrap();
                     }
                     {
-                        let mut p = enc.begin_pass("g_cobs", None);
+                        let mut p = cur.pass("g_cobs");
                         cont.launch(
                             &bk,
                             &mut sh,
@@ -893,7 +973,7 @@ fn main() {
                         .unwrap();
                     }
                     {
-                        let mut p = enc.begin_pass("g_act", None);
+                        let mut p = cur.pass("g_act");
                         cont.launch(
                             &bk,
                             &mut sh,
@@ -905,7 +985,7 @@ fn main() {
                         .unwrap();
                     }
                     {
-                        let mut p = enc.begin_pass("g_adv", None);
+                        let mut p = cur.pass("g_adv");
                         cont.launch(
                             &bk,
                             &mut sh,
@@ -917,28 +997,28 @@ fn main() {
                         .unwrap();
                     }
                     {
-                        let mut p = enc.begin_pass("g_lpo", None);
+                        let mut p = cur.pass("g_lpo");
                         cont.launch(&bk, &mut sh, &mut p, &mut lpo, f_lpo.columns(off, nb), None)
                             .unwrap();
                     }
                     {
-                        let mut p = enc.begin_pass("g_vo", None);
+                        let mut p = cur.pass("g_vo");
                         cont.launch(&bk, &mut sh, &mut p, &mut vo, f_vo.columns(off, nb), None)
                             .unwrap();
                     }
                     {
-                        let mut p = enc.begin_pass("g_ret", None);
+                        let mut p = cur.pass("g_ret");
                         cont.launch(&bk, &mut sh, &mut p, &mut ret, f_ret.columns(off, nb), None)
                             .unwrap();
                     }
                     a_net
-                        .forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m)
+                        .forward(&bk, &g, &op, &act, &mut sh, &mut cur, ct, &o1m)
                         .unwrap();
                     c_net
-                        .forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m)
+                        .forward(&bk, &g, &op, &act, &mut sh, &mut cur, ct, &o1m)
                         .unwrap();
                     {
-                        let mut p = enc.begin_pass("ag", None);
+                        let mut p = cur.pass("ag");
                         ppo.actor_grad(
                             &mut p,
                             &ap,
@@ -959,7 +1039,7 @@ fn main() {
                     if let Some(sn) = s_net.as_mut() {
                         let fom = f_obs_mir.as_ref().unwrap();
                         {
-                            let mut p = enc.begin_pass("s_obs", None);
+                            let mut p = cur.pass("s_obs");
                             cont.launch(
                                 &bk,
                                 &mut sh,
@@ -970,15 +1050,15 @@ fn main() {
                             )
                             .unwrap();
                         }
-                        sn.forward(&bk, &g, &op, &act, &mut sh, &mut enc, &o1m)
+                        sn.forward(&bk, &g, &op, &act, &mut sh, &mut cur, ct, &o1m)
                             .unwrap();
                         {
-                            let mut p = enc.begin_pass("s_tgt", None);
+                            let mut p = cur.pass("s_tgt");
                             g.dispatch_tiled(&bk, &mut sh, &mut p, &mut tgt, &pa, &sn.a[la + 1])
                                 .unwrap();
                         }
                         {
-                            let mut p = enc.begin_pass("s_cp", None);
+                            let mut p = cur.pass("s_cp");
                             op.launch(
                                 &bk,
                                 &mut sh,
@@ -990,17 +1070,17 @@ fn main() {
                             .unwrap();
                         }
                         {
-                            let mut p = enc.begin_pass("s_sub", None);
+                            let mut p = cur.pass("s_sub");
                             op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Sub, &mut res, &tgt)
                                 .unwrap();
                         }
                         {
-                            let mut p = enc.begin_pass("s_mul", None);
+                            let mut p = cur.pass("s_mul");
                             op.launch(&bk, &mut sh, &mut p, OpAssignVariant::Mul, &mut res, &gw)
                                 .unwrap();
                         }
                         {
-                            let mut p = enc.begin_pass("s_add", None);
+                            let mut p = cur.pass("s_add");
                             op.launch(
                                 &bk,
                                 &mut sh,
@@ -1013,7 +1093,7 @@ fn main() {
                         }
                     }
                     {
-                        let mut p = enc.begin_pass("vg", None);
+                        let mut p = cur.pass("vg");
                         ppo.value_grad(
                             &mut p,
                             &vp,
@@ -1025,20 +1105,20 @@ fn main() {
                         .unwrap();
                     }
                     a_net
-                        .backward(&bk, &g, &act, &mut sh, &mut enc, &om1)
+                        .backward(&bk, &g, &act, &mut sh, &mut cur, ct, &om1)
                         .unwrap();
                     c_net
-                        .backward(&bk, &g, &act, &mut sh, &mut enc, &om1)
+                        .backward(&bk, &g, &act, &mut sh, &mut cur, ct, &om1)
                         .unwrap();
                     {
-                        let mut p = enc.begin_pass("dl", None);
+                        let mut p = cur.pass("dl");
                         g.dispatch_naive(&bk, &mut sh, &mut p, &mut dls, &gls, &om1)
                             .unwrap();
                     }
-                    a_net.adam(&bk, &ad, &mut sh, &mut enc, &adp).unwrap();
-                    c_net.adam(&bk, &ad, &mut sh, &mut enc, &adp).unwrap();
+                    a_net.adam(&bk, &ad, &mut sh, &mut cur, &adp).unwrap();
+                    c_net.adam(&bk, &ad, &mut sh, &mut cur, &adp).unwrap();
                     {
-                        let mut p = enc.begin_pass("al", None);
+                        let mut p = cur.pass("al");
                         ad.step(
                             &bk, &mut sh, &mut p, &adp, &mut lst, &dls, &mut mls, &mut vls,
                         )
@@ -1047,7 +1127,7 @@ fn main() {
                 }
                 enc_s += t_enc.elapsed().as_secs_f64();
                 let t_exec = Instant::now();
-                bk.submit(enc).unwrap();
+                cur.flush();
                 bk.synchronize().unwrap();
                 exec_s += t_exec.elapsed().as_secs_f64();
 
