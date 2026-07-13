@@ -408,7 +408,11 @@ impl GpuMlp {
                     self.a[i].transpose_last_dims(),
                 )?;
             }
-            {
+            // db = row-sums of delta (the vortx GEMV ran ~100x below bandwidth).
+            if let Some(ct) = ct {
+                cur.flush();
+                ct.row_sum(&self.db[i], &self.delta[i], self.dims[i + 1], self.batch)?;
+            } else {
                 let mut p = cur.pass("db");
                 g.dispatch_naive(bk, sh, &mut p, &mut self.db[i], &self.delta[i], om1)?;
             }
@@ -1091,7 +1095,10 @@ fn main() {
                     c_net
                         .backward(&bk, &g, &act, &mut sh, &mut cur, ct, &om1)
                         .unwrap();
-                    {
+                    if let Some(ct) = ct {
+                        cur.flush();
+                        ct.row_sum(&dls, &gls, ad_, mb).unwrap();
+                    } else {
                         let mut p = cur.pass("dl");
                         g.dispatch_naive(&bk, &mut sh, &mut p, &mut dls, &gls, &om1)
                             .unwrap();

@@ -130,6 +130,15 @@ impl CutileGemm {
     ) -> anyhow::Result<()> {
         unreachable!("stub CutileGemm is never constructed")
     }
+    pub fn row_sum(
+        &self,
+        _out: &vortx::tensor::Tensor<f32>,
+        _x: &vortx::tensor::Tensor<f32>,
+        _m: usize,
+        _n: usize,
+    ) -> anyhow::Result<()> {
+        unreachable!("stub CutileGemm is never constructed")
+    }
 }
 
 #[cfg(feature = "cutile")]
@@ -264,6 +273,31 @@ mod real {
             let mask = cmpf(yt, zero, predicate::GreaterThan, cmp_ordering::Ordered);
             let deriv = select(mask, one, yt + one);
             g.store(gt * deriv);
+        }
+
+        /// Row sums: `out[r] = Σ_c x[r, c]` — the bias gradient (replaces the
+        /// vortx `delta · ones` GEMV, which ran ~100x below memory bandwidth).
+        #[cutile::entry()]
+        unsafe fn row_sum_ct<const BM: i32, const BN: i32>(
+            out: &mut Tensor<f32, { [BM] }>,
+            x: &Tensor<f32, { [-1, -1] }>,
+            n: i32,
+        ) {
+            let part = x.partition(const_shape![BM, BN]);
+            let pid: (i32, i32, i32) = get_tile_block_id();
+            // Seed the accumulator from the first column-tile's reduction (both
+            // addition operands then come from reduce_sum — the AST compiler
+            // resolves the const-generic result shape inconsistently between
+            // broadcast and reduce_sum otherwise).
+            let t0: Tile<f32, { [BM, BN] }> = part.load([pid.0, 0]);
+            let mut acc: Tile<f32, { [BM] }> = reduce_sum(t0, 1i32);
+            let nt = (n + BN - 1) / BN;
+            for j in 1i32..nt {
+                let t: Tile<f32, { [BM, BN] }> = part.load([pid.0, j]);
+                let s: Tile<f32, { [BM] }> = reduce_sum(t, 1i32);
+                acc = acc + s;
+            }
+            out.store(acc);
         }
 
         /// Sum the split-K partials: `out[mb, nb] = Σ_s parts[s·blocks_m + mb, nb]`.
@@ -611,6 +645,40 @@ mod real {
             Ok(())
         }
 
+        /// Bias gradient: `out(m×1) = row_sums(x(m×n))` in one launch.
+        pub fn row_sum(
+            &self,
+            out: &vortx::tensor::Tensor<f32>,
+            x: &vortx::tensor::Tensor<f32>,
+            m: usize,
+            n: usize,
+        ) -> anyhow::Result<()> {
+            let bm = tile_for(m, 128);
+            let bn = tile_for(n, 128);
+            let xv = self.view(x, m, n, false);
+            let out_ptr = buf_ptr(out.buffer());
+            // Rank-1 view; keyed with zeroed second slots to stay distinct
+            // from any 2-D view of the same buffer.
+            let out_key = (out_ptr, [m as i32, 0], [1i32, 0]);
+            let out_t = match self.outputs.borrow_mut().remove(&out_key) {
+                Some(t) => t,
+                // SAFETY: same invariants as raw_view, rank-1.
+                None => unsafe {
+                    CtTensor::from_raw_parts(out_ptr, m * 4, self.device_id, vec![m as i32], vec![1])
+                },
+            };
+            let (out_back, _, _) = unsafe {
+                row_sum_ct(out_t.partition([bm]), xv, n as i32)
+                    .generics(vec![bm.to_string(), bn.to_string()])
+                    .async_on(&self.stream)
+                    .map_err(anyhow_err)?
+            };
+            self.outputs
+                .borrow_mut()
+                .insert(out_key, out_back.unpartition());
+            Ok(())
+        }
+
         /// Numeric self-test through the REAL interop path (khal buffers,
         /// strided transposes, ragged dims, split-K): compares against a CPU
         /// reference. Returns the worst relative error (tf32 tolerance).
@@ -721,6 +789,30 @@ mod real {
                     anyhow::bail!("fused bias+elu: rel err {err:.3e}, backward err {err_g:.3e}");
                 }
                 worst = worst.max(err).max(err_g);
+                // Row sums (bias gradient) — pure f32 adds, tight tolerance.
+                let gs = vortx::tensor::Tensor::matrix_from_na(
+                    bk,
+                    &DMatrix::<f32>::from_element(m, 1, 7.7),
+                    rw,
+                )?;
+                self.row_sum(&gs, &gg, m, n)?;
+                bk.synchronize().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                let got_s = bk
+                    .slow_read_vec(gs.buffer())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                let mut err_s = 0.0f64;
+                for r in 0..m {
+                    let mut refv = 0.0f64;
+                    for c in 0..n {
+                        refv += got_g[r * n + c] as f64;
+                    }
+                    err_s = err_s.max((got_s[r] as f64 - refv).abs() / refv.abs().max(1.0));
+                }
+                if err_s > 1e-4 {
+                    anyhow::bail!("row_sum err {err_s:.3e}");
+                }
+                worst = worst.max(err_s);
             }
             Ok(worst)
         }
