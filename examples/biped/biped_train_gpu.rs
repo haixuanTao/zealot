@@ -503,7 +503,14 @@ fn main() {
 
         // Persistent GPU update state (weights + Adam moments survive all iters).
         let total = n * T;
-        let mb = total / MINIBATCHES;
+        // BIPED_MINIBATCHES overrides the minibatch COUNT (default MINIBATCHES=4)
+        // — fewer, larger minibatches = fewer kernel launches per epoch at the
+        // same total FLOPs (launch-gap vs compute-bound diagnostics / tuning).
+        let minibatches: usize = std::env::var("BIPED_MINIBATCHES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MINIBATCHES);
+        let mb = total / minibatches;
         // Mirror augmentation (BIPED_MIRROR_AUG=1): append the L/R mirror of every
         // sample → symmetric policy. To keep the minibatch SIZE `mb` (and the
         // pre-sized GPU buffers) unchanged, we double the minibatch COUNT instead
@@ -833,6 +840,10 @@ fn main() {
                 .map(|c| batch[last_off + c].mean_old.clone())
                 .collect();
             let mut last_kl = 0.0f32;
+            // Update-phase profile: where the PPO update wall-clock goes
+            // (encode = CPU command recording, exec = submit+synchronize i.e.
+            // GPU execution incl. launch gaps, kl = the per-epoch readback).
+            let (mut enc_s, mut exec_s, mut kl_s) = (0.0f64, 0.0f64, 0.0f64);
             for _epoch in 0..EPOCHS {
                 gstep += n_mb as u64;
                 let bc1 = 1.0 - 0.9f32.powi(gstep.min(1 << 30) as i32);
@@ -852,6 +863,7 @@ fn main() {
                     BufferUsages::UNIFORM,
                 )
                 .unwrap();
+                let t_enc = Instant::now();
                 let mut enc = bk.begin_encoding();
                 for k in 0..n_mb {
                     let off = (k * mb) as u32;
@@ -1033,10 +1045,14 @@ fn main() {
                         .unwrap();
                     }
                 }
+                enc_s += t_enc.elapsed().as_secs_f64();
+                let t_exec = Instant::now();
                 bk.submit(enc).unwrap();
                 bk.synchronize().unwrap();
+                exec_s += t_exec.elapsed().as_secs_f64();
 
                 // Per-epoch KL (last minibatch) → adaptive-KL LR for the next epoch.
+                let t_kl = Instant::now();
                 let mn = bk.slow_read_vec(a_net.a[la + 1].buffer()).await.unwrap(); // [ad x mb]
                 let ls = bk.slow_read_vec(lst.buffer()).await.unwrap(); // [ad]
                 let mut kl = 0.0f32;
@@ -1048,6 +1064,7 @@ fn main() {
                     }
                 }
                 kl /= mb as f32;
+                kl_s += t_kl.elapsed().as_secs_f64();
                 last_kl = kl;
                 if kl > DESIRED_KL * 2.0 {
                     lr = (lr / 1.5).max(LR_MIN);
@@ -1135,6 +1152,18 @@ fn main() {
                     ns2ms(st.stage_motors_ns),
                     ns2ms(st.flush_static_ns),
                     ns2ms(st.serial_commit_ns),
+                );
+                // Update-phase split: stage = batch normalize/transpose + H2D
+                // upload (everything outside the epoch loop); encode = CPU
+                // command recording; exec = submit+synchronize (GPU execution
+                // incl. per-launch gaps — the CUDA-graph target); kl = per-epoch
+                // KL readback for the adaptive-LR schedule.
+                println!(
+                    "[prof-upd] stage={:.2}s encode={:.2}s exec={:.2}s kl={:.2}s",
+                    upd_s - enc_s - exec_s - kl_s,
+                    enc_s,
+                    exec_s,
+                    kl_s,
                 );
                 // Structured per-component reward + termination-cause line for the
                 // W&B sidecar (`wandb_logger.py` parses the `[rb]` prefix). Mean of
