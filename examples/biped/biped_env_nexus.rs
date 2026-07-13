@@ -1301,13 +1301,27 @@ impl BipedNexusBatchEnv {
             .collect();
         let mut state = GpuPhysicsState::from_rapier(&gpu, &envs_refs);
         state.multibodies_mut().set_gravity(&gpu, [0.0, 0.0, -9.81]);
-        // Implicit-coriolis augments the mass matrix with `dt·C` — at fewer
-        // substeps that over-damps, at more it under-damps, so passive feet creep
-        // ∝ num_solver_iterations (the sim-to-real foot-slip bug). MuJoCo/Genesis
-        // don't do this. Override with BIPED_IMPLICIT_CORIOLIS=0 to test/disable.
-        if let Ok(v) = std::env::var("BIPED_IMPLICIT_CORIOLIS") {
-            state.multibodies_mut().set_implicit_coriolis(v != "0");
-        }
+        // Implicit-coriolis OFF by default (BIPED_IMPLICIT_CORIOLIS=1 restores
+        // the old nexus default). Two reasons:
+        // 1. FIDELITY: implicit coriolis augments the mass matrix with `dt·C` —
+        //    at fewer substeps that over-damps, at more it under-damps, so
+        //    passive feet creep ∝ num_solver_iterations (the sim-to-real
+        //    foot-slip bug). MuJoCo (whose RECOMMENDED `implicitfast`
+        //    integrator deliberately skips the Coriolis derivatives), Genesis,
+        //    PhysX and Bullet all treat Coriolis explicitly with one dynamics
+        //    linearization per step; rapier's per-substep rebuild is the outlier.
+        // 2. SPEED: with it on, nexus rebuilds M/LU/accelerations EVERY TGS
+        //    substep (8×/step — compute_dynamics_pre + gravity_and_lu were 51%
+        //    of ALL GPU time); off = once per step, measured 1.9 s → 1.0 s per
+        //    training iteration @2048 envs.
+        // NOTE: this changes the physics slightly — train and eval with the
+        // same setting.
+        let implicit_coriolis = std::env::var("BIPED_IMPLICIT_CORIOLIS")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        state
+            .multibodies_mut()
+            .set_implicit_coriolis(implicit_coriolis);
 
         // Seed per-DOF Coulomb joint friction (MJCF `frictionloss`) into the
         // multibody. Env-major `[env][dof]` layout matching the velocity section:
@@ -1344,7 +1358,15 @@ impl BipedNexusBatchEnv {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1.0);
+            // Every joint DOF gets a floor armature of 0.01 (the official G1
+            // models set `armature="0.01"` on ALL joints): PD-held non-action
+            // joints (e.g. the G1 29-DOF body's arms) with ZERO armature go
+            // numerically unstable once implicit-coriolis no longer refreshes
+            // the mass matrix每 substep (passive stand → NaN in <20 steps).
             let mut arm_per_dof = vec![0.0f32; dpb];
+            for a in arm_per_dof.iter_mut().skip(6) {
+                *a = 0.01 * arm_scale;
+            }
             for k in 0..NUM_JOINTS {
                 let dof = idx.joint_dof_offset[k] as usize;
                 if let Some(s) = robot.joints.iter().find(|j| j.name == idx.actuated[k].1) {
