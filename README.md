@@ -2,7 +2,11 @@
 
 Reinforcement-learning locomotion on top of [nexus](https://github.com/dimforge/nexus),
 dimforge's cross-platform GPU physics engine — aiming to be, roughly, "the
-WBC-AGILE of nexus" but all-Rust and WebGPU-native.
+WBC-AGILE of nexus" but all-Rust. The engine core is portable WebGPU; training
+performance work targets the **native-CUDA (cuda-oxide) fast path** — the
+headline numbers below are the CUDA + cuTile build, and the WebGPU column
+currently trails it ~4× at scale (open vortx-GEMM regression, see the
+benchmark notes).
 
 ## Workspace layout
 
