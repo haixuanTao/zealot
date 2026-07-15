@@ -115,8 +115,15 @@ A full training step is a **rollout** plus a **PPO update**. `examples/biped/ite
 way — **full CPU** = rapier rollout (CPU MLP + rayon physics) + CPU PPO update;
 **full GPU** = nexus rollout (vortx policy) + GPU PPO update (the Stage-B path
 verified in `gpu_update_check`) — over a T=32 rollout and a 5-epoch × 16-minibatch
-update. Throughput is `N·T / iteration_time`, same env-control-steps/s unit, and
-the **Isaac** column is PhysX 5's total `Computation` (collection + learning):
+update. Throughput is `N·T / iteration_time`, same env-control-steps/s unit. The
+**Isaac** column is not a synthetic benchmark: it's NVIDIA's
+[WBC-AGILE](https://github.com/nvidia-isaac/WBC-AGILE) training pipeline
+(Isaac-Lab/PhysX-5-based) running **its own LeRobot no-arms velocity task**
+(`velocity_lerobot_no_arms`, rsl_rl runner) on the same 5090 — the reported
+number is rsl_rl's total `Computation` (collection + learning), the same unit.
+Being Isaac-Lab-based, WBC-AGILE's throughput ≈ the Isaac Lab engine ceiling, so
+this column doubles as both the production-pipeline proxy and the PhysX
+reference:
 
 The GPU update is **GPU-resident** (the batch is normalized + uploaded once, each
 minibatch is an on-GPU column gather), uses a **tiled GEMM**, and the GEMM inner
@@ -169,7 +176,8 @@ loop is **vec4** (4-wide FMA) — all verified bit-exact against the CPU update
 > the PPO `gemm_tiled` (~22%), not physics.
 > The **†** column (**mac**) is
 > the previous `position-iters = 8` setting and awaits re-measurement on that
-> hardware. The **Isaac** column is PhysX's own solver and is config-independent.
+> hardware. The **Isaac** column is PhysX's own solver (via WBC-AGILE's task, see
+> above) and is config-independent.
 >
 > **Table refresh (2026-07, LeRobot biped, position-iters 4):** the **linux CPU /
 > WebGPU / native CUDA** columns below were re-measured on the current stack.
@@ -194,6 +202,8 @@ loop is **vec4** (4-wide FMA) — all verified bit-exact against the CPU update
 > **G1 cross-sim check (2026-07):** a strictly-sequential, same-hour run on the same
 > 5090, every sim driving the Unitree G1 (full training env-steps/s, `biped_train_gpu`):
 > zealot 12-DOF **61 k / 71 k / 82 k** @ N=2 048/4 096/8 192 vs Isaac Lab full-body G1
+> (stock `Isaac-Velocity-Flat-G1-v0` + rsl_rl — not the WBC-AGILE task used in the
+> LeRobot table above)
 > 72 k / 115 k / 180 k, MJX full-body 76.5 k / 89 k / 97.7 k, and Genesis 12-DOF
 > 342 k / 622 k / 963 k. The Genesis headline is not iteration-equivalent — it
 > integrates 2×10 ms strides per 20 ms control step vs zealot's 4×5 ms substeps
@@ -357,10 +367,11 @@ rollout throughput, like `biped_fps`.
 
 Numbers are **env-control-steps / second**. Bold = winner of each CPU/GPU pair.
 Measured on a M-series mac + WebGPU and a 24-core x86 box with an RTX 5090. The
-**Isaac** column is NVIDIA Isaac Lab + PhysX 5 on the same 5090, same task
-(`Velocity-LeRobot-NoArms-v0`), measured the same way — rsl_rl *collection*
-throughput (`num_envs · 24 / collection_time`, i.e. physics + policy inference,
-no learning step) — as the production reference for "how fast this *should* go".
+**Isaac** column is NVIDIA's WBC-AGILE pipeline (Isaac Lab + PhysX 5) on the same
+5090, running its LeRobot no-arms velocity task (`velocity_lerobot_no_arms`),
+measured the same way — rsl_rl *collection* throughput
+(`num_envs · 24 / collection_time`, i.e. physics + policy inference, no learning
+step) — as the production reference for "how fast this *should* go".
 
 Same config note as the iteration table: **linux** columns re-measured at
 position-iters = 4 + explicit Coriolis; **†** columns are the previous
