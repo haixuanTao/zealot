@@ -97,9 +97,12 @@ collection + learning, the same unit as the tables below):
 
 ```
 full iteration — 8192 envs, T=32, 5e x 16mb
-  FULL CPU (rapier + CPU MLP + CPU update) :  68319 ms =   3.8 k env/s
-  FULL GPU (nexus + vortx + GPU update)    :   7242 ms =  36.2 k env/s
+  FULL CPU (rapier + CPU MLP + CPU update) :  68545 ms =   3.8 k env/s
+  FULL GPU (nexus + vortx + GPU update)    :  11256 ms =  23.3 k env/s
 ```
+
+(That's the WebGPU path; the native-CUDA + cuTile build reaches **99.5 k** at the
+same N — see the table + reproduce block below.)
 
 Sweep N by re-running with `2048` / `4096` / `8192`. For **rollout-only**
 throughput (no PPO update, matches the rollout table below): `cargo run --release
@@ -168,6 +171,26 @@ loop is **vec4** (4-wide FMA) — all verified bit-exact against the CPU update
 > the previous `position-iters = 8` setting and awaits re-measurement on that
 > hardware. The **Isaac** column is PhysX's own solver and is config-independent.
 >
+> **Table refresh (2026-07, LeRobot biped, position-iters 4):** the **linux CPU /
+> WebGPU / native CUDA** columns below were re-measured on the current stack.
+> `iter_e2e_bench` now runs the same **cuTile tf32** update + rollout forward as
+> the trainer (build with `--features cutile`, run with `BIPED_CUTILE_GEMM=1`;
+> cuTile's one-time per-shape JIT — ~9 s update, ~2 s forward — is warmed
+> *outside* the timers, since a training run pays it once per process). Native
+> CUDA jumped to **79.8 k @ N=2 048 / 99.5 k @ N=8 192** (+31%/+56% over the
+> 2026-06 column) and **no longer plateaus at large N** — the old flat line was
+> the update, not the physics. That puts the Isaac gap at **~2.0× @ N=8 192**
+> (was 3.2×) and **ahead of the table's Isaac number at N=2 048**. Two
+> regressions were found and are recorded rather than hidden: (1) the **WebGPU
+> column dropped** (36.2 k → 23.3 k @ N=8 192) — cuTile is CUDA-only so WebGPU
+> still rides the vortx GEMM update, which got slower somewhere in the
+> cuTile/nvptx refactor window (root cause unbisected; the CUDA-side vortx
+> fallback shows the same disease ~15× worse per call); (2) **CUDA-graph replay
+> is currently 4–7× slower than eager** on this driver state (`BIPED_CAPTURE=1`
+> / the update's default capture path; measured directly, un-profiled, and
+> invisible under nsys) — the bench grew a `BIPED_UPD_GRAPH=0` escape hatch and
+> the CUDA column above is eager.
+>
 > **G1 cross-sim check (2026-07):** a strictly-sequential, same-hour run on the same
 > 5090, every sim driving the Unitree G1 (full training env-steps/s, `biped_train_gpu`):
 > zealot 12-DOF **61 k / 71 k / 82 k** @ N=2 048/4 096/8 192 vs Isaac Lab full-body G1
@@ -180,26 +203,25 @@ loop is **vec4** (4-wide FMA) — all verified bit-exact against the CPU update
 > is ~0.85× of Isaac; the gap opens with batch (2.2× at 8 192, where zealot
 > plateaus) — that large-N slope is the megakernel lever below.
 
-| N envs | mac CPU† | mac GPU† | linux CPU (24-core) | linux GPU (RTX 5090, WebGPU) | linux GPU (RTX 5090, native CUDA) | Isaac/PhysX 5 (5090) |
+| N envs | mac CPU† | mac GPU† | linux CPU (24-core) | linux GPU (RTX 5090, WebGPU) | linux GPU (RTX 5090, native CUDA + cuTile) | Isaac/PhysX 5 (5090) |
 |-------:|--------:|--------:|--------------------:|-----------------------------:|----------------------------------:|---------------------:|
-| 512    | 2.0 k   | 3.8 k   | 2.2 k               | 17.2 k                       | **34.7 k**                        | —                    |
-| 1 024  | 2.0 k   | 5.3 k   | 2.5 k               | 24.9 k                       | **49.7 k**                        | —                    |
-| 2 048  | 2.1 k   | 6.5 k   | 2.9 k               | 31.8 k                       | **61.0 k**                        | 67 k                 |
-| 4 096  | 2.1 k   | 7.7 k   | 3.4 k               | 34.7 k                       | **63.0 k**                        | 126 k                |
-| 8 192  | 2.1 k   | 8.0 k   | 3.8 k               | 36.2 k                       | **63.6 k**                        | 201 k                |
+| 512    | 2.0 k   | 3.8 k   | 2.2 k               | 17.0 k                       | **40.7 k**                        | —                    |
+| 1 024  | 2.0 k   | 5.3 k   | 2.5 k               | 20.7 k                       | **62.1 k**                        | —                    |
+| 2 048  | 2.1 k   | 6.5 k   | 2.9 k               | 22.5 k                       | **79.8 k**                        | 67 k                 |
+| 4 096  | 2.1 k   | 7.7 k   | 3.2 k               | 22.8 k                       | **91.4 k**                        | 126 k                |
+| 8 192  | 2.1 k   | 8.0 k   | 3.7 k               | 23.3 k                       | **99.5 k**                        | 201 k                |
 
 The **native-CUDA** column is the *same* Rust stack compiled to PTX via
 [cuda-oxide](https://github.com/NVlabs/cuda-oxide) (Rust→PTX, LLVM 21) — no WebGPU
 at all, both the vortx tensor ops and the `nexus3d` physics, straight from the
 *verbatim* `#[spirv]` shader source, bit-exact vs WebGPU (boxes-physics pose
 fingerprint identical; full biped iteration gather err 0.0 — the contact-path
-codegen crash is fixed, nexus-cuda `29fac1e`). It's now **~1.8–2× over WebGPU
-across the sweep** (up to ~2× on the smaller batches; was ~1.4× before the
-2026-06 per-env-parallelism work). Two levers compound: (1) the GEMM-heavy PPO
-update (~3× via `cuLaunchKernel` — no per-dispatch bind groups, higher GEMM
-throughput), and (2) the per-env optimizations land harder on CUDA — CUDA-graph
-capture (effective only on CUDA) lets the cooperative-kernel physics wins show,
-and fixed-grid dispatch is CUDA-only (WebGPU keeps its native indirect dispatch).
+codegen crash is fixed, nexus-cuda `29fac1e`). With the 2026-07 cuTile update
+it's now **~2.4–4.3× over WebGPU across the sweep**. Three levers compound:
+(1) the PPO update and rollout forward on **cuTile tf32 tensor cores**
+(CUDA-only), (2) lower dispatch cost via `cuLaunchKernel` — no per-dispatch
+bind groups, and (3) fixed-grid dispatch is CUDA-only (WebGPU keeps its native
+indirect dispatch).
 Getting there took ~12 general cuda-oxide codegen fixes plus two khal↔cuda-oxide
 ABI fixes (push element-count not byte-length for slice kernel args; pass a
 shader's `&0` offset by value to dodge a null-deref that DCE'd a whole kernel).
@@ -215,9 +237,10 @@ both SPIR-V and PTX), so they lifted **both** columns again: native CUDA to
 **63.6 k @ N=8 192 / 61.0 k @ N=2 048** (34.7 k @ N=512) and WebGPU to **36.2 k @
 N=8 192 / 31.8 k @ N=2 048** (17.2 k @ N=512, +22–47% across the sweep; the
 fixed-grid default is CUDA-only, the rest is shared). **The Isaac gap (native
-CUDA) is now ~3.2× at N = 8 192 (was 4.8×) and ~1.1× at N = 2 048 (was 1.9×)** —
-the dispatch and per-env wins close it substantially, but the large-N gap is the
-fused-solver (megakernel) / per-articulation-FK architecture, not dispatches. Two hardware notes worth recording. (1) The vec4 **inner-loop FMA** is a ~12%
+CUDA) is now ~2.0× at N = 8 192 (was 4.8×, then 3.2×) and zealot is ~1.2×
+AHEAD at N = 2 048** after the 2026-07 cuTile refresh — what remains at large N
+is the fused-solver (megakernel) / per-articulation-FK architecture, not
+dispatches or the update. Two hardware notes worth recording. (1) The vec4 **inner-loop FMA** is a ~12%
 win on the 5090 but **flat on the mac** — Metal auto-vectorizes the inner loop;
 rust-gpu → SPIR-V → NVIDIA does not, so the explicit `Vec4` FMA matters there.
 (2) vec4 **global loads** (a `gemm_tiled_vec4` with 128-bit loads, verified
@@ -275,10 +298,13 @@ Reproduce:
 ```sh
 # WebGPU
 cargo run --release --example iter_e2e_bench --features "gpu biped_gpu" -- <num_envs> 32 5 16
-# native CUDA (needs the cuda-oxide toolchain + embedded cubins; fixed-grid is the CUDA default)
-BIPED_CUDA=1 cargo run --release --example iter_e2e_bench --features "gpu biped_gpu cuda_backend" -- <num_envs> 32 5 16
-# with CUDA-graph capture of the rollout (the updated native-CUDA column):
-BIPED_CAPTURE=1 BIPED_CUDA=1 cargo run --release --example iter_e2e_bench --features "gpu biped_gpu cuda_backend" -- <num_envs> 32 5 16
+# native CUDA + cuTile tf32 (the current native-CUDA column; needs the cuda-oxide
+# toolchain + embedded cubins; fixed-grid is the CUDA default)
+BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 cargo run --release --example iter_e2e_bench \
+    --features "gpu biped_gpu cuda_backend cutile" -- <num_envs> 32 5 16
+# BIPED_CAPTURE=1 (rollout CUDA-graph capture) and the update's default graph path
+# are currently pathological on this driver (replay 4–7× slower than eager, see the
+# note above); BIPED_UPD_GRAPH=0 forces the eager update without per-launch syncs.
 ```
 
 ## End-to-end training (GPU PPO) — **default trainer**

@@ -18,6 +18,7 @@ mod gpu_policy;
 
 use biped_env::BipedEnv;
 use biped_env_nexus::{BipedNexusBatchEnv, StepOut, default_mjcf_path};
+use cutile_gemm::{CutileGemm, EncCursor};
 use gpu_policy::GpuPolicy;
 use khal::BufferUsages;
 use khal::Shader;
@@ -106,57 +107,86 @@ impl GpuMlp {
         op: &OpAssign,
         act: &Activation,
         sh: &mut TensorLayoutBuffers,
-        enc: &mut <GpuBackend as Backend>::Encoder,
+        cur: &mut EncCursor,
+        ct: Option<&CutileGemm>,
         o1m: &Tensor<f32>,
     ) -> anyhow::Result<()> {
         let l = self.layers();
         for i in 0..l {
             let (lf, rt) = self.a.split_at_mut(i + 1);
             let (ain, aout) = (&lf[i], &mut rt[0]);
-            {
-                let mut p = enc.begin_pass("z", None);
-                // vec4 global loads only for the qualifying contiguous hidden GEMMs
-                // (out%64, in%16, batch%64); input/output layers fall back to scalar.
-                if self.dims[i + 1] % 64 == 0 && self.dims[i] % 16 == 0 && self.batch % 64 == 0 {
-                    g.dispatch_tiled(bk, sh, &mut p, &mut *aout, &self.w[i], ain)?;
-                } else {
+            // z = act(W[i]·a[i] + b[i]) — ONE fused tf32 cuTile launch when
+            // enabled (gemm + bias broadcast + ELU epilogue); else the vortx
+            // gemm / bias-GEMV / add / ELU pass chain.
+            if let Some(ct) = ct {
+                cur.flush(); // pending khal work must hit the stream first
+                ct.gemm_bias_act(
+                    aout,
+                    &self.w[i],
+                    ain,
+                    self.dims[i + 1],
+                    self.batch,
+                    self.dims[i],
+                    &self.b[i],
+                    1,
+                    i < l - 1,
+                )?;
+            } else {
+                {
+                    let mut p = cur.pass("z");
                     g.dispatch_tiled(bk, sh, &mut p, &mut *aout, &self.w[i], ain)?;
                 }
-            }
-            {
-                let mut p = enc.begin_pass("bb", None);
-                g.dispatch_naive(bk, sh, &mut p, &mut self.bb[i], &self.b[i], o1m)?;
-            }
-            {
-                let mut p = enc.begin_pass("bias", None);
-                op.launch(
-                    bk,
-                    sh,
-                    &mut p,
-                    OpAssignVariant::Add,
-                    &mut *aout,
-                    &self.bb[i],
-                )?;
-            }
-            if i < l - 1 {
-                let mut p = enc.begin_pass("elu", None);
-                act.elu(bk, sh, &mut p, &mut *aout)?;
+                {
+                    let mut p = cur.pass("bb");
+                    g.dispatch_naive(bk, sh, &mut p, &mut self.bb[i], &self.b[i], o1m)?;
+                }
+                {
+                    let mut p = cur.pass("bias");
+                    op.launch(
+                        bk,
+                        sh,
+                        &mut p,
+                        OpAssignVariant::Add,
+                        &mut *aout,
+                        &self.bb[i],
+                    )?;
+                }
+                if i < l - 1 {
+                    let mut p = cur.pass("elu");
+                    act.elu(bk, sh, &mut p, &mut *aout)?;
+                }
             }
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     fn backward(
         &mut self,
         bk: &GpuBackend,
         g: &Gemm,
         act: &Activation,
         sh: &mut TensorLayoutBuffers,
-        enc: &mut <GpuBackend as Backend>::Encoder,
+        cur: &mut EncCursor,
+        ct: Option<&CutileGemm>,
         om1: &Tensor<f32>,
     ) -> anyhow::Result<()> {
         for i in (0..self.layers()).rev() {
-            {
-                let mut p = enc.begin_pass("dw", None);
+            // dW[i] = delta[i] · a[i]ᵀ — the deep-K (K = batch) wgrad, where
+            // the cuTile split-K path matters most.
+            if let Some(ct) = ct {
+                cur.flush();
+                ct.gemm(
+                    &self.dw[i],
+                    &self.delta[i],
+                    false,
+                    &self.a[i],
+                    true,
+                    self.dims[i + 1],
+                    self.dims[i],
+                    self.batch,
+                )?;
+            } else {
+                let mut p = cur.pass("dw");
                 g.dispatch_tiled(
                     bk,
                     sh,
@@ -166,8 +196,12 @@ impl GpuMlp {
                     self.a[i].transpose_last_dims(),
                 )?;
             }
-            {
-                let mut p = enc.begin_pass("db", None);
+            // db = row-sums of delta (the vortx GEMV ran ~100x below bandwidth).
+            if let Some(ct) = ct {
+                cur.flush();
+                ct.row_sum(&self.db[i], &self.delta[i], self.dims[i + 1], self.batch)?;
+            } else {
+                let mut p = cur.pass("db");
                 g.dispatch_naive(bk, sh, &mut p, &mut self.db[i], &self.delta[i], om1)?;
             }
             if i > 0 {
@@ -175,11 +209,29 @@ impl GpuMlp {
                     let (lf, rt) = self.delta.split_at_mut(i);
                     let dp = &mut lf[i - 1];
                     let dc = &rt[0];
-                    let mut p = enc.begin_pass("da", None);
-                    g.dispatch_tiled(bk, sh, &mut p, dp, self.w[i].transpose_last_dims(), dc)?;
+                    // delta[i-1] = W[i]ᵀ · delta[i] (dgrad).
+                    if let Some(ct) = ct {
+                        cur.flush();
+                        ct.gemm(
+                            dp,
+                            &self.w[i],
+                            true,
+                            dc,
+                            false,
+                            self.dims[i],
+                            self.batch,
+                            self.dims[i + 1],
+                        )?;
+                    } else {
+                        let mut p = cur.pass("da");
+                        g.dispatch_tiled(bk, sh, &mut p, dp, self.w[i].transpose_last_dims(), dc)?;
+                    }
                 }
-                {
-                    let mut p = enc.begin_pass("eb", None);
+                if let Some(ct) = ct {
+                    cur.flush();
+                    ct.elu_backward(&self.delta[i - 1], &self.a[i], self.dims[i], self.batch)?;
+                } else {
+                    let mut p = cur.pass("eb");
                     act.elu_backward(bk, sh, &mut p, &mut self.delta[i - 1], &self.a[i])?;
                 }
             }
@@ -191,12 +243,12 @@ impl GpuMlp {
         bk: &GpuBackend,
         ad: &Adam,
         sh: &mut TensorLayoutBuffers,
-        enc: &mut <GpuBackend as Backend>::Encoder,
+        cur: &mut EncCursor,
         ap: &Tensor<AdamParams>,
     ) -> anyhow::Result<()> {
         for i in 0..self.layers() {
             {
-                let mut p = enc.begin_pass("aw", None);
+                let mut p = cur.pass("aw");
                 ad.step(
                     bk,
                     sh,
@@ -209,7 +261,7 @@ impl GpuMlp {
                 )?;
             }
             {
-                let mut p = enc.begin_pass("ab", None);
+                let mut p = cur.pass("ab");
                 ad.step(
                     bk,
                     sh,
@@ -338,7 +390,16 @@ fn main() {
             &mut rng,
         );
         let mut gpu = GpuPolicy::new(env.backend(), &ac2, n).expect("gpu policy");
+        // cuTile tf32 tensor-core GEMMs for the update AND the rollout policy
+        // forward (BIPED_CUTILE_GEMM=1; needs --features cutile) — same wiring
+        // as biped_train_gpu, so the bench measures the current fast path.
+        let ct: Option<&'static CutileGemm> = CutileGemm::init(env.backend()).await;
+        gpu.set_cutile(ct);
         let (mut gc, mut gcc) = env.initial_obs().await;
+        // Warm the policy forward once, untimed: cuTile JITs per-shape kernels
+        // on first use (~2 s); a training run pays that once per process, so the
+        // steady-state iteration shouldn't carry it.
+        let _ = gpu.forward(env.backend(), &ac2, &gc, &gcc).await.unwrap();
         let mut samp: Vec<Vec<Sample>> = (0..n).map(|_| Vec::with_capacity(t_steps)).collect();
         let (mut rs, mut vs, mut ds): (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<bool>>) = (
             (0..n).map(|_| vec![]).collect(),
@@ -541,12 +602,12 @@ fn main() {
         // barriers keep the minibatch steps ordered (Adam writes w, next forward
         // reads it) while removing ~minibatches-1 host<->GPU sync stalls per epoch.
         macro_rules! run_minibatches {
-            ($enc:ident) => {{
+            ($cur:ident) => {{
                 for k in 0..minibatches {
                     let off = (k * mb) as u32;
                     let nb = mb as u32;
                     {
-                        let mut p = $enc.begin_pass("g_obs", None);
+                        let mut p = $cur.pass("g_obs");
                         cont.launch(
                             &bk,
                             &mut sh,
@@ -558,7 +619,7 @@ fn main() {
                         .unwrap();
                     }
                     {
-                        let mut p = $enc.begin_pass("g_cobs", None);
+                        let mut p = $cur.pass("g_cobs");
                         cont.launch(
                             &bk,
                             &mut sh,
@@ -570,7 +631,7 @@ fn main() {
                         .unwrap();
                     }
                     {
-                        let mut p = $enc.begin_pass("g_act", None);
+                        let mut p = $cur.pass("g_act");
                         cont.launch(
                             &bk,
                             &mut sh,
@@ -582,7 +643,7 @@ fn main() {
                         .unwrap();
                     }
                     {
-                        let mut p = $enc.begin_pass("g_adv", None);
+                        let mut p = $cur.pass("g_adv");
                         cont.launch(
                             &bk,
                             &mut sh,
@@ -594,28 +655,28 @@ fn main() {
                         .unwrap();
                     }
                     {
-                        let mut p = $enc.begin_pass("g_lpo", None);
+                        let mut p = $cur.pass("g_lpo");
                         cont.launch(&bk, &mut sh, &mut p, &mut lpo, f_lpo.columns(off, nb), None)
                             .unwrap();
                     }
                     {
-                        let mut p = $enc.begin_pass("g_vo", None);
+                        let mut p = $cur.pass("g_vo");
                         cont.launch(&bk, &mut sh, &mut p, &mut vo, f_vo.columns(off, nb), None)
                             .unwrap();
                     }
                     {
-                        let mut p = $enc.begin_pass("g_ret", None);
+                        let mut p = $cur.pass("g_ret");
                         cont.launch(&bk, &mut sh, &mut p, &mut ret, f_ret.columns(off, nb), None)
                             .unwrap();
                     }
                     a_net
-                        .forward(&bk, &g, &op, &act, &mut sh, &mut $enc, &o1m)
+                        .forward(&bk, &g, &op, &act, &mut sh, &mut $cur, ct, &o1m)
                         .unwrap();
                     c_net
-                        .forward(&bk, &g, &op, &act, &mut sh, &mut $enc, &o1m)
+                        .forward(&bk, &g, &op, &act, &mut sh, &mut $cur, ct, &o1m)
                         .unwrap();
                     {
-                        let mut p = $enc.begin_pass("ag", None);
+                        let mut p = $cur.pass("ag");
                         ppo.actor_grad(
                             &mut p,
                             &ap,
@@ -630,7 +691,7 @@ fn main() {
                         .unwrap();
                     }
                     {
-                        let mut p = $enc.begin_pass("vg", None);
+                        let mut p = $cur.pass("vg");
                         ppo.value_grad(
                             &mut p,
                             &vp,
@@ -642,20 +703,23 @@ fn main() {
                         .unwrap();
                     }
                     a_net
-                        .backward(&bk, &g, &act, &mut sh, &mut $enc, &om1)
+                        .backward(&bk, &g, &act, &mut sh, &mut $cur, ct, &om1)
                         .unwrap();
                     c_net
-                        .backward(&bk, &g, &act, &mut sh, &mut $enc, &om1)
+                        .backward(&bk, &g, &act, &mut sh, &mut $cur, ct, &om1)
                         .unwrap();
-                    {
-                        let mut p = $enc.begin_pass("dl", None);
+                    if let Some(ct) = ct {
+                        $cur.flush();
+                        ct.row_sum(&dls, &gls, ad_, mb).unwrap();
+                    } else {
+                        let mut p = $cur.pass("dl");
                         g.dispatch_naive(&bk, &mut sh, &mut p, &mut dls, &gls, &om1)
                             .unwrap();
                     }
-                    a_net.adam(&bk, &ad, &mut sh, &mut $enc, &adp).unwrap();
-                    c_net.adam(&bk, &ad, &mut sh, &mut $enc, &adp).unwrap();
+                    a_net.adam(&bk, &ad, &mut sh, &mut $cur, &adp).unwrap();
+                    c_net.adam(&bk, &ad, &mut sh, &mut $cur, &adp).unwrap();
                     {
-                        let mut p = $enc.begin_pass("al", None);
+                        let mut p = $cur.pass("al");
                         ad.step(
                             &bk, &mut sh, &mut p, &adp, &mut lst, &dls, &mut mls, &mut vls,
                         )
@@ -666,8 +730,32 @@ fn main() {
         }
         // KHAL_CUDA_PROFILE syncs after every launch, which is illegal mid-capture
         // — fall through to the eager path so the per-kernel timer can run.
+        // BIPED_UPD_GRAPH=0 also forces eager epochs (no per-launch sync): escape
+        // hatch for drivers where cuGraphLaunch replay is slower than eager encode.
+        // cuTile JITs its update kernels on first use (~8-9 s for the fwd/bwd/
+        // row-sum shapes) — run ONE untimed epoch to compile them, then restart
+        // the update timer and subtract the warm-up from the whole-iteration
+        // clock. Steady-state training pays this once per process (the trainer's
+        // iter-0 `upd` shows it), so the per-iteration numbers shouldn't.
+        let warm_ms = if ct.is_some() {
+            let tw = Instant::now();
+            let mut cur = EncCursor::new(&bk);
+            run_minibatches!(cur);
+            cur.flush();
+            bk.synchronize().unwrap();
+            tw.elapsed().as_secs_f64() * 1e3
+        } else {
+            0.0
+        };
+        let tu = Instant::now();
+        // The cuTile path launches on the stream between khal submits (untested
+        // under stream capture) — run its epochs eagerly.
         let profiling = std::env::var_os("KHAL_CUDA_PROFILE").is_some();
-        if let Some(cuda) = bk.as_cuda().filter(|_| !profiling) {
+        let no_graph = std::env::var("BIPED_UPD_GRAPH").is_ok_and(|v| v == "0");
+        if let Some(cuda) = bk
+            .as_cuda()
+            .filter(|_| !profiling && !no_graph && ct.is_none())
+        {
             // CUDA-graph path: capture ONE epoch's launch sequence (recorded, not
             // executed) into a graph, then replay it `epochs` times with one
             // cuGraphLaunch each — skipping all per-dispatch host encode. Every
@@ -679,16 +767,16 @@ fn main() {
             // those pageable H2D copies during capture would make cuGraphLaunch
             // return INVALID_VALUE.
             {
-                let mut enc = bk.begin_encoding();
-                run_minibatches!(enc);
-                bk.submit(enc).unwrap();
+                let mut cur = EncCursor::new(&bk);
+                run_minibatches!(cur);
+                cur.flush();
                 bk.synchronize().unwrap();
             }
             let tcap = Instant::now();
             cuda.begin_capture().unwrap();
-            let mut enc = bk.begin_encoding();
-            run_minibatches!(enc);
-            bk.submit(enc).unwrap();
+            let mut cur = EncCursor::new(&bk);
+            run_minibatches!(cur);
+            cur.flush();
             let graph = cuda.end_capture().unwrap();
             let cap_ms = tcap.elapsed().as_secs_f64() * 1e3;
             // epoch 0 ran eagerly above; replay the captured epoch for the rest.
@@ -705,14 +793,14 @@ fn main() {
             );
         } else {
             for _ in 0..epochs {
-                let mut enc = bk.begin_encoding();
-                run_minibatches!(enc);
-                bk.submit(enc).unwrap();
+                let mut cur = EncCursor::new(&bk);
+                run_minibatches!(cur);
+                cur.flush();
                 bk.synchronize().unwrap();
             }
         }
         let upd_ms = tu.elapsed().as_secs_f64() * 1e3;
-        let gpu_ms = tg.elapsed().as_secs_f64() * 1e3;
+        let gpu_ms = tg.elapsed().as_secs_f64() * 1e3 - warm_ms;
         eprintln!("  [WebGPU update only] {upd_ms:9.1} ms");
         // Correctness guard: a_net.a[0] holds the LAST minibatch's gathered obs —
         // confirm the .columns()+Contiguous gather matches the CPU-normalized data.
