@@ -28,8 +28,11 @@ so the format choice reduces to "what can produce rapier types." Decisions:
 
 - **First toy walker:** build the scene programmatically in Rust (like the nexus examples) —
   faster than authoring/parsing a file for ~5 bodies.
-- **Real robots (G1/T1):** load **URDF** via [`rapier3d-urdf`](https://crates.io/crates/rapier3d-urdf)
-  (dimforge, rapier 0.32 — matches nexus). MJCF has no mature pure-Rust loader; USD is Omniverse-bound.
+- **Real robots (G1/H2):** ship as **MJCF** assets in `assets/robots/`, parsed by the
+  in-repo subset loader (`examples/biped/biped_mjcf.rs`) and generated from Unitree's
+  official models by `tools/convert_unitree_biped.py`. Select at runtime with
+  `BIPED_ROBOT=lerobot|g1|g1_29dof|h2plus` — 12-DOF legs-only variants, plus a
+  full-body 29-joint G1 whose wrists are welded to fit the solver's 32-DOF cap.
 - **The MDP** stays Rust code (`EnvConfig`), separate from the asset.
 
 There is no CLI binary — the project is demonstrated through runnable **examples**
@@ -58,17 +61,15 @@ toolchain). Two groups:
 
 ## Status
 
-The `zealot-env` / `zealot-rl` crates are still scaffolds (env step loop has no
-physics yet). The working physics + RL currently lives in the **pendulum
-examples**, ported verbatim from nexus-rl's `pendulum_headless`: they drive
-`nexus3d` directly rather than going through `zealot-env`/`zealot-rl`. Folding
-that logic into the crates is the next step, gated on:
-
-1. A ~10-line nexus patch: make joint-motor targets writable + velocities readable.
-2. The learning-stack decision for `zealot-rl`: **burn** (fast, batteries-included)
-   vs **vortx + hand-rolled backprop** (unified dimforge/WebGPU stack, stronger
-   browser/dora story). Both are confirmed viable on nexus — `pendulum_gpu_policy`
-   already trains a vortx policy on-GPU.
+The working core is the **biped stack** in `examples/biped/`: batched nexus GPU
+envs (`biped_env_nexus.rs`), the GPU-resident PPO trainer (`biped_train_gpu.rs`,
+see below), and multi-robot assets selected with `BIPED_ROBOT=lerobot` (default)
+| `g1` | `g1_29dof` | `h2plus` (robot table in `zealot-env/src/robots/`). The
+learning-stack decision landed on **vortx + hand-rolled backprop**, with the hot
+PPO GEMMs since moved to **cuTile tf32 tensor cores** (`BIPED_CUTILE_GEMM=1`,
+kernels bit-checked in `examples/biped/cutile_gemm.rs`). The pendulum examples
+remain the gentle introduction; `zealot-rl` carries the CPU reference
+implementations the GPU path is verified against.
 
 ## Quick start — reproduce the GPU benchmark (agent-runnable)
 
@@ -166,6 +167,18 @@ loop is **vec4** (4-wide FMA) — all verified bit-exact against the CPU update
 > The **†** column (**mac**) is
 > the previous `position-iters = 8` setting and awaits re-measurement on that
 > hardware. The **Isaac** column is PhysX's own solver and is config-independent.
+>
+> **G1 cross-sim check (2026-07):** a strictly-sequential, same-hour run on the same
+> 5090, every sim driving the Unitree G1 (full training env-steps/s, `biped_train_gpu`):
+> zealot 12-DOF **61 k / 71 k / 82 k** @ N=2 048/4 096/8 192 vs Isaac Lab full-body G1
+> 72 k / 115 k / 180 k, MJX full-body 76.5 k / 89 k / 97.7 k, and Genesis 12-DOF
+> 342 k / 622 k / 963 k. The Genesis headline is not iteration-equivalent — it
+> integrates 2×10 ms strides per 20 ms control step vs zealot's 4×5 ms substeps
+> (each with 8 TGS iterations), so per integration step it's roughly engine parity.
+> Isaac's lead, by contrast, is real: PhysX 5 runs the *same* TGS budget on the G1
+> (4 steps × 8 position iterations, plus velocity iterations). At 2 048 envs zealot
+> is ~0.85× of Isaac; the gap opens with batch (2.2× at 8 192, where zealot
+> plateaus) — that large-N slope is the megakernel lever below.
 
 | N envs | mac CPU† | mac GPU† | linux CPU (24-core) | linux GPU (RTX 5090, WebGPU) | linux GPU (RTX 5090, native CUDA) | Isaac/PhysX 5 (5090) |
 |-------:|--------:|--------:|--------------------:|-----------------------------:|----------------------------------:|---------------------:|
@@ -217,9 +230,14 @@ the rollout (~2.3× off PhysX) plus the update vs Isaac's fused-CUDA learning st
 > **Next levers (2026-06, in priority order).** After the dispatch + per-env-parallelism
 > wins above, the GPU profile (via `KHAL_CUDA_PROFILE=1`) has shifted — physics is no
 > longer the single dominant cost:
-> 1. **`gemm_tiled` (PPO policy/value matmuls) is now the top GPU kernel (~22%).** The
->    next lever is the *learning* side: higher GEMM throughput and/or fusing the PPO
->    update, not more physics work.
+> 1. ~~`gemm_tiled` (PPO policy/value matmuls), the top GPU kernel (~22%)~~ **(done,
+>    2026-07)** — the PPO update's GEMMs now run on **cuTile tf32 tensor cores**
+>    (`BIPED_CUTILE_GEMM=1`, `cutile` feature: ~90× the vortx GEMM on the PPO shapes,
+>    split-K for the weight grads, fused bias+ELU forward, row-sum bias grads —
+>    update 0.23 s → 0.06 s @ N=2 048). The rollout's policy forward rides the same
+>    tf32 path. Same month, the *host* side of the iteration was fixed too: GAE /
+>    bootstrap / mirror-aug / normalize were 8 192 serial CPU value-net forwards —
+>    now rayon-parallel, bit-identical, 0.57 s → 0.04 s @ N=8 192.
 > 2. **Block-per-articulation resident-state substep megakernel** — fuse FK → mass-matrix
 >    → LU → constraint solve → integrate into one workgroup-scoped kernel that loads the
 >    articulation's `M`/jacobians/velocities into **shared memory once**, killing both
@@ -235,6 +253,22 @@ the rollout (~2.3× off PhysX) plus the update vs Isaac's fused-CUDA learning st
 >    init_solve-style phase-split needs that geometry stored/recomputed — left as a TODO.
 > 4. **Stage `M` in shared memory** for the finalize/init back-solves (each lane currently
 >    re-reads `M` from global) — folds into lever 2.
+>
+> **DOF scaling — a negative result worth recording (2026-07).** On full-body robots
+> the solver's **dense n×n LU** is the wall: the factor is O(n³), the per-substep
+> limit/contact back-solves are O(n²) each (`init_solve_joint_with_bias` alone was 28%
+> of GPU at 31 nv), the full-body G1 runs at only ~0.65× the 12-DOF rate, and
+> `MAX_MB_DOFS = 32` hard-caps what fits (hence the welded wrists). The textbook fix —
+> a MuJoCo-style **tree-sparse LᵀDL** (factor O(n·depth²), every solve O(n·depth)) —
+> was built, shipped shader-only, and benchmarked: it wins single-env but **loses
+> 10–15% at training batch scale** and leaves the DOF penalty unchanged. Cause: the
+> sparse factor/solves run serially on one lane while the dense LU spreads its larger
+> work across all 32 warp lanes — at 18–31 nv that's *more serial steps per warp*
+> despite far fewer FLOPs, and batch scale is throughput-bound
+> ([dimforge/nexus#15](https://github.com/dimforge/nexus/pull/15), closed with the
+> write-up). The salvage is an **env-per-lane layout** (one warp = 32 envs, the serial
+> sparse code becomes the per-lane inner loop, MJX/Isaac-style) — which folds into the
+> megakernel work in lever 2 and is what eventually dissolves the 32-DOF cap.
 
 Reproduce:
 
@@ -263,16 +297,24 @@ WBC-AGILE's T1 velocity policy (actor `[obs,256,256,128,12]`, critic
 `[cobs,512,256,128,1]`, `init_noise_std=1.0`, entropy 0.01, clip 0.2).
 
 ```sh
-# Default: native CUDA + CUDA-graph capture of the rollout (the fast path).
-BIPED_CUDA=1 BIPED_GRAPH=1 cargo run --release --example biped_train_gpu \
-    --features "gpu biped_gpu cuda_backend" -- <iters> <num_envs> <ckpt.safetensors>
+# The fast path: native CUDA + cuTile tf32 GEMMs. Build WITH the `cutile` feature —
+# without it BIPED_CUTILE_GEMM silently no-ops and the update falls back ~20× slower.
+BIPED_ROBOT=g1 BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
+    --features "gpu biped_gpu cuda_backend cutile" -- <iters> <num_envs> <ckpt.safetensors>
 ```
 
 Logs `iter / curr / step_rew / falls / torso_z / lr / kl / sec` per 10 iters
 (plus a `[prof]` per-phase split and a `[rb]` per-component reward line) and
-checkpoints to safetensors (auto-resumes). **~1.1 s/iter @ N=2048** with the
-CUDA graph — ≈8–10× the legacy CPU-policy trainer `biped_train_nexus` (policy +
-PPO on the CPU), which is kept only as a reference/fallback. This is the
+checkpoints to safetensors. **Auto-resumes** if the checkpoint file exists
+(default `/tmp/biped_policy_gpu.safetensors`) — delete it for a fresh run, and
+*always* before benchmarking or comparing iter-0 stats. As of 2026-07 (cuTile
+tf32 update path + rayon-parallel GAE/bootstrap + one-launch small-batch sort)
+the trainer sustains **~0.8 s/iter @ N=2 048** on the G1 12-DOF — **61 k / 71 k
+/ 82 k env-steps/s @ N=2 048/4 096/8 192** — ≈8–10× the legacy CPU-policy
+trainer `biped_train_nexus` (policy + PPO on the CPU), which is kept only as a
+reference/fallback. `BIPED_GRAPH=1` (CUDA-graph capture of the training rollout)
+is opt-in and under investigation: nsys shows replay is GPU-perfect (~7 ms/step
+of launch bubbles eliminated) yet un-profiled wall-clock currently regresses. This is the
 *training* counterpart to the throughput benchmark, and the basis for a WBC-AGILE
 training A/B (matched config, matched iteration count).
 
