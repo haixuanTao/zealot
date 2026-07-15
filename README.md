@@ -317,6 +317,47 @@ BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 cargo run --release --example iter_e2e_bench \
 # note above); BIPED_UPD_GRAPH=0 forces the eager update without per-launch syncs.
 ```
 
+## Benchmark — G1 vs the production pipeline (WBC-AGILE, 2026-07)
+
+The LeRobot table above compares against WBC-AGILE's *lightest* task. This one
+compares the **Unitree G1** against the pipeline NVIDIA actually ships for it:
+[WBC-AGILE](https://github.com/nvidia-isaac/WBC-AGILE)'s `Velocity-G1-History-v0`
+— full 29-DOF G1, delayed DC-motor actuation model, 5-step observation history,
+contact sensors, the full manager/reward stack, PhysX TGS at 8 position + 4
+velocity iterations, 200 Hz physics / 50 Hz control (the same 4×5 ms structure
+zealot uses). Same 5090, same hour, strictly sequential; WBC-AGILE numbers are
+steady-state rsl_rl `Computation` (collection + learning); zealot is
+`iter_e2e_bench` (native CUDA + cuTile, T=32, 5e×16mb) with `BIPED_ROBOT=g1`
+(12-DOF legs-only, wrists/waist fused):
+
+| N envs | zealot G1 (solver-iters 4) | zealot G1 (solver-iters 8, AGILE-matched) | WBC-AGILE G1 (29 DOF) |
+|-------:|---------------------------:|------------------------------------------:|----------------------:|
+| 2 048  | 70.4 k                     | **51.1 k**                                | 20.6 k                |
+| 4 096  | 81.3 k                     | **60.4 k**                                | 32.3 k                |
+| 8 192  | 89.5 k                     | **68.5 k**                                | 47.4 k                |
+
+At the AGILE-matched solver budget zealot is **2.5× / 1.9× / 1.4× ahead**. Read
+it with two asymmetries in mind, one per side. Against zealot: WBC-AGILE
+simulates the **full 29-DOF body** with a heavier task (history obs, delayed
+actuators, sensors) — applying zealot's measured ~0.65× full-body DOF penalty
+puts a hypothetical full-body zealot at rough **parity at 8 192** and ahead
+below. Against WBC-AGILE: its own task overhead is real — the *stock*
+`Isaac-Velocity-Flat-G1-v0` on the same box does 72 k / 115 k / 180 k, so the
+production stack runs **~3.5–3.8× below its engine's ceiling**. That gap is the
+actual competitive target: a production-grade task costs PhysX most of its
+headline throughput, while zealot's task layer (rewards/obs on rayon, cuTile
+policy) keeps ~all of it.
+
+Reproduce (zealot side; WBC-AGILE side is `scripts/train.py
+--task Velocity-G1-History-v0 --headless --num_envs N --max_iterations 15` from
+its repo):
+
+```sh
+BIPED_ROBOT=g1 BIPED_SOLVER_ITERS=8 BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 \
+    cargo run --release --example iter_e2e_bench \
+    --features "gpu biped_gpu cuda_backend cutile" -- <num_envs> 32 5 16
+```
+
 ## End-to-end training (GPU PPO) — **default trainer**
 
 The iteration benchmark above times *one* step end-to-end (rollout + update) for
