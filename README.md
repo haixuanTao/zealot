@@ -334,33 +334,44 @@ steady-state rsl_rl `Computation` (collection + learning); zealot is
 `iter_e2e_bench` (native CUDA + cuTile, T=32, 5e×16mb) with `BIPED_ROBOT=g1`
 (12-DOF legs-only, wrists/waist fused):
 
-| N envs | zealot 12-DOF (iters 4) | zealot 12-DOF (iters 8) | zealot full-body, 31 nv (iters 8) | WBC-AGILE full-body, 35 nv |
-|-------:|------------------------:|------------------------:|----------------------------------:|---------------------------:|
-| 2 048  | 70.4 k                  | 51.1 k                  | **35.4 k**                        | 20.6 k                     |
-| 4 096  | 81.3 k                  | 60.4 k                  | **42.9 k**                        | 32.3 k                     |
-| 8 192  | 89.5 k                  | 68.5 k                  | **56.1 k**                        | 47.4 k                     |
+All zealot columns run solver-iters 8 (the AGILE-matched TGS budget; at the
+LeRobot table's iters-4 config the 12-DOF G1 does 70.4 / 81.3 / 89.5 k).
+**+delay+hist** = `BIPED_MOTOR_DELAY=0,4 BIPED_OBS_HISTORY=5` — the same
+actuation-latency + stacked-observation realism WBC-AGILE's task carries (its
+numbers include that work, so a bare zealot row would be under-modeled):
 
-The bold column is the par-to-par comparison — full body vs full body at the
-same TGS budget: zealot is **1.7× / 1.3× / 1.2× ahead**. Residual asymmetries,
-one per side: zealot's full-body model welds the wrists (31 nv vs AGILE's true
-29-joint 35 nv, the `MAX_MB_DOFS = 32` cap) and its task layer is lighter — no
-actuator-delay model or observation history (both hold the upper body with PD
-and actuate the legs). Against WBC-AGILE: its own task overhead dominates its
-profile — the *stock* `Isaac-Velocity-Flat-G1-v0` on the same box does
-72 k / 115 k / 180 k, so the production stack runs **~3.5–3.8× below its
-engine's ceiling**, and a GPU-utilization probe during its steady iterations
-shows why: 75% "utilization" at only **156 W of the 600 W budget** — the
-launch-bound signature of many tiny manager-framework kernels with Python gaps,
-not extra simulation compute. A production-grade task costs PhysX most of its
-headline throughput, while zealot's task layer (rewards/obs on rayon, cuTile
-policy) keeps ~all of it — that, not the engine, is the actual competitive gap.
+| N envs | zealot 12-DOF | 12-DOF +delay+hist | zealot full-body (31 nv) | full-body +delay+hist | WBC-AGILE (35 nv) |
+|-------:|--------------:|-------------------:|-------------------------:|----------------------:|------------------:|
+| 2 048  | 51.1 k        | 43.8 k             | 35.4 k                   | **31.5 k**            | 20.6 k            |
+| 4 096  | 60.4 k        | 50.7 k             | 42.9 k                   | **37.0 k**            | 32.3 k            |
+| 8 192  | 68.5 k        | 55.7 k             | 56.1 k                   | **40.3 k**            | 47.4 k            |
+
+The bold column is the honest like-for-like: full body, same TGS budget, same
+delay/history modeling — zealot is **1.5× ahead at 2 048, 1.15× at 4 096, and
+0.85× (behind) at 8 192**. The realism costs zealot 11–28%, worst at large N,
+for a known and optimizable reason: the actuator delay's mid-decimation
+restages currently re-upload the whole `links_static` mirror (up to 3 extra
+flushes per control step) — a dirty-range or per-env upload would reclaim most
+of it — and the history adds a 225-input actor plus obs memcpy. Remaining
+asymmetries: zealot welds the wrists (31 vs 35 nv, the `MAX_MB_DOFS = 32` cap),
+has no DC-motor torque-speed saturation yet, and no contact-sensor history.
+Against WBC-AGILE the structural point stands: the *stock*
+`Isaac-Velocity-Flat-G1-v0` on the same box does 72 k / 115 k / 180 k, so the
+production stack runs **~3.5–3.8× below its engine's ceiling**, and a
+GPU-utilization probe during its steady iterations shows why: 75% "utilization"
+at only **156 W of the 600 W budget** — the launch-bound signature of many tiny
+manager-framework kernels with Python gaps, not extra simulation compute.
+Equivalent realism costs zealot a measured 11–28%; AGILE's task layer costs
+~3.5×.
 
 Reproduce (zealot side; WBC-AGILE side is `scripts/train.py
 --task Velocity-G1-History-v0 --headless --num_envs N --max_iterations 15` from
 its repo):
 
 ```sh
-BIPED_ROBOT=g1 BIPED_SOLVER_ITERS=8 BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 \
+# bold column: full-body + AGILE-parity realism flags
+BIPED_ROBOT=g1_29dof BIPED_SOLVER_ITERS=8 BIPED_MOTOR_DELAY=0,4 BIPED_OBS_HISTORY=5 \
+    BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 \
     cargo run --release --example iter_e2e_bench \
     --features "gpu biped_gpu cuda_backend cutile" -- <num_envs> 32 5 16
 ```
