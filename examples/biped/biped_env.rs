@@ -13,6 +13,7 @@
 use rapier3d::prelude::*;
 use rayon::prelude::*;
 use roxmltree::Node;
+use zealot_env::obs_history::ObsHistory;
 use zealot_env::rng::Lcg;
 use zealot_env::robots::{RobotSpec, NUM_JOINTS};
 use zealot_env::tasks::velocity_flat::{
@@ -344,6 +345,18 @@ pub struct BipedEnv {
     /// `last_action = action[t-2]` (lag-2, zero for the first 2 post-reset steps);
     /// fed to the obs under the explicit-PD/transfer path to match the policy.
     prev2_action: [f32; NUM_JOINTS],
+    /// Actuator delay (BIPED_MOTOR_DELAY=min,max, physics substeps) — mirrors
+    /// the nexus env's WBC-AGILE-style target delay. None = off.
+    motor_delay: Option<(u32, u32)>,
+    delay_k: u32,
+    /// Dedicated RNG stream for lag sampling (command/DR stream untouched).
+    delay_rng: Lcg,
+    delay_prev_targets: [f32; NUM_JOINTS],
+    delay_fresh: bool,
+    /// Observation history (BIPED_OBS_HISTORY=H) — mirrors the nexus env
+    /// (stacked oldest→newest, replicated on reset). CPU env has no obs
+    /// noise, so the clean frame is pushed. None = off.
+    obs_hist: Option<ObsHistory>,
     /// Seconds each foot has been airborne (tracked across steps for air-time reward).
     air_time: [f32; NUM_FEET],
     /// Each foot's sole-normal in its own link frame, captured at the flat spawn
@@ -462,6 +475,25 @@ impl BipedEnv {
                 foot_sole_local[i] = world.bodies[foot].rotation().conjugate() * Vec3::Z;
             }
         }
+        // BIPED_MOTOR_DELAY=min,max (or max → min=0), physics substeps —
+        // same parse as the nexus env; unset/unparseable = off.
+        let motor_delay: Option<(u32, u32)> = std::env::var("BIPED_MOTOR_DELAY").ok().and_then(
+            |s| {
+                let p: Vec<u32> = s.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
+                match p.as_slice() {
+                    [max] => Some((0, *max)),
+                    [min, max] => Some((*min, *max)),
+                    _ => None,
+                }
+            },
+        );
+        if let Some((min, max)) = motor_delay {
+            assert!(
+                min <= max && max <= task.decimation,
+                "BIPED_MOTOR_DELAY: need min <= max <= decimation ({})",
+                task.decimation
+            );
+        }
         let mut env = Self {
             mjcf,
             robot,
@@ -475,6 +507,12 @@ impl BipedEnv {
             last_action: [0.0; NUM_JOINTS],
             prev_action: [0.0; NUM_JOINTS],
             prev2_action: [0.0; NUM_JOINTS],
+            motor_delay,
+            delay_k: 0,
+            delay_rng: Lcg::new(seed ^ 0xD31A7),
+            delay_prev_targets: [0.0; NUM_JOINTS],
+            delay_fresh: true,
+            obs_hist: ObsHistory::from_env(1, OBS_DIM),
             air_time: [0.0; NUM_FEET],
             foot_sole_local,
             randomization: Randomization::default(),
@@ -495,7 +533,7 @@ impl BipedEnv {
     }
 
     pub fn obs_dim(&self) -> usize {
-        OBS_DIM
+        OBS_DIM * self.obs_hist.as_ref().map_or(1, |h| h.h())
     }
     pub fn critic_obs_dim(&self) -> usize {
         CRITIC_OBS_DIM
@@ -650,6 +688,14 @@ impl BipedEnv {
         self.prev2_action = [0.0; NUM_JOINTS];
         self.air_time = [0.0; NUM_FEET];
         self.gait_phase = 0.0;
+        // Actuator delay: resample the lag for the new episode from the
+        // DEDICATED delay stream; fresh = first post-reset command applies
+        // from substep 0.
+        if let Some((min, max)) = self.motor_delay {
+            let r = self.delay_rng.range(0.0, 1.0);
+            self.delay_k = min + ((r * (max - min + 1) as f32) as u32).min(max - min);
+            self.delay_fresh = true;
+        }
         // Apply pinned joint offsets (multi-pose rollout) before observing.
         if let Some(offsets) = self.pinned_joint_offsets {
             self.perturb_initial_joints(&offsets);
@@ -662,6 +708,9 @@ impl BipedEnv {
         self.task.observe(&state, &self.cmd, &mut obs);
         let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
         self.task.observe_critic(&state, &self.cmd, &mut critic_obs);
+        if let Some(hist) = &mut self.obs_hist {
+            obs = hist.reset_stacked(0, &obs);
+        }
         (obs, critic_obs)
     }
 
@@ -677,12 +726,28 @@ impl BipedEnv {
         }
         // Apply PD position targets.
         let targets = self.task.joint_targets(&noisy_action);
+        // Actuator delay: substeps `0..switch_at` apply last step's targets,
+        // `switch_at..` apply this step's (switch_at = 0 → no delay this step;
+        // switch_at = decimation → last step's targets hold the whole step).
+        let switch_at: u32 = match self.motor_delay {
+            None => 0,
+            Some(_) if self.delay_fresh => {
+                self.delay_fresh = false;
+                0
+            }
+            Some(_) => self.delay_k.min(self.task.decimation),
+        };
         // Actuator model. BIPED_EXPLICIT_PD=1 applies force-based PD as an EXPLICIT
         // joint torque each substep (the nexus fix), bypassing rapier's soft
         // constraint motor — which under-realizes kp on the low-inertia leg joints
         // and lets the robot buckle. Default = the (soft) constraint motor, so CPU
         // training is unchanged.
         let explicit_pd = std::env::var("BIPED_EXPLICIT_PD").is_ok();
+        let first_targets = if switch_at > 0 {
+            self.delay_prev_targets
+        } else {
+            targets
+        };
         for k in 0..NUM_JOINTS {
             let jr = &self.world.joints[k];
             // With explicit PD, zero the constraint motor so it doesn't double-act.
@@ -695,7 +760,7 @@ impl BipedEnv {
                 if let Some(link) = mb.link_mut(link_id) {
                     link.joint
                         .data
-                        .set_motor_position(JointAxis::AngZ, targets[k], kp, kd);
+                        .set_motor_position(JointAxis::AngZ, first_targets[k], kp, kd);
                 }
             }
         }
@@ -706,7 +771,28 @@ impl BipedEnv {
             self.push_at = self.step_count + self.next_push_step();
         }
         // Advance physics at the control decimation.
-        for _ in 0..self.task.decimation {
+        for i in 0..self.task.decimation {
+            // Actuator delay: this substep crosses the lag — switch the
+            // constraint motor to this step's targets. (The explicit-PD path
+            // below picks its target per substep instead.)
+            if switch_at > 0 && i == switch_at && !explicit_pd {
+                for k in 0..NUM_JOINTS {
+                    let jr = &self.world.joints[k];
+                    let (kp, kd) = (jr.kp, jr.kd);
+                    if let Some((mb, link_id)) = self.world.multibody.get_mut(jr.handle) {
+                        if let Some(link) = mb.link_mut(link_id) {
+                            link.joint
+                                .data
+                                .set_motor_position(JointAxis::AngZ, targets[k], kp, kd);
+                        }
+                    }
+                }
+            }
+            let sub_targets = if i < switch_at {
+                &self.delay_prev_targets
+            } else {
+                &targets
+            };
             // Explicit force-based PD: recompute τ = clamp(kp·(target−q) − kd·q̇,
             // ±effort) from the CURRENT joint state each substep and apply it as an
             // internal torque (+τ on child, −τ on parent) about the world joint
@@ -726,7 +812,7 @@ impl BipedEnv {
                     let wc = self.world.bodies[child].angvel();
                     let axis = rc * Vec3::Z;
                     let qd = (wc - wp).dot(axis);
-                    let tau = (kp * (targets[k] - q) - kd * qd).clamp(-effort, effort);
+                    let tau = (kp * (sub_targets[k] - q) - kd * qd).clamp(-effort, effort);
                     let tvec = axis * tau;
                     self.world.bodies[child].add_torque(tvec, true);
                     self.world.bodies[parent].add_torque(-tvec, true);
@@ -746,6 +832,9 @@ impl BipedEnv {
                 &(),
                 &(),
             );
+        }
+        if self.motor_delay.is_some() {
+            self.delay_prev_targets = targets;
         }
         self.prev2_action = self.prev_action;
         self.prev_action = self.last_action;
@@ -792,6 +881,9 @@ impl BipedEnv {
         self.task.observe(&state, &self.cmd, &mut obs);
         let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
         self.task.observe_critic(&state, &self.cmd, &mut critic_obs);
+        if let Some(hist) = &mut self.obs_hist {
+            obs = hist.push_stacked(0, &obs);
+        }
         // Advance the gait clock AFTER building this step's obs (matches the nexus
         // env order: observe with current phase, then advance; reset → 0).
         self.gait_phase = (self.gait_phase + self.task.control_dt() / self.gait_period).fract();

@@ -9,6 +9,7 @@
 //! Modules:
 //! - `config` — the generic [`EnvConfig`] task interface (the MDP contract).
 //! - `math`   — dependency-free vec/quat helpers used by the MDP.
+//! - `obs_history` — per-env observation-frame stacking (`BIPED_OBS_HISTORY`).
 //! - `rng`    — a small deterministic LCG for command / domain sampling.
 //! - `robots` — robot asset specs (pure data): LeRobot bipedal, Unitree G1,
 //!               Unitree H2 Plus (select with `BIPED_ROBOT`).
@@ -20,11 +21,13 @@
 
 pub mod config;
 pub mod math;
+pub mod obs_history;
 pub mod rng;
 pub mod robots;
 pub mod tasks;
 
 pub use config::{BodyState, EnvConfig};
+pub use obs_history::ObsHistory;
 pub use robots::{JointSpec, LeRobotBipedal, RobotSpec, NUM_JOINTS};
 pub use tasks::VelocityFlatTask;
 

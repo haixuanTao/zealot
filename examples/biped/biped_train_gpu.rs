@@ -96,12 +96,20 @@ static JMIRROR: std::sync::LazyLock<[usize; NUM_JOINTS]> =
     std::sync::LazyLock::new(|| ROBOT.mirror);
 static JSIGN: std::sync::LazyLock<[f32; NUM_JOINTS]> =
     std::sync::LazyLock::new(|| ROBOT.mirror_sign);
+/// BIPED_OBS_HISTORY frame count (1 = feature off) — must match the env's.
+static OBS_H: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("BIPED_OBS_HISTORY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&h| h > 1)
+        .unwrap_or(1)
+});
 fn jmirror(v: &[f32]) -> Vec<f32> {
     (0..NUM_JOINTS).map(|i| JSIGN[i] * v[JMIRROR[i]]).collect()
 }
-// obs(45): last_action[0:12], cmd[12:16]=(vx,vy,yaw,aux), joint_pos[16:28],
+// obs frame(45): last_action[0:12], cmd[12:16]=(vx,vy,yaw,aux), joint_pos[16:28],
 // joint_vel[28:40], proj_grav[40:43]=(fwd,lat,up), gait_phase[43:45]=(sin,cos).
-fn mirror_obs(o: &[f32]) -> Vec<f32> {
+fn mirror_frame(o: &[f32]) -> Vec<f32> {
     let mut m = o.to_vec();
     m[0..12].copy_from_slice(&jmirror(&o[0..12]));
     m[13] = -o[13];
@@ -113,15 +121,22 @@ fn mirror_obs(o: &[f32]) -> Vec<f32> {
     m[44] = -o[44];
     m
 }
-// critic(51) = obs(45) + base_lin_vel(3)[fwd,lat,up] + base_ang_vel(3)[roll,pitch,yaw].
+// With BIPED_OBS_HISTORY the actor obs is H stacked 45-frames — the mirror is
+// block-diagonal (each frame mirrors independently). H=1 = the plain frame.
+fn mirror_obs(o: &[f32]) -> Vec<f32> {
+    o.chunks(OBS_FRAME).flat_map(|f| mirror_frame(f)).collect()
+}
+// critic(51) = obs frame(45) + base_lin_vel(3)[fwd,lat,up] + base_ang_vel(3)
+// [roll,pitch,yaw] — single-frame (privileged critic carries no history).
 fn mirror_critic(c: &[f32]) -> Vec<f32> {
-    let mut m = mirror_obs(&c[0..45]);
+    let mut m = mirror_frame(&c[0..45]);
     m.extend_from_slice(&c[45..]);
     m[46] = -c[46];
     m[48] = -c[48];
     m[50] = -c[50];
     m
 }
+const OBS_FRAME: usize = 45;
 fn mirror_sample(s: &Sample) -> Sample {
     Sample {
         obs: mirror_obs(&s.obs),
@@ -184,8 +199,8 @@ fn action_sperm() -> SPerm {
         sign: JSIGN.to_vec(),
     }
 }
-// obs(45) signed perm — exactly the index/sign pattern of `mirror_obs`.
-fn obs_sperm() -> SPerm {
+// obs frame(45) signed perm — exactly the index/sign pattern of `mirror_frame`.
+fn obs_frame_sperm() -> SPerm {
     let mut perm: Vec<usize> = (0..45).collect();
     let mut sign = vec![1.0f32; 45];
     for i in 0..NUM_JOINTS {
@@ -203,9 +218,22 @@ fn obs_sperm() -> SPerm {
     sign[44] = -1.0; // gait phase cos
     SPerm { perm, sign }
 }
-// critic(51) signed perm = obs(45) + [lin_vel(3), ang_vel(3)] per `mirror_critic`.
+// Full actor-input signed perm: the frame perm tiled H times (block-diagonal),
+// matching `mirror_obs`.
+fn obs_sperm() -> SPerm {
+    let f = obs_frame_sperm();
+    let h = *OBS_H;
+    let mut perm = Vec::with_capacity(OBS_FRAME * h);
+    let mut sign = Vec::with_capacity(OBS_FRAME * h);
+    for b in 0..h {
+        perm.extend(f.perm.iter().map(|&p| p + OBS_FRAME * b));
+        sign.extend_from_slice(&f.sign);
+    }
+    SPerm { perm, sign }
+}
+// critic(51) signed perm = obs frame(45) + [lin_vel(3), ang_vel(3)] per `mirror_critic`.
 fn critic_sperm() -> SPerm {
-    let mut sp = obs_sperm();
+    let mut sp = obs_frame_sperm();
     sp.perm.extend(45..51);
     sp.sign.extend(std::iter::repeat(1.0).take(6));
     sp.sign[46] = -1.0; // lin_vel lateral
@@ -538,7 +566,21 @@ fn main() {
         let resumed = !ckpt.is_empty() && std::path::Path::new(&ckpt).exists();
         let mut ac = if resumed {
             println!("resuming from {ckpt}...");
-            ActorCritic::load(&ckpt).expect("load checkpoint")
+            let ac = ActorCritic::load(&ckpt).expect("load checkpoint");
+            // BIPED_OBS_HISTORY changes the actor input dim — a stale checkpoint
+            // must fail loudly here, not as a silent normalizer truncation.
+            assert_eq!(
+                ac.actor.dims[0], od,
+                "checkpoint actor input dim {} != env obs dim {} — \
+                 BIPED_OBS_HISTORY mismatch? delete {ckpt} or match the setting",
+                ac.actor.dims[0], od
+            );
+            assert_eq!(
+                ac.critic.dims[0], cd,
+                "checkpoint critic input dim {} != env critic obs dim {} — delete {ckpt}",
+                ac.critic.dims[0], cd
+            );
+            ac
         } else {
             ActorCritic::new(
                 &[od, 256, 256, 128, NUM_JOINTS],

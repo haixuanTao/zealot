@@ -37,6 +37,7 @@ use rayon::prelude::*;
 use roxmltree::Node;
 use std::collections::HashMap;
 use std::time::Instant;
+use zealot_env::obs_history::ObsHistory;
 use zealot_env::rng::Lcg;
 use zealot_env::robots::{RobotSpec, NUM_JOINTS};
 use zealot_env::tasks::velocity_flat::{
@@ -1013,6 +1014,31 @@ pub struct BipedNexusBatchEnv {
     resample_at: Vec<u32>,
     last_action: Vec<[f32; NUM_JOINTS]>,
     prev_action: Vec<[f32; NUM_JOINTS]>,
+    /// Actuator delay (BIPED_MOTOR_DELAY=min,max): the PD position target is
+    /// delayed by a per-env lag of k physics SUBSTEPS (WBC-AGILE's
+    /// DelayedPDActuator semantics — k ~ uniform int [min,max] inclusive,
+    /// resampled at every episode reset; max ≤ decimation). None = off, and
+    /// the staging path below is byte-identical to the no-delay build.
+    motor_delay: Option<(u32, u32)>,
+    /// Per-env sampled lag, in physics substeps.
+    delay_k: Vec<u32>,
+    /// Dedicated RNG stream for lag sampling, so enabling the delay leaves the
+    /// env's command/DR stream untouched (keeps `0,0` bitwise-comparable to
+    /// the no-delay build — the staging-equivalence check).
+    delay_rng: Vec<Lcg>,
+    /// Joint targets applied last control step (post `joint_targets` clamp).
+    delay_prev_targets: Vec<[f32; NUM_JOINTS]>,
+    /// Set on reset: the first post-reset command applies from substep 0
+    /// regardless of `delay_k` (AGILE replicates the first command into the
+    /// delay buffer — a fresh env never sees another episode's targets).
+    delay_fresh: Vec<bool>,
+    /// Per-step scratch: this step's targets + each env's crossing substep.
+    delay_now: Vec<[f32; NUM_JOINTS]>,
+    delay_slot: Vec<u32>,
+    /// Observation history (BIPED_OBS_HISTORY=H): the ACTOR obs becomes the
+    /// last H noised 45-frames stacked oldest→newest (WBC-AGILE semantics —
+    /// replicated on reset). Critic stays single-frame privileged. None = off.
+    obs_hist: Option<ObsHistory>,
     air_time: Vec<[f32; NUM_FEET]>,
     /// Index of the foot that most recently touched down, per env (-1 = none yet,
     /// reset on episode reset). Drives `FootObs.alt_step`: a touchdown only counts
@@ -1426,6 +1452,35 @@ impl BipedNexusBatchEnv {
         let resample_at = vec![0u32; num_envs];
         let last_action = vec![[0.0f32; NUM_JOINTS]; num_envs];
         let prev_action = vec![[0.0f32; NUM_JOINTS]; num_envs];
+        // BIPED_MOTOR_DELAY=min,max (or just max → min=0), in physics
+        // substeps. `0,0` is a valid ENABLED config (constant zero delay —
+        // used by the staging-equivalence check); unset/unparseable = off.
+        let motor_delay: Option<(u32, u32)> = std::env::var("BIPED_MOTOR_DELAY").ok().and_then(
+            |s| {
+                let p: Vec<u32> = s.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
+                match p.as_slice() {
+                    [max] => Some((0, *max)),
+                    [min, max] => Some((*min, *max)),
+                    _ => None,
+                }
+            },
+        );
+        if let Some((min, max)) = motor_delay {
+            assert!(
+                min <= max && max <= task.decimation,
+                "BIPED_MOTOR_DELAY: need min <= max <= decimation ({})",
+                task.decimation
+            );
+            assert!(task.decimation <= 32, "BIPED_MOTOR_DELAY: decimation > 32 unsupported");
+            assert!(
+                std::env::var("BIPED_GRAPH").is_err(),
+                "BIPED_MOTOR_DELAY re-stages motor targets mid-decimation (host write_buffer \
+                 between substeps), which CUDA-graph capture cannot record — unset BIPED_GRAPH"
+            );
+            println!(
+                "actuator delay ENABLED: {min}..={max} physics substeps, resampled per env at reset"
+            );
+        }
         let air_time = vec![[0.0f32; NUM_FEET]; num_envs];
         let last_td_foot = vec![-1i8; num_envs];
         let gait_phase = vec![0.0f32; num_envs];
@@ -1454,6 +1509,20 @@ impl BipedNexusBatchEnv {
         let rng: Vec<Lcg> = (0..num_envs)
             .map(|e| Lcg::new(seed ^ ((e as u64).wrapping_mul(2654435761))))
             .collect();
+        // Dedicated delay RNG stream (never touches the command/DR stream).
+        let mut delay_rng: Vec<Lcg> = (0..num_envs)
+            .map(|e| Lcg::new(seed ^ ((e as u64).wrapping_mul(2654435761)) ^ 0xD31A7))
+            .collect();
+        let delay_k: Vec<u32> = if let Some((min, max)) = motor_delay {
+            (0..num_envs)
+                .map(|e| {
+                    let r = delay_rng[e].range(0.0, 1.0);
+                    min + ((r * (max - min + 1) as f32) as u32).min(max - min)
+                })
+                .collect()
+        } else {
+            vec![0; num_envs]
+        };
         let sampler = CommandSampler::default();
         let sampler_default = CommandSampler::default();
 
@@ -1470,6 +1539,14 @@ impl BipedNexusBatchEnv {
             resample_at,
             last_action,
             prev_action,
+            motor_delay,
+            delay_k,
+            delay_rng,
+            delay_prev_targets: vec![[0.0f32; NUM_JOINTS]; num_envs],
+            delay_fresh: vec![true; num_envs],
+            delay_now: vec![[0.0f32; NUM_JOINTS]; num_envs],
+            delay_slot: vec![0u32; num_envs],
+            obs_hist: ObsHistory::from_env(num_envs, OBS_DIM),
             air_time,
             last_td_foot,
             gait_phase,
@@ -1535,7 +1612,7 @@ impl BipedNexusBatchEnv {
     }
 
     pub fn obs_dim(&self) -> usize {
-        OBS_DIM
+        OBS_DIM * self.obs_hist.as_ref().map_or(1, |h| h.h())
     }
 
     pub fn critic_obs_dim(&self) -> usize {
@@ -2378,33 +2455,96 @@ impl BipedNexusBatchEnv {
         (sync_ms, graph_ms)
     }
 
+    /// Stage one env's joint position targets into the host `links_static`
+    /// mirror (uploaded by the next `flush_links_static`).
+    fn stage_env_targets(&mut self, e: usize, targets: &[f32; NUM_JOINTS]) {
+        for k in 0..NUM_JOINTS {
+            let link = self.idx.actuated[k].0;
+            self.state.multibodies_mut().stage_motor_position(
+                e as u32,
+                link,
+                JointAxis::AngZ,
+                targets[k],
+            );
+        }
+    }
+
     pub async fn step(&mut self, actions: &[[f32; NUM_JOINTS]]) -> Vec<StepOut> {
         assert_eq!(actions.len(), self.n);
 
         // (1) Stage every env's motor targets host-side in the mirror, then
         // push the whole `links_static` buffer in ONE write_buffer call.
         // Replaces `num_envs * NUM_JOINTS` per-step write_buffer calls.
+        //
+        // With BIPED_MOTOR_DELAY, env e's fresh target instead lands at
+        // substep `delay_k[e]` (the previous step's target applies before it),
+        // so each env is still staged exactly once per control step — at its
+        // crossing substep — and only substeps with crossing envs pay a flush.
+        // `delay_any[i]` marks substeps 1..decimation that need a restage.
+        let mut delay_any = [false; 32];
         let t = Instant::now();
-        for e in 0..self.n {
-            let targets = self.task.joint_targets(&actions[e]);
-            for k in 0..NUM_JOINTS {
-                let link = self.idx.actuated[k].0;
-                self.state.multibodies_mut().stage_motor_position(
-                    e as u32,
-                    link,
-                    JointAxis::AngZ,
-                    targets[k],
-                );
+        if self.motor_delay.is_none() {
+            for e in 0..self.n {
+                let targets = self.task.joint_targets(&actions[e]);
+                for k in 0..NUM_JOINTS {
+                    let link = self.idx.actuated[k].0;
+                    self.state.multibodies_mut().stage_motor_position(
+                        e as u32,
+                        link,
+                        JointAxis::AngZ,
+                        targets[k],
+                    );
+                }
+            }
+            self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
+
+            let t = Instant::now();
+            self.state
+                .multibodies_mut()
+                .flush_links_static(&self.gpu)
+                .expect("flush motor targets");
+            self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
+        } else {
+            let decim = self.task.decimation as usize;
+            let mut staged0 = false;
+            for e in 0..self.n {
+                self.delay_now[e] = self.task.joint_targets(&actions[e]);
+                let k = self.delay_k[e] as usize;
+                // (slot, stage a_{t-1} instead of a_t)
+                let (slot, prev) = if self.delay_fresh[e] {
+                    self.delay_fresh[e] = false;
+                    (0, false)
+                } else if k == 0 {
+                    (0, false)
+                } else if k >= decim {
+                    (0, true) // a_{t-1} holds for the whole step
+                } else {
+                    (k, false)
+                };
+                self.delay_slot[e] = slot as u32;
+                if slot == 0 {
+                    let tg = if prev {
+                        self.delay_prev_targets[e]
+                    } else {
+                        self.delay_now[e]
+                    };
+                    self.stage_env_targets(e, &tg);
+                    staged0 = true;
+                } else {
+                    delay_any[slot] = true;
+                }
+            }
+            self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
+
+            if staged0 {
+                let t = Instant::now();
+                self.state
+                    .multibodies_mut()
+                    .flush_links_static(&self.gpu)
+                    .expect("flush motor targets");
+                self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
             }
         }
-        self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
-
-        let t = Instant::now();
-        self.state
-            .multibodies_mut()
-            .flush_links_static(&self.gpu)
-            .expect("flush motor targets");
-        self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
 
         // (1b) Push perturbation: roughly every `push_interval` control steps
         // (±50% jitter), kick each torso with a random velocity so the policy
@@ -2453,10 +2593,32 @@ impl BipedNexusBatchEnv {
             // since the trace readback syncs per step.
             let trace = std::env::var("BIPED_SUBSTEP_TRACE").is_ok();
             for i in 0..self.task.decimation {
+                // BIPED_MOTOR_DELAY: envs whose lag crosses at this substep get
+                // their fresh target now (one extra whole-mirror flush, only on
+                // substeps that actually have crossings).
+                if i > 0 && self.motor_delay.is_some() && delay_any[i as usize] {
+                    let tf = Instant::now();
+                    for e in 0..self.n {
+                        if self.delay_slot[e] == i {
+                            let tg = self.delay_now[e];
+                            self.stage_env_targets(e, &tg);
+                        }
+                    }
+                    self.state
+                        .multibodies_mut()
+                        .flush_links_static(&self.gpu)
+                        .expect("flush delayed motor targets");
+                    self.timings.flush_static_ns += tf.elapsed().as_nanos() as u64;
+                }
                 let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
                 if trace {
                     self.trace_foot_substep(self.global_step, i).await;
                 }
+            }
+        }
+        if self.motor_delay.is_some() {
+            for e in 0..self.n {
+                self.delay_prev_targets[e] = self.delay_now[e];
             }
         }
         self.timings.pipeline_step_ns += t.elapsed().as_nanos() as u64;
@@ -2769,6 +2931,12 @@ impl BipedNexusBatchEnv {
                     *v += rng.range(-0.05, 0.05) * obs_noise;
                 }
             }
+            // Obs history: push the final (noised) frame, emit the stacked
+            // window. Must run after the noise block — the history records
+            // exactly what the policy saw (WBC-AGILE ordering).
+            if let Some(hist) = &mut self.obs_hist {
+                c.obs = hist.push_stacked(e, &c.obs);
+            }
             self.air_time[e] = c.new_air;
             if c.td_foot >= 0 {
                 self.last_td_foot[e] = c.td_foot;
@@ -2878,6 +3046,15 @@ impl BipedNexusBatchEnv {
         self.air_time[env] = [0.0; NUM_FEET];
         self.last_td_foot[env] = -1;
         self.gait_phase[env] = 0.0;
+        // Actuator delay: resample the lag for the new episode (from the
+        // DEDICATED delay stream — the command/DR stream stays untouched) and
+        // mark fresh so the first post-reset command applies from substep 0
+        // (`delay_prev_targets` is stale across the reset).
+        if let Some((min, max)) = self.motor_delay {
+            let r = self.delay_rng[env].range(0.0, 1.0);
+            self.delay_k[env] = min + ((r * (max - min + 1) as f32) as u32).min(max - min);
+            self.delay_fresh[env] = true;
+        }
 
         // Cached prev joint angles + poses are stale across a reset; clear so
         // the next step seeds them again with zero velocity.
@@ -2921,6 +3098,11 @@ impl BipedNexusBatchEnv {
                     "[verify_reset] env {env} tpl {t}: obs maxdiff={do_max:.3e} critic maxdiff={dc_max:.3e}"
                 );
             }
+            // Obs history: replicate the fresh 45-frame into all H slots
+            // (the verify check above compares the pre-stack frame).
+            if let Some(hist) = &mut self.obs_hist {
+                return (hist.reset_stacked(env, &obs), critic_obs);
+            }
             return (obs, critic_obs);
         }
 
@@ -2934,6 +3116,9 @@ impl BipedNexusBatchEnv {
         let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
         self.task
             .observe_critic(&state, &self.cmd[env], &mut critic_obs);
+        if let Some(hist) = &mut self.obs_hist {
+            obs = hist.reset_stacked(env, &obs);
+        }
         (obs, critic_obs)
     }
 
@@ -2962,6 +3147,14 @@ impl BipedNexusBatchEnv {
         let nt = self.templates.len().min(self.n);
         self.template_spawn_obs = obs[..nt].to_vec();
         self.template_spawn_critic_obs = critic_obs[..nt].to_vec();
+        // Obs history: the template cache above holds single 45-frames (the
+        // reset fast path patches the command into the frame before stacking);
+        // the vectors handed to the policy get the replicated H-stack.
+        if let Some(hist) = &mut self.obs_hist {
+            for (e, o) in obs.iter_mut().enumerate() {
+                *o = hist.reset_stacked(e, o);
+            }
+        }
         (obs, critic_obs)
     }
 
@@ -2986,6 +3179,11 @@ impl BipedNexusBatchEnv {
         self.air_time[e] = [0.0; NUM_FEET];
         self.last_td_foot[e] = -1;
         self.gait_phase[e] = 0.0;
+        // Deterministic render path: pin the delay to `min` (no RNG draw).
+        if let Some((min, _)) = self.motor_delay {
+            self.delay_k[e] = min;
+            self.delay_fresh[e] = true;
+        }
         self.has_prev_joint_pos[e] = false;
         self.has_prev_pose[e] = false;
         let poses = self.slurp_poses().await;
@@ -2997,6 +3195,9 @@ impl BipedNexusBatchEnv {
         let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
         self.task
             .observe_critic(&state, &self.cmd[e], &mut critic_obs);
+        if let Some(hist) = &mut self.obs_hist {
+            obs = hist.reset_stacked(e, &obs);
+        }
         (obs, critic_obs)
     }
 

@@ -48,10 +48,10 @@ fn jmirror(v: &[f32]) -> Vec<f32> {
     (0..NUM_JOINTS).map(|i| JSIGN[i] * v[JMIRROR[i]]).collect()
 }
 
-// obs layout (45): last_action[0:12], command[12:16]=(vx,vy,yaw,aux),
+// obs frame layout (45): last_action[0:12], command[12:16]=(vx,vy,yaw,aux),
 // joint_pos[16:28], joint_vel[28:40], proj_grav[40:43]=(fwd,lat,up),
 // gait_phase[43:45]=(sin,cos).
-fn mirror_obs(o: &[f32]) -> Vec<f32> {
+fn mirror_frame(o: &[f32]) -> Vec<f32> {
     let mut m = o.to_vec();
     m[0..12].copy_from_slice(&jmirror(&o[0..12]));
     m[13] = -o[13]; // command vy
@@ -64,9 +64,16 @@ fn mirror_obs(o: &[f32]) -> Vec<f32> {
     m
 }
 
-// critic_obs (51) = obs(45) + base_lin_vel(3)[fwd,lat,up] + base_ang_vel(3)[roll,pitch,yaw].
+// With BIPED_OBS_HISTORY the actor obs is H stacked 45-frames — mirror each
+// frame independently (block-diagonal). H=1 = the plain frame.
+fn mirror_obs(o: &[f32]) -> Vec<f32> {
+    o.chunks(45).flat_map(|f| mirror_frame(f)).collect()
+}
+
+// critic_obs (51) = obs frame(45) + base_lin_vel(3)[fwd,lat,up] +
+// base_ang_vel(3)[roll,pitch,yaw] — single-frame (no history on the critic).
 fn mirror_critic(c: &[f32]) -> Vec<f32> {
-    let mut m = mirror_obs(&c[0..45]);
+    let mut m = mirror_frame(&c[0..45]);
     m.extend_from_slice(&c[45..]);
     m[46] = -c[46]; // lin_vel lateral (polar vector)
     m[48] = -c[48]; // ang_vel roll  (axial: negate roll + yaw, keep pitch)
@@ -117,7 +124,19 @@ fn main() {
         // it and continue training from there. Otherwise build a fresh net.
         let mut ac = if !policy_path.is_empty() && std::path::Path::new(&policy_path).exists() {
             println!("resuming from existing checkpoint {policy_path}...");
-            ActorCritic::load(&policy_path).expect("load checkpoint")
+            let ac = ActorCritic::load(&policy_path).expect("load checkpoint");
+            assert_eq!(
+                ac.actor.dims[0], obs_dim,
+                "checkpoint actor input dim {} != env obs dim {obs_dim} — \
+                 BIPED_OBS_HISTORY mismatch? delete {policy_path} or match the setting",
+                ac.actor.dims[0]
+            );
+            assert_eq!(
+                ac.critic.dims[0], critic_dim,
+                "checkpoint critic input dim {} != env critic obs dim {critic_dim} — delete {policy_path}",
+                ac.critic.dims[0]
+            );
+            ac
         } else {
             // Matches WBC-AGILE T1 velocity policy exactly: asymmetric net
             // (actor smaller, privileged critic wider), `init_noise_std=1.0`,
