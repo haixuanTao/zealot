@@ -41,6 +41,7 @@ use vortx::linalg::{
     Activation, Adam, AdamParams, Contiguous, Gemm, OpAssign, OpAssignVariant, Ppo, PpoActorParams,
     PpoValueParams,
 };
+use rayon::prelude::*;
 use vortx::shapes::TensorLayoutBuffers;
 use vortx::tensor::Tensor;
 use zealot_env::robots::{RobotSpec, NUM_JOINTS};
@@ -791,20 +792,26 @@ fn main() {
             let roll_s = t_roll.elapsed().as_secs_f64();
             // ---------------- GAE + batch ----------------
             let t_gae = Instant::now();
-            let mut batch: Vec<Sample> = Vec::with_capacity(total);
-            for e in 0..n {
+            // Per-env bootstrap value + GAE are independent across envs; run them
+            // in parallel, then flatten in env order so the batch is unchanged.
+            samp.par_iter_mut().enumerate().for_each(|(e, se)| {
                 let lv = ac.value(&gcc[e]);
                 let (adv, retn) = gae(&rs[e], &vs[e], &ds[e], lv, GAMMA, LAM);
                 for t in 0..T {
-                    samp[e][t].adv = adv[t];
-                    samp[e][t].ret = retn[t];
-                    batch.push(std::mem::take(&mut samp[e][t]));
+                    se[t].adv = adv[t];
+                    se[t].ret = retn[t];
+                }
+            });
+            let mut batch: Vec<Sample> = Vec::with_capacity(total);
+            for se in samp.iter_mut() {
+                for t in 0..T {
+                    batch.push(std::mem::take(&mut se[t]));
                 }
             }
             // Mirror augmentation: append the L/R mirror of every sample. `total`
             // doubles; minibatch size `mb` is unchanged, so `n_mb` (count) doubles.
             if mirror_aug {
-                let mir: Vec<Sample> = batch.iter().map(mirror_sample).collect();
+                let mir: Vec<Sample> = batch.par_iter().map(mirror_sample).collect();
                 batch.extend(mir);
             }
             let total = batch.len();
@@ -825,11 +832,11 @@ fn main() {
             // ---------------- GPU PPO UPDATE (persistent nets, advancing Adam) -------
             let t_upd = Instant::now();
             let on: Vec<Vec<f32>> = batch
-                .iter()
+                .par_iter()
                 .map(|s| ac.obs_norm.normalize(&s.obs))
                 .collect();
             let cn: Vec<Vec<f32>> = batch
-                .iter()
+                .par_iter()
                 .map(|s| ac.critic_norm.normalize(&s.critic_obs))
                 .collect();
             let f_obs = mk(&bk, &DMatrix::from_fn(od, total, |r, c| on[c][r]), st);
@@ -839,7 +846,7 @@ fn main() {
             // current (iter-start) actor weights.
             let f_obs_mir = if mirror_loss > 0.0 {
                 let onm: Vec<Vec<f32>> = batch
-                    .iter()
+                    .par_iter()
                     .map(|s| ac.obs_norm.normalize(&mirror_obs(&s.obs)))
                     .collect();
                 if let Some(sn) = s_net.as_mut() {
