@@ -1432,6 +1432,17 @@ impl BipedNexusBatchEnv {
             .collect();
         let mut state = GpuPhysicsState::from_rapier(&gpu, &envs_refs);
         state.multibodies_mut().set_gravity(&gpu, [0.0, 0.0, -9.81]);
+        // BIPED_CONTACT_CAP: eagerly pre-size the contact/constraint buffers
+        // (per batch). Required before BIPED_GRAPH capture on terrain — the
+        // lazy in-step resize can't run once a CUDA graph is captured, and
+        // overflowing pairs are silently dropped (feet sink into the mesh).
+        if let Some(cap) = std::env::var("BIPED_CONTACT_CAP")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            state.reserve_contacts(&gpu, cap);
+            println!("contact buffers pre-sized to {cap}/batch");
+        }
         // Implicit-coriolis OFF by default (BIPED_IMPLICIT_CORIOLIS=1 restores
         // the old nexus default). Two reasons:
         // 1. FIDELITY: implicit coriolis augments the mass matrix with `dt·C` —
