@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use zealot_env::obs_history::ObsHistory;
 use zealot_env::rng::Lcg;
+use zealot_env::terrain::{TerrainCurriculum, TerrainFamily, TerrainStrip};
 use zealot_env::robots::{RobotSpec, NUM_JOINTS};
 use zealot_env::tasks::velocity_flat::{
     BaseState, CRITIC_OBS_DIM, CommandSampler, FootObs, NUM_FEET, OBS_DIM, RobotState,
@@ -503,6 +504,11 @@ fn build_env_scene(
     robot: &RobotSpec,
     dr: &DrParams,
     task_dt: f32,
+    // BIPED_TERRAIN: this env's terrain trimesh (the SAME `SharedShape` Arc is
+    // cloned across envs of one family so nexus dedupes the mesh buffers).
+    // Appended LAST so all existing collider/link indices are unchanged.
+    // None = flag off = byte-identical scene.
+    terrain_shape: Option<&SharedShape>,
 ) -> (EnvScene, LinkIndices) {
     let mut bodies = RigidBodySet::new();
     let mut colliders = ColliderSet::new();
@@ -825,15 +831,44 @@ fn build_env_scene(
         next_mb_link += 1;
     }
 
-    // Ground (Z-up).
-    let ground = bodies.insert(RigidBodyBuilder::fixed().translation(Vec3::new(0.0, 0.0, -0.5)));
-    colliders.insert_with_parent(
-        ColliderBuilder::cuboid(50.0, 50.0, 0.5)
-            .friction(dr.friction)
-            .restitution(dr.restitution),
-        ground,
-        &mut bodies,
+    // Ground (Z-up). With terrain on, the cuboid stretches to backstop the
+    // whole 160 m strip (x ∈ [8, 168]); its top stays at z = 0.
+    let (g_pos, g_hx) = if terrain_shape.is_some() {
+        (Vec3::new(75.0, 0.0, -0.5), 100.0)
+    } else {
+        (Vec3::new(0.0, 0.0, -0.5), 50.0)
+    };
+    // With terrain on, the ground cuboid and the strip trimesh fully overlap
+    // (both fixed). nexus's broad-phase doesn't filter fixed-fixed pairs, and
+    // cuboid-vs-strip would emit a PFM pair per overlapping TRIANGLE (~10^6) —
+    // so statics get a group that excludes each other while still colliding
+    // with the robot (which keeps default ALL/ALL groups). Flag-off ground
+    // keeps rapier defaults (bit-identity).
+    let static_groups = InteractionGroups::new(
+        Group::GROUP_2,
+        Group::ALL ^ Group::GROUP_2,
+        InteractionTestMode::And,
     );
+    let ground = bodies.insert(RigidBodyBuilder::fixed().translation(g_pos));
+    let mut gb = ColliderBuilder::cuboid(g_hx, 50.0, 0.5)
+        .friction(dr.friction)
+        .restitution(dr.restitution);
+    if terrain_shape.is_some() {
+        gb = gb.collision_groups(static_groups);
+    }
+    colliders.insert_with_parent(gb, ground, &mut bodies);
+    // BIPED_TERRAIN: the difficulty strip, one trimesh collider at identity.
+    if let Some(shape) = terrain_shape {
+        let tb = bodies.insert(RigidBodyBuilder::fixed());
+        colliders.insert_with_parent(
+            ColliderBuilder::new(shape.clone())
+                .friction(dr.friction)
+                .restitution(dr.restitution)
+                .collision_groups(static_groups),
+            tb,
+            &mut bodies,
+        );
+    }
 
     // Rapier's `local_mprops` is populated by its step pipeline; we hand the
     // scene to nexus without stepping rapier first, so call recompute here. See
@@ -939,7 +974,8 @@ fn build_env_scene(
         // 6 root DOFs + one per hinge — counts ALL model joints, not just the
         // actuated ones (the G1 29-DOF body carries 13 extra held joints).
         dofs_per_batch: 6 + mjcf.iter().filter(|b| b.joint.is_some()).count() as u32,
-        colliders_per_batch: (mjcf.len() + 1) as u32, // robot bodies + ground
+        // robot bodies + ground (+ terrain trimesh when BIPED_TERRAIN=1)
+        colliders_per_batch: (mjcf.len() + 1 + terrain_shape.is_some() as usize) as u32,
         torso_link: 0,
         foot_links,
         illegal_ground_links,
@@ -998,6 +1034,27 @@ struct DbgStance {
 /// command, step counter, action history, air-time, sole-normals) lives in
 /// parallel vectors keyed by env index. Reset uses pre-built single-env spawn
 /// templates and `state.reset_env_from(env_i, template)`.
+/// BIPED_TERRAIN=1 state: the three family strips + per-env curriculum
+/// (WBC-AGILE's terrain_levels_vel_curriculum — see zealot_env::terrain).
+struct TerrainSetup {
+    strips: [TerrainStrip; 3],
+    /// Per-env curriculum state (level + success/failure counters).
+    curriculum: Vec<TerrainCurriculum>,
+    /// Dedicated RNG stream (levels, spawn jitter) — the env's command/DR
+    /// streams stay untouched, keeping flag-off runs bit-identical.
+    rng: Vec<Lcg>,
+    /// Chord-sum traveled distance since episode start (AGILE's metric:
+    /// straight-line segments between command-resample points).
+    travel: Vec<f32>,
+    last_xy: Vec<[f32; 2]>,
+}
+
+impl TerrainSetup {
+    fn strip_for(&self, env: usize) -> &TerrainStrip {
+        &self.strips[env % 3]
+    }
+}
+
 pub struct BipedNexusBatchEnv {
     // Topology + indexing
     mjcf: Vec<MjBody>,
@@ -1039,6 +1096,8 @@ pub struct BipedNexusBatchEnv {
     /// last H noised 45-frames stacked oldest→newest (WBC-AGILE semantics —
     /// replicated on reset). Critic stays single-frame privileged. None = off.
     obs_hist: Option<ObsHistory>,
+    /// Rough-terrain difficulty curriculum (BIPED_TERRAIN=1). None = off.
+    terrain: Option<TerrainSetup>,
     air_time: Vec<[f32; NUM_FEET]>,
     /// Index of the foot that most recently touched down, per env (-1 = none yet,
     /// reset on episode reset). Drives `FootObs.alt_step`: a touchdown only counts
@@ -1297,6 +1356,50 @@ impl BipedNexusBatchEnv {
             template_dr[0].friction = f;
         }
 
+        // BIPED_TERRAIN=1: generate the three family strips once and wrap each
+        // in ONE SharedShape (cloned across that family's envs so nexus dedupes
+        // the mesh buffers to 3 uploads). ORIENTED pseudo-normals are required
+        // by the nexus trimesh contact path; the strips are closed slabs.
+        let terrain_on = std::env::var("BIPED_TERRAIN").as_deref() == Ok("1");
+        let terrain_build = if terrain_on {
+            let t0 = Instant::now();
+            let strips = [
+                TerrainStrip::generate(TerrainFamily::Boxes, seed),
+                TerrainStrip::generate(TerrainFamily::Rough, seed),
+                TerrainStrip::generate(TerrainFamily::Wave, seed),
+            ];
+            let mk_shape = |verts: Vec<[f32; 3]>, tris: Vec<[u32; 3]>| -> SharedShape {
+                let pts: Vec<_> = verts
+                    .into_iter()
+                    .map(|v| Vec3::new(v[0], v[1], v[2]))
+                    .collect();
+                SharedShape::trimesh_with_flags(
+                    pts,
+                    tris,
+                    TriMeshFlags::ORIENTED | TriMeshFlags::FIX_INTERNAL_EDGES,
+                )
+                .expect("terrain trimesh build")
+            };
+            let shapes: Vec<SharedShape> = strips
+                .iter()
+                .map(|s| {
+                    let (v, t) = s.mesh();
+                    mk_shape(v, t)
+                })
+                .collect();
+            let (sv, st) = TerrainStrip::flat_stub_mesh();
+            let stub = mk_shape(sv, st);
+            println!(
+                "terrain curriculum ENABLED: 3 family strips ({} rows x {} m patches), built in {:.1}s",
+                zealot_env::terrain::ROWS,
+                zealot_env::terrain::PATCH,
+                t0.elapsed().as_secs_f64()
+            );
+            Some((strips, shapes, stub))
+        } else {
+            None
+        };
+
         // Build the per-env scenes — cycle across the templates so envs get
         // mixed DR from the start. We keep the LinkIndices from the first one
         // (topology is invariant).
@@ -1304,7 +1407,8 @@ impl BipedNexusBatchEnv {
         let mut env_scenes: Vec<EnvScene> = Vec::with_capacity(num_envs);
         for e in 0..num_envs {
             let dr = template_dr[e % num_templates];
-            let (scene, ix) = build_env_scene(&mjcf, &robot, &dr, task.sim_dt);
+            let tshape = terrain_build.as_ref().map(|(_, shapes, _)| &shapes[e % 3]);
+            let (scene, ix) = build_env_scene(&mjcf, &robot, &dr, task.sim_dt, tshape);
             if idx_out.is_none() {
                 idx_out = Some(ix);
             }
@@ -1416,7 +1520,11 @@ impl BipedNexusBatchEnv {
         let mut templates: Vec<GpuPhysicsState> = Vec::with_capacity(num_templates);
         let mut template_foot_sole: Vec<[Vec3; NUM_FEET]> = Vec::with_capacity(num_templates);
         for dr in &template_dr {
-            let (scene, ix) = build_env_scene(&mjcf, &robot, dr, task.sim_dt);
+            // Templates carry a tiny far-below flat stub in the terrain slot:
+            // collider count/order parity with the main batch (strides match),
+            // zero mesh memory per template, and resets never copy geometry.
+            let tstub = terrain_build.as_ref().map(|(_, _, stub)| stub);
+            let (scene, ix) = build_env_scene(&mjcf, &robot, dr, task.sim_dt, tstub);
             template_foot_sole.push(ix.foot_sole_local);
             let envs_refs = vec![(
                 &scene.bodies,
@@ -1547,6 +1655,24 @@ impl BipedNexusBatchEnv {
             delay_now: vec![[0.0f32; NUM_JOINTS]; num_envs],
             delay_slot: vec![0u32; num_envs],
             obs_hist: ObsHistory::from_env(num_envs, OBS_DIM),
+            terrain: terrain_build.map(|(strips, _shapes, _stub)| {
+                let mut rng: Vec<Lcg> = (0..num_envs)
+                    .map(|e| {
+                        Lcg::new(
+                            (seed ^ 0x7E22_A100)
+                                .wrapping_add((e as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                        )
+                    })
+                    .collect();
+                let curriculum = rng.iter_mut().map(TerrainCurriculum::init).collect();
+                TerrainSetup {
+                    strips,
+                    curriculum,
+                    rng,
+                    travel: vec![0.0; num_envs],
+                    last_xy: vec![[0.0, 0.0]; num_envs],
+                }
+            }),
             air_time,
             last_td_foot,
             gait_phase,
@@ -1596,7 +1722,44 @@ impl BipedNexusBatchEnv {
                 .sampler
                 .resample_steps(&mut env.rng[e], env.task.control_dt());
         }
+        // BIPED_TERRAIN: teleport every env onto its initial-level patch (the
+        // as-built state stands on flat ground at the origin). Uses the same
+        // template each env was built from, so its DR sample is preserved.
+        // Training is on-terrain from step 0, like AGILE.
+        if env.terrain.is_some() {
+            for e in 0..num_envs {
+                let t = e % env.templates.len().max(1);
+                let off = env.terrain_spawn_offset(e);
+                env.state.reset_env_from_snapshot_offset(
+                    &env.gpu,
+                    e as u32,
+                    &env.template_snapshots[t],
+                    off,
+                );
+                if env.motor_delay.is_some() {
+                    env.delay_fresh[e] = true;
+                }
+            }
+        }
         env
+    }
+
+    /// BIPED_TERRAIN: pick env `e`'s spawn offset — its current level's patch
+    /// center plus AGILE's ±2.5 m jitter, lifted to clear the local terrain —
+    /// and reset its travel bookkeeping to the new spawn.
+    fn terrain_spawn_offset(&mut self, e: usize) -> Vec3 {
+        let ter = self.terrain.as_mut().expect("terrain on");
+        let level = ter.curriculum[e].level;
+        let (cx, cy) = TerrainStrip::patch_center(level);
+        let rng = &mut ter.rng[e];
+        let (sx, sy) = (cx + rng.range(-2.5, 2.5), cy + rng.range(-2.5, 2.5));
+        // Clearance over a foot-sized neighborhood + a small epsilon: spawn
+        // height is relative to flat ground (the template pose), so the offset
+        // z lifts the whole robot by the local surface height.
+        let hz = ter.strip_for(e).height_max_in(sx, sy, 0.3) + 0.02;
+        ter.travel[e] = 0.0;
+        ter.last_xy[e] = [sx, sy];
+        Vec3::new(sx, sy, hz)
     }
 
     #[allow(dead_code)]
@@ -2252,11 +2415,18 @@ impl BipedNexusBatchEnv {
         } else {
             (Vec3::ZERO, Vec3::ZERO)
         };
+        // BIPED_TERRAIN: heights are relative to the LOCAL ground surface so
+        // the base-height reward, fall detection and obs semantics carry over
+        // to rough patches unchanged (h = 0 off the strip / flag off).
+        let ground_h = self
+            .terrain
+            .as_ref()
+            .map_or(0.0, |ter| ter.strip_for(env).height(t.x, t.y));
         let base = BaseState {
             orientation: [r.x, r.y, r.z, r.w],
             lin_vel_world: [lv.x, lv.y, lv.z],
             ang_vel_world: [av.x, av.y, av.z],
-            height: t.z,
+            height: t.z - ground_h,
             pos_xy: [t.x, t.y],
         };
 
@@ -2346,7 +2516,13 @@ impl BipedNexusBatchEnv {
             let fwd = Vec3::from(self.robot.foot_forward_local);
             let foot_fwd_in_base = (base_rot_inv * foot_pose.rotation) * fwd;
             let yaw_rel_base = foot_fwd_in_base.y.atan2(foot_fwd_in_base.x);
-            let contact = pos.z < CONTACT_Z;
+            // BIPED_TERRAIN: contact + clearance are relative to the LOCAL
+            // ground under the foot (0 off-strip / flag off).
+            let foot_ground_h = self
+                .terrain
+                .as_ref()
+                .map_or(0.0, |ter| ter.strip_for(env).height(pos.x, pos.y));
+            let contact = pos.z - foot_ground_h < CONTACT_Z;
             let prev_air = self.air_time[env][i];
             let first_contact = contact && prev_air > 0.0;
             // Alternating touchdown: a step that lands on the OTHER foot than the
@@ -2357,7 +2533,7 @@ impl BipedNexusBatchEnv {
                 contact,
                 first_contact,
                 air_time: if contact { prev_air } else { new_air[i] },
-                height: pos.z,
+                height: pos.z - foot_ground_h,
                 planar_speed,
                 tilt,
                 yaw_rel_base,
@@ -2673,6 +2849,16 @@ impl BipedNexusBatchEnv {
         for e in 0..self.n {
             self.step_count[e] += 1;
             if self.step_count[e] >= self.resample_at[e] {
+                // BIPED_TERRAIN travel metric (AGILE's): accumulate the
+                // straight-line chord from the last resample point.
+                if let Some(ter) = &mut self.terrain {
+                    let p = poses[e * self.idx.colliders_per_batch as usize
+                        + self.idx.torso_link as usize]
+                        .translation;
+                    let [lx, ly] = ter.last_xy[e];
+                    ter.travel[e] += ((p.x - lx).powi(2) + (p.y - ly).powi(2)).sqrt();
+                    ter.last_xy[e] = [p.x, p.y];
+                }
                 self.cmd[e] = self.sampler.sample(&mut self.rng[e]);
                 self.resample_at[e] = self.step_count[e]
                     + self
@@ -2784,11 +2970,15 @@ impl BipedNexusBatchEnv {
                 state.feet = feet;
                 state.phase = self.gait_phase[e];
                 let env_base = e * cpb_idx;
-                let illegal = self
-                    .idx
-                    .illegal_ground_links
-                    .iter()
-                    .any(|&l| poses[env_base + l as usize].translation.z < illegal_z);
+                let illegal = self.idx.illegal_ground_links.iter().any(|&l| {
+                    let p = poses[env_base + l as usize].translation;
+                    // BIPED_TERRAIN: threshold vs the LOCAL ground height.
+                    let gh = self
+                        .terrain
+                        .as_ref()
+                        .map_or(0.0, |ter| ter.strip_for(e).height(p.x, p.y));
+                    p.z - gh < illegal_z
+                });
                 let fell =
                     illegal || self.task.fell_over(&state.base) || !state.base.height.is_finite();
                 let rb = self.task.reward(&state, &self.cmd[e]);
@@ -2955,6 +3145,20 @@ impl BipedNexusBatchEnv {
             self.prev_action[e] = self.last_action[e];
             self.last_action[e] = actions[e];
             let timeout = self.step_count[e] >= self.task.max_steps();
+            // BIPED_TERRAIN: on EVERY episode end (fall/illegal/timeout — AGILE
+            // updates for all resets), close the travel chord and run the
+            // promote/demote state machine; the next reset spawns at the
+            // (possibly new) level's patch.
+            if c.fell || timeout {
+                if let Some(ter) = &mut self.terrain {
+                    let p = poses[env_base + self.idx.torso_link as usize].translation;
+                    let [lx, ly] = ter.last_xy[e];
+                    let traveled =
+                        ter.travel[e] + ((p.x - lx).powi(2) + (p.y - ly).powi(2)).sqrt();
+                    let rng = &mut ter.rng[e];
+                    ter.curriculum[e].on_episode_end(traveled, rng);
+                }
+            }
             // Accumulate per-component reward + termination causes for W&B
             // (drained by `take_reward_log`). Every (env, step) contributes to
             // the component means; termination counters tally episode ends.
@@ -3015,6 +3219,15 @@ impl BipedNexusBatchEnv {
         Some(out)
     }
 
+    /// Mean terrain-difficulty level across envs (BIPED_TERRAIN; the
+    /// curriculum's progress metric — AGILE logs the same).
+    pub fn mean_terrain_level(&self) -> Option<f32> {
+        self.terrain.as_ref().map(|t| {
+            t.curriculum.iter().map(|c| c.level as f32).sum::<f32>()
+                / t.curriculum.len().max(1) as f32
+        })
+    }
+
     /// Read the accumulated per-phase timings and reset the counters.
     /// Pair with the timed loop in `biped_fps.rs` to get a breakdown of
     /// where the per-step budget went.
@@ -3029,8 +3242,20 @@ impl BipedNexusBatchEnv {
         // for a given seed.
         let r = self.rng[env].range(0.0, 1.0);
         let t = ((r * self.templates.len() as f32) as usize).min(self.templates.len() - 1);
-        self.state
-            .reset_env_from_snapshot(&self.gpu, env as u32, &self.template_snapshots[t]);
+        if self.terrain.is_some() {
+            // Teleport to the env's current difficulty patch (level was
+            // already updated by the curriculum when the episode ended).
+            let off = self.terrain_spawn_offset(env);
+            self.state.reset_env_from_snapshot_offset(
+                &self.gpu,
+                env as u32,
+                &self.template_snapshots[t],
+                off,
+            );
+        } else {
+            self.state
+                .reset_env_from_snapshot(&self.gpu, env as u32, &self.template_snapshots[t]);
+        }
         // Mirror the template's sole-normal so update_feet's tilt makes sense.
         // Cached per-template (constant) — NO per-reset rapier-scene rebuild.
         self.foot_sole_local[env] = self.template_foot_sole[t];
@@ -3439,10 +3664,11 @@ impl BipedNexusBatchEnv {
         (dofs, mm)
     }
 
-    /// Global collider index of the ground in env `e` (last collider per env).
+    /// Global collider index of the ground cuboid in env `e` (last collider
+    /// per env, or second-to-last when the terrain trimesh is appended).
     pub fn ground_collider(&self, e: usize) -> u32 {
-        // colliders_per_batch = robot bodies + 1 ground (ground inserted last).
-        (e as u32 + 1) * self.idx.colliders_per_batch - 1
+        let after_ground = self.terrain.is_some() as u32;
+        (e as u32 + 1) * self.idx.colliders_per_batch - 1 - after_ground
     }
 }
 

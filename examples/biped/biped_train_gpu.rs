@@ -746,14 +746,28 @@ fn main() {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.4);
+        // BIPED_TERRAIN: AGILE-consistency — the terrain curriculum IS the
+        // difficulty control (no stand phase, no command ramp; full ±0.5 m/s
+        // from iter 0). Note: episodes under a STANDING command travel < 2 m
+        // and count as curriculum failures (AGILE has the same coupling);
+        // consider BIPED_STAND_PROB=0 for terrain runs.
+        let terrain_on = std::env::var("BIPED_TERRAIN").as_deref() == Ok("1");
+        if terrain_on {
+            println!(
+                "terrain curriculum drives difficulty: command scale pinned to 1.0 \
+                 (stand/ramp curricula bypassed)"
+            );
+        }
         for it in 0..iters {
             let t_iter = Instant::now();
             let frac = it as f32 / iters as f32;
-            let cscale = if frac < stand_frac {
+            let cscale = if terrain_on {
+                1.0
+            } else if frac < stand_frac {
                 0.0
             } else {
-                ((frac - stand_frac) / (ramp_end - stand_frac)).clamp(0.0, 1.0)
-            } * max_cscale;
+                ((frac - stand_frac) / (ramp_end - stand_frac)).clamp(0.0, 1.0) * max_cscale
+            };
             env.set_command_scale(cscale);
             let tscale = ((it as f32 / iters as f32 - 0.4) / 0.5).clamp(0.0, 1.0) * torque_max;
             env.set_torque_scale(tscale);
@@ -1295,6 +1309,9 @@ fn main() {
                         " term_illegal={} term_fell={} term_timeout={} samples={}",
                         rl.illegal, rl.fell, rl.timeout, rl.samples
                     ));
+                    if let Some(lvl) = env.mean_terrain_level() {
+                        s.push_str(&format!(" terrain_level={lvl:.3}"));
+                    }
                     println!("{s}");
                 }
             }

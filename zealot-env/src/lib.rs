@@ -25,6 +25,7 @@ pub mod obs_history;
 pub mod rng;
 pub mod robots;
 pub mod tasks;
+pub mod terrain;
 
 pub use config::{BodyState, EnvConfig};
 pub use obs_history::ObsHistory;

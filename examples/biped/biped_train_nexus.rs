@@ -169,8 +169,15 @@ fn main() {
         }
         // Curriculum: command-velocity ramps 0 → 1 over the first 40% of iters.
         let warmup = (iters as f32 * 0.4).max(1.0);
+        // BIPED_TERRAIN: the terrain curriculum drives difficulty — full
+        // commands from iter 0 (AGILE-consistent; see biped_train_gpu).
+        let terrain_on = std::env::var("BIPED_TERRAIN").as_deref() == Ok("1");
         for it in 0..iters {
-            let scale = (it as f32 / warmup).min(1.0);
+            let scale = if terrain_on {
+                1.0
+            } else {
+                (it as f32 / warmup).min(1.0)
+            };
             env.set_command_scale(scale);
 
             // Collect T steps across all envs.
