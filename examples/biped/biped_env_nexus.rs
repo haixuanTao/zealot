@@ -1089,9 +1089,10 @@ pub struct BipedNexusBatchEnv {
     /// regardless of `delay_k` (AGILE replicates the first command into the
     /// delay buffer — a fresh env never sees another episode's targets).
     delay_fresh: Vec<bool>,
-    /// Per-step scratch: this step's targets + each env's crossing substep.
+    /// Per-step scratch: this step's targets + the packed GPU delay-state
+    /// upload ([tick, k, prev targets per link] per env).
     delay_now: Vec<[f32; NUM_JOINTS]>,
-    delay_slot: Vec<u32>,
+    delay_state_buf: Vec<f32>,
     /// Observation history (BIPED_OBS_HISTORY=H): the ACTOR obs becomes the
     /// last H noised 45-frames stacked oldest→newest (WBC-AGILE semantics —
     /// replicated on reset). Critic stays single-frame privileged. None = off.
@@ -1579,12 +1580,10 @@ impl BipedNexusBatchEnv {
                 "BIPED_MOTOR_DELAY: need min <= max <= decimation ({})",
                 task.decimation
             );
-            assert!(task.decimation <= 32, "BIPED_MOTOR_DELAY: decimation > 32 unsupported");
-            assert!(
-                std::env::var("BIPED_GRAPH").is_err(),
-                "BIPED_MOTOR_DELAY re-stages motor targets mid-decimation (host write_buffer \
-                 between substeps), which CUDA-graph capture cannot record — unset BIPED_GRAPH"
-            );
+            // GPU-side delay (gravity_and_lu selects prev-vs-current target by
+            // a per-step tick): no mid-decimation host writes, so this is
+            // CUDA-graph-compatible (the per-step delay-state upload sits next
+            // to the motor flush, outside the captured region).
             println!(
                 "actuator delay ENABLED: {min}..={max} physics substeps, resampled per env at reset"
             );
@@ -1653,7 +1652,7 @@ impl BipedNexusBatchEnv {
             delay_prev_targets: vec![[0.0f32; NUM_JOINTS]; num_envs],
             delay_fresh: vec![true; num_envs],
             delay_now: vec![[0.0f32; NUM_JOINTS]; num_envs],
-            delay_slot: vec![0u32; num_envs],
+            delay_state_buf: Vec::new(),
             obs_hist: ObsHistory::from_env(num_envs, OBS_DIM),
             terrain: terrain_build.map(|(strips, _shapes, _stub)| {
                 let mut rng: Vec<Lcg> = (0..num_envs)
@@ -2652,12 +2651,8 @@ impl BipedNexusBatchEnv {
         // push the whole `links_static` buffer in ONE write_buffer call.
         // Replaces `num_envs * NUM_JOINTS` per-step write_buffer calls.
         //
-        // With BIPED_MOTOR_DELAY, env e's fresh target instead lands at
-        // substep `delay_k[e]` (the previous step's target applies before it),
-        // so each env is still staged exactly once per control step — at its
-        // crossing substep — and only substeps with crossing envs pay a flush.
-        // `delay_any[i]` marks substeps 1..decimation that need a restage.
-        let mut delay_any = [false; 32];
+        // With BIPED_MOTOR_DELAY, the delay itself runs GPU-side (see the
+        // delay-state upload below); staging is identical to the no-delay path.
         let t = Instant::now();
         if self.motor_delay.is_none() {
             for e in 0..self.n {
@@ -2681,45 +2676,50 @@ impl BipedNexusBatchEnv {
                 .expect("flush motor targets");
             self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
         } else {
-            let decim = self.task.decimation as usize;
-            let mut staged0 = false;
+            // GPU-side delay: stage the CURRENT targets for every env (exactly
+            // the no-delay staging), then upload the per-batch delay state
+            // [tick=0, k_eff, prev targets] in ONE additional pre-step write.
+            // The gravity_and_lu kernel swaps in the previous target while its
+            // per-step tick < k — ZERO mid-decimation host writes (the old
+            // per-substep restage stalled the stream on a pageable H2D copy,
+            // ~70 ms/step at 4096 envs).
             for e in 0..self.n {
                 self.delay_now[e] = self.task.joint_targets(&actions[e]);
-                let k = self.delay_k[e] as usize;
-                // (slot, stage a_{t-1} instead of a_t)
-                let (slot, prev) = if self.delay_fresh[e] {
-                    self.delay_fresh[e] = false;
-                    (0, false)
-                } else if k == 0 {
-                    (0, false)
-                } else if k >= decim {
-                    (0, true) // a_{t-1} holds for the whole step
-                } else {
-                    (k, false)
-                };
-                self.delay_slot[e] = slot as u32;
-                if slot == 0 {
-                    let tg = if prev {
-                        self.delay_prev_targets[e]
-                    } else {
-                        self.delay_now[e]
-                    };
-                    self.stage_env_targets(e, &tg);
-                    staged0 = true;
-                } else {
-                    delay_any[slot] = true;
-                }
+                let tg = self.delay_now[e];
+                self.stage_env_targets(e, &tg);
             }
             self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
 
-            if staged0 {
-                let t = Instant::now();
-                self.state
-                    .multibodies_mut()
-                    .flush_links_static(&self.gpu)
-                    .expect("flush motor targets");
-                self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
+            let t = Instant::now();
+            self.state
+                .multibodies_mut()
+                .flush_links_static(&self.gpu)
+                .expect("flush motor targets");
+            let stride = self.state.multibodies_mut().motor_delay_stride() as usize;
+            if self.delay_state_buf.len() != stride * self.n {
+                self.delay_state_buf = vec![0.0; stride * self.n];
             }
+            for e in 0..self.n {
+                let base = e * stride;
+                self.delay_state_buf[base] = 0.0; // tick
+                self.delay_state_buf[base + 1] = if self.delay_fresh[e] {
+                    self.delay_fresh[e] = false;
+                    0.0 // first post-reset command applies from substep 0
+                } else {
+                    self.delay_k[e] as f32
+                };
+                for j in 0..NUM_JOINTS {
+                    let link = self.idx.actuated[j].0 as usize;
+                    self.delay_state_buf[base + 2 + link] = self.delay_prev_targets[e][j];
+                }
+            }
+            let buf = std::mem::take(&mut self.delay_state_buf);
+            self.state
+                .multibodies_mut()
+                .write_motor_delay_state(&self.gpu, &buf)
+                .expect("write motor delay state");
+            self.delay_state_buf = buf;
+            self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
         }
 
         // (1b) Push perturbation: roughly every `push_interval` control steps
@@ -2769,23 +2769,6 @@ impl BipedNexusBatchEnv {
             // since the trace readback syncs per step.
             let trace = std::env::var("BIPED_SUBSTEP_TRACE").is_ok();
             for i in 0..self.task.decimation {
-                // BIPED_MOTOR_DELAY: envs whose lag crosses at this substep get
-                // their fresh target now (one extra whole-mirror flush, only on
-                // substeps that actually have crossings).
-                if i > 0 && self.motor_delay.is_some() && delay_any[i as usize] {
-                    let tf = Instant::now();
-                    for e in 0..self.n {
-                        if self.delay_slot[e] == i {
-                            let tg = self.delay_now[e];
-                            self.stage_env_targets(e, &tg);
-                        }
-                    }
-                    self.state
-                        .multibodies_mut()
-                        .flush_links_static(&self.gpu)
-                        .expect("flush delayed motor targets");
-                    self.timings.flush_static_ns += tf.elapsed().as_nanos() as u64;
-                }
                 let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
                 if trace {
                     self.trace_foot_substep(self.global_step, i).await;
