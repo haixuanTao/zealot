@@ -140,10 +140,11 @@ impl RobotSpec {
             "" | "lerobot" => lerobot_bipedal::lerobot(),
             "g1" | "unitree_g1" => unitree_g1::unitree_g1(),
             "g1_agile" => unitree_g1::unitree_g1_agile(),
+            "g1_29dof_agile" => unitree_g1::unitree_g1_29dof_agile(),
             "g1_29dof" | "g1_29" | "g1full" => unitree_g1::unitree_g1_29dof(),
             "h2plus" | "h2_plus" | "unitree_h2_plus" => unitree_h2_plus::unitree_h2_plus(),
             other => {
-                panic!("unknown BIPED_ROBOT '{other}' (expected lerobot | g1 | g1_agile | g1_29dof | h2plus)")
+                panic!("unknown BIPED_ROBOT '{other}' (expected lerobot | g1 | g1_agile | g1_29dof | g1_29dof_agile | h2plus)")
             }
         }
     }

@@ -459,6 +459,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda-device"
+version = "0.1.0"
+dependencies = [
+ "cuda-macros",
+]
+
+[[package]]
+name = "cuda-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "reserved-oxide-symbols",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "cudarc"
 version = "0.19.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1265,6 +1282,7 @@ dependencies = [
 name = "khal-std"
 version = "0.2.0"
 dependencies = [
+ "cuda-device",
  "glam 0.32.1",
  "glamx 0.3.0",
  "khal-derive",

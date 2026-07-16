@@ -14,7 +14,7 @@
 //!    either side (a zealot edit or an upstream AGILE retune) fails a test
 //!    instead of silently skewing cross-stack comparisons.
 
-use zealot_env::robots::unitree_g1::{unitree_g1, unitree_g1_agile};
+use zealot_env::robots::unitree_g1::{unitree_g1, unitree_g1_29dof_agile, unitree_g1_agile};
 
 include!("data/agile_g1_actuators.rs");
 
@@ -33,6 +33,18 @@ fn agile_actuator_parity() {
         assert_eq!(j.armature, armature, "{name} armature");
         assert_eq!(j.action_scale, AGILE_ACTION_SCALE, "{name} action scale");
         assert_eq!(j.default_pos, q0, "{name} default pos");
+    }
+}
+
+/// The full-body AGILE variant carries the same 12 AGILE-matched leg joints.
+#[test]
+fn full_body_agile_legs_match() {
+    let legs = unitree_g1_agile();
+    let full = unitree_g1_29dof_agile();
+    for (a, b) in legs.joints.iter().zip(full.joints.iter()) {
+        assert_eq!(a.name, b.name);
+        assert_eq!((a.kp, a.kd, a.effort_limit, a.armature), (b.kp, b.kd, b.effort_limit, b.armature), "{}", a.name);
+        assert_eq!(a.action_scale, b.action_scale, "{}", a.name);
     }
 }
 

@@ -221,6 +221,33 @@ pub const fn unitree_g1_29dof() -> RobotSpec {
     spec
 }
 
+/// [`unitree_g1_29dof`] (full body, 31 nv) with **WBC-AGILE's actuator
+/// parametrization** — legs from [`unitree_g1_agile`], upper-body holding
+/// gains from AGILE's own waist/arm actuator groups (waist kp 300 / kd 5,
+/// shoulder_pitch 90/2, shoulder_roll 60/1, shoulder_yaw 20/0.4, elbow 60/1,
+/// wrist_roll 4/0.2; efforts per the model). The closest zealot gets to
+/// AGILE's simulated robot: 31 vs 35 nv (wrist pitch/yaw welded for the
+/// 32-DOF solver cap).
+pub const fn unitree_g1_29dof_agile() -> RobotSpec {
+    let mut spec = unitree_g1_agile();
+    spec.name = "unitree_g1_29dof_agile";
+    spec.mjcf_rel_path = "Documents/work/zealot/assets/robots/unitree_g1_29dof.xml";
+    spec.urdf_rel_path = "Documents/work/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf";
+    spec.total_mass = 33.34;
+    spec.illegal_ground_fragments = &["hip", "knee", "torso", "waist", "shoulder", "elbow", "wrist"];
+    // Fragment match order: most specific first (first match wins).
+    spec.held_joints = &[
+        ("waist_yaw", 300.0, 5.0, 88.0),
+        ("waist", 300.0, 5.0, 50.0), // waist_roll / waist_pitch
+        ("shoulder_pitch", 90.0, 2.0, 25.0),
+        ("shoulder_roll", 60.0, 1.0, 25.0),
+        ("shoulder", 20.0, 0.4, 25.0), // shoulder_yaw
+        ("elbow", 60.0, 1.0, 25.0),
+        ("wrist", 4.0, 0.2, 25.0), // wrist_roll (pitch/yaw are welded)
+    ];
+    spec
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
