@@ -699,6 +699,14 @@ fn main() {
         );
         let mut gstep: u64 = 0;
         let mut lr = LR; // adaptive-KL LR, persists across iterations
+        // LR floor override (BIPED_LR_MIN). rsl_rl's adaptive-KL schedule brakes
+        // down to 1e-5; our 1e-4 default was tuned for the shaped reward and is
+        // too high a floor for spikier reward sets (KL runs away when the
+        // controller wants to brake further and can't).
+        let lr_min: f32 = std::env::var("BIPED_LR_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(LR_MIN);
 
         let (mut gc, mut gcc) = env.initial_obs().await;
         // Velocity-command curriculum: STAND-BEFORE-WALK. Hold the command at 0
@@ -1198,7 +1206,7 @@ fn main() {
                 kl_s += t_kl.elapsed().as_secs_f64();
                 last_kl = kl;
                 if kl > DESIRED_KL * 2.0 {
-                    lr = (lr / 1.5).max(LR_MIN);
+                    lr = (lr / 1.5).max(lr_min);
                 } else if kl > 0.0 && kl < DESIRED_KL / 2.0 {
                     lr = (lr * 1.5).min(LR_MAX);
                 }
