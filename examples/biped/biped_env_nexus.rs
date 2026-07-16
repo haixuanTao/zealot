@@ -1338,7 +1338,15 @@ impl BipedNexusBatchEnv {
         }
 
         let gpu = make_backend().await;
-        let pipeline = GpuPhysicsPipeline::from_backend(&gpu);
+        let mut pipeline = GpuPhysicsPipeline::from_backend(&gpu);
+        // BIPED_CONTACT_REDUCE=1: merge per-triangle terrain contacts to ≤4
+        // points per collider pair before the solvers (training-grade
+        // approximation; flat-ground contacts unaffected). Biggest terrain
+        // perf lever — the mb contact-constraint kernels scale with points.
+        if std::env::var("BIPED_CONTACT_REDUCE").as_deref() == Ok("1") {
+            pipeline.contact_reduction = true;
+            println!("contact reduction ENABLED (per-pair manifolds merged to ≤4 points)");
+        }
 
         // Sample DR for the templates first (each defines one rapier scene).
         let mut tpl_rng = Lcg::new(seed);
