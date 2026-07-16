@@ -482,6 +482,50 @@ impl Default for RewardWeights {
     }
 }
 
+impl RewardWeights {
+    /// WBC-AGILE's G1 `velocity_history` reward set, term for term
+    /// (`BIPED_AGILE_REWARDS=1`). AGILE has NO stepping rewards — locomotion
+    /// emerges from sharp tracking + terrain — so every zealot-only shaping
+    /// term (gait_clock, air_time, single_support, bilateral_symmetry,
+    /// com_centering, pose, forward_progress) is zeroed here. Terms AGILE has
+    /// that we can't express (action_rate_rate, root_acc, dof_vel_limits,
+    /// torque family — those live in the env's BIPED_TORQUE_W/POWER_W hooks)
+    /// are noted at the call site. `flight` carries AGILE's `jumping` weight.
+    pub fn agile() -> Self {
+        Self {
+            track_lin_vel: 5.0,
+            forward_progress: 0.0,
+            track_ang_vel: 5.0,
+            upright: 5.0,
+            base_height: 2.5,
+            base_height_target: 0.72, // AGILE DEFAULT_PELVIS_HEIGHT (bent-knee stance)
+            pose: 0.0,
+            bilateral_symmetry: 0.0,
+            action_rate: -0.25,
+            action_rate_hipz_hipx: 0.0,
+            body_ang_vel: -0.25,
+            lin_vel_z: -0.25,
+            dof_pos_limits: -0.5,
+            dof_vel: -1e-4,
+            termination: -2.0, // AGILE is_terminated -100 × dt
+            air_time: 0.0,
+            flight: -20.0, // AGILE `jumping`
+            single_support: 0.0,
+            stand_planted: 0.0,
+            foot_slip: -0.05, // AGILE feet_slip
+            foot_clearance: 0.0,
+            foot_clearance_target: 0.03,
+            foot_orientation: -0.05, // AGILE feet_roll_l2
+            feet_yaw_mean: -2.0,
+            feet_distance: -0.1,
+            feet_distance_ref: 0.2,
+            gait_clock: 0.0,
+            gait_swing_ratio: 0.4,
+            com_centering: 0.0,
+        }
+    }
+}
+
 /// Standard deviations of the exponential tracking kernels (`exp(-err²/std²)`),
 /// from the deployed policy.
 #[derive(Clone, Copy, Debug)]
@@ -516,6 +560,19 @@ impl Default for RewardStds {
             upright: 10_f32.to_radians(),
             base_height: 0.1,
             pose: 1.0, // unused (pose weight = 0) but kept for API stability
+        }
+    }
+}
+
+impl RewardStds {
+    /// WBC-AGILE's exact kernel widths (`BIPED_AGILE_REWARDS=1`).
+    pub fn agile() -> Self {
+        Self {
+            lin_vel: 0.2,
+            ang_vel: 0.2,
+            upright: 10_f32.to_radians(),
+            base_height: 0.1,
+            pose: 1.0,
         }
     }
 }
@@ -652,11 +709,28 @@ impl VelocityFlatTask {
         // walking blocker, so the key dials are the velocity-tracking weight vs
         // the standing magnets (upright / base_height). Set e.g.
         // `BIPED_W_TRACK_LIN=10 BIPED_W_UPRIGHT=3 BIPED_W_BASE_H=1.5` at launch.
-        let mut weights = RewardWeights::default();
+        // BIPED_AGILE_REWARDS=1: WBC-AGILE's exact G1 term set — no stepping
+        // rewards, no extra stand income, AGILE kernel widths, AGILE's 0.72 m
+        // bent-knee height target (NOT the per-robot straight-leg default).
+        // Pair with BIPED_POWER_W=0 (AGILE has no power term).
+        let agile_rewards = std::env::var("BIPED_AGILE_REWARDS").is_ok_and(|v| v == "1");
+        if agile_rewards {
+            println!(
+                "AGILE reward parity ENABLED: WBC-AGILE G1 term set (no stepping rewards), \
+                 stds lin/ang 0.2, height target 0.72"
+            );
+        }
+        let mut weights = if agile_rewards {
+            RewardWeights::agile()
+        } else {
+            RewardWeights::default()
+        };
         // The base-height target is per-robot (lerobot trunk 0.72 m, G1 pelvis
         // 0.78 m, H2 Plus pelvis 1.03 m); the RewardWeights default keeps the
         // lerobot value for struct-literal users.
-        weights.base_height_target = robot.base_height;
+        if !agile_rewards {
+            weights.base_height_target = robot.base_height;
+        }
         let env_f32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
         if let Some(v) = env_f32("BIPED_W_TRACK_LIN") {
             weights.track_lin_vel = v;
@@ -670,7 +744,11 @@ impl VelocityFlatTask {
         if let Some(v) = env_f32("BIPED_W_BASE_H") {
             weights.base_height = v;
         }
-        let mut stds = RewardStds::default();
+        let mut stds = if agile_rewards {
+            RewardStds::agile()
+        } else {
+            RewardStds::default()
+        };
         if let Some(v) = env_f32("BIPED_STD_LIN") {
             stds.lin_vel = v;
         }
