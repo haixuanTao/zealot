@@ -147,6 +147,43 @@ pub const fn unitree_g1() -> RobotSpec {
     }
 }
 
+/// [`unitree_g1`] with **WBC-AGILE's actuator parametrization** instead of
+/// unitree_rl_gym's — for like-for-like training A/Bs against NVIDIA's
+/// pipeline. Sourced from AGILE's `G1_29DOF_DELAYED_DC_MOTOR` +
+/// `Velocity-G1-History` task cfg (regenerate the pinned table with
+/// `tools/pull_agile_actuators.py`; the `agile_actuator_parity` test asserts
+/// this spec matches it). Deltas vs [`unitree_g1`]: knee kp 150→200, ankle kp
+/// 40→20, kd 2/4/2 → 2.5/5/0.2 (ankle_roll 0.1), armature 0.01→0.02,
+/// hip_roll effort 139@20 → 88@32, action_scale 0.25→0.5. NOT yet modeled:
+/// AGILE's DC torque-speed saturation (needs the nexus kernel change).
+pub const fn unitree_g1_agile() -> RobotSpec {
+    let mut spec = unitree_g1();
+    spec.name = "unitree_g1_agile";
+    let mut i = 0;
+    while i < NUM_JOINTS {
+        let j = &mut spec.joints[i];
+        let name = j.name;
+        if contains(name, "hip") {
+            // All three hip families: kp 100 (same), kd 2.5, 88 N·m @ 32 rad/s
+            // (AGILE bins hip_roll with the other hips, unlike the URDF).
+            j.kd = 2.5;
+            j.effort_limit = 88.0;
+            j.vel_limit = 32.0;
+        } else if contains(name, "knee") {
+            j.kp = 200.0;
+            j.kd = 5.0;
+        } else {
+            // ankles: soft position gain, near-zero damping.
+            j.kp = 20.0;
+            j.kd = if contains(name, "ankle_roll") { 0.1 } else { 0.2 };
+        }
+        j.armature = 0.02;
+        j.action_scale = 0.5;
+        i += 1;
+    }
+    spec
+}
+
 /// The Unitree G1 **rev 1.0 full body** (29-DOF model, 25 live joints): the
 /// same 12 leg actions as [`unitree_g1`], but the waist (3), shoulders (3×2),
 /// elbows and wrist rolls are REAL PD-held joints instead of mass welded into
