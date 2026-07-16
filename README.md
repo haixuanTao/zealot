@@ -327,50 +327,57 @@ The LeRobot table above compares against WBC-AGILE's *lightest* task. This one
 compares the **Unitree G1** against the pipeline NVIDIA actually ships for it:
 [WBC-AGILE](https://github.com/nvidia-isaac/WBC-AGILE)'s `Velocity-G1-History-v0`
 — full 29-DOF G1, delayed DC-motor actuation model, 5-step observation history,
-contact sensors, the full manager/reward stack, PhysX TGS at 8 position + 4
-velocity iterations, 200 Hz physics / 50 Hz control (the same 4×5 ms structure
-zealot uses). Same 5090, same hour, strictly sequential; WBC-AGILE numbers are
-steady-state rsl_rl `Computation` (collection + learning); zealot is
-`iter_e2e_bench` (native CUDA + cuTile, T=32, 5e×16mb) with `BIPED_ROBOT=g1`
-(12-DOF legs-only, wrists/waist fused):
+rough-terrain curriculum, contact sensors, the full manager/reward stack, PhysX
+TGS at 8 position + 4 velocity iterations, 200 Hz physics / 50 Hz control (the
+same 4×5 ms structure zealot uses). Same 5090, strictly sequential; WBC-AGILE
+numbers are steady-state rsl_rl `Computation` (collection + learning); zealot
+is `iter_e2e_bench` (native CUDA + cuTile, T=32, 5e×16mb):
 
 All zealot columns run solver-iters 8 (the AGILE-matched TGS budget; at the
 LeRobot table's iters-4 config the 12-DOF G1 does 70.4 / 81.3 / 89.5 k).
-**+delay+hist** = `BIPED_MOTOR_DELAY=0,4 BIPED_OBS_HISTORY=5` — the same
-actuation-latency + stacked-observation realism WBC-AGILE's task carries (its
-numbers include that work, so a bare zealot row would be under-modeled):
+**+realism** = `BIPED_MOTOR_DELAY=0,4 BIPED_OBS_HISTORY=5` with AGILE-matched
+actuator gains (`g1_29dof_agile`) — the actuation-latency + stacked-observation
+modeling WBC-AGILE's task carries. **+terrain** additionally runs
+`BIPED_TERRAIN=1`: a port of AGILE's `terrain_levels_vel_curriculum`
+(20-level boxes/rough/wave trimesh strips, teleport resets, the same
+promote/demote rules). WBC-AGILE's numbers *always* include its rough terrain —
+so the terrain column is the only fully like-for-like one; the flat column is
+shown because most published sim benchmarks are flat-ground:
 
-| N envs | zealot 12-DOF | 12-DOF +delay+hist | zealot full-body (31 nv) | full-body +delay+hist | WBC-AGILE (35 nv) |
-|-------:|--------------:|-------------------:|-------------------------:|----------------------:|------------------:|
-| 2 048  | 51.1 k        | 43.8 k             | 35.4 k                   | **31.5 k**            | 20.6 k            |
-| 4 096  | 60.4 k        | 50.7 k             | 42.9 k                   | **37.0 k**            | 32.3 k            |
-| 8 192  | 68.5 k        | 55.7 k             | 56.1 k                   | **40.3 k**            | 47.4 k            |
+| N envs | zealot 12-DOF | full-body +realism (flat) | full-body +realism +terrain | WBC-AGILE (terrain, 35 nv) |
+|-------:|--------------:|--------------------------:|----------------------------:|---------------------------:|
+| 2 048  | 51.1 k        | 33.1 k                    | **25.4 k**                  | 20.6 k                     |
+| 4 096  | 60.4 k        | 39.2 k                    | **30.7 k**                  | 32.3 k                     |
+| 8 192  | 68.5 k        | 44.1 k                    | **33.6 k**                  | 47.4 k                     |
 
 The bold column is the honest like-for-like: full body, same TGS budget, same
-delay/history modeling — zealot is **1.5× ahead at 2 048, 1.15× at 4 096, and
-0.85× (behind) at 8 192**. The realism costs zealot 11–28%, worst at large N,
-for a known and optimizable reason: the actuator delay's mid-decimation
-restages currently re-upload the whole `links_static` mirror (up to 3 extra
-flushes per control step) — a dirty-range or per-env upload would reclaim most
-of it — and the history adds a 225-input actor plus obs memcpy. Remaining
-asymmetries: zealot welds the wrists (31 vs 35 nv, the `MAX_MB_DOFS = 32` cap),
-has no DC-motor torque-speed saturation yet, and no contact-sensor history.
+delay/history modeling, same terrain curriculum — zealot is **1.23× ahead at
+2 048, 0.95× at 4 096, and 0.71× at 8 192**. The crossover is a saturation
+story, not a work story: zealot's warp-per-env kernels keep the GPU busy from
+2 048 envs (so doubling envs buys only ~20%), while AGILE's iteration at small
+N is dominated by the fixed host cost of thousands of eager-torch launches — a
+GPU probe during its steady iterations shows 75% "utilization" at only **156 W
+of the 600 W budget** — so its curve keeps climbing until the GPU finally
+fills. zealot's remaining per-env overhead on terrain is per-triangle contact
+generation (a GPU contact-reduction pass, `BIPED_CONTACT_REDUCE=1`, already
+merges the output manifolds and is included above). Remaining asymmetries:
+zealot welds the wrists (31 vs 35 nv, the `MAX_MB_DOFS = 32` cap), has no
+DC-motor torque-speed saturation yet, and no contact-sensor history; zealot's
+boxes terrain uses heightfield steps rather than true vertical faces.
 Against WBC-AGILE the structural point stands: the *stock*
 `Isaac-Velocity-Flat-G1-v0` on the same box does 72 k / 115 k / 180 k, so the
-production stack runs **~3.5–3.8× below its engine's ceiling**, and a
-GPU-utilization probe during its steady iterations shows why: 75% "utilization"
-at only **156 W of the 600 W budget** — the launch-bound signature of many tiny
-manager-framework kernels with Python gaps, not extra simulation compute.
-Equivalent realism costs zealot a measured 11–28%; AGILE's task layer costs
-~3.5×.
+production stack runs **~3.5–3.8× below its engine's ceiling** — its task
+layer costs ~3.5×, while zealot's equivalent realism + terrain costs a
+measured 23–33%.
 
 Reproduce (zealot side; WBC-AGILE side is `scripts/train.py
 --task Velocity-G1-History-v0 --headless --num_envs N --max_iterations 15` from
 its repo):
 
 ```sh
-# bold column: full-body + AGILE-parity realism flags
-BIPED_ROBOT=g1_29dof BIPED_SOLVER_ITERS=8 BIPED_MOTOR_DELAY=0,4 BIPED_OBS_HISTORY=5 \
+# bold column: full-body + AGILE-parity realism + terrain curriculum
+BIPED_ROBOT=g1_29dof_agile BIPED_SOLVER_ITERS=8 BIPED_MOTOR_DELAY=0,4 BIPED_OBS_HISTORY=5 \
+    BIPED_TERRAIN=1 BIPED_CONTACT_REDUCE=1 BIPED_CONTACT_CAP=128 \
     BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 \
     cargo run --release --example iter_e2e_bench \
     --features "gpu biped_gpu cuda_backend cutile" -- <num_envs> 32 5 16
