@@ -389,10 +389,18 @@ pub struct DrParams {
     pub friction: f32,
     pub restitution: f32,
     pub pd_scale: f32,
+    /// Extra multiplier on kd ONLY (default 1.0 → kd follows `pd_scale`).
+    /// AGILE-parity DR (`BIPED_AGILE_DR=1`) randomizes damping on a wider,
+    /// independent range from stiffness (kd ×U(0.8,2.0) vs kp ×U(0.9,1.1)).
+    pub kd_scale: f32,
     /// Per-env multiplier on every link's mass (and, to stay physically
     /// consistent, its inertia tensor). Models payload / build-tolerance /
     /// CAD-vs-reality mass error. ~±20% by default.
     pub mass_scale: f32,
+    /// Additive payload on the ROOT link only, kg (AGILE randomize_base_mass:
+    /// +U(−1,5) kg on the pelvis; mass only, inertia untouched — matches
+    /// Isaac's `operation: add`). Default 0.
+    pub base_payload_kg: f32,
     pub contact_natural_frequency: f32,
     pub contact_damping_ratio: f32,
     /// Sampled base orientation at spawn — separate axes so a single template
@@ -417,7 +425,9 @@ impl Default for DrParams {
             friction: 1.0,
             restitution: 0.0,
             pd_scale: 1.0,
+            kd_scale: 1.0,
             mass_scale: 1.0,
+            base_payload_kg: 0.0,
             contact_natural_frequency: 30.0,
             contact_damping_ratio: 5.0,
             spawn_yaw: 0.0,
@@ -571,12 +581,18 @@ fn build_env_scene(
         // consistent (fixed geometry/density → I ∝ m). Applied per-env from the
         // template's sampled `dr.mass_scale`.
         let ms = dr.mass_scale;
+        // Root-only additive payload (AGILE randomize_base_mass, mass only).
+        let payload = if b.parent.is_none() {
+            dr.base_payload_kg
+        } else {
+            0.0
+        };
         let h = bodies.insert(
             RigidBodyBuilder::dynamic()
                 .position(world[i])
                 .additional_mass_properties(MassProperties::with_inertia_matrix(
                     b.com,
-                    (b.mass * ms).max(1e-3),
+                    (b.mass * ms + payload).max(1e-3),
                     inertia_mat * ms,
                 ))
                 .build(),
@@ -754,7 +770,7 @@ fn build_env_scene(
             .map(|s| {
                 (
                     s.kp * dr.pd_scale * pj,
-                    s.kd * dr.pd_scale * pj,
+                    s.kd * dr.pd_scale * dr.kd_scale * pj,
                     s.effort_limit * pj,
                     s.pos_limit,
                     s.damping,
@@ -1124,6 +1140,11 @@ pub struct BipedNexusBatchEnv {
     /// policy to learn genuine balance recovery (sim-to-real robustness)
     /// rather than a brittle nexus-specific reflex.
     push_vel: f32,
+    /// AGILE reset_base/reset_robot_joints velocity randomization
+    /// (BIPED_RESET_VEL=1): every reset writes base lin ±0.25 m/s (x,y), base
+    /// ang ±0.5 rad/s (r/p/y) and joint vels ±1.0 rad/s — episodes START in
+    /// motion, so a statically stable stand is never the t=0 state.
+    reset_vel: bool,
     push_interval: u64,
     /// Angular kick magnitude, rad/s (BIPED_PUSH_ANGVEL, default 0 = linear-only
     /// pushes). WBC-AGILE uses ±0.25 on roll/pitch/yaw.
@@ -1451,6 +1472,20 @@ impl BipedNexusBatchEnv {
             state.reserve_contacts(&gpu, cap);
             println!("contact buffers pre-sized to {cap}/batch");
         }
+        // BIPED_MAX_COLORS: bound for the contact-graph coloring (nexus default
+        // 8 → the solver runs max_colors+1 passes per phase whether or not the
+        // colors are used). The biped scene's rigid-rigid contact graph is tiny
+        // (dynamics live in the multibody solver), so the default mostly buys
+        // empty solver dispatches. Under-provisioning is self-healing but bad:
+        // the coloring-failed ratchet adds +5. Keep constant per run (graph
+        // capture records the pass count).
+        if let Some(mc) = std::env::var("BIPED_MAX_COLORS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            state.set_max_colors(mc);
+            println!("contact-coloring max_colors = {mc} (default 8)");
+        }
         // Implicit-coriolis OFF by default (BIPED_IMPLICIT_CORIOLIS=1 restores
         // the old nexus default). Two reasons:
         // 1. FIDELITY: implicit coriolis augments the mass matrix with `dt·C` —
@@ -1614,6 +1649,10 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.7);
+        let reset_vel = std::env::var("BIPED_RESET_VEL").is_ok_and(|v| v == "1");
+        if reset_vel {
+            println!("reset-velocity randomization ENABLED (AGILE reset_base/joints: lin ±0.25, ang ±0.5, joints ±1.0)");
+        }
         let push_vel = std::env::var("BIPED_PUSH_VEL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1698,6 +1737,7 @@ impl BipedNexusBatchEnv {
             global_step: 0,
             dbg_stance: Vec::new(),
             push_vel,
+            reset_vel,
             push_interval,
             push_angvel,
             next_push_at: push_interval,
@@ -3258,6 +3298,30 @@ impl BipedNexusBatchEnv {
             self.state
                 .reset_env_from_snapshot(&self.gpu, env as u32, &self.template_snapshots[t]);
         }
+        // AGILE reset-velocity randomization: overwrite the fresh env's dof
+        // velocities (snapshot resets them to 0) so the episode starts in
+        // motion. Layout per env in `dof_state`: [0..3) root lin, [3..6) root
+        // ang, [6..dpb) joint velocities; element-offset write touches only
+        // this env's slice of the velocity section.
+        if self.reset_vel {
+            let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
+            let mut v = vec![0.0f32; dpb];
+            v[0] = self.rng[env].range(-0.25, 0.25);
+            v[1] = self.rng[env].range(-0.25, 0.25);
+            for d in 3..6 {
+                v[d] = self.rng[env].range(-0.5, 0.5);
+            }
+            for d in 6..dpb {
+                v[d] = self.rng[env].range(-1.0, 1.0);
+            }
+            self.gpu
+                .write_buffer(
+                    self.state.multibodies_mut().dof_state_mut().buffer_mut(),
+                    (env * dpb) as u64,
+                    &v,
+                )
+                .expect("dof_state reset-velocity write");
+        }
         // Mirror the template's sole-normal so update_feet's tilt makes sense.
         // Cached per-template (constant) — NO per-reset rapier-scene rebuild.
         self.foot_sole_local[env] = self.template_foot_sole[t];
@@ -3703,6 +3767,42 @@ async fn make_backend() -> KhalGpuBackend {
 /// Initial-pose jitter ranges are conservative — wider tilts make every
 /// episode start mid-fall, which the policy can't recover from at small T.
 fn sample_dr(rng: &mut Lcg) -> DrParams {
+    // BIPED_AGILE_DR=1: sample the WBC-AGILE LocomotionEventCfg ranges instead
+    // of zealot's (which are 2–4× harsher exactly where stepping is risky —
+    // kp ±30% vs their ±10%, link mass ±20% vs ±5%, spawn tilt ±20° vs ±10°).
+    // AGILE-side mapping: friction single-μ U(0.2,1.25) (their static 0.2–1.5 /
+    // dynamic 0.2–1.0; nexus has one μ), restitution U(0,0.1), per-joint kp
+    // ±10% (via pd_scale_per_joint — also touches effort ±10%, deviation:
+    // AGILE leaves effort alone), kd ×U(0.8,2.0) per env (theirs is per joint),
+    // link mass ×U(0.95,1.05) + pelvis payload +U(−1,5) kg, tilt ±10°, no z
+    // jitter. Not modeled: CoM offsets, armature ×U(0,2), continuous wrenches.
+    if std::env::var("BIPED_AGILE_DR").is_ok_and(|v| v == "1") {
+        let pd_scale = 1.0;
+        let kd_scale = rng.range(0.8, 2.0);
+        let friction = rng.range(0.2, 1.25);
+        let restitution = rng.range(0.0, 0.1);
+        let mass_scale = rng.range(0.95, 1.05);
+        let base_payload_kg = rng.range(-1.0, 5.0);
+        let mut pd_scale_per_joint = [1.0f32; NUM_JOINTS];
+        for v in pd_scale_per_joint.iter_mut() {
+            *v = rng.range(0.9, 1.1);
+        }
+        return DrParams {
+            friction,
+            restitution,
+            pd_scale,
+            kd_scale,
+            mass_scale,
+            base_payload_kg,
+            contact_natural_frequency: rng.range(10.0, 50.0),
+            contact_damping_ratio: rng.range(2.0, 8.0),
+            spawn_yaw: rng.range(-std::f32::consts::PI, std::f32::consts::PI),
+            spawn_roll: rng.range(-0.1745, 0.1745),
+            spawn_pitch: rng.range(-0.1745, 0.1745),
+            spawn_z_offset: 0.0,
+            pd_scale_per_joint,
+        };
+    }
     // BIPED_SPAWN_DR scales the initial-pose tilt/height randomization (default
     // 1.0). Set to 0.0 to start every episode upright at nominal height — used to
     // test whether aggressive spawn DR is what's preventing the policy from
@@ -3748,7 +3848,9 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
         // (the real actuators' effective kp/kd differ from the modelled values),
         // and a policy that's robust to ±30% gain error transfers far better.
         pd_scale: rng.range(0.7, 1.3),
+        kd_scale: 1.0,
         mass_scale,
+        base_payload_kg: 0.0,
         // Contact-stiffness DR — now LIVE on the multibody contact solver (the
         // kernel reads per-env contact_natural_frequency / contact_damping_ratio
         // from SimParams; it used to hardcode 30/5). This is the analog of
