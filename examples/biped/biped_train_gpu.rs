@@ -39,7 +39,7 @@ use nalgebra::DMatrix;
 use std::time::Instant;
 use vortx::linalg::{
     Activation, Adam, AdamParams, Contiguous, Gemm, OpAssign, OpAssignVariant, Ppo, PpoActorParams,
-    PpoValueParams,
+    PpoValueParams, Reduce, ReduceVariant,
 };
 use rayon::prelude::*;
 use vortx::shapes::TensorLayoutBuffers;
@@ -644,6 +644,7 @@ fn main() {
         let op = OpAssign::from_backend(&bk).unwrap();
         let act = Activation::from_backend(&bk).unwrap();
         let ad = Adam::from_backend(&bk).unwrap();
+
         let ppo = Ppo::from_backend(&bk).unwrap();
         let cont = Contiguous::from_backend(&bk).unwrap();
         let mut sh = TensorLayoutBuffers::new(&bk);
@@ -714,6 +715,41 @@ fn main() {
         // stats that drifted since the rollout forwards, corrupting the PPO
         // ratios — measured as a pre-update KL floor (BIPED_KL_PROBE) that
         // grows whenever obs statistics move fast.
+        // Global grad-norm clip bound (BIPED_GRAD_CLIP, rsl_rl max_grad_norm
+        // semantics; 0/absent = off, rsl_rl uses 1.0).
+        let grad_clip: f32 = std::env::var("BIPED_GRAD_CLIP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        if grad_clip > 0.0 {
+            println!("grad-norm clip ENABLED: global max_grad_norm = {grad_clip} (rsl_rl parity)");
+        }
+        // Grad-clip machinery: GPU-side squared norms (one SqNorm reduce per
+        // grad tensor into a slot of `sqn`, single tiny readback per
+        // minibatch) + per-shape scale tensors for the (rare) clip events.
+        let red = Reduce::from_backend(&bk).unwrap();
+        let mut sqn = mk(&bk, &DMatrix::<f32>::zeros(1, 32), rw);
+        let (mut gc_scales, mut gc_lens): (Vec<Tensor<f32>>, Vec<usize>) = (vec![], vec![]);
+        let mut gc_slots = 0usize;
+        if grad_clip > 0.0 {
+            for net in [&a_net, &c_net] {
+                for i in 0..net.layers() {
+                    let (r, c) = (net.dims[i + 1], net.dims[i]);
+                    gc_scales.push(mk(&bk, &DMatrix::<f32>::zeros(r, c), st));
+                    gc_lens.push(r * c);
+                    gc_slots += 1;
+                }
+                for i in 0..net.layers() {
+                    let r = net.dims[i + 1];
+                    gc_scales.push(mk(&bk, &DMatrix::<f32>::zeros(r, 1), st));
+                    gc_lens.push(r);
+                    gc_slots += 1;
+                }
+            }
+            gc_scales.push(mk(&bk, &DMatrix::<f32>::zeros(ad_, 1), st));
+            gc_lens.push(ad_);
+            gc_slots += 1;
+        }
         let norm_freeze = std::env::var("BIPED_NORM_FREEZE").is_ok_and(|v| v == "1");
         if norm_freeze {
             println!("obs-normalizer FREEZE enabled: per-iteration stats snapshot (exact PPO ratios)");
@@ -1246,6 +1282,96 @@ fn main() {
                         let mut p = cur.pass("dl");
                         g.dispatch_naive(&bk, &mut sh, &mut p, &mut dls, &gls, &om1)
                             .unwrap();
+                    }
+                    // BIPED_GRAD_CLIP: rsl_rl-style global grad-norm clip
+                    // (max_grad_norm, theirs 1.0) over actor+critic+log_std
+                    // grads together, applied per minibatch BEFORE Adam (so
+                    // moments accumulate clipped grads, like torch). Host
+                    // roundtrip: flush+sync, read every grad buffer, compute
+                    // one global norm, scale+write back only when clipping.
+                    // Costs a per-minibatch sync — worth it: unclipped outlier
+                    // minibatches spike per-epoch KL, and the adaptive-KL
+                    // controller then pins lr ~10x below rsl_rl's operating
+                    // point for hundreds of iterations.
+                    if grad_clip > 0.0 {
+                        // Squared norm of every grad tensor, GPU-side, into
+                        // one slot each of `sqn`; a single 32-float readback
+                        // then yields the global norm.
+                        {
+                            let mut p = cur.pass("gcn");
+                            let mut slot = 0u32;
+                            for net in [&a_net, &c_net] {
+                                for t in net.dw.iter().chain(net.db.iter()) {
+                                    red.launch(
+                                        &bk,
+                                        &mut sh,
+                                        &mut p,
+                                        ReduceVariant::SqNorm,
+                                        t,
+                                        sqn.columns_mut(slot, 1),
+                                    )
+                                    .unwrap();
+                                    slot += 1;
+                                }
+                            }
+                            red.launch(
+                                &bk,
+                                &mut sh,
+                                &mut p,
+                                ReduceVariant::SqNorm,
+                                &dls,
+                                sqn.columns_mut(slot, 1),
+                            )
+                            .unwrap();
+                        }
+                        cur.flush();
+                        bk.synchronize().unwrap();
+                        let sums = bk.slow_read_vec(sqn.buffer()).await.unwrap();
+                        let norm = sums[..gc_slots].iter().sum::<f32>().sqrt();
+                        if norm > grad_clip {
+                            let sc = grad_clip / norm;
+                            for (buf, len) in gc_scales.iter_mut().zip(gc_lens.iter()) {
+                                bk.write_buffer(buf.buffer_mut(), 0, &vec![sc; *len])
+                                    .unwrap();
+                            }
+                            let mut p = cur.pass("gcs");
+                            let mut si = 0usize;
+                            for net in [&mut a_net, &mut c_net] {
+                                for i in 0..net.dw.len() {
+                                    op.launch(
+                                        &bk,
+                                        &mut sh,
+                                        &mut p,
+                                        OpAssignVariant::Mul,
+                                        &mut net.dw[i],
+                                        &gc_scales[si],
+                                    )
+                                    .unwrap();
+                                    si += 1;
+                                }
+                                for i in 0..net.db.len() {
+                                    op.launch(
+                                        &bk,
+                                        &mut sh,
+                                        &mut p,
+                                        OpAssignVariant::Mul,
+                                        &mut net.db[i],
+                                        &gc_scales[si],
+                                    )
+                                    .unwrap();
+                                    si += 1;
+                                }
+                            }
+                            op.launch(
+                                &bk,
+                                &mut sh,
+                                &mut p,
+                                OpAssignVariant::Mul,
+                                &mut dls,
+                                &gc_scales[si],
+                            )
+                            .unwrap();
+                        }
                     }
                     a_net.adam(&bk, &ad, &mut sh, &mut cur, &adp).unwrap();
                     c_net.adam(&bk, &ad, &mut sh, &mut cur, &adp).unwrap();
