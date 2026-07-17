@@ -22,6 +22,10 @@ subgroup_ops = []
 cpu = ["khal-std/cpu", "khal/cpu"]
 cpu-parallel = ["cpu", "khal-std/cpu-parallel"]
 cuda = ["khal-std/cuda", "khal/cuda"]
+# cuda-oxide: PTX device backend, forwarded from khal-std. nexus's shader
+# crates reference `vortx-shaders/cuda-oxide`, so the feature must exist here
+# even when it is never activated.
+cuda-oxide = ["khal-std/cuda-oxide"]
 
 [dependencies]
 khal-std = { workspace = true }

@@ -20,6 +20,7 @@ webgpu = [ "khal/webgpu" ]
 cpu = ["khal/cpu", "vortx-shaders/cpu"]
 cpu-parallel = ["cpu", "vortx-shaders/cpu-parallel"]
 cuda = ["khal/cuda", "khal-builder/cuda", "vortx-shaders/cuda"]
+cuda-oxide = ["vortx-shaders/cuda-oxide", "khal-std/cuda-oxide"]
 metal = ["khal/metal"]
 push_constants = ["khal/push_constants", "vortx-shaders/push_constants"]
 subgroup_ops = ["khal/subgroup_ops", "vortx-shaders/subgroup_ops"]
@@ -29,18 +30,8 @@ unsafe_remove_boundchecks = []
 version = "0.3.0"
 
 [workspace.dependencies]
-<<<<<<< HEAD
-<<<<<<< HEAD
-khal-std = "0.2"
-khal = { version = "0.2", features = ["derive"]}
-=======
-khal-std = { version = "0.1", default-features = false }
-khal = { version = "0.1", features = ["derive"]}
->>>>>>> 28ae1be (vortx-shaders: build cleanly for the nvptx64 (cuda-oxide) device target)
-=======
 khal-std = { version = "0.2", default-features = false }
 khal = { version = "0.2", features = ["derive"]}
->>>>>>> a7bfba8 (vortx: cuda-oxide native-CUDA feature wiring (sm_120))
 
 [dependencies]
 bytemuck = "1"
@@ -63,19 +54,15 @@ anyhow = "1"
 wgpu = "29"
 
 [build-dependencies]
-<<<<<<< HEAD
 khal-builder = "0.2"
-=======
-khal-builder = "0.2.0"
->>>>>>> a7bfba8 (vortx: cuda-oxide native-CUDA feature wiring (sm_120))
 # To build the shader from the dependency instead of local path.
 vortx-shaders = { version = "0.3", path = "./vortx-shaders" }
 
 [patch.crates-io]
 # Local khal forks — required for the standalone cuda-oxide cubin build
 # (crates.io khal-std lacks the `cuda-oxide` feature).
-khal-builder = { path = "../khal/crates/khal-builder" }
-khal = { path = "../khal/crates/khal" }
-khal-std = { path = "../khal/crates/khal-std" }
-khal-derive = { path = "../khal/crates/khal-derive" }
+khal-builder = { path = "../khal-unified/crates/khal-builder" }
+khal = { path = "../khal-unified/crates/khal" }
+khal-std = { path = "../khal-unified/crates/khal-std" }
+khal-derive = { path = "../khal-unified/crates/khal-derive" }
 #glamx = { git = "https://github.com/dimforge/glamx", branch = "bytemuck" }
