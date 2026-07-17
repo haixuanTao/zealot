@@ -707,6 +707,19 @@ fn main() {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(LR_MIN);
+        // BIPED_NORM_FREEZE=1: freeze the obs normalizers for each whole
+        // iteration (rollout forwards, mean_old/logp_old, GAE, staged update
+        // obs and the mirror map all share ONE transform; new stats merge at
+        // the iteration boundary). Without it the update re-normalizes with
+        // stats that drifted since the rollout forwards, corrupting the PPO
+        // ratios — measured as a pre-update KL floor (BIPED_KL_PROBE) that
+        // grows whenever obs statistics move fast.
+        let norm_freeze = std::env::var("BIPED_NORM_FREEZE").is_ok_and(|v| v == "1");
+        if norm_freeze {
+            println!("obs-normalizer FREEZE enabled: per-iteration stats snapshot (exact PPO ratios)");
+        }
+        let mut pn_obs = zealot_rl::ppo::PendingNorm::default();
+        let mut pn_cobs = zealot_rl::ppo::PendingNorm::default();
 
         let (mut gc, mut gcc) = env.initial_obs().await;
         // Velocity-command curriculum: STAND-BEFORE-WALK. Hold the command at 0
@@ -792,7 +805,12 @@ fn main() {
             let mut reset_dur = std::time::Duration::ZERO;
             for _ in 0..T {
                 for e in 0..n {
-                    ac.record_obs(&gc[e], &gcc[e]);
+                    if norm_freeze {
+                        pn_obs.push(&gc[e]);
+                        pn_cobs.push(&gcc[e]);
+                    } else {
+                        ac.record_obs(&gc[e], &gcc[e]);
+                    }
                 }
                 let (means, values) = gpu.forward(&bk, &ac, &gc, &gcc).await.unwrap();
                 let mut acts = Vec::with_capacity(n);
@@ -872,10 +890,20 @@ fn main() {
                     batch.push(std::mem::take(&mut se[t]));
                 }
             }
-            // Mirror augmentation: append the L/R mirror of every sample. `total`
+            // Mirror augmentation: add the L/R mirror of every sample. `total`
             // doubles; minibatch size `mb` is unchanged, so `n_mb` (count) doubles.
+            // Mirrored copies go FIRST, originals LAST: the adaptive-KL LR
+            // schedule measures drift on the LAST minibatch, and a mirrored
+            // sample's `mean_old` is the mirror of the original's mean — for a
+            // non-equivariant policy that differs from the network's actual
+            // output on the mirrored obs, so measuring KL on mirrored samples
+            // reads policy ASYMMETRY as update drift (verified with
+            // BIPED_KL_PROBE: pre-update KL ~0.02 and growing on mirrored
+            // tails, exactly 0 on originals). That artifact pinned lr at the
+            // floor and early-stopped every epoch under fast-changing rewards.
             if mirror_aug {
-                let mir: Vec<Sample> = batch.par_iter().map(mirror_sample).collect();
+                let mut mir: Vec<Sample> = batch.par_iter().map(mirror_sample).collect();
+                std::mem::swap(&mut batch, &mut mir);
                 batch.extend(mir);
             }
             let total = batch.len();
@@ -920,6 +948,13 @@ fn main() {
             } else {
                 None
             };
+            // Frozen-normalizer commit point: every consumer of the transform
+            // this iteration (rollout forwards, GAE, staged obs, mirror map)
+            // has now run — merge the iteration's pending stats for the next.
+            if norm_freeze {
+                ac.obs_norm.commit(&mut pn_obs);
+                ac.critic_norm.commit(&mut pn_cobs);
+            }
             let f_act = mk(
                 &bk,
                 &DMatrix::from_fn(ad_, total, |r, c| batch[c].action[r]),
@@ -980,6 +1015,44 @@ fn main() {
             // (encode = CPU command recording, exec = submit+synchronize i.e.
             // GPU execution incl. launch gaps, kl = the per-epoch readback).
             let (mut enc_s, mut exec_s, mut kl_s) = (0.0f64, 0.0f64, 0.0f64);
+            // BIPED_KL_PROBE=1: measure KL of the last minibatch BEFORE any
+            // update this iteration. Same weights + same states ⇒ must be ~0;
+            // a nonzero floor here means the KL bookkeeping (mean_old vs the
+            // staged obs) compares mismatched state/action pairs, i.e. the
+            // adaptive-LR controller reacts to an artifact, not policy drift.
+            let kl_probe = std::env::var("BIPED_KL_PROBE").is_ok_and(|v| v == "1");
+            if kl_probe {
+                let mut cur = EncCursor::new(&bk);
+                {
+                    let mut p = cur.pass("kp_obs");
+                    cont.launch(
+                        &bk,
+                        &mut sh,
+                        &mut p,
+                        &mut a_net.a[0],
+                        f_obs.columns(((n_mb - 1) * mb) as u32, mb as u32),
+                        None,
+                    )
+                    .unwrap();
+                }
+                a_net
+                    .forward(&bk, &g, &op, &act, &mut sh, &mut cur, ct, &o1m)
+                    .unwrap();
+                cur.flush();
+                bk.synchronize().unwrap();
+                let mn = bk.slow_read_vec(a_net.a[la + 1].buffer()).await.unwrap();
+                let ls = bk.slow_read_vec(lst.buffer()).await.unwrap();
+                let mut kl0 = 0.0f32;
+                for c in 0..mb {
+                    for k in 0..ad_ {
+                        let inv = (-ls[k]).exp();
+                        let d = (mn[k * mb + c] - mean_old_last[c][k]) * inv;
+                        kl0 += 0.5 * d * d;
+                    }
+                }
+                kl0 /= mb as f32;
+                println!("[klprobe] pre-update kl = {kl0:.6} (must be ~0)");
+            }
             for _epoch in 0..EPOCHS {
                 gstep += n_mb as u64;
                 let bc1 = 1.0 - 0.9f32.powi(gstep.min(1 << 30) as i32);
@@ -1205,6 +1278,9 @@ fn main() {
                 kl /= mb as f32;
                 kl_s += t_kl.elapsed().as_secs_f64();
                 last_kl = kl;
+                if kl_probe {
+                    println!("[klprobe] epoch {_epoch} cumulative kl = {kl:.6} (lr {lr:.2e})");
+                }
                 if kl > DESIRED_KL * 2.0 {
                     lr = (lr / 1.5).max(lr_min);
                 } else if kl > 0.0 && kl < DESIRED_KL / 2.0 {

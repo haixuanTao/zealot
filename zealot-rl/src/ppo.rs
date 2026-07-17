@@ -112,6 +112,31 @@ pub struct Normalizer {
     count: f32,
 }
 
+/// Welford state accumulated by `Normalizer::update_deferred`, merged into the
+/// live statistics by `Normalizer::commit` at an iteration boundary.
+#[derive(Clone, Debug, Default)]
+pub struct PendingNorm {
+    mean: Vec<f32>,
+    m2: Vec<f32>,
+    count: f32,
+}
+
+impl PendingNorm {
+    /// Fold one observation into the pending statistics (Welford).
+    pub fn push(&mut self, x: &[f32]) {
+        self.count += 1.0;
+        if self.mean.is_empty() {
+            self.mean = vec![0.0; x.len()];
+            self.m2 = vec![0.0; x.len()];
+        }
+        for i in 0..x.len() {
+            let d = x[i] - self.mean[i];
+            self.mean[i] += d / self.count;
+            self.m2[i] += d * (x[i] - self.mean[i]);
+        }
+    }
+}
+
 impl Normalizer {
     /// New normalizer for `dim`-vectors (starts as the identity transform).
     pub fn new(dim: usize) -> Self {
@@ -140,6 +165,33 @@ impl Normalizer {
             self.mean[i] += d / self.count;
             self.m2[i] += d * (x[i] - self.mean[i]);
         }
+    }
+
+    /// Merge a `PendingNorm` accumulated via `PendingNorm::push` (Chan et al.
+    /// parallel-Welford merge), then reset it. Lets a trainer freeze the
+    /// normalization transform for a whole rollout+update iteration (every
+    /// consumer — policy forward, stored `mean_old`/`logp_old`, GAE value
+    /// forwards, the update's staged obs, the mirror map — sees the SAME
+    /// transform), which makes the PPO importance ratios exact. Updating live
+    /// mid-iteration instead makes π_old's inputs unrecoverable and corrupts
+    /// the ratios (observed as a nonzero pre-update KL floor that grows when
+    /// obs statistics move fast).
+    pub fn commit(&mut self, pending: &mut PendingNorm) {
+        if pending.count == 0.0 {
+            return;
+        }
+        let n1 = self.count;
+        let n2 = pending.count;
+        let tot = n1 + n2;
+        for i in 0..self.mean.len() {
+            let d = pending.mean[i] - self.mean[i];
+            self.mean[i] += d * n2 / tot;
+            self.m2[i] += pending.m2[i] + d * d * n1 * n2 / tot;
+        }
+        self.count = tot;
+        pending.count = 0.0;
+        pending.mean.clear();
+        pending.m2.clear();
     }
 
     /// Whiten `x` to ~zero-mean/unit-variance, clamped to ±5.
