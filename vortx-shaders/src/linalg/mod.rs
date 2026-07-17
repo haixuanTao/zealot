@@ -31,6 +31,4 @@ pub use optim::GpuAdam;
 #[cfg(not(target_arch_is_gpu))]
 pub use ppo::{GpuPpoActorGrad, GpuPpoValueGrad};
 #[cfg(not(target_arch_is_gpu))]
-pub use reduce::{ReduceAdd, ReduceMax, ReduceMin, ReduceMul, ReduceSqNorm};
-#[cfg(not(target_arch_is_gpu))]
 pub use repeat::Repeat;
