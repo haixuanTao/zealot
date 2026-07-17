@@ -21,7 +21,7 @@ pub use activation::{GpuElu, GpuEluBackward, GpuEluVec4, GpuTanh, GpuTanhBackwar
 #[cfg(not(target_arch_is_gpu))]
 pub use contiguous::{Contiguous, ContiguousWithOffset};
 #[cfg(not(target_arch_is_gpu))]
-pub use gemm::{GemmNaive, GemmTiled};
+pub use gemm::{GemmNaive, GemmTiled, GemmTiledVec4};
 #[cfg(not(target_arch_is_gpu))]
 pub use op_assign::{GpuAdd, GpuCopy, GpuCopyWithOffsets, GpuDiv, GpuMul, GpuSub};
 #[cfg(not(target_arch_is_gpu))]
