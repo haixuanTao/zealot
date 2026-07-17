@@ -356,3 +356,8 @@ required-features = ["cpu"]
 name = "passive_stand"
 path = "examples/biped/passive_stand.rs"
 required-features = ["gpu", "biped_gpu"]
+
+[[example]]
+name = "layout_solve_bench"
+path = "examples/layout_solve_bench.rs"
+required-features = ["gpu", "biped_gpu", "cuda_backend"]
