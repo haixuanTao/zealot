@@ -1468,7 +1468,7 @@ impl BipedNexusBatchEnv {
                 // Per-batch contact/constraint slots; the Grow policy lazy-
                 // resizes from the previous frame's counts, so start small
                 // (the default 4096/batch OOMs at 4096 envs).
-                collisions_capacity: 64,
+                collisions_capacity: 128,
                 ..Default::default()
             },
         );
@@ -1609,7 +1609,7 @@ impl BipedNexusBatchEnv {
                 // Per-batch contact/constraint slots; the Grow policy lazy-
                 // resizes from the previous frame's counts, so start small
                 // (the default 4096/batch OOMs at 4096 envs).
-                collisions_capacity: 64,
+                collisions_capacity: 128,
                 ..Default::default()
             },
         );
