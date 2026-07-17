@@ -9,7 +9,7 @@
 //! / fallback; prefer `biped_train_gpu` for real runs.
 //!
 //! Mirror of `biped_train.rs` but uses `BipedNexusBatchEnv` (one batched
-//! `GpuPhysicsState` holding N envs) instead of `Vec<BipedEnv>` over rapier CPU.
+//! `RbdState` holding N envs) instead of `Vec<BipedEnv>` over rapier CPU.
 //! Same MDP (`zealot-env`), same PPO (`zealot-rl`), same obs/action layout — so
 //! a policy trained here is swap-compatible with the CPU rollout/render path.
 //!
@@ -110,7 +110,7 @@ fn main() {
         .unwrap_or_else(|| "/tmp/biped_policy_nexus.safetensors".to_string());
 
     let xml = std::fs::read_to_string(default_mjcf_path()).expect("read mjcf");
-    println!("building {num_envs} envs (batched on one GpuPhysicsState)...");
+    println!("building {num_envs} envs (batched on one RbdState)...");
 
     pollster::block_on(async {
         let mut env = BipedNexusBatchEnv::new(&xml, num_envs, 32, 0xC0FFEE).await;

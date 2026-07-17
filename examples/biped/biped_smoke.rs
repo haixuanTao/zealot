@@ -20,9 +20,9 @@
 
 use khal::backend::{Backend, GpuBackend as KhalGpuBackend, WebGpu};
 use khal::re_exports::wgpu;
-use nexus3d::rbd::dynamics::GpuSimParams;
+use nexus3d::rbd::dynamics::RbdSimParams;
 use nexus3d::rbd::math::Pose;
-use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
+use nexus3d::rbd::pipeline::{RbdPipeline, RbdState};
 use rapier3d::prelude::*;
 use rapier3d_urdf::{UrdfLoaderOptions, UrdfMultibodyOptions, UrdfRobot};
 use std::collections::HashMap;
@@ -237,14 +237,14 @@ async fn webgpu_backend() -> KhalGpuBackend {
 }
 
 /// Per-rigid-body world poses (one per body, base-frame), indexed by body id.
-async fn read_body_poses(gpu: &KhalGpuBackend, state: &GpuPhysicsState) -> Vec<Pose> {
+async fn read_body_poses(gpu: &KhalGpuBackend, state: &RbdState) -> Vec<Pose> {
     gpu.slow_read_vec(state.body_poses().buffer())
         .await
         .expect("body_poses")
 }
 
 /// Read the multibody generalized coordinates (joint angles, possibly + base DOFs).
-async fn read_dofs(gpu: &KhalGpuBackend, state: &mut GpuPhysicsState) -> Vec<f32> {
+async fn read_dofs(gpu: &KhalGpuBackend, state: &mut RbdState) -> Vec<f32> {
     gpu.slow_read_vec(state.multibodies_mut().dof_values().buffer())
         .await
         .expect("dof_values")
@@ -263,7 +263,7 @@ fn main() {
     pollster::block_on(async {
         let robot = RobotSpec::from_env();
         let gpu = webgpu_backend().await;
-        let pipeline = GpuPhysicsPipeline::from_backend(&gpu);
+        let pipeline = RbdPipeline::new(&gpu).unwrap();
 
         let scene = build_scene(&robot, spawn_height);
         println!(
@@ -275,7 +275,7 @@ fn main() {
             scene.foot_idx,
         );
 
-        let mut sp = GpuSimParams::default();
+        let mut sp = RbdSimParams::default();
         sp.dt = DT;
         sp.num_solver_iterations = SOLVER_ITERS;
         let envs = vec![(
@@ -285,7 +285,7 @@ fn main() {
             &scene.multibody,
             &sp,
         )];
-        let mut state = GpuPhysicsState::from_rapier(&gpu, &envs);
+        let mut state = RbdState::from_rapier(&gpu, &envs);
         state.multibodies_mut().set_gravity(&gpu, [0.0, -9.81, 0.0]);
 
         // --- initial geometry / DOF diagnostics ---
@@ -344,7 +344,7 @@ fn main() {
                 }
             }
 
-            let _ = pipeline.step(&gpu, &mut state, None).await;
+            let _ = pipeline.step(&gpu, &mut state, None);
             gpu.synchronize().expect("sync");
             pipeline.auto_resize_buffers(&gpu, &mut state).await;
 

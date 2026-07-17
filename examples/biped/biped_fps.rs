@@ -96,7 +96,7 @@ fn main() {
     );
 
     // ------------------------------------------------------------------
-    // GPU: one batched GpuPhysicsState holding all N envs, one dispatch/step.
+    // GPU: one batched RbdState holding all N envs, one dispatch/step.
     // ------------------------------------------------------------------
     pollster::block_on(async {
         let build_t0 = Instant::now();

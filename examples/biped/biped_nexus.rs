@@ -22,15 +22,15 @@
 //! zero through to its mass-matrix and gravity-force kernels.
 //!
 //! **Fix:** call `rb.recompute_mass_properties_from_colliders(&colliders)` on
-//! every body before constructing `GpuPhysicsState::from_rapier`. Done below.
+//! every body before constructing `RbdState::from_rapier`. Done below.
 //!
 //! Run: `cargo run --release --example biped_nexus --features biped_gpu -- [steps]`
 
 use khal::backend::{Backend, GpuBackend as KhalGpuBackend, WebGpu};
 use khal::re_exports::wgpu;
-use nexus3d::rbd::dynamics::GpuSimParams;
+use nexus3d::rbd::dynamics::RbdSimParams;
 use nexus3d::rbd::math::Pose as NexusPose;
-use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
+use nexus3d::rbd::pipeline::{RbdPipeline, RbdState};
 use rapier3d::prelude::*;
 use roxmltree::Node;
 use std::collections::HashMap;
@@ -299,13 +299,13 @@ async fn webgpu_backend() -> KhalGpuBackend {
     KhalGpuBackend::WebGpu(w)
 }
 
-async fn read_poses(gpu: &KhalGpuBackend, state: &GpuPhysicsState) -> Vec<NexusPose> {
+async fn read_poses(gpu: &KhalGpuBackend, state: &RbdState) -> Vec<NexusPose> {
     gpu.slow_read_vec(state.poses().buffer())
         .await
         .expect("poses")
 }
 
-async fn read_dofs(gpu: &KhalGpuBackend, state: &mut GpuPhysicsState) -> Vec<f32> {
+async fn read_dofs(gpu: &KhalGpuBackend, state: &mut RbdState) -> Vec<f32> {
     gpu.slow_read_vec(state.multibodies_mut().dof_values().buffer())
         .await
         .expect("dofs")
@@ -318,7 +318,7 @@ async fn read_dofs(gpu: &KhalGpuBackend, state: &mut GpuPhysicsState) -> Vec<f32
 /// it's `Copy + bytemuck::Zeroable`, so an `unsafe` zero-init is safe.
 async fn read_ws_link0(
     gpu: &KhalGpuBackend,
-    state: &mut GpuPhysicsState,
+    state: &mut RbdState,
 ) -> nexus3d::rbd::shaders::dynamics::MultibodyLinkWorkspace {
     use nexus3d::rbd::shaders::dynamics::MultibodyLinkWorkspace;
     let mut out: [MultibodyLinkWorkspace; 1] = [unsafe { std::mem::zeroed() }];
@@ -328,13 +328,13 @@ async fn read_ws_link0(
     out[0]
 }
 
-async fn read_dof_state(gpu: &KhalGpuBackend, state: &mut GpuPhysicsState) -> Vec<f32> {
+async fn read_dof_state(gpu: &KhalGpuBackend, state: &mut RbdState) -> Vec<f32> {
     gpu.slow_read_vec(state.multibodies_mut().dof_state().buffer())
         .await
         .expect("dof_state")
 }
 
-async fn read_accels(gpu: &KhalGpuBackend, state: &mut GpuPhysicsState) -> Vec<f32> {
+async fn read_accels(gpu: &KhalGpuBackend, state: &mut RbdState) -> Vec<f32> {
     gpu.slow_read_vec(state.multibodies_mut().gen_accelerations().buffer())
         .await
         .expect("gen_accelerations")
@@ -345,7 +345,7 @@ async fn read_accels(gpu: &KhalGpuBackend, state: &mut GpuPhysicsState) -> Vec<f
 /// force assembly for that link).
 async fn read_mprops_link0(
     gpu: &KhalGpuBackend,
-    state: &mut GpuPhysicsState,
+    state: &mut RbdState,
 ) -> nexus3d::rbd::shaders::dynamics::LocalMassProperties {
     use nexus3d::rbd::shaders::dynamics::LocalMassProperties;
     let mut out: [LocalMassProperties; 1] = [unsafe { std::mem::zeroed() }];
@@ -372,7 +372,7 @@ fn main() {
 
     pollster::block_on(async {
         let gpu = webgpu_backend().await;
-        let pipeline = GpuPhysicsPipeline::from_backend(&gpu);
+        let pipeline = RbdPipeline::new(&gpu).unwrap();
         let mut scene = build_scene(&mjcf, &robot);
         // rapier's `local_mprops` is populated by its step pipeline — since we
         // hand the scene to nexus without stepping rapier first, we have to
@@ -395,7 +395,7 @@ fn main() {
             scene.actuated.len(),
         );
 
-        let mut sp = GpuSimParams::default();
+        let mut sp = RbdSimParams::default();
         sp.dt = DT;
         sp.num_solver_iterations = SOLVER_ITERS;
         let envs = vec![(
@@ -418,7 +418,7 @@ fn main() {
             total_mass > 1.0,
             "rapier local_mprops still zero — recompute didn't fire"
         );
-        let mut state = GpuPhysicsState::from_rapier(&gpu, &envs);
+        let mut state = RbdState::from_rapier(&gpu, &envs);
         state.multibodies_mut().set_gravity(&gpu, [0.0, 0.0, -9.81]);
 
         let p0 = read_poses(&gpu, &state).await;
@@ -473,7 +473,7 @@ fn main() {
                     let _ = mm.set_motor_position(&gpu, 0, *lid, JointAxis::AngZ, target);
                 }
             }
-            let _ = pipeline.step(&gpu, &mut state, None).await;
+            let _ = pipeline.step(&gpu, &mut state, None);
             gpu.synchronize().expect("sync");
             pipeline.auto_resize_buffers(&gpu, &mut state).await;
 

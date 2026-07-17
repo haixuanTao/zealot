@@ -66,11 +66,11 @@ cutile = { path = "../cutile-rs/cutile", optional = true }
 cutile-compiler = { path = "../cutile-rs/cutile-compiler", optional = true }
 cuda-core = { path = "../cutile-rs/cuda-core", optional = true }
 cuda-async = { path = "../cutile-rs/cuda-async", optional = true }
-vortx = { version = "0.1", optional = true }
+vortx = { version = "0.3", optional = true }
 khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
-nexus3d = { path = "../nexus-cuda/crates/nexus3d", features = ["rbd", "from_rapier"], optional = true }
-rapier3d = { version = "0.32", optional = true }
-rapier3d-urdf = { path = "../rapier/crates/rapier3d-urdf", features = ["stl"], optional = true }
+nexus3d = { path = "../nexus-merge/crates/nexus3d", features = ["rbd"], optional = true }
+rapier3d = { version = "0.34", optional = true }
+rapier3d-urdf = { version = "0.34", features = ["stl"], optional = true }
 roxmltree = { version = "0.20", optional = true }
 rayon = { version = "1", optional = true }
 pollster = { version = "0.4", optional = true }
@@ -78,7 +78,7 @@ zealot-env = { workspace = true, optional = true }
 zealot-rl = { workspace = true, optional = true }
 
 [dev-dependencies]
-nalgebra = "0.34"
+nalgebra = "0.35"
 wgpu = "29"
 async-std = { version = "1", features = ["attributes"] }
 anyhow = "1"
@@ -319,14 +319,14 @@ required-features = ["gpu", "biped_gpu"]
 # (vendored naga 29.0.4) snapshots the condition value at its Emit point
 # instead. See docs/metal-contact-bug-proposal.md.
 naga = { path = "../naga-fixed" }
-khal = { path = "../khal/crates/khal" }
-khal-derive = { path = "../khal/crates/khal-derive" }
-khal-std = { path = "../khal/crates/khal-std" }
-khal-builder = { path = "../khal/crates/khal-builder" }
-vortx = { path = "../vortx" }
-vortx-shaders = { path = "../vortx/vortx-shaders" }
+khal = { path = "../khal-unified/crates/khal" }
+khal-derive = { path = "../khal-unified/crates/khal-derive" }
+khal-std = { path = "../khal-unified/crates/khal-std" }
+khal-builder = { path = "../khal-unified/crates/khal-builder" }
+vortx = { path = "../vortx-unified" }
+vortx-shaders = { path = "../vortx-unified/vortx-shaders" }
 parry3d = { path = "../parry/crates/parry3d" }
-rapier3d = { path = "../rapier/crates/rapier3d" }
+
 
 # Probe rapier foot–ground contact (`--features cpu`).
 [[example]]

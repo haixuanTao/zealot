@@ -30,7 +30,7 @@ use khal::Shader;
 use khal::backend::{Backend, Encoder, GpuBackend as KhalGpuBackend};
 use nalgebra::DMatrix;
 use nexus3d::rbd::math::Pose;
-use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
+use nexus3d::rbd::pipeline::{RbdPipeline, RbdState};
 use rapier3d::prelude::*;
 use std::time::Instant;
 use vortx::linalg::{
@@ -347,10 +347,10 @@ fn main() {
         let (bodies, colliders) = build_boxes();
         let ij = ImpulseJointSet::new();
         let mj = MultibodyJointSet::new();
-        let sp = nexus3d::rbd::dynamics::GpuSimParams::default();
+        let sp = nexus3d::rbd::dynamics::RbdSimParams::default();
         let envs = vec![(&bodies, &colliders, &ij, &mj, &sp); n];
-        let pipeline = GpuPhysicsPipeline::from_backend(&bk);
-        let mut state = GpuPhysicsState::from_rapier(&bk, &envs);
+        let pipeline = RbdPipeline::from_backend(&bk);
+        let mut state = RbdState::from_rapier(&bk, &envs);
 
         // ---- policy (rollout forward) + reference net ----------------------
         let mut ac = ActorCritic::new(
@@ -421,7 +421,7 @@ fn main() {
             t_samp += ms(t);
             // nexus physics step (batched, all N envs)
             let t = Instant::now();
-            let _ = pipeline.step(&bk, &mut state, None).await;
+            let _ = pipeline.step(&bk, &mut state, None);
             bk.synchronize().unwrap();
             t_phys += ms(t);
         }

@@ -1,6 +1,6 @@
 //! Vectorized N-env biped environment on nexus GPU physics.
 //!
-//! `BipedNexusBatchEnv` owns one `GpuPhysicsState` holding N parallel envs and
+//! `BipedNexusBatchEnv` owns one `RbdState` holding N parallel envs and
 //! the host-side bookkeeping each env needs (RNG, current command, step counter,
 //! action history, air-time per foot). One `pipeline.step(...)` advances every
 //! env on the GPU; one `slow_read_buffer(links_workspace)` brings the full
@@ -10,7 +10,7 @@
 //! What's mirrored from `biped_env.rs`:
 //! - MJCF scene build (per env), foot box collider, PD motors, dynamic root.
 //! - Per-env friction / restitution / contact-softness / PD-scale randomization
-//!   (baked into the rapier scene + `GpuSimParams` before `from_rapier`).
+//!   (baked into the rapier scene + `RbdSimParams` before `from_rapier`).
 //! - Episode-end reset via pre-built spawn templates + `state.reset_env_from`.
 //!
 //! What's NOT mirrored (nexus host API doesn't expose them):
@@ -26,9 +26,9 @@
 
 use khal::backend::{Backend, Buffer, GpuBackend as KhalGpuBackend};
 use khal::re_exports::wgpu;
-use nexus3d::rbd::dynamics::GpuSimParams;
+use nexus3d::rbd::dynamics::RbdSimParams;
 use nexus3d::rbd::math::Pose as NexusPose;
-use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsSnapshot, GpuPhysicsState};
+use nexus3d::rbd::pipeline::{RbdPipeline, RbdSnapshot, RbdState};
 use nexus3d::rbd::queries::GpuIndexedContact as NexusIndexedContact;
 use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint as NexusMbContact;
 use nexus3d::rbd::shaders::dynamics::MultibodyLinkWorkspace;
@@ -446,7 +446,7 @@ pub struct EnvScene {
     pub colliders: ColliderSet,
     pub impulse: ImpulseJointSet,
     pub multibody: MultibodyJointSet,
-    pub sim_params: GpuSimParams,
+    pub sim_params: RbdSimParams,
 }
 
 /// Indices into the per-env link layout, common across every env (the topology
@@ -898,7 +898,7 @@ fn build_env_scene(
     // contact-solver knobs against the WBC-AGILE-matched config without a rebuild
     // each time (BIPED_SOLVER_ITERS / BIPED_CONTACT_NF / BIPED_CONTACT_DR).
     let env_f32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
-    let mut sp = GpuSimParams::default();
+    let mut sp = RbdSimParams::default();
     sp.dt = task_dt;
     sp.num_solver_iterations = std::env::var("BIPED_SOLVER_ITERS")
         .ok()
@@ -1046,7 +1046,7 @@ struct DbgStance {
 
 /// One vectorized env over nexus GPU physics.
 ///
-/// All N envs share a single `GpuPhysicsState`. Per-env host state (RNG,
+/// All N envs share a single `RbdState`. Per-env host state (RNG,
 /// command, step counter, action history, air-time, sole-normals) lives in
 /// parallel vectors keyed by env index. Reset uses pre-built single-env spawn
 /// templates and `state.reset_env_from(env_i, template)`.
@@ -1185,8 +1185,8 @@ pub struct BipedNexusBatchEnv {
 
     // GPU state
     gpu: KhalGpuBackend,
-    pipeline: GpuPhysicsPipeline,
-    state: GpuPhysicsState,
+    pipeline: RbdPipeline,
+    state: RbdState,
 
     /// CUDA-graph capture of one control step's `decimation × pipeline.step`
     /// physics sequence. The per-step host re-encode of those dispatches is
@@ -1202,11 +1202,11 @@ pub struct BipedNexusBatchEnv {
     graph_warmup_steps: u32,
 
     // Pre-built spawn templates for reset_env_from (different DR samples).
-    templates: Vec<GpuPhysicsState>,
+    templates: Vec<RbdState>,
     /// CPU snapshot of each template, read off the GPU once at setup so resets
     /// are write-only (no per-reset `slow_read_buffer` stalls — the dominant
     /// reset cost on WebGPU). Parallel to `templates`.
-    template_snapshots: Vec<GpuPhysicsSnapshot>,
+    template_snapshots: Vec<RbdSnapshot>,
     template_dr: Vec<DrParams>,
     /// Cached per-template `foot_sole_local` (constant per template) so reset_env
     /// doesn't rebuild the rapier scene every reset.
@@ -1293,7 +1293,7 @@ pub struct RewardLog {
 }
 
 impl BipedNexusBatchEnv {
-    /// Build N envs sharing one batched GpuPhysicsState. `num_templates` controls
+    /// Build N envs sharing one batched RbdState. `num_templates` controls
     /// how many distinct DR samples are pre-built and cycled across the N envs
     /// at construction and reset time (higher = better coverage, more GPU mem).
     pub async fn new(mjcf_xml: &str, num_envs: usize, num_templates: usize, seed: u64) -> Self {
@@ -1359,7 +1359,7 @@ impl BipedNexusBatchEnv {
         }
 
         let gpu = make_backend().await;
-        let mut pipeline = GpuPhysicsPipeline::from_backend(&gpu);
+        let mut pipeline = RbdPipeline::new(&gpu).unwrap();
         // BIPED_CONTACT_REDUCE=1: merge per-triangle terrain contacts to ≤4
         // points per collider pair before the solvers (training-grade
         // approximation; flat-ground contacts unaffected). Biggest terrain
@@ -1459,7 +1459,7 @@ impl BipedNexusBatchEnv {
                 )
             })
             .collect();
-        let mut state = GpuPhysicsState::from_rapier(&gpu, &envs_refs);
+        let mut state = RbdState::from_rapier(&gpu, &envs_refs, Default::default());
         state.multibodies_mut().set_gravity(&gpu, [0.0, 0.0, -9.81]);
         // BIPED_CONTACT_CAP: eagerly pre-size the contact/constraint buffers
         // (per batch). Required before BIPED_GRAPH capture on terrain — the
@@ -1572,7 +1572,7 @@ impl BipedNexusBatchEnv {
         // rebuilding the whole rapier scene every reset (build_env_scene is heavy:
         // bodies + colliders + joints + inertia eigendecomps — and reset_env runs
         // thousands of times per training iteration, once per fallen env).
-        let mut templates: Vec<GpuPhysicsState> = Vec::with_capacity(num_templates);
+        let mut templates: Vec<RbdState> = Vec::with_capacity(num_templates);
         let mut template_foot_sole: Vec<[Vec3; NUM_FEET]> = Vec::with_capacity(num_templates);
         for dr in &template_dr {
             // Templates carry a tiny far-below flat stub in the terrain slot:
@@ -1588,7 +1588,7 @@ impl BipedNexusBatchEnv {
                 &scene.multibody,
                 &scene.sim_params,
             )];
-            let mut tpl = GpuPhysicsState::from_rapier(&gpu, &envs_refs);
+            let mut tpl = RbdState::from_rapier(&gpu, &envs_refs, Default::default());
             tpl.multibodies_mut().set_gravity(&gpu, [0.0, 0.0, -9.81]);
             templates.push(tpl);
         }
@@ -1598,7 +1598,7 @@ impl BipedNexusBatchEnv {
         // fallen env); the old reset_env_from re-read the constant template from
         // the GPU 6× per reset, and each slow_read_buffer stalls the WebGPU queue
         // (tens of seconds/iter on Metal). Reading once here makes resets cheap.
-        let mut template_snapshots: Vec<GpuPhysicsSnapshot> = Vec::with_capacity(num_templates);
+        let mut template_snapshots: Vec<RbdSnapshot> = Vec::with_capacity(num_templates);
         for tpl in &templates {
             template_snapshots.push(tpl.snapshot(&gpu).await);
         }
@@ -2651,7 +2651,7 @@ impl BipedNexusBatchEnv {
         // Warmup so the color count / buffers stabilise (capture must not realloc).
         for _ in 0..32 {
             for _ in 0..decim {
-                let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+                let _ = self.pipeline.step(&self.gpu, &mut self.state, None);
             }
         }
         self.gpu.synchronize().expect("warmup sync");
@@ -2660,7 +2660,7 @@ impl BipedNexusBatchEnv {
         let t0 = Instant::now();
         for _ in 0..t_steps {
             for _ in 0..decim {
-                let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+                let _ = self.pipeline.step(&self.gpu, &mut self.state, None);
             }
             self.gpu.synchronize().expect("sync");
         }
@@ -2670,7 +2670,7 @@ impl BipedNexusBatchEnv {
         let graph_ms = if let Some(cuda) = self.gpu.as_cuda() {
             cuda.begin_capture().expect("begin_capture");
             for _ in 0..decim {
-                let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+                let _ = self.pipeline.step(&self.gpu, &mut self.state, None);
             }
             let graph = cuda.end_capture().expect("end_capture");
             graph.upload().ok();
@@ -2810,7 +2810,7 @@ impl BipedNexusBatchEnv {
                 let cuda = self.gpu.as_cuda().expect("cuda backend for BIPED_GRAPH");
                 cuda.begin_capture().expect("begin_capture");
                 for _ in 0..self.task.decimation {
-                    let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+                    let _ = self.pipeline.step(&self.gpu, &mut self.state, None);
                 }
                 let g = cuda.end_capture().expect("end_capture");
                 g.upload().ok();
@@ -2828,7 +2828,7 @@ impl BipedNexusBatchEnv {
             // since the trace readback syncs per step.
             let trace = std::env::var("BIPED_SUBSTEP_TRACE").is_ok();
             for i in 0..self.task.decimation {
-                let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+                let _ = self.pipeline.step(&self.gpu, &mut self.state, None);
                 if trace {
                     self.trace_foot_substep(self.global_step, i).await;
                 }
@@ -2871,7 +2871,7 @@ impl BipedNexusBatchEnv {
             let t = Instant::now();
             self.pipeline
                 .auto_resize_buffers(&self.gpu, &mut self.state)
-                .await;
+                .unwrap();
             self.timings.auto_resize_ns += t.elapsed().as_nanos() as u64;
             self.tick_since_resize = 0;
         }
@@ -3622,11 +3622,21 @@ impl BipedNexusBatchEnv {
             .await
             .expect("pairs_len readback");
         let pbuf = self.state.dbg_collision_pairs().buffer();
-        let mut v = vec![[0u32; 2]; pbuf.len()];
+        let mut raw: Vec<nexus3d::rbd::shaders::broad_phase::CollisionPair> =
+            vec![
+                nexus3d::rbd::shaders::broad_phase::CollisionPair {
+                    colliders: glamx::UVec2::new(0, 0).into(),
+                };
+                pbuf.len() as usize
+            ];
         self.gpu
-            .slow_read_buffer(pbuf, &mut v)
+            .slow_read_buffer(pbuf, &mut raw)
             .await
             .expect("pairs readback");
+        let v: Vec<[u32; 2]> = raw
+            .iter()
+            .map(|p| [p.colliders.x, p.colliders.y])
+            .collect();
         (len, v)
     }
 
