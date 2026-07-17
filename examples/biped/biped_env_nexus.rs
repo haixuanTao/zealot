@@ -1459,7 +1459,19 @@ impl BipedNexusBatchEnv {
                 )
             })
             .collect();
-        let mut state = RbdState::from_rapier(&gpu, &envs_refs, Default::default());
+        let mut state = RbdState::from_rapier(
+            &gpu,
+            &envs_refs,
+            nexus3d::rbd::pipeline::RbdCapacities {
+                batches: envs_refs.len() as u32,
+                body_capacity: (envs_refs.len() as u32 * 32).max(1024),
+                // Per-batch contact/constraint slots; the Grow policy lazy-
+                // resizes from the previous frame's counts, so start small
+                // (the default 4096/batch OOMs at 4096 envs).
+                collisions_capacity: 64,
+                ..Default::default()
+            },
+        );
         state.multibodies_mut().set_gravity(&gpu, [0.0, 0.0, -9.81]);
         // BIPED_CONTACT_CAP: eagerly pre-size the contact/constraint buffers
         // (per batch). Required before BIPED_GRAPH capture on terrain — the
@@ -1588,7 +1600,19 @@ impl BipedNexusBatchEnv {
                 &scene.multibody,
                 &scene.sim_params,
             )];
-            let mut tpl = RbdState::from_rapier(&gpu, &envs_refs, Default::default());
+            let mut tpl = RbdState::from_rapier(
+            &gpu,
+            &envs_refs,
+            nexus3d::rbd::pipeline::RbdCapacities {
+                batches: envs_refs.len() as u32,
+                body_capacity: (envs_refs.len() as u32 * 32).max(1024),
+                // Per-batch contact/constraint slots; the Grow policy lazy-
+                // resizes from the previous frame's counts, so start small
+                // (the default 4096/batch OOMs at 4096 envs).
+                collisions_capacity: 64,
+                ..Default::default()
+            },
+        );
             tpl.multibodies_mut().set_gravity(&gpu, [0.0, 0.0, -9.81]);
             templates.push(tpl);
         }
