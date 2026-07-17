@@ -46,7 +46,7 @@ struct GpuNet {
 impl GpuNet {
     fn new(backend: &GpuBackend, net: &Mlp, n: usize) -> Self {
         let dims = net.dims.clone();
-        let rw = BufferUsages::STORAGE | BufferUsages::COPY_SRC;
+        let rw = BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST;
         let mut a = Vec::with_capacity(net.w.len() + 1);
         for l in 0..=net.w.len() {
             a.push(matrix(backend, &DMatrix::<f32>::zeros(dims[l], n), rw));
@@ -64,7 +64,7 @@ impl GpuNet {
 
     /// (Re)upload weights and biases from the CPU net. Call after each PPO update.
     fn sync(&mut self, backend: &GpuBackend, net: &Mlp) {
-        let st = BufferUsages::STORAGE;
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
         let n = self.n;
         self.w.clear();
         self.b.clear();

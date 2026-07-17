@@ -313,8 +313,8 @@ impl GpuMlp {
     fn new(bk: &GpuBackend, net: &Mlp, m: usize) -> Self {
         let d = net.dims.clone();
         let (st, rw) = (
-            BufferUsages::STORAGE,
-            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
         );
         let l = net.w.len();
         let z = |r: usize, c: usize| DMatrix::<f32>::zeros(r, c);
@@ -535,7 +535,7 @@ impl GpuMlp {
     /// are untouched — the projection is a small correction). Recreating the
     /// tensors is fine: `forward`/`backward` only borrow `w`/`b` per pass.
     fn write_w(&mut self, bk: &GpuBackend, net: &Mlp) {
-        let rw = BufferUsages::STORAGE | BufferUsages::COPY_SRC;
+        let rw = BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST;
         for l in 0..self.w.len() {
             let (out, inp) = (self.dims[l + 1], self.dims[l]);
             self.w[l] = mk(bk, &wmat(&net.w[l], out, inp), rw);
@@ -648,8 +648,8 @@ fn main() {
         let cont = Contiguous::from_backend(&bk).unwrap();
         let mut sh = TensorLayoutBuffers::new(&bk);
         let (st, rw) = (
-            BufferUsages::STORAGE,
-            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
         );
         let mut a_net = GpuMlp::new(&bk, &ac.actor, mb);
         let mut c_net = GpuMlp::new(&bk, &ac.critic, mb);
