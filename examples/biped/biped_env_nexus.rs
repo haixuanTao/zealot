@@ -1191,7 +1191,7 @@ pub struct BipedNexusBatchEnv {
     /// CUDA-graph capture of one control step's `decimation × pipeline.step`
     /// physics sequence. The per-step host re-encode of those dispatches is
     /// ~half the physics time (~24 ms/step measured); capturing once and
-    /// replaying via `cuGraphLaunch` removes it. Opt-in via `BIPED_GRAPH=1`
+    /// replaying via `cuGraphLaunch` removes it. DEFAULT ON; `BIPED_GRAPH=0`
     /// (eager dispatch is the default). Captured lazily after warmup; replayed
     /// thereafter with the freshly-staged motor buffer (the graph records kernel
     /// launches, not data, so per-step buffer writes + resets are honoured).
@@ -2817,16 +2817,19 @@ impl BipedNexusBatchEnv {
             self.next_push_at = self.global_step + self.rng[0].range(0.5 * base, 1.5 * base) as u64;
         }
 
-        // (2) Advance physics at the control decimation. With BIPED_GRAPH=1 on a
-        // CUDA backend, capture the `decimation × pipeline.step` dispatch sequence
-        // ONCE (after warmup) into a CUDA graph and replay it per step — removing
-        // the ~24 ms/step host re-encode (~half the physics cost). The graph
-        // records kernel launches, not data, so the per-step motor-buffer write
-        // (above) and resets are honoured on replay. Eager dispatch otherwise.
+        // (2) Advance physics at the control decimation. On a CUDA backend the
+        // `decimation × pipeline.step` dispatch sequence is captured ONCE (after
+        // warmup) into a CUDA graph and replayed per step — removing the
+        // ~24 ms/step host re-encode. That re-encode cost GROWS over a run
+        // (measured 2.3s → 12s/iter by iter 800 on the eager path); graph replay
+        // holds it FLAT at ~2.3s/iter. The graph records kernel launches, not
+        // data, so the per-step motor-buffer write (above) and resets are
+        // honoured on replay. DEFAULT ON; `BIPED_GRAPH=0` forces eager dispatch
+        // (fallback if a graph-replay driver issue ever surfaces).
         let t = Instant::now();
         let mut ran_physics = false;
         #[cfg(feature = "cuda_backend")]
-        if std::env::var("BIPED_GRAPH").is_ok() {
+        if std::env::var("BIPED_GRAPH").map(|v| v != "0").unwrap_or(true) {
             if let Some(g) = self.physics_graph.as_ref() {
                 g.0.launch().expect("physics graph replay");
                 ran_physics = true;
