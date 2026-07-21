@@ -55,12 +55,13 @@ macro_rules! decl_reductions {
 
             #[cfg(not(feature = "subgroup_ops"))]
             {
-                // Rolled + opaque bound: see `opaque_bound`.
-                let mut stride = 64usize;
-                for _ in 0..opaque_bound(7) {
-                    reduce_workspace_sum(thread_id, stride, workspace);
-                    stride /= 2;
-                }
+                reduce_workspace_sum(thread_id, 64, workspace);
+                reduce_workspace_sum(thread_id, 32, workspace);
+                reduce_workspace_sum(thread_id, 16, workspace);
+                reduce_workspace_sum(thread_id, 8, workspace);
+                reduce_workspace_sum(thread_id, 4, workspace);
+                reduce_workspace_sum(thread_id, 2, workspace);
+                reduce_workspace_sum(thread_id, 1, workspace);
             }
 
             if local_id.x == 0 {
@@ -112,12 +113,13 @@ macro_rules! decl_reductions {
 
             #[cfg(not(feature = "subgroup_ops"))]
             {
-                // Rolled + opaque bound: see `opaque_bound`.
-                let mut stride = 64usize;
-                for _ in 0..opaque_bound(7) {
-                    reduce_workspace_mul(thread_id, stride, workspace);
-                    stride /= 2;
-                }
+                reduce_workspace_mul(thread_id, 64, workspace);
+                reduce_workspace_mul(thread_id, 32, workspace);
+                reduce_workspace_mul(thread_id, 16, workspace);
+                reduce_workspace_mul(thread_id, 8, workspace);
+                reduce_workspace_mul(thread_id, 4, workspace);
+                reduce_workspace_mul(thread_id, 2, workspace);
+                reduce_workspace_mul(thread_id, 1, workspace);
             }
 
             if local_id.x == 0 {
@@ -187,12 +189,13 @@ macro_rules! decl_reductions {
                     khal_std::sync::workgroup_memory_barrier_with_group_sync();
                 }
 
-                // Rolled + opaque bound: see `opaque_bound`.
-                let mut stride = 64usize;
-                for _ in 0..opaque_bound(7) {
-                    reduce_workspace_min(thread_id, stride, workspace);
-                    stride /= 2;
-                }
+                reduce_workspace_min(thread_id, 64, workspace);
+                reduce_workspace_min(thread_id, 32, workspace);
+                reduce_workspace_min(thread_id, 16, workspace);
+                reduce_workspace_min(thread_id, 8, workspace);
+                reduce_workspace_min(thread_id, 4, workspace);
+                reduce_workspace_min(thread_id, 2, workspace);
+                reduce_workspace_min(thread_id, 1, workspace);
             }
 
             if local_id.x == 0 {
@@ -262,12 +265,13 @@ macro_rules! decl_reductions {
                     khal_std::sync::workgroup_memory_barrier_with_group_sync();
                 }
 
-                // Rolled + opaque bound: see `opaque_bound`.
-                let mut stride = 64usize;
-                for _ in 0..opaque_bound(7) {
-                    reduce_workspace_max(thread_id, stride, workspace);
-                    stride /= 2;
-                }
+                reduce_workspace_max(thread_id, 64, workspace);
+                reduce_workspace_max(thread_id, 32, workspace);
+                reduce_workspace_max(thread_id, 16, workspace);
+                reduce_workspace_max(thread_id, 8, workspace);
+                reduce_workspace_max(thread_id, 4, workspace);
+                reduce_workspace_max(thread_id, 2, workspace);
+                reduce_workspace_max(thread_id, 1, workspace);
             }
 
             if local_id.x == 0 {
@@ -340,12 +344,13 @@ pub fn reduce_sq_norm(
 
     #[cfg(not(feature = "subgroup_ops"))]
     {
-        // Rolled + opaque bound: see `opaque_bound`.
-        let mut stride = 64usize;
-        for _ in 0..opaque_bound(7) {
-            reduce_workspace_sum(thread_id, stride, workspace);
-            stride /= 2;
-        }
+        reduce_workspace_sum(thread_id, 64, workspace);
+        reduce_workspace_sum(thread_id, 32, workspace);
+        reduce_workspace_sum(thread_id, 16, workspace);
+        reduce_workspace_sum(thread_id, 8, workspace);
+        reduce_workspace_sum(thread_id, 4, workspace);
+        reduce_workspace_sum(thread_id, 2, workspace);
+        reduce_workspace_sum(thread_id, 1, workspace);
     }
 
     if local_id.x == 0 {
@@ -357,26 +362,6 @@ pub fn reduce_sq_norm(
         {
             output.write(0, workspace.read(0));
         }
-    }
-}
-
-
-/// An optimization-opaque loop bound for the barriered reduction chains.
-/// rustc_codegen_nvvm fully unrolls/inlines constant sequences and its
-/// structurizer then sinks `bar.sync` into the divergent `thread_id < stride`
-/// guards — mismatched barrier counts deadlock the block on sm_90+. Routing
-/// the bound through `black_box` keeps the loop rolled (the barrier stays at
-/// the uniform loop tail). Plain constant on SPIR-V (rust-gpu has no
-/// `black_box`; naga's uniformity analysis keeps barriers sound there).
-#[inline(always)]
-fn opaque_bound(n: u32) -> u32 {
-    #[cfg(target_arch = "spirv")]
-    {
-        n
-    }
-    #[cfg(not(target_arch = "spirv"))]
-    {
-        core::hint::black_box(n)
     }
 }
 
