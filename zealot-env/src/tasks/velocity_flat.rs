@@ -358,6 +358,10 @@ pub struct RewardWeights {
     /// summed over both feet. Strong because un-shaped foot yaw is the dominant
     /// posture artefact for under-constrained humanoid RL.
     pub feet_yaw_mean: f32,
+    /// WBC's `feet_yaw_diff_l2`: penalty on the squared wrapped yaw difference
+    /// between the two feet (splayed/pigeon-toed stance). AGILE G1 weight −0.1,
+    /// lerobot −0.02.
+    pub feet_yaw_diff: f32,
     /// WBC's `feet_distance_from_ref` (lateral mode): penalises deviation of the
     /// lateral (body-Y) foot separation from `feet_distance_ref`.
     pub feet_distance: f32,
@@ -469,6 +473,10 @@ impl Default for RewardWeights {
             foot_clearance_target: 0.03, // (unused at weight 0; kept for the gated compute)
             foot_orientation: -0.01,     // WBC feet_roll_l2 -0.01 (was -0.5)
             feet_yaw_mean: -0.4,         // WBC feet_yaw_mean_vs_base -0.4 (was -2.0)
+            feet_yaw_diff: 0.0, // OFF: keeps the tuned baseline reward unchanged
+            // (runs are compared against a pinned iter-0 reference). WBC has it
+            // in every config (G1 -0.1, lerobot -0.02); enable via agile() or a
+            // struct update when the next baseline is re-pinned.
             feet_distance: -0.02,        // WBC feet_distance_from_ref -0.02 (was -0.1)
             feet_distance_ref: 0.2,
             gait_clock: 3.0, // dense periodic gait reward (the load-bearing
@@ -517,6 +525,7 @@ impl RewardWeights {
             foot_clearance_target: 0.03,
             foot_orientation: -0.05, // AGILE feet_roll_l2
             feet_yaw_mean: -2.0,
+            feet_yaw_diff: -0.1, // AGILE feet_yaw_diff_l2 (no turn reduction in G1 cfg)
             feet_distance: -0.1,
             feet_distance_ref: 0.2,
             gait_clock: 0.0,
@@ -621,6 +630,8 @@ pub struct RewardBreakdown {
     pub foot_orientation: f32,
     /// Foot-yaw-vs-base penalty contribution.
     pub feet_yaw_mean: f32,
+    /// Left/right foot-yaw-difference penalty contribution.
+    pub feet_yaw_diff: f32,
     /// Lateral foot-distance penalty contribution.
     pub feet_distance: f32,
     /// Periodic gait-clock contribution (dense reward for matching each foot's
@@ -654,6 +665,7 @@ impl RewardBreakdown {
             + self.foot_clearance
             + self.foot_orientation
             + self.feet_yaw_mean
+            + self.feet_yaw_diff
             + self.feet_distance
             + self.gait_clock
             + self.com_centering
@@ -1118,6 +1130,18 @@ impl VelocityFlatTask {
         }
         let feet_yaw_mean = self.weights.feet_yaw_mean * yaw_sq * dt;
 
+        // WBC's `feet_yaw_diff_l2`: squared wrapped yaw difference between the
+        // two feet (splay / pigeon-toe). Base-relative yaws work here — the base
+        // yaw cancels in the difference.
+        let feet_yaw_diff = if NUM_FEET == 2 {
+            let d = state.feet[1].yaw_rel_base - state.feet[0].yaw_rel_base;
+            let d = (d + core::f32::consts::PI).rem_euclid(2.0 * core::f32::consts::PI)
+                - core::f32::consts::PI;
+            self.weights.feet_yaw_diff * d.powi(2) * dt
+        } else {
+            0.0
+        };
+
         // WBC's `feet_distance_from_ref` (lateral mode): penalise the absolute
         // deviation of the lateral stance width from `feet_distance_ref`. We
         // transform the foot-to-foot world XY difference into the base frame
@@ -1222,6 +1246,7 @@ impl VelocityFlatTask {
             foot_clearance,
             foot_orientation,
             feet_yaw_mean,
+            feet_yaw_diff,
             feet_distance,
             gait_clock,
             com_centering,
