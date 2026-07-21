@@ -68,7 +68,7 @@ cuda-core = { path = "../cutile-rs/cuda-core", optional = true }
 cuda-async = { path = "../cutile-rs/cuda-async", optional = true }
 vortx = { version = "0.3", optional = true }
 khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
-nexus3d = { path = "../nexus-merge/crates/nexus3d", features = ["rbd"], optional = true }
+nexus3d = { path = "../nexus-pr4/crates/nexus3d", features = ["rbd"], optional = true }
 rapier3d = { version = "0.34", optional = true }
 rapier3d-urdf = { version = "0.34", features = ["stl"], optional = true }
 roxmltree = { version = "0.20", optional = true }

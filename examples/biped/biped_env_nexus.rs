@@ -1893,28 +1893,7 @@ impl BipedNexusBatchEnv {
     /// finite-diff in `read_state`, so we skip the `dof_state` readback (also
     /// untrustworthy per dimforge/nexus-rustgpu#1).
     async fn slurp_state(&mut self) -> (Vec<MultibodyLinkWorkspace>, Vec<NexusPose>) {
-        let mut ws: Vec<MultibodyLinkWorkspace> = vec![
-            unsafe { std::mem::zeroed() };
-            self.state
-                .multibodies_mut()
-                .links_workspace()
-                .buffer()
-                .len()
-        ];
-        self.gpu
-            .slow_read_buffer(
-                self.state.multibodies_mut().links_workspace().buffer(),
-                &mut ws,
-            )
-            .await
-            .expect("links_workspace readback");
-        let mut poses: Vec<NexusPose> =
-            vec![NexusPose::default(); self.state.body_poses().buffer().len()];
-        self.gpu
-            .slow_read_buffer(self.state.body_poses().buffer(), &mut poses)
-            .await
-            .expect("body_poses readback");
-        (ws, poses)
+        unimplemented!("slurp_state: links_workspace is SoA (Vec4) on the upstream base — probe not ported")
     }
 
     /// Hot-path readback: ONLY `body_poses` (no `links_workspace`). The fast
@@ -1937,253 +1916,7 @@ impl BipedNexusBatchEnv {
     /// whether the sliding foot is loaded (large N) with friction below the clamp
     /// (F < μ·N → solver issue) or unloaded (N≈0 → no contact / hovering).
     pub async fn debug_contact_impulses(&mut self) {
-        use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint;
-        let total = self
-            .state
-            .multibodies_mut()
-            .contact_constraints()
-            .buffer()
-            .len();
-        let cnt_total = self
-            .state
-            .multibodies_mut()
-            .contact_constraint_count()
-            .buffer()
-            .len();
-        let mut cons: Vec<MultibodyContactConstraint> =
-            vec![MultibodyContactConstraint::default(); total];
-        self.gpu
-            .slow_read_buffer(
-                self.state.multibodies_mut().contact_constraints().buffer(),
-                &mut cons,
-            )
-            .await
-            .expect("contact_constraints readback");
-        let mut cnt = vec![0u32; cnt_total];
-        self.gpu
-            .slow_read_buffer(
-                self.state
-                    .multibodies_mut()
-                    .contact_constraint_count()
-                    .buffer(),
-                &mut cnt,
-            )
-            .await
-            .expect("contact count readback");
-        let stride = total / cnt_total.max(1); // MAX constraints per mb
-        let n0 = (cnt[0] as usize).min(stride);
-        // Generalized velocities (env 0) + per-constraint jacobian rows, so we can
-        // recompute J·v = Σ_i jac[i]·dof_state[i] on the host — the contact-point
-        // tangential velocity the solver ACTUALLY perceives — and compare it to the
-        // foot's real world slip. For env 0 (batch 0, mb 0): v_base=0, the jac
-        // column for slot s starts at s*dpb, ndofs = dpb.
-        let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
-        let dtot = self.state.multibodies_mut().dof_state().buffer().len();
-        let mut dof = vec![0.0f32; dtot];
-        self.gpu
-            .slow_read_buffer(self.state.multibodies_mut().dof_state().buffer(), &mut dof)
-            .await
-            .expect("dof_state readback");
-        let jtot = self
-            .state
-            .multibodies_mut()
-            .contact_constraint_jacs()
-            .buffer()
-            .len();
-        let mut jacs = vec![0.0f32; jtot];
-        self.gpu
-            .slow_read_buffer(
-                self.state
-                    .multibodies_mut()
-                    .contact_constraint_jacs()
-                    .buffer(),
-                &mut jacs,
-            )
-            .await
-            .expect("contact_constraint_jacs readback");
-        let host_jv = |s: usize| -> f32 {
-            let base = s * dpb;
-            let mut v = 0.0f32;
-            for i in 0..dpb {
-                if base + i < jacs.len() {
-                    v += jacs[base + i] * dof[i]; // env0 dof_state = dof[0..dpb]
-                }
-            }
-            v
-        };
-        // |J| of a constraint's jac row — if a LOADED foot's tangent |J|≈0 the
-        // jacobian is degenerate (can't apply friction in that direction); if |J|
-        // is healthy then Jv_host≈0 means the velocity is genuinely zeroed.
-        let jnorm = |s: usize| -> f32 {
-            let base = s * dpb;
-            let mut v = 0.0f32;
-            for i in 0..dpb {
-                if base + i < jacs.len() {
-                    v += jacs[base + i] * jacs[base + i];
-                }
-            }
-            v.sqrt()
-        };
-        let mut out = String::from("[contact] env0:");
-        for s in 0..n0 {
-            let c = cons[s];
-            if c.kind == 1 {
-                // Normal: print impulse + the bias rhs. rhs_wo_bias = dist·inv_dt
-                // (speculative, dist>0) — the raw-inv_dt term suspected of the
-                // ∝inv_dt energy injection; rhs includes the (saturating) erp bias.
-                // _pad0 = with-bias-solve J·v, _pad1 = no-bias-stabilization J·v
-                // (both pre-impulse). Comparing across iters localizes the energy
-                // injection (with-bias = integrate adds too much; no-bias = removal
-                // leaves a growing residual).
-                let wbias_jv = f32::from_bits(c._pad0);
-                let nobias_jv = f32::from_bits(c._pad1);
-                out.push_str(&format!(
-                    " N[link{} s{}]={:.3}(wJv={:+.4} nJv={:+.4} il={:.2})",
-                    c.link_id, s, c.impulse, wbias_jv, nobias_jv, c.inv_lhs
-                ));
-            } else if c.kind == 2 {
-                let n = cons[c.normal_constraint_slot as usize];
-                // Jv_host = jac·dof_state (the foot's tangential velocity the solver
-                // sees). If Jv_host≈0 while the foot world-slips ~2 m/s, the contact
-                // jacobian is blind to the real motion (the bug). rhs is the target
-                // (0 = stick). F is the applied impulse vs clamp μN.
-                out.push_str(&format!(
-                    " F[s{}]={:.3} Jv_host={:+.3} |J|={:.2} (clampμN={:.2})",
-                    s,
-                    c.impulse,
-                    host_jv(s),
-                    jnorm(s),
-                    c.friction_coeff * n.impulse
-                ));
-            }
-        }
-        // Per-foot STANCE-PHASE kinematics from the link's WORLD POSE — no velocity
-        // convention, no assumed moment arm. While a foot is continuously loaded we
-        // track how far its origin (a) NET-drifts from where it touched down and
-        // (b) wanders in total path length, plus how much it rotates. A foot that
-        // is "planted" while the body vaults over it has NET drift ≈ 0; a foot that
-        // SLIDES has net drift growing across the phase. We also test the
-        // rolling-without-slip relation directly: v_origin ≈ ω·R ⇒ rolling;
-        // v_origin ≫ ω·R ⇒ translating (sliding). Requires per-step calls.
-        let wtotal = self
-            .state
-            .multibodies_mut()
-            .links_workspace()
-            .buffer()
-            .len();
-        let mut ws: Vec<MultibodyLinkWorkspace> = vec![unsafe { std::mem::zeroed() }; wtotal];
-        self.gpu
-            .slow_read_buffer(
-                self.state.multibodies_mut().links_workspace().buffer(),
-                &mut ws,
-            )
-            .await
-            .expect("links_workspace readback");
-        if self.dbg_stance.len() < self.idx.foot_links.len() {
-            self.dbg_stance = vec![DbgStance::default(); self.idx.foot_links.len()];
-        }
-        let cdt = self.task.control_dt();
-        for (fi, &fl) in self.idx.foot_links.iter().enumerate() {
-            // Loaded? Sum normal impulses on this link.
-            let mut n_imp = 0.0f32;
-            for s in 0..n0 {
-                let c = cons[s];
-                if c.kind == 1 && c.link_id == fl {
-                    n_imp += c.impulse;
-                }
-            }
-            let w = ws[fl as usize]; // env 0
-            let p = w.local_to_world.translation;
-            let q = w.local_to_world.rotation; // glam::Quat
-            let loaded = n_imp > 0.05; // well-loaded (≈ ½ body weight), not a graze
-            let st = &mut self.dbg_stance[fi];
-            if loaded && !st.loaded {
-                // Touchdown: start a fresh stance phase.
-                *st = DbgStance {
-                    loaded: true,
-                    start_x: p.x,
-                    start_y: p.y,
-                    start_quat: [q.x, q.y, q.z, q.w],
-                    steps: 1,
-                    prev_x: p.x,
-                    prev_y: p.y,
-                    path_len: 0.0,
-                };
-            } else if loaded && st.loaded {
-                let dx = p.x - st.prev_x;
-                let dy = p.y - st.prev_y;
-                st.path_len += (dx * dx + dy * dy).sqrt();
-                st.prev_x = p.x;
-                st.prev_y = p.y;
-                st.steps += 1;
-            } else if !loaded && st.loaded {
-                // Lift-off: report the whole stance phase.
-                let net = ((p.x - st.start_x).powi(2) + (p.y - st.start_y).powi(2)).sqrt();
-                let q0 = nexus3d::rbd::math::Quat::from_xyzw(
-                    st.start_quat[0],
-                    st.start_quat[1],
-                    st.start_quat[2],
-                    st.start_quat[3],
-                );
-                let rot_deg = q0.angle_between(q).to_degrees();
-                let dur = st.steps as f32 * cdt;
-                eprintln!(
-                    "[stance] foot{fl}: dur={dur:.2}s  net_drift={:.1}cm  path={:.1}cm  rot={rot_deg:.0}deg  (drift_rate={:.2} m/s)",
-                    net * 100.0,
-                    st.path_len * 100.0,
-                    if dur > 1e-3 { net / dur } else { 0.0 },
-                );
-                st.loaded = false;
-            }
-            let tag = if loaded { "STANCE" } else { "swing " };
-            out.push_str(&format!("  foot{fl}[{tag} N={n_imp:.2}]"));
-        }
-        // Generalized velocities (env 0): is the foot moved by the BASE translating
-        // (root linear DOFs large → planted foot dragged) or by the LEG joints
-        // spinning (joint q̇ large → motors actively swinging the stance foot)?
-        // Layout: [root lin x,y,z, root ang x,y,z, joint q̇ ×NUM_JOINTS].
-        // (`dpb` / `dof` were read at the top of this function.)
-        let b = 0; // env 0
-        let root_lin = (dof[b * dpb].powi(2) + dof[b * dpb + 1].powi(2)).sqrt();
-        let root_ang =
-            (dof[b * dpb + 3].powi(2) + dof[b * dpb + 4].powi(2) + dof[b * dpb + 5].powi(2)).sqrt();
-        // Max |q̇| over the joint DOFs (everything past the 6 root DOFs).
-        let mut qd_max = 0.0f32;
-        for d in 6..dpb {
-            qd_max = qd_max.max(dof[b * dpb + d].abs());
-        }
-        out.push_str(&format!(
-            "  | root_lin={root_lin:.2}m/s root_ang={root_ang:.2} max|q̇|={qd_max:.2}rad/s"
-        ));
-        // Generalized acceleration `a = M⁻¹τ` (gravity bias, pre-contact). For a
-        // PASSIVE standing robot under vertical gravity the HORIZONTAL base accel
-        // (DOF 0,1) and base angular accel should be ~0; a spurious value here is
-        // the task #27 g/M inconsistency that drives the foot creep.
-        let atot = self
-            .state
-            .multibodies_mut()
-            .gen_accelerations()
-            .buffer()
-            .len();
-        let mut acc = vec![0.0f32; atot];
-        self.gpu
-            .slow_read_buffer(
-                self.state.multibodies_mut().gen_accelerations().buffer(),
-                &mut acc,
-            )
-            .await
-            .expect("gen_accelerations readback");
-        if dpb <= atot {
-            out.push_str(&format!(
-                "  | a_base=[x={:+.2} y={:+.2} z={:+.2} | ωx={:+.2} ωy={:+.2} ωz={:+.2}] a_joints=[",
-                acc[0], acc[1], acc[2], acc[3], acc[4], acc[5]
-            ));
-            for d in 6..dpb {
-                out.push_str(&format!("{:+.1} ", acc[d]));
-            }
-            out.push(']');
-        }
-        eprintln!("{out}");
+        unimplemented!("debug_contact_impulses: constraint-count tensor + AoS workspace absent on the upstream base — probe not ported")
     }
 
     /// PHASE-A substep trace: read env0's foot-link world XY + per-foot normal
@@ -2193,113 +1926,8 @@ impl BipedNexusBatchEnv {
     /// per-substep resolution of the foot contact-point trajectory — to isolate
     /// the exact substep a loaded foot flips from planted to sliding. Reuses the
     /// `debug_contact_impulses` readback pattern (links_workspace + contacts).
-    pub async fn trace_foot_substep(&mut self, gstep: u64, sub: u32) {
-        use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint;
-        let total = self
-            .state
-            .multibodies_mut()
-            .contact_constraints()
-            .buffer()
-            .len();
-        let cnt_total = self
-            .state
-            .multibodies_mut()
-            .contact_constraint_count()
-            .buffer()
-            .len();
-        let mut cons: Vec<MultibodyContactConstraint> =
-            vec![MultibodyContactConstraint::default(); total];
-        self.gpu
-            .slow_read_buffer(
-                self.state.multibodies_mut().contact_constraints().buffer(),
-                &mut cons,
-            )
-            .await
-            .expect("contact_constraints readback");
-        let mut cnt = vec![0u32; cnt_total];
-        self.gpu
-            .slow_read_buffer(
-                self.state
-                    .multibodies_mut()
-                    .contact_constraint_count()
-                    .buffer(),
-                &mut cnt,
-            )
-            .await
-            .expect("contact count readback");
-        let stride = total / cnt_total.max(1);
-        let n0 = (cnt[0] as usize).min(stride);
-        let wtotal = self
-            .state
-            .multibodies_mut()
-            .links_workspace()
-            .buffer()
-            .len();
-        let mut ws: Vec<MultibodyLinkWorkspace> = vec![unsafe { std::mem::zeroed() }; wtotal];
-        self.gpu
-            .slow_read_buffer(
-                self.state.multibodies_mut().links_workspace().buffer(),
-                &mut ws,
-            )
-            .await
-            .expect("links_workspace readback");
-        let mut out = format!("[sub] g={gstep} s={sub}");
-        for &fl in &self.idx.foot_links {
-            let mut n_imp = 0.0f32;
-            // Perceived tangent SPEED magnitude over BOTH orthonormal tangents of
-            // the foot's contacts: wbias = entering the with-bias solve (_pad0, post
-            // integrate_velocities+motor), nobias = entering stabilization (_pad1).
-            // Compared to the foot's actual world velocity, this tells us if the
-            // contact jacobian sees the real slip or is blind to it.
-            let mut wb2 = 0.0f32;
-            let mut nb2 = 0.0f32;
-            // Geometric contact-point world XY of the MOST LOADED normal point
-            // (the active load-bearing point), + how many points share load — so
-            // we can see the single load-bearing point DANCE between candidate
-            // points across substeps (the ratchet-forward hypothesis).
-            let mut cpx = 0.0f32;
-            let mut cpy = 0.0f32;
-            let mut max_imp = 0.0f32;
-            let mut n_loaded = 0u32;
-            for c in cons.iter().take(n0) {
-                if c.link_id == fl {
-                    if c.kind == 1 {
-                        n_imp += c.impulse;
-                        if c.impulse > 0.02 {
-                            n_loaded += 1;
-                        }
-                        if c.impulse > max_imp {
-                            max_imp = c.impulse;
-                            cpx = f32::from_bits(c._pad4[0]);
-                            cpy = f32::from_bits(c._pad4[1]);
-                        }
-                    } else if c.kind == 2 {
-                        let w = f32::from_bits(c._pad0);
-                        let n = f32::from_bits(c._pad1);
-                        wb2 += w * w;
-                        nb2 += n * n;
-                    }
-                }
-            }
-            let wref = &ws[fl as usize];
-            let p = wref.local_to_world.translation;
-            // Independent contact-point horizontal velocity from the foot's rigid-body
-            // velocity: v_contact = v_lin + ω × r, r = (0,0,-SOLE_DZ). If this ≈ tJv_wb
-            // → jacobian is correct and the foot is PIVOTING (contact ~stationary, not a
-            // slip bug). If v_contact ≫ tJv_wb → the jacobian is BLIND to the real slip.
-            const SOLE_DZ: f32 = 0.04;
-            let v = wref.rb_vels.linear;
-            let a = wref.rb_vels.angular;
-            let cx = v.x - a.y * SOLE_DZ;
-            let cy = v.y + a.x * SOLE_DZ;
-            let v_contact = (cx * cx + cy * cy).sqrt();
-            out.push_str(&format!(
-                " foot{fl}: ox={:+.5} oy={:+.5} z={:.4} N={n_imp:.3} nL={n_loaded} cp=({cpx:+.5},{cpy:+.5}) tJv={:.4}",
-                p.x, p.y, p.z, wb2.sqrt()
-            ));
-            let _ = (v_contact, a);
-        }
-        eprintln!("{out}");
+    pub async fn trace_foot_substep(&mut self, _gstep: u64, _sub: u32) {
+        unimplemented!("trace_foot_substep: constraint-count tensor absent on the upstream base — probe not ported")
     }
 
     /// Inject a random velocity kick to every env's torso — a push perturbation,
@@ -2322,15 +1950,17 @@ impl BipedNexusBatchEnv {
             .expect("dof_state readback for push");
         let pv = self.push_vel;
         let pa = self.push_angvel;
+        // Upstream-base layout is BATCH-INTERLEAVED: dof `d` of env `e` at
+        // `d·n + e` (fork layout was `e·dpb + d`).
         for e in 0..n {
             let dvx = self.rng[e].range(-pv, pv);
             let dvy = self.rng[e].range(-pv, pv);
-            buf[e * dpb] += dvx; // root linear x velocity
-            buf[e * dpb + 1] += dvy; // root linear y velocity
+            buf[e] += dvx; // root linear x velocity
+            buf[n + e] += dvy; // root linear y velocity
             if pa > 0.0 {
                 for d in 3..6 {
                     // root angular x/y/z velocity (world frame)
-                    buf[e * dpb + d] += self.rng[e].range(-pa, pa);
+                    buf[d * n + e] += self.rng[e].range(-pa, pa);
                 }
             }
         }
@@ -3341,13 +2971,18 @@ impl BipedNexusBatchEnv {
             for d in 6..dpb {
                 v[d] = self.rng[env].range(-1.0, 1.0);
             }
-            self.gpu
-                .write_buffer(
-                    self.state.multibodies_mut().dof_state_mut().buffer_mut(),
-                    (env * dpb) as u64,
-                    &v,
-                )
-                .expect("dof_state reset-velocity write");
+            // Upstream-base layout is BATCH-INTERLEAVED (dof d of env e at
+            // d·n + e), so one env's velocities are strided — write per-dof.
+            // Fine at reset frequency; a real port would batch this.
+            for (d, val) in v.iter().enumerate() {
+                self.gpu
+                    .write_buffer(
+                        self.state.multibodies_mut().dof_state_mut().buffer_mut(),
+                        (d * self.n + env) as u64,
+                        core::slice::from_ref(val),
+                    )
+                    .expect("dof_state reset-velocity write");
+            }
         }
         // Mirror the template's sole-normal so update_feet's tilt makes sense.
         // Cached per-template (constant) — NO per-reset rapier-scene rebuild.
@@ -3671,43 +3306,7 @@ impl BipedNexusBatchEnv {
     /// (`inv_lhs` = 1/(J·M⁻¹·Jᵀ), `rhs`, accumulated `impulse`, jacobians) and
     /// the per-batch active counts. Diagnoses the WebGpu contact-solve blow-up.
     pub async fn dbg_mb_contacts(&mut self) -> (Vec<u32>, Vec<NexusMbContact>) {
-        let mut cnt = vec![
-            0u32;
-            self.state
-                .multibodies_mut()
-                .dbg_contact_constraint_count()
-                .buffer()
-                .len()
-        ];
-        self.gpu
-            .slow_read_buffer(
-                self.state
-                    .multibodies_mut()
-                    .dbg_contact_constraint_count()
-                    .buffer(),
-                &mut cnt,
-            )
-            .await
-            .expect("cc count readback");
-        let mut ccs = vec![
-            NexusMbContact::default();
-            self.state
-                .multibodies_mut()
-                .dbg_contact_constraints()
-                .buffer()
-                .len()
-        ];
-        self.gpu
-            .slow_read_buffer(
-                self.state
-                    .multibodies_mut()
-                    .dbg_contact_constraints()
-                    .buffer(),
-                &mut ccs,
-            )
-            .await
-            .expect("cc readback");
-        (cnt, ccs)
+        unimplemented!("dbg_mb_contacts: constraint-count tensor absent on the upstream base — probe not ported")
     }
 
     /// DEBUG: world pose of every body for all envs (spawn-divergence check:
