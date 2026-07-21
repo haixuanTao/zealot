@@ -700,6 +700,14 @@ fn main() {
         );
         let mut gstep: u64 = 0;
         let mut lr = LR; // adaptive-KL LR, persists across iterations
+        // Best-checkpoint tracking. The adaptive-KL controller can oscillate a
+        // CONVERGED policy off its peak late in training (reward drifts down,
+        // terrain curriculum collapses), and the periodic `ckpt` save keeps only
+        // the LATEST (possibly degraded) weights. Track a smoothed reward and
+        // save the peak policy separately to `<ckpt>.best` — that's the one to
+        // deploy; overtraining then can't cost us the good model.
+        let mut rew_ema = 0.0f32;
+        let mut best_ema = f32::NEG_INFINITY;
         // LR floor override (BIPED_LR_MIN). rsl_rl's adaptive-KL schedule brakes
         // down to 1e-5; our 1e-4 default was tuned for the shaped reward and is
         // too high a floor for spikier reward sets (KL runs away when the
@@ -1046,6 +1054,14 @@ fn main() {
             let mean_old_last: Vec<Vec<f32>> = (0..mb)
                 .map(|c| batch[last_off + c].mean_old.clone())
                 .collect();
+            // Rollout-policy log-std snapshot (σ_old), for the FULL Gaussian KL
+            // below. `ac.log_std` (CPU) is the rollout value here — the GPU `lst`
+            // buffer trains during the update and is synced back to `ac.log_std`
+            // only after. The previous mean-only KL ignored σ entirely, so when
+            // the policy's std drifted (the `al` pass trains log_std) it
+            // UNDER-estimated the true divergence → the adaptive-LR controller
+            // didn't brake enough → overshoot. rsl_rl uses the full analytic KL.
+            let log_std_old: Vec<f32> = ac.log_std.clone();
             let mut last_kl = 0.0f32;
             // Update-phase profile: where the PPO update wall-clock goes
             // (encode = CPU command recording, exec = submit+synchronize i.e.
@@ -1081,9 +1097,14 @@ fn main() {
                 let mut kl0 = 0.0f32;
                 for c in 0..mb {
                     for k in 0..ad_ {
-                        let inv = (-ls[k]).exp();
-                        let d = (mn[k * mb + c] - mean_old_last[c][k]) * inv;
-                        kl0 += 0.5 * d * d;
+                        let ls_new = ls[k];
+                        let ls_old = log_std_old[k];
+                        let sig_old2 = (2.0 * ls_old).exp();
+                        let inv_sig_new2 = (-2.0 * ls_new).exp();
+                        let dmu = mn[k * mb + c] - mean_old_last[c][k];
+                        kl0 += (ls_new - ls_old)
+                            + 0.5 * (sig_old2 + dmu * dmu) * inv_sig_new2
+                            - 0.5;
                     }
                 }
                 kl0 /= mb as f32;
@@ -1393,12 +1414,22 @@ fn main() {
                 let t_kl = Instant::now();
                 let mn = bk.slow_read_vec(a_net.a[la + 1].buffer()).await.unwrap(); // [ad x mb]
                 let ls = bk.slow_read_vec(lst.buffer()).await.unwrap(); // [ad]
+                // Full analytic Gaussian KL(old‖new) per rsl_rl:
+                //   Σ_k  log(σ_new/σ_old) + (σ_old² + (μ_old−μ_new)²)/(2σ_new²) − ½
+                // (ls = log σ_new current; log_std_old = log σ_old rollout). The
+                // old mean-only form dropped the σ terms, under-reading KL when the
+                // std moved and letting the LR controller overshoot.
                 let mut kl = 0.0f32;
                 for c in 0..mb {
                     for k in 0..ad_ {
-                        let inv = (-ls[k]).exp();
-                        let d = (mn[k * mb + c] - mean_old_last[c][k]) * inv;
-                        kl += 0.5 * d * d;
+                        let ls_new = ls[k];
+                        let ls_old = log_std_old[k];
+                        let sig_old2 = (2.0 * ls_old).exp();
+                        let inv_sig_new2 = (-2.0 * ls_new).exp();
+                        let dmu = mn[k * mb + c] - mean_old_last[c][k];
+                        kl += (ls_new - ls_old)
+                            + 0.5 * (sig_old2 + dmu * dmu) * inv_sig_new2
+                            - 0.5;
                     }
                 }
                 kl /= mb as f32;
@@ -1418,7 +1449,11 @@ fn main() {
                 // regardless, letting per-iter KL blow to ~100 during the walk-command
                 // ramp (the policy thrashed instead of refining a gait). `kl` here is
                 // current-vs-rollout policy, i.e. cumulative per-iter drift, so this
-                // caps per-iter KL at ~5× target.
+                // caps per-iter KL at ~5× target. (Tightening this to 1.5× was tried
+                // and crippled learning ~40× — it sits inside the per-epoch KL
+                // estimate's noise floor and trips constantly. The late-phase
+                // degradation is instead handled by the cosine LR-ceiling decay, so
+                // this early-phase safety stays loose.)
                 if kl > DESIRED_KL * 5.0 {
                     break;
                 }
@@ -1528,10 +1563,31 @@ fn main() {
             if !ckpt.is_empty() && (it % 50 == 0 || it == iters - 1) {
                 let _ = ac.save(&ckpt);
             }
+            // Periodic ARCHIVE snapshots (`<ckpt>.iterN`, every 500 iters):
+            // unlike the overwritten latest/best files these keep the whole
+            // training trajectory on disk (~1.4 MB each), so any stage can be
+            // re-rendered / recovered / diffed after the fact — the original
+            // degraded run's iter-4000 peak was unrecoverable precisely
+            // because only the (overwritten) latest existed.
+            if !ckpt.is_empty() && it > 0 && it % 500 == 0 {
+                let _ = ac.save(&format!("{ckpt}.iter{it}"));
+            }
+            // Best-checkpoint: EMA-smooth the mean step reward (α=0.02, ~50-iter
+            // window) so we save on a sustained improvement, not a noisy spike;
+            // warm up 200 iters before arming so early-training garbage never
+            // wins. `<ckpt>.best` = the peak policy to deploy.
+            let mean_step_rew = total_reward / total as f32;
+            rew_ema = if it == 0 { mean_step_rew } else { 0.98 * rew_ema + 0.02 * mean_step_rew };
+            if !ckpt.is_empty() && it >= 200 && rew_ema > best_ema {
+                best_ema = rew_ema;
+                if ac.save(&format!("{ckpt}.best")).is_ok() {
+                    println!("[best] new peak reward-EMA {rew_ema:.4} @iter {it} → {ckpt}.best");
+                }
+            }
         }
         if !ckpt.is_empty() {
             ac.save(&ckpt).expect("save");
-            println!("saved → {ckpt}");
+            println!("saved → {ckpt} (latest); best policy at {ckpt}.best (reward-EMA {best_ema:.4})");
         }
     });
 }
