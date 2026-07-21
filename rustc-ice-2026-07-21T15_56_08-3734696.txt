@@ -1,0 +1,52 @@
+thread 'rustc' panicked at /home/champagne/.cargo/git/checkouts/rust-cuda-f2e68423bdc84998/2479a9c/crates/rustc_codegen_nvvm/src/context.rs:719:33:
+unknown option: --unroll-threshold=0
+stack backtrace:
+   0:     0x7140b9bf4205 - std::backtrace::Backtrace::create::h28667da6d4dff785
+   1:     0x7140b9bf4155 - std::backtrace::Backtrace::force_capture::h97461ed3200b3bf4
+   2:     0x7140b8c7f260 - std[a2e6032cce42d97f]::panicking::update_hook::<alloc[ff7d08515ebedc7]::boxed::Box<rustc_driver_impl[de6ab808e8043f3f]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7140b8c7eac3 - std[a2e6032cce42d97f]::panicking::update_hook::<alloc[ff7d08515ebedc7]::boxed::Box<rustc_driver_impl[de6ab808e8043f3f]::install_ice_hook::{closure#1}>>::{closure#0}
+   4:     0x7140b9c0e36e - std::panicking::rust_panic_with_hook::hbc7edc3b462870f0
+   5:     0x7140b9c0e06a - std::panicking::begin_panic_handler::{{closure}}::hf9e5cd48d862b8ac
+   6:     0x7140b9c0a6f9 - std::sys::backtrace::__rust_end_short_backtrace::hd57bebce377ef2e9
+   7:     0x7140b9c0dd4d - __rustc[46d736129294a9b7]::rust_begin_unwind
+   8:     0x7140b62d2560 - core::panicking::panic_fmt::h21871f0b1dcaf625
+   9:     0x7140a2244ef8 - rustc_codegen_nvvm::context::CodegenArgs::parse::panic_cold_display::ha58a0ed84b792f31
+  10:     0x7140a2242756 - rustc_codegen_nvvm::context::CodegenArgs::from_session::hfe8f1922358cfaf3
+  11:     0x7140a225b00b - <rustc_codegen_nvvm::NvvmCodegenBackend as rustc_codegen_ssa::traits::backend::CodegenBackend>::target_config::h8e1e7e5562fe5e29
+  12:     0x7140bb577165 - rustc_interface[373d4675362b8f62]::util::add_configuration
+  13:     0x7140bb7555ee - rustc_interface[373d4675362b8f62]::interface::run_compiler::<(), rustc_driver_impl[de6ab808e8043f3f]::run_compiler::{closure#0}>::{closure#1}
+  14:     0x7140bb5b3241 - std[a2e6032cce42d97f]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[373d4675362b8f62]::util::run_in_thread_with_globals<rustc_interface[373d4675362b8f62]::util::run_in_thread_pool_with_globals<rustc_interface[373d4675362b8f62]::interface::run_compiler<(), rustc_driver_impl[de6ab808e8043f3f]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  15:     0x7140bb5b2f22 - <<std[a2e6032cce42d97f]::thread::Builder>::spawn_unchecked_<rustc_interface[373d4675362b8f62]::util::run_in_thread_with_globals<rustc_interface[373d4675362b8f62]::util::run_in_thread_pool_with_globals<rustc_interface[373d4675362b8f62]::interface::run_compiler<(), rustc_driver_impl[de6ab808e8043f3f]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[606ee596359a9bc5]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  16:     0x7140bb5b9085 - std::sys::pal::unix::thread::Thread::new::thread_start::hf6a510012528f331
+  17:     0x7140b4c9caa4 - start_thread
+                               at ./nptl/pthread_create.c:447:8
+  18:     0x7140b4d29c6c - clone3
+                               at ./misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:78:0
+  19:                0x0 - <unknown>
+
+
+rustc version: 1.91.0-nightly (f34ba774c 2025-08-03)
+platform: x86_64-unknown-linux-gnuthread 'rustc' panicked at /home/champagne/.cargo/git/checkouts/rust-cuda-f2e68423bdc84998/2479a9c/crates/rustc_codegen_nvvm/src/context.rs:719:33:
+unknown option: --unroll-threshold=0
+stack backtrace:
+   0:     0x7140b9bf4205 - std::backtrace::Backtrace::create::h28667da6d4dff785
+   1:     0x7140b9bf4155 - std::backtrace::Backtrace::force_capture::h97461ed3200b3bf4
+   2:     0x7140b8c7f260 - std[a2e6032cce42d97f]::panicking::update_hook::<alloc[ff7d08515ebedc7]::boxed::Box<rustc_driver_impl[de6ab808e8043f3f]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7140b9c0e36e - std::panicking::rust_panic_with_hook::hbc7edc3b462870f0
+   4:     0x7140b9c0e06a - std::panicking::begin_panic_handler::{{closure}}::hf9e5cd48d862b8ac
+   5:     0x7140b9c0a6f9 - std::sys::backtrace::__rust_end_short_backtrace::hd57bebce377ef2e9
+   6:     0x7140b9c0dd4d - __rustc[46d736129294a9b7]::rust_begin_unwind
+   7:     0x7140b62d2560 - core::panicking::panic_fmt::h21871f0b1dcaf625
+   8:     0x7140a2244ef8 - rustc_codegen_nvvm::context::CodegenArgs::parse::panic_cold_display::ha58a0ed84b792f31
+   9:     0x7140a2242756 - rustc_codegen_nvvm::context::CodegenArgs::from_session::hfe8f1922358cfaf3
+  10:     0x7140a225b00b - <rustc_codegen_nvvm::NvvmCodegenBackend as rustc_codegen_ssa::traits::backend::CodegenBackend>::target_config::h8e1e7e5562fe5e29
+  11:     0x7140bb577165 - rustc_interface[373d4675362b8f62]::util::add_configuration
+  12:     0x7140bb7555ee - rustc_interface[373d4675362b8f62]::interface::run_compiler::<(), rustc_driver_impl[de6ab808e8043f3f]::run_compiler::{closure#0}>::{closure#1}
+  13:     0x7140bb5b3241 - std[a2e6032cce42d97f]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[373d4675362b8f62]::util::run_in_thread_with_globals<rustc_interface[373d4675362b8f62]::util::run_in_thread_pool_with_globals<rustc_interface[373d4675362b8f62]::interface::run_compiler<(), rustc_driver_impl[de6ab808e8043f3f]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  14:     0x7140bb5b2f22 - <<std[a2e6032cce42d97f]::thread::Builder>::spawn_unchecked_<rustc_interface[373d4675362b8f62]::util::run_in_thread_with_globals<rustc_interface[373d4675362b8f62]::util::run_in_thread_pool_with_globals<rustc_interface[373d4675362b8f62]::interface::run_compiler<(), rustc_driver_impl[de6ab808e8043f3f]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[606ee596359a9bc5]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  15:     0x7140bb5b9085 - std::sys::pal::unix::thread::Thread::new::thread_start::hf6a510012528f331
+  16:     0x7140b4c9caa4 - start_thread
+                               at ./nptl/pthread_create.c:447:8
+  17:     0x7140b4d29c6c - clone3
+                               at ./misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:78:0
+  18:                0x0 - <unknown>
