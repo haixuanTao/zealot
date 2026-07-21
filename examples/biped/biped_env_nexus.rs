@@ -31,6 +31,7 @@ use nexus3d::rbd::math::Pose as NexusPose;
 use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsSnapshot, GpuPhysicsState};
 use nexus3d::rbd::queries::GpuIndexedContact as NexusIndexedContact;
 use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint as NexusMbContact;
+use nexus3d::rbd::shaders::dynamics::MAX_CONTACT_SENSORS;
 use nexus3d::rbd::shaders::dynamics::MultibodyLinkWorkspace;
 use rapier3d::prelude::*;
 use rayon::prelude::*;
@@ -1116,6 +1117,22 @@ pub struct BipedNexusBatchEnv {
     /// Rough-terrain difficulty curriculum (BIPED_TERRAIN=1). None = off.
     terrain: Option<TerrainSetup>,
     air_time: Vec<[f32; NUM_FEET]>,
+    /// BIPED_CONTACT_SENSE=1: foot contact comes from the solver's summed
+    /// normal-contact impulse per foot (nexus contact force sensor) instead of
+    /// the geometric foot-height proxy. AGILE-parity contact semantics: a foot
+    /// counts as planted only when it actually bears load.
+    contact_sense: bool,
+    /// Contact-force threshold, N (BIPED_CONTACT_FORCE_N, default 1.0 =
+    /// AGILE's `feet_slip` contact_threshold). Compared against
+    /// `sensed_force`.
+    contact_force_n: f32,
+    /// Impulse → force conversion: 1 / substep dt' (the sensor reads the last
+    /// substep's converged normal impulse).
+    sensor_inv_dt: f32,
+    /// Per-env per-foot sensed normal force, N, from the last physics step of
+    /// the control tick. Seeded to "planted" (half body weight) on reset so
+    /// the spawn pose reads as standing before the first step's readback.
+    sensed_force: Vec<[f32; NUM_FEET]>,
     /// Index of the foot that most recently touched down, per env (-1 = none yet,
     /// reset on episode reset). Drives `FootObs.alt_step`: a touchdown only counts
     /// as a step if it's the OTHER foot than this, enforcing L→R→L→R alternation.
@@ -1241,7 +1258,7 @@ pub struct BipedNexusBatchEnv {
 }
 
 /// Number of logged reward components (see [`REWARD_COMP_NAMES`]).
-pub const NUM_REWARD_COMPS: usize = 28;
+pub const NUM_REWARD_COMPS: usize = 29;
 
 /// Names of the per-component reward terms, in `rlog_comps` / `RewardLog::comps`
 /// order. The first 20 mirror `RewardBreakdown`'s live terms; the last four are
@@ -1276,6 +1293,7 @@ pub const REWARD_COMP_NAMES: [&str; NUM_REWARD_COMPS] = [
     "gait_clock",    // dense periodic swing/stance-matching reward
     "com_centering", // CoM-over-support-foot (low-ankle-torque single-support)
     "stand_planted", // per-airborne-foot penalty at standing command (balance, don't step)
+    "feet_yaw_diff", // WBC feet_yaw_diff_l2: L/R foot yaw splay penalty
 ];
 
 /// One window of accumulated reward/termination stats (see `take_reward_log`).
@@ -1471,6 +1489,42 @@ impl BipedNexusBatchEnv {
         {
             state.reserve_contacts(&gpu, cap);
             println!("contact buffers pre-sized to {cap}/batch");
+        }
+        // BIPED_CONTACT_SENSE=1: force-sensed foot contact. The nexus MB
+        // solver folds each foot link's solved NORMAL-constraint impulses into
+        // a tiny per-env buffer at the end of every step (last substep, post-
+        // stabilization); we read it back alongside body_poses and gate every
+        // contact-derived gait signal on measured load instead of the
+        // foot-height proxy (which can't tell a planted foot from one hovering
+        // just under the threshold). Threshold BIPED_CONTACT_FORCE_N (default
+        // 1.0 N = AGILE's feet_slip contact_threshold).
+        let contact_sense = std::env::var("BIPED_CONTACT_SENSE").is_ok_and(|v| v == "1");
+        let contact_force_n = std::env::var("BIPED_CONTACT_FORCE_N")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        let solver_iters = std::env::var("BIPED_SOLVER_ITERS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(SOLVER_ITERS);
+        let sensor_inv_dt = solver_iters as f32 / task.sim_dt;
+        if contact_sense {
+            let mbs = state.multibodies_mut();
+            let mut links = [0u32; NUM_FEET];
+            for (i, l) in links.iter_mut().enumerate() {
+                let bl = mbs.link_of_body(0, idx.foot_links[i]);
+                assert!(
+                    bl[1] != u32::MAX,
+                    "foot body {} is not a multibody link",
+                    idx.foot_links[i]
+                );
+                *l = bl[1];
+            }
+            mbs.set_contact_sensor_links(&gpu, &links);
+            println!(
+                "contact sensing ENABLED: force-based foot contact (links {links:?}, \
+                 threshold {contact_force_n} N)"
+            );
         }
         // BIPED_MAX_COLORS: bound for the contact-graph coloring (nexus default
         // 8 → the solver runs max_colors+1 passes per phase whether or not the
@@ -1731,6 +1785,10 @@ impl BipedNexusBatchEnv {
                 }
             }),
             air_time,
+            contact_sense,
+            contact_force_n,
+            sensor_inv_dt,
+            sensed_force: vec![[0.5 * robot.total_mass * 9.81; NUM_FEET]; num_envs],
             last_td_foot,
             gait_phase,
             gait_period,
@@ -2580,7 +2638,15 @@ impl BipedNexusBatchEnv {
                 .terrain
                 .as_ref()
                 .map_or(0.0, |ter| ter.strip_for(env).height(pos.x, pos.y));
-            let contact = pos.z - foot_ground_h < CONTACT_Z;
+            // BIPED_CONTACT_SENSE=1: measured load-bearing contact from the
+            // solver's normal impulses (AGILE force-sensor semantics — a foot
+            // skimming just under CONTACT_Z no longer reads as planted).
+            // Default: geometric foot-height proxy.
+            let contact = if self.contact_sense {
+                self.sensed_force[env][i] >= self.contact_force_n
+            } else {
+                pos.z - foot_ground_h < CONTACT_Z
+            };
             let prev_air = self.air_time[env][i];
             let first_contact = contact && prev_air > 0.0;
             // Alternating touchdown: a step that lands on the OTHER foot than the
@@ -2883,6 +2949,38 @@ impl BipedNexusBatchEnv {
         // implicit drain.
         let t = Instant::now();
         let poses = self.slurp_poses().await;
+        // Force-sensed contact (BIPED_CONTACT_SENSE=1): pull the per-foot
+        // normal-impulse sums the MB solver folded out during the last physics
+        // step of this control tick. Tiny buffer (4 f32 per env) — piggybacks
+        // on the same sync point as the pose readback.
+        if self.contact_sense {
+            let mbs_per_batch = {
+                let mbs = self.state.multibodies_mut();
+                mbs.multibodies_per_batch() as usize
+            };
+            let buf_len = self
+                .state
+                .multibodies_mut()
+                .contact_sensor_out()
+                .buffer()
+                .len();
+            let mut imp = vec![0.0f32; buf_len];
+            self.gpu
+                .slow_read_buffer(
+                    self.state.multibodies_mut().contact_sensor_out().buffer(),
+                    &mut imp,
+                )
+                .await
+                .unwrap();
+            // Env e = multibody 0 of batch e (zealot builds one robot per
+            // batch); slot i = foot i (set_contact_sensor_links order).
+            for e in 0..self.n {
+                let base = e * mbs_per_batch * MAX_CONTACT_SENSORS as usize;
+                for i in 0..NUM_FEET {
+                    self.sensed_force[e][i] = imp[base + i] * self.sensor_inv_dt;
+                }
+            }
+        }
         self.timings.readback_ns += t.elapsed().as_nanos() as u64;
 
         // (4) Serial pre-pass: step_count + command resample. Cheap; can't
@@ -3049,6 +3147,7 @@ impl BipedNexusBatchEnv {
                 comps[25] = rb.gait_clock;
                 comps[26] = rb.com_centering;
                 comps[27] = rb.stand_planted;
+                comps[28] = rb.feet_yaw_diff;
                 if fell {
                     comps[23] = self.task.weights.termination;
                     reward += self.task.weights.termination;
@@ -3335,6 +3434,10 @@ impl BipedNexusBatchEnv {
         self.last_action[env] = [0.0; NUM_JOINTS];
         self.prev_action[env] = [0.0; NUM_JOINTS];
         self.air_time[env] = [0.0; NUM_FEET];
+        // Force-sensed contact: seed the new episode as planted (half body
+        // weight per foot) — the spawn pose stands on both soles, and the
+        // real sensed value arrives with the first step's readback.
+        self.sensed_force[env] = [0.5 * self.robot.total_mass * 9.81; NUM_FEET];
         self.last_td_foot[env] = -1;
         self.gait_phase[env] = 0.0;
         // Actuator delay: resample the lag for the new episode (from the
@@ -3468,6 +3571,7 @@ impl BipedNexusBatchEnv {
         self.last_action[e] = [0.0; NUM_JOINTS];
         self.prev_action[e] = [0.0; NUM_JOINTS];
         self.air_time[e] = [0.0; NUM_FEET];
+        self.sensed_force[e] = [0.5 * self.robot.total_mass * 9.81; NUM_FEET];
         self.last_td_foot[e] = -1;
         self.gait_phase[e] = 0.0;
         // Deterministic render path: pin the delay to `min` (no RNG draw).
