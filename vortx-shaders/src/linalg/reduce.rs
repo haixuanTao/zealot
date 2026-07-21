@@ -370,11 +370,13 @@ pub fn reduce_sq_norm(
 /// `black_box`; naga's uniformity analysis keeps barriers sound there).
 #[inline(always)]
 fn opaque_bound(n: u32) -> u32 {
-    #[cfg(target_arch = "spirv")]
+    // Plain on SPIR-V and cuda-oxide (neither lowers black_box; cuda-oxide
+    // does not unroll unless opted in) — black_box targets nvvm only.
+    #[cfg(any(target_arch = "spirv", feature = "cuda-oxide"))]
     {
         n
     }
-    #[cfg(not(target_arch = "spirv"))]
+    #[cfg(not(any(target_arch = "spirv", feature = "cuda-oxide")))]
     {
         core::hint::black_box(n)
     }
