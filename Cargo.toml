@@ -30,7 +30,7 @@ unsafe_remove_boundchecks = []
 version = "0.3.0"
 
 [workspace.dependencies]
-khal-std = "0.2"
+khal-std = { version = "0.2", default-features = false }
 khal = { version = "0.2", features = ["derive"]}
 
 [dependencies]
