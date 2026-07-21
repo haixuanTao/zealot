@@ -1519,7 +1519,17 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(SOLVER_ITERS);
-        let sensor_inv_dt = solver_iters as f32 / task.sim_dt;
+        // Impulse→force divisor. On the upstream base the DEFAULT
+        // explicit-coriolis mode builds contact constraints ONCE per step, so
+        // the sensed impulse is accumulated over the whole physics step →
+        // divide by sim_dt. Implicit-coriolis rebuilds per substep → the
+        // readout is the last substep's impulse → divide by the substep dt.
+        let implicit_coriolis = std::env::var("BIPED_IMPLICIT_CORIOLIS").as_deref() == Ok("1");
+        let sensor_inv_dt = if implicit_coriolis {
+            solver_iters as f32 / task.sim_dt
+        } else {
+            1.0 / task.sim_dt
+        };
         if contact_sense {
             let mbs = state.multibodies_mut();
             let mut links = [0u32; NUM_FEET];
@@ -2629,10 +2639,13 @@ impl BipedNexusBatchEnv {
                 )
                 .await
                 .unwrap();
-            // Env e = multibody 0 of batch e (zealot builds one robot per
-            // batch); slot i = foot i (set_contact_sensor_links order).
+            // Env e = multibody 0 of batch e; upstream-base buffers are
+            // INTERLEAVED: slot index = (mb_idx·num_batches + batch)·MAX + s
+            // = (0·n + e)·MAX + s with one robot per batch. Slot i = foot i
+            // (set_contact_sensor_links order).
+            let _ = mbs_per_batch; // 1 robot per batch on this stack
             for e in 0..self.n {
-                let base = e * mbs_per_batch * MAX_CONTACT_SENSORS as usize;
+                let base = e * MAX_CONTACT_SENSORS as usize;
                 for i in 0..NUM_FEET {
                     self.sensed_force[e][i] = imp[base + i] * self.sensor_inv_dt;
                 }
