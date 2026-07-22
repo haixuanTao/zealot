@@ -174,7 +174,9 @@ def main():
     for i, n in enumerate(POLICY_JOINTS):
         da = model.joint(n).dofadr[0]
         model.dof_damping[da] = 0.001
-        model.dof_frictionloss[da] = 0.0
+        # frictionloss 0.1 = the trained spec (adopted from this very model's
+        # baked-in value once training gained a frictionloss path).
+        model.dof_frictionloss[da] = 0.1
         model.dof_armature[da] = 0.02
 
     held = []  # (qposadr, dofadr, kp, kd, eff, q_home)

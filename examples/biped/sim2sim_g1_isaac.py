@@ -181,7 +181,8 @@ def main():
     for p in stage.Traverse():
         if p.IsA(UsdPhysics.RevoluteJoint) and p.GetName() in POLICY_JOINTS:
             api = PhysxSchema.PhysxJointAPI.Apply(p)
-            api.CreateJointFrictionAttr(0.0).Set(0.0)
+            # frictionloss 0.1 = the trained spec value.
+            api.CreateJointFrictionAttr(0.1).Set(0.1)
             api.CreateArmatureAttr(0.02).Set(0.02)
     dome = UsdLux.DomeLight.Define(stage, "/World/dome")
     dome.CreateIntensityAttr(500.0)

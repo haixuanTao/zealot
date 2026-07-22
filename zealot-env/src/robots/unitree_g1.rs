@@ -72,7 +72,11 @@ const fn joint(name: &'static str, default_pos: f32, pos_limit: (f32, f32)) -> J
         pos_limit,
         armature: 0.01,
         damping: 0.001,
-        frictionloss: 0.0,
+        // Real gearboxes have Coulomb friction; Unitree's official models
+        // omit it, but MuJoCo playground's G1 bakes `frictionloss="0.1"`
+        // into every joint (DeepMind's estimate for these actuators). Adopt
+        // it so training and the sim2sim harnesses model the same value.
+        frictionloss: 0.1,
     }
 }
 
