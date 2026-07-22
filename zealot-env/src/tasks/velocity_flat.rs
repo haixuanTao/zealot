@@ -756,6 +756,13 @@ impl VelocityFlatTask {
         if let Some(v) = env_f32("BIPED_W_BASE_H") {
             weights.base_height = v;
         }
+        // AGILE-alignment override: WBC has NO air-time reward — its gait
+        // economy comes from torque/energy regularizers. Paying completed
+        // swing DURATION (capped 0.4s ≈ our natural swing) selects for
+        // maximal, exaggerated swings once a gait exists. 0 = AGILE parity.
+        if let Some(v) = env_f32("BIPED_W_AIR_TIME") {
+            weights.air_time = v;
+        }
         let mut stds = if agile_rewards {
             RewardStds::agile()
         } else {

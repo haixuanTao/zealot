@@ -2754,10 +2754,24 @@ impl BipedNexusBatchEnv {
         // BIPED_ANKLE_TORQUE_W (0 disables). Default 4.0: at 1.0 the penalty
         // (~-0.003/step) was too cheap against the tracking reward and the
         // learned gait balanced by torquing the ankles (flat-footed shuffle).
+        // Multiplier on the ankle extras. Default 1.0 = AGILE parity (the old
+        // 4.0 was tuned against the lerobot-magnitude constants below and
+        // would put the G1 ankles 4× over WBC).
         let ankle_torque_w = std::env::var("BIPED_ANKLE_TORQUE_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(4.0);
+            .unwrap_or(1.0);
+        // AGILE-named torque regularizers, WBC-AGILE **G1** config verbatim
+        // (`torques` -5e-5 on every controlled joint, `ankle_torques` an extra
+        // -1e-4 on ankle joints, `ankle_roll_torques` an extra -1e-3 on
+        // ankle-roll). The previous hardcoded constants were WBC's *lerobot*
+        // magnitudes (5e-4/1.5e-3/6.5e-3 — 10× stronger) and the roll branch
+        // matched the lerobot-only name "anklex", which never fires on the
+        // G1's `ankle_roll` joints.
+        let env_f32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
+        let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(5e-5);
+        let w_ankle_torques = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1e-4);
+        let w_ankle_roll_torques = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(1e-3);
         // Mechanical-power (energy) penalty weight. Penalizes Σ|τᵢ·q̇ᵢ| — the rate
         // of mechanical work, the principled cost-of-transport proxy. Unlike Στ²
         // (effort, penalized even when static), this only charges for work done in
@@ -2766,10 +2780,15 @@ impl BipedNexusBatchEnv {
         // BIPED_POWER_W tunes it (0 = off). Default 4e-3 (was 2e-3): the
         // higher energy price further biases against shuffle/ankle-balance
         // gaits in favor of discrete weight-transferring steps.
-        let power_w: f32 = std::env::var("BIPED_POWER_W")
+        // RENAMED: `BIPED_MECH_POWER_W` (mechanical-power Σ|τ·q̇| penalty, a
+        // zealot-only term — WBC-AGILE has NO power cost; its gait economy is
+        // the torque family above). Default now 0 = AGILE parity; the legacy
+        // name `BIPED_POWER_W` is still honored if set.
+        let power_w: f32 = std::env::var("BIPED_MECH_POWER_W")
             .ok()
+            .or_else(|| std::env::var("BIPED_POWER_W").ok())
             .and_then(|s| s.parse().ok())
-            .unwrap_or(4e-3);
+            .unwrap_or(0.0);
         let cpb_idx = self.idx.colliders_per_batch as usize;
         let computed: Vec<PerEnv> = (0..self.n)
             .into_par_iter()
@@ -2858,15 +2877,17 @@ impl BipedNexusBatchEnv {
                             .clamp(-j.effort_limit, j.effort_limit);
                         let t2 = tau * tau;
                         power += (tau * state.joint_vel[i]).abs();
+                        // AGILE structure: base `torques` on EVERY joint, plus
+                        // additive ankle / ankle-roll extras (their RewTerms
+                        // stack). Roll detection covers both naming schemes
+                        // (G1 `ankle_roll`, lerobot `anklex`).
+                        leg_pen += w_torques * t2;
                         if j.name.contains("ankle") {
-                            let w = if j.name.contains("anklex") {
-                                6.5e-3
-                            } else {
-                                1.5e-3
-                            };
+                            let mut w = w_ankle_torques;
+                            if j.name.contains("ankle_roll") || j.name.contains("anklex") {
+                                w += w_ankle_roll_torques;
+                            }
                             ankle_pen += w * t2;
-                        } else {
-                            leg_pen += 5e-4 * t2;
                         }
                     }
                     comps[20] = -(torque_w * leg_pen) * sc_dt;
