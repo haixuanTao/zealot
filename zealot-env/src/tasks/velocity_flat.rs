@@ -274,11 +274,30 @@ impl CommandSampler {
         if rng.chance(self.standing_prob) {
             return VelocityCommand::default();
         }
-        VelocityCommand {
+        let mut cmd = VelocityCommand {
             vx: rng.range(self.lin_vel_x.0, self.lin_vel_x.1),
             vy: rng.range(self.lin_vel_y.0, self.lin_vel_y.1),
             yaw_rate: rng.range(self.ang_vel_z.0, self.ang_vel_z.1),
+        };
+        // Low-speed mass (BIPED_SLOW_PROB, default 0.25): uniform range
+        // sampling puts almost no probability on SLOW commands relative to
+        // the reward's sharp kernel, and the terrain curriculum pays for
+        // travel — the 30k-iter policy learned exactly two speeds (0 and
+        // ~±1 m/s), saturating every magnitude in between. Scaling a
+        // fraction of draws into [0.15, 0.5]× forces the slow-precision
+        // regime into the data so magnitude tracking has something to
+        // learn from.
+        let slow_prob: f32 = std::env::var("BIPED_SLOW_PROB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.25);
+        if rng.chance(slow_prob) {
+            let k = rng.range(0.15, 0.5);
+            cmd.vx *= k;
+            cmd.vy *= k;
+            cmd.yaw_rate *= k;
         }
+        cmd
     }
 
     /// Draw a resample interval in control steps, given the control dt.
@@ -1121,11 +1140,14 @@ impl VelocityFlatTask {
 
         // Flat foot: penalize the squared sole tilt of any foot in contact, so the
         // robot plants its whole sole rather than balancing on a toe/heel/edge.
+        // UNGATED (AGILE feet_roll_l2 parity): penalize sole tilt on ALL feet,
+        // not just loaded ones. The contact-gated form left swing-foot posture
+        // free, and the learned policy exploited it (hard dorsiflexion — toes
+        // pointing up through swing; functional-ish for toe-clearance but an
+        // engine-flattered habit under box friction, and ugly).
         let mut tilt_sq = 0.0;
         for f in &state.feet {
-            if f.contact {
-                tilt_sq += f.tilt.powi(2);
-            }
+            tilt_sq += f.tilt.powi(2);
         }
         let foot_orientation = self.weights.foot_orientation * tilt_sq * dt;
 

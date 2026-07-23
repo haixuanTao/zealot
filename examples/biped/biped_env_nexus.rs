@@ -418,6 +418,14 @@ pub struct DrParams {
     /// left/right differ; scales kp, kd, and the effort (torque) limit together.
     /// Default `[1.0; NUM_JOINTS]` (symmetric, nominal).
     pub pd_scale_per_joint: [f32; NUM_JOINTS],
+    /// Foot collider shape for this template: 0 = the BIPED_FOOT_SHAPE env
+    /// default, 1 = box, 2 = capsule. `BIPED_FOOT_SHAPE=dr` samples 1/2 at
+    /// 50/50 per template — STRUCTURAL-error DR: the box's sharp edges and
+    /// the capsule's roll-through resolve contact so differently that a
+    /// policy trained on both can't overfit either engine's handling of
+    /// either shape (μ-DR alone can't cover model-shape bias — the box
+    /// friction corner over-grant was multiplicative at every μ).
+    pub foot_shape_id: u8,
 }
 
 impl Default for DrParams {
@@ -436,6 +444,7 @@ impl Default for DrParams {
             spawn_pitch: 0.0,
             spawn_z_offset: 0.0,
             pd_scale_per_joint: [1.0; NUM_JOINTS],
+            foot_shape_id: 0,
         }
     }
 }
@@ -660,8 +669,11 @@ fn build_env_scene(
             // box/capsule, which sit at the computed `center`). NOTE the rounded-
             // capsule rationale above: a hull reintroduces sharp foot-strike edges,
             // so this is opt-in for fidelity experiments, not the tuned default.
-            let foot_shape =
-                std::env::var("BIPED_FOOT_SHAPE").unwrap_or_else(|_| "capsule".to_string());
+            let foot_shape = match dr.foot_shape_id {
+                1 => "box".to_string(),
+                2 => "capsule".to_string(),
+                _ => std::env::var("BIPED_FOOT_SHAPE").unwrap_or_else(|_| "capsule".to_string()),
+            };
             let convex_cb = if foot_shape == "convex" && !b.mesh_pts.is_empty() {
                 ColliderBuilder::convex_hull(&b.mesh_pts)
             } else {
@@ -3575,6 +3587,7 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
             spawn_pitch: rng.range(-0.1745, 0.1745),
             spawn_z_offset: 0.0,
             pd_scale_per_joint,
+            foot_shape_id: sample_foot_shape(rng),
         };
     }
     // BIPED_SPAWN_DR scales the initial-pose tilt/height randomization (default
@@ -3682,5 +3695,18 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
             }
             a
         },
+        foot_shape_id: sample_foot_shape(rng),
+    }
+}
+
+/// Per-template foot-shape draw: `BIPED_FOOT_SHAPE=dr` → 50/50 box/capsule
+/// (structural-error DR — see the DrParams field doc); any other value → 0
+/// (the global env default, no draw consumed so existing streams are
+/// unchanged in non-dr mode... draw IS consumed in dr mode only).
+fn sample_foot_shape(rng: &mut Lcg) -> u8 {
+    if std::env::var("BIPED_FOOT_SHAPE").as_deref() == Ok("dr") {
+        if rng.range(0.0, 1.0) < 0.5 { 1 } else { 2 }
+    } else {
+        0
     }
 }
