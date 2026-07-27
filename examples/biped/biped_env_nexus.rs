@@ -1404,6 +1404,12 @@ impl BipedNexusBatchEnv {
         // (slow gait clocks) are only cheap for the fragile ankles if the
         // CoM rides over the stance foot — raise this together with
         // BIPED_GAIT_PERIOD.
+        if let Some(w) = std::env::var("BIPED_W_FEET_DISTANCE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.feet_distance = w;
+        }
         if let Some(w) = std::env::var("BIPED_COM_CENTERING_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
