@@ -31,3 +31,37 @@ trains on) costs ~1.65x vs the bold config and still lands at 1.9x / 1.2x /
 Caveats: cross-box comparison vs published/AGILE rows pending a rerun on the
 original box after the current training run frees it; production row measured
 at the bench schedule, not the production update.
+
+## Remaining scenarios (same box/stack, 2026-07-28)
+
+### iter_e2e_bench, k env-steps/s (published July values in parens)
+
+| N | 12-DOF it8 | 12-DOF it4 | 29-DOF +realism flat |
+|---:|---:|---:|---:|
+| 2048 | 98.2 (51.1) | 107.7 (70.4) | 65.6 (33.1) |
+| 4096 | 113.0 (60.4) | 120.2 (81.3) | 72.4 (39.2) |
+| 8192 | 118.9 (68.5) | 120.7 (89.5) | 73.2 (44.1) |
+
+### rollout-only (rollout_e2e_bench, 256 steps, WebGPU vs CPU rapier)
+
+| N | GPU k env/s | CPU k env/s |
+|---:|---:|---:|
+| 2048 | 109.3 | 7.4 |
+| 4096 | 124.8 | 7.4 |
+| 8192 | 136.3 | 7.4 |
+
+### true-training throughput (biped_train_gpu, BIPED_ROBOT=g1) — DRIVER-LIMITED
+
+18.7 / 34.5 / 59.3 k env-steps/s at N=2048/4096/8192. NOT comparable to the
+published 61/71/82k: this box runs driver 580.159 (the update-path-pathology
+era the README documents) vs 595.84 on the training box — the ~1.8s/iter of
+unprofiled update overhead is the driver, not the stack (rollout side matches
+the published rollout times exactly, e.g. 0.87s @4096). Re-measure on the
+training box post-v7 for the release table.
+
+### nexus bench_batch_sweep3 @1024 batches (WebGPU, solver-fix branch, TRUE 8 substeps)
+
+| scene | wall/step | GPU/step | steps/s | non-finite |
+|---|---:|---:|---:|---:|
+| boxes(3) | 1930 µs | 1021 µs | 530k | 0 |
+| chain(6) | 1232 µs | 1219 µs | 831k | 0 |
