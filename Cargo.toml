@@ -192,6 +192,12 @@ name = "pendulum_smoke"
 path = "examples/pendulum/pendulum_smoke.rs"
 required-features = ["pendulum"]
 
+
+[[example]]
+name = "boxtest"
+path = "examples/pendulum/boxtest.rs"
+required-features = ["pendulum"]
+
 [[example]]
 name = "inverted_pendulum"
 path = "examples/pendulum/inverted_pendulum.rs"
@@ -316,6 +322,10 @@ required-features = ["gpu", "biped_gpu"]
 # and nexus-rl are sibling checkouts under the same parent dir, so the relative
 # paths match. Only consulted when a GPU feature pulls these crates into the graph.
 [patch.crates-io]
+# rapier 0.34 with lock/limit positional biases clamped to max_corrective_velocity
+# (same energy-injection class as the nexus fixes: uncapped 1/dt biases turn mm
+# violations at 5ms steps into m/s kicks — measured kJ spikes on the G1).
+rapier3d = { path = "../rapier3d-0.34-patched" }
 # naga 29 MSL backend miscompiles rust-gpu `while` loops on Metal: the
 # hoisted continuing block re-evaluates the `break_if` condition after the
 # loop phis were already advanced, exiting one body-execution early (drops
