@@ -173,7 +173,13 @@ struct World {
 }
 
 fn build_world(mjcf: &[MjBody], robot: &RobotSpec, base_yaw: f32) -> World {
-    let spawn_z = robot.spawn_z;
+    // BIPED_SPAWN_RAISE: lift the spawn so the soles start clear of the floor
+    // (the ~2mm default overlap triggers rapier's 10 m/s depenetration launch).
+    let spawn_z = robot.spawn_z
+        + std::env::var("BIPED_SPAWN_RAISE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0);
     let mut bodies = RigidBodySet::new();
     let mut colliders = ColliderSet::new();
     let impulse = ImpulseJointSet::new();
@@ -247,16 +253,26 @@ fn build_world(mjcf: &[MjBody], robot: &RobotSpec, base_yaw: f32) -> World {
             continue;
         };
         let spec = robot.joints.iter().find(|j| &j.name == jname);
+        // Joints outside the robot spec (G1 arms/waist): LOCK rigid instead of
+        // weak default motors (kp50/kd1 underdamped arms shook the whole robot
+        // airborne). Mirrors the nexus env, which builds the legs-only robot.
+        let axes = if spec.is_some() {
+            locked
+        } else {
+            locked | JointAxesMask::ANG_Z
+        };
         let (kp, kd, effort) = spec
             .map(|s| (s.kp, s.kd, s.effort_limit))
             .unwrap_or((50.0, 1.0, 20.0));
-        let mut joint = GenericJointBuilder::new(locked)
+        let mut joint = GenericJointBuilder::new(axes)
             .local_frame1(Pose::from_parts(b.local_pos, b.local_quat))
             .local_frame2(Pose::IDENTITY)
             .build();
-        joint.set_motor_model(JointAxis::AngZ, MotorModel::ForceBased);
-        joint.set_motor_position(JointAxis::AngZ, 0.0, kp, kd);
-        joint.set_motor_max_force(JointAxis::AngZ, effort);
+        if spec.is_some() {
+            joint.set_motor_model(JointAxis::AngZ, MotorModel::ForceBased);
+            joint.set_motor_position(JointAxis::AngZ, 0.0, kp, kd);
+            joint.set_motor_max_force(JointAxis::AngZ, effort);
+        }
         let handle = multibody
             .insert(handles[parent], handles[i], joint, true)
             .expect("insert joint");
@@ -461,6 +477,15 @@ impl BipedEnv {
         let task = VelocityFlatTask::new();
         let mut ip = IntegrationParameters::default();
         ip.dt = task.sim_dt;
+        // Diff-harness knobs: cap depenetration + more substeps (defaults match
+        // the tuned GPU stand config; rapier default max_corrective_velocity=10
+        // launches the G1 off ~mm spawn overlaps exactly like the GPU did).
+        if let Some(v) = std::env::var("BIPED_MAX_CORR_VEL").ok().and_then(|v| v.parse::<f32>().ok()) {
+            ip.normalized_max_corrective_velocity = v;
+        }
+        if let Some(n) = std::env::var("BIPED_SOLVER_ITERS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            ip.num_solver_iterations = n.max(1);
+        }
         // Match the nexus GPU env + Isaac/PhysX reference (position iterations =
         // 4). Was 8; lowered for parity so CPU-vs-GPU benchmarks compare like
         // fidelity. See biped_env_nexus.rs `SOLVER_ITERS`.

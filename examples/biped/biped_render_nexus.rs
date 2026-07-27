@@ -342,6 +342,41 @@ fn main() {
             }
             // Other envs: just hold zero (we don't render them).
             let outs = env.step(&actions).await;
+            if std::env::var("BIPED_DBG_JACS").is_ok() && step == 5 {
+                let (jacs, cols, (cpb, dpb, spb)) = env.dbg_mb_jac_columns().await;
+                let (_, cons) = env.dbg_mb_contacts().await;
+                let mut out = String::from("{\n");
+                out.push_str(&format!("  \"cpb\": {cpb}, \"dpb\": {dpb}, \"spb\": {spb},\n"));
+                out.push_str("  \"slots\": [\n");
+                for (i, c) in cons.iter().take(192).enumerate() {
+                    if c.kind == 0 { continue; }
+                    let row: Vec<String> = (0..dpb as usize)
+                        .map(|d| format!("{:.6}", jacs[i * dpb as usize + d]))
+                        .collect();
+                    let col: Vec<String> = (0..dpb as usize)
+                        .map(|d| format!("{:.6}", cols[i * dpb as usize + d]))
+                        .collect();
+                    out.push_str(&format!(
+                        "    {{\"s\": {i}, \"kind\": {}, \"link\": {}, \"inv_lhs\": {:.6}, \"lin_jac\": [{:.6},{:.6},{:.6}], \"ang_jac\": [{:.6},{:.6},{:.6}], \"jrow\": [{}], \"col\": [{}]}},\n",
+                        c.kind, c.link_id, c.inv_lhs,
+                        c.lin_jac.x, c.lin_jac.y, c.lin_jac.z,
+                        c.ang_jac.x, c.ang_jac.y, c.ang_jac.z,
+                        row.join(","), col.join(",")));
+                }
+                out.push_str("    {\"s\": -1, \"kind\": 0, \"link\": 0, \"inv_lhs\": 0, \"lin_jac\": [0,0,0], \"ang_jac\": [0,0,0], \"jrow\": [], \"col\": []}\n  ]\n}\n");
+                let ls = env.dbg_links_static().await;
+                // links_static is batch-interleaved: link i of batch b at i*NB+b.
+                let nb = 64usize;
+                for i in 0..13 {
+                    let l = &ls[i * nb];
+                    println!("[dbgl] link {i} mass {:.4} com {:?}", 1.0/l.local_mprops.inv_mass.x.max(1e-9), l.local_mprops.com);
+                }
+                let bj = env.dbg_body_jacobians().await;
+                let bjs: Vec<String> = bj.iter().map(|v| format!("{v:.6}")).collect();
+                std::fs::write("/tmp/bodyjacs.json", format!("[{}]", bjs.join(","))).unwrap();
+                std::fs::write("/tmp/jacdump.json", out).unwrap();
+                println!("[dbgj] wrote /tmp/jacdump.json");
+            }
             if std::env::var("BIPED_DBG_CONTACTS").is_ok() && step < 30 {
                 let (_, cons) = env.dbg_mb_contacts().await;
                 // Aligned with the CPU probe ([cpuc]): per-foot Fz + per-point
@@ -363,7 +398,7 @@ fn main() {
                         } else if c.kind == 2 {
                             // tangent row: lin_jac = tangent dir; print its x-component,
                             // impulse and mu (clamp = mu * paired normal impulse).
-                            pts.push_str(&format!(" [T{:+.3} tx{:+.2} mu{:.2}]", c.impulse, c.lin_jac.x, c.friction_coeff));
+                            pts.push_str(&format!(" [T{:+.3} tx{:+.2} slip{:+.4}]", c.impulse, c.lin_jac.x, c._unused_cfm));
                         }
                     }
                     line.push_str(&format!(" foot{}: Fz~{:7.1}N pts[{} ]",

@@ -801,7 +801,17 @@ fn build_env_scene(
         // It's NOT scaled by `pd_scale` (it's a physical property, not a gain).
         let damping = b.joint_damping.unwrap_or(spec_damping);
         let kd = kd + damping;
-        let mut joint = GenericJointBuilder::new(locked)
+        // BIPED_LOCK_HELD=1: weld non-action joints (G1 waist/arms) rigid
+        // instead of PD-holding them. The held-gains default is underdamped:
+        // during a passive stand the arms swing ~7cm in 1.6s — a moving-COM
+        // disturbance that alone drives a constant base-pitch drift.
+        let lock_held = spec.is_none() && std::env::var("BIPED_LOCK_HELD").is_ok();
+        let axes = if lock_held {
+            locked | JointAxesMask::ANG_Z
+        } else {
+            locked
+        };
+        let mut joint = GenericJointBuilder::new(axes)
             .local_frame1(Pose::from_parts(b.local_pos, b.local_quat))
             .local_frame2(Pose::IDENTITY)
             .build();
@@ -826,7 +836,9 @@ fn build_env_scene(
         } else {
             MotorModel::ForceBased
         };
-        joint.set_motor_model(JointAxis::AngZ, motor_model);
+        if !lock_held {
+            joint.set_motor_model(JointAxis::AngZ, motor_model);
+        }
         // Motor gains come straight from the robot spec (RobotSpec::joints),
         // which already bakes in the physical torque-PD correction (STIFFNESS_SCALE
         // / DAMPING_SCALE) — kp is a real torque/rad gain, FIXED, identical to what
@@ -841,8 +853,10 @@ fn build_env_scene(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
-        joint.set_motor_position(JointAxis::AngZ, 0.0, kp * kp_scale, kd * kd_scale);
-        joint.set_motor_max_force(JointAxis::AngZ, effort);
+        if !lock_held {
+            joint.set_motor_position(JointAxis::AngZ, 0.0, kp * kp_scale, kd * kd_scale);
+            joint.set_motor_max_force(JointAxis::AngZ, effort);
+        }
         // Enforce the free axis's position limits — OFF by default (set
         // BIPED_JOINT_LIMITS=1 to enable). Setting a limit makes the multibody
         // solver emit a limit constraint (kind=1) alongside each motor
@@ -3503,6 +3517,24 @@ impl BipedNexusBatchEnv {
     /// dofs_per_batch, constraints_per_batch))`. Slot `s` of batch `b` is
     /// `[b*columns_per_batch + s*dofs_per_batch ..][..ndofs]` in both banks.
     /// The columns are the prime suspect for the WebGpu contact divergence.
+    pub async fn dbg_links_static(&mut self) -> Vec<nexus3d::rbd::shaders::dynamics::MultibodyLinkStatic> {
+        let buf = self.state.multibodies_mut().dbg_links_static().buffer();
+        let mut v: Vec<nexus3d::rbd::shaders::dynamics::MultibodyLinkStatic> =
+            (0..buf.len() as usize).map(|_| unsafe { std::mem::zeroed() }).collect();
+        self.gpu.slow_read_buffer(buf, &mut v).await.expect("links static readback");
+        v
+    }
+
+    pub async fn dbg_body_jacobians(&mut self) -> Vec<f32> {
+        let buf = self.state.multibodies_mut().dbg_body_jacobians().buffer();
+        let mut v = vec![0f32; buf.len() as usize];
+        self.gpu
+            .slow_read_buffer(buf, &mut v)
+            .await
+            .expect("body jacobians readback");
+        v
+    }
+
     pub async fn dbg_mb_jac_columns(&mut self) -> (Vec<f32>, Vec<f32>, (u32, u32, u32)) {
         let strides = self
             .state

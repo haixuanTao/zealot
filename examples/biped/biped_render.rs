@@ -173,6 +173,8 @@ fn main() {
             let outp = env.step(&action);
             if std::env::var("BIPED_DBG_CONTACTS").is_ok() && step < 30 {
                 println!("[cpuc] step {step}:{}", env.dbg_contact_report(0.02));
+                let (p, _) = env.base_pose();
+                println!("[cpuf] step {step}: base_z {:.3}\n{}", p[2], env.foot_report());
             }
             obs = outp.obs;
             if outp.done {
