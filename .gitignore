@@ -8,3 +8,5 @@ __pycache__/
 .claude/
 wandb/
 vast_nexus_ptx/
+
+bench/**/*.mp4

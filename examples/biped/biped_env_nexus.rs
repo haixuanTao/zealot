@@ -1928,7 +1928,7 @@ impl BipedNexusBatchEnv {
         // on the CPU side without an actual GPU reset — the GPU state is
         // already at the correct spawn pose from `from_rapier`).
         for e in 0..num_envs {
-            env.cmd[e] = env.sampler.sample(&mut env.rng[e]);
+            env.cmd[e] = eval_cmd_override().unwrap_or_else(|| env.sampler.sample(&mut env.rng[e]));
             env.resample_at[e] = env
                 .sampler
                 .resample_steps(&mut env.rng[e], env.task.control_dt());
@@ -2730,7 +2730,7 @@ impl BipedNexusBatchEnv {
                     ter.travel[e] += ((p.x - lx).powi(2) + (p.y - ly).powi(2)).sqrt();
                     ter.last_xy[e] = [p.x, p.y];
                 }
-                self.cmd[e] = self.sampler.sample(&mut self.rng[e]);
+                self.cmd[e] = eval_cmd_override().unwrap_or_else(|| self.sampler.sample(&mut self.rng[e]));
                 self.resample_at[e] = self.step_count[e]
                     + self
                         .sampler
@@ -3183,7 +3183,7 @@ impl BipedNexusBatchEnv {
         self.foot_sole_local[env] = self.template_foot_sole[t];
 
         // Reset host state.
-        self.cmd[env] = self.sampler.sample(&mut self.rng[env]);
+        self.cmd[env] = eval_cmd_override().unwrap_or_else(|| self.sampler.sample(&mut self.rng[env]));
         self.step_count[env] = 0;
         self.resample_at[env] = self
             .sampler
@@ -3633,6 +3633,18 @@ async fn make_backend() -> KhalGpuBackend {
 /// env (minus push perturbations, which nexus can't apply at runtime).
 /// Initial-pose jitter ranges are conservative — wider tilts make every
 /// episode start mid-fall, which the policy can't recover from at small T.
+
+/// `BIPED_EVAL_CMD="vx,vy,yaw"`: pin every sampled velocity command to a fixed
+/// value (benchmark/eval runs; overrides the command curriculum).
+fn eval_cmd_override() -> Option<VelocityCommand> {
+    static CMD: std::sync::OnceLock<Option<VelocityCommand>> = std::sync::OnceLock::new();
+    *CMD.get_or_init(|| {
+        let v = std::env::var("BIPED_EVAL_CMD").ok()?;
+        let p: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (p.len() == 3).then(|| VelocityCommand { vx: p[0], vy: p[1], yaw_rate: p[2] })
+    })
+}
+
 fn sample_dr(rng: &mut Lcg) -> DrParams {
     // BIPED_AGILE_DR=1: sample the WBC-AGILE LocomotionEventCfg ranges instead
     // of zealot's (which are 2–4× harsher exactly where stepping is risky —

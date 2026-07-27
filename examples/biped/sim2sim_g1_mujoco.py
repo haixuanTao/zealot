@@ -47,10 +47,17 @@ POLICY = sys.argv[1] if len(sys.argv) > 1 else "/tmp/biped_policy_gpu.safetensor
 OUT = sys.argv[2] if len(sys.argv) > 2 else "/tmp/g1_sim2sim_mujoco.mp4"
 SECONDS = float(sys.argv[3]) if len(sys.argv) > 3 else 30.0
 
-MODEL_XML = os.path.expanduser(
-    "~/miniforge3/envs/mjx/lib/python3.12/site-packages/mujoco_playground"
-    "/_src/locomotion/g1/xmls/scene_mjx_feetonly_flat_terrain.xml"
-)
+def _model_xml() -> str:
+    override = os.environ.get("S2S_MODEL_XML")
+    if override:
+        return override
+    import mujoco_playground
+    return os.path.join(
+        os.path.dirname(mujoco_playground.__file__),
+        "_src/locomotion/g1/xmls/scene_mjx_feetonly_flat_terrain.xml",
+    )
+
+MODEL_XML = _model_xml()
 
 PHYS_DT = 1.0 / 200.0
 DECIMATION = 4
@@ -289,6 +296,25 @@ def main():
 
     ff.stdin.close()
     ff.wait()
+    # Structured metrics for benchmark harnesses (S2S_METRICS_JSON=<path>).
+    mpath = os.environ.get("S2S_METRICS_JSON")
+    if mpath:
+        import json as _json
+        final_d = float(np.linalg.norm(data.qpos[free_q:free_q + 2] - dist0))
+        final_t = ep_t * CONTROL_DT
+        eps = [{"seconds": float(t), "traveled_m": float(d), "end": why}
+               for (t, d, why) in survived]
+        eps.append({"seconds": final_t, "traveled_m": final_d, "end": "clip_end"})
+        with open(mpath, "w") as f:
+            _json.dump({
+                "engine": "mujoco",
+                "model_xml": MODEL_XML,
+                "policy": POLICY,
+                "command": [float(c) for c in CMD],
+                "clip_seconds": SECONDS,
+                "falls": sum(1 for e in eps if e["end"] == "fell"),
+                "episodes": eps,
+            }, f, indent=1)
     if survived:
         ts = [s for s, _, _ in survived]
         print(f"\n{len(survived)} completed attempts; mean survival "

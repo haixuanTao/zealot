@@ -1,0 +1,75 @@
+{
+ "label": "v6c-iter0.7k-preliminary",
+ "checkpoint": "bench_ckpt_v6c.safetensors",
+ "runs": [
+  {
+   "engine": "nexus",
+   "command": "0,0,0",
+   "clip_seconds": 15,
+   "survived_s": 15.0,
+   "fell": false,
+   "traveled_m": 7.826,
+   "mean_speed": 0.522,
+   "max_pitch_deg": 5.22,
+   "ankle_pinned_frac": 0.211,
+   "run": "stand"
+  },
+  {
+   "engine": "mujoco",
+   "command": "0,0,0",
+   "clip_seconds": 15,
+   "survived_s": 15.0,
+   "fell": false,
+   "falls": 0,
+   "traveled_m": 13.126,
+   "mean_speed": 0.875,
+   "run": "stand"
+  },
+  {
+   "engine": "nexus",
+   "command": "0.4,0,0",
+   "clip_seconds": 15,
+   "survived_s": 15.0,
+   "fell": false,
+   "traveled_m": 12.086,
+   "mean_speed": 0.806,
+   "max_pitch_deg": 38.51,
+   "ankle_pinned_frac": 0.258,
+   "run": "walk04"
+  },
+  {
+   "engine": "mujoco",
+   "command": "0.4,0,0",
+   "clip_seconds": 15,
+   "survived_s": 15.0,
+   "fell": false,
+   "falls": 0,
+   "traveled_m": 2.876,
+   "mean_speed": 0.192,
+   "run": "walk04"
+  },
+  {
+   "engine": "nexus",
+   "command": "0.8,0,0",
+   "clip_seconds": 15,
+   "survived_s": 15.0,
+   "fell": false,
+   "traveled_m": 5.334,
+   "mean_speed": 0.356,
+   "max_pitch_deg": 11.19,
+   "ankle_pinned_frac": 0.233,
+   "run": "walk08"
+  },
+  {
+   "engine": "mujoco",
+   "command": "0.8,0,0",
+   "clip_seconds": 15,
+   "survived_s": 15.0,
+   "fell": false,
+   "falls": 0,
+   "traveled_m": 0.922,
+   "mean_speed": 0.061,
+   "run": "walk08"
+  }
+ ]
+}
