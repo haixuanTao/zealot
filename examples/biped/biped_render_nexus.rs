@@ -342,6 +342,35 @@ fn main() {
             }
             // Other envs: just hold zero (we don't render them).
             let outs = env.step(&actions).await;
+            if std::env::var("BIPED_DBG_CONTACTS").is_ok() && step < 30 {
+                let (_, cons) = env.dbg_mb_contacts().await;
+                // Aligned with the CPU probe ([cpuc]): per-foot Fz + per-point
+                // (x, normal imp, tangent imp). x = +ang_jac.y (ground-static:
+                // ang_jac=(pt-com)x(-z) so ang_jac.y = pt_x - com_x, com_x=0).
+                // Fz = last-substep accumulated impulse / substep dt.
+                let decim: f32 = std::env::var("BIPED_DECIMATION")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+                let sub_dt = 0.02 / decim / 8.0;
+                let mut line = format!("[gpuc] step {step}:");
+                for foot_link in [6u32, 12u32] {
+                    let mut fz = 0.0f32;
+                    let mut pts = String::new();
+                    for c in cons.iter().take(192) {
+                        if c.kind == 0 || c.link_id != foot_link { continue; }
+                        if c.kind == 1 {
+                            fz += c.impulse;
+                            pts.push_str(&format!(" (x{:+.3} N{:.3} rhs{:+.2})", c.ang_jac.y, c.impulse, c.rhs));
+                        } else if c.kind == 2 {
+                            // tangent row: lin_jac = tangent dir; print its x-component,
+                            // impulse and mu (clamp = mu * paired normal impulse).
+                            pts.push_str(&format!(" [T{:+.3} tx{:+.2} mu{:.2}]", c.impulse, c.lin_jac.x, c.friction_coeff));
+                        }
+                    }
+                    line.push_str(&format!(" foot{}: Fz~{:7.1}N pts[{} ]",
+                        if foot_link == 6 { 0 } else { 1 }, fz / sub_dt, pts));
+                }
+                println!("{line}");
+            }
 
             if !passive && outs[0].done {
                 resets.push(step);

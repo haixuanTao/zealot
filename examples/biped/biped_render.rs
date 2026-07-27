@@ -165,8 +165,15 @@ fn main() {
             let (p, q) = env.base_pose();
             bases.push([p[0], p[1], p[2], q[0], q[1], q[2], q[3]]);
             joints.push(env.joint_angles());
-            let action = to_action(&ac.mean(&obs));
+            let action = if std::env::var("BIPED_PASSIVE").is_ok() {
+                [0.0; NUM_JOINTS] // hold the default pose, no policy involved
+            } else {
+                to_action(&ac.mean(&obs))
+            };
             let outp = env.step(&action);
+            if std::env::var("BIPED_DBG_CONTACTS").is_ok() && step < 30 {
+                println!("[cpuc] step {step}:{}", env.dbg_contact_report(0.02));
+            }
             obs = outp.obs;
             if outp.done {
                 resets.push(step);

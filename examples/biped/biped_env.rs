@@ -939,6 +939,43 @@ impl BipedEnv {
         s
     }
 
+    /// DEBUG (differential harness vs nexus GPU): per-foot contact impulse
+    /// report from rapier's own manifolds — per point: world x/z, dist, normal
+    /// impulse, |tangent impulse|. `imp` is rapier's stored per-point impulse
+    /// (its own warmstart bookkeeping); Fz estimates use imp/dt.
+    pub fn dbg_contact_report(&self, dt: f32) -> String {
+        use std::fmt::Write as _;
+        let w = &self.world;
+        let mut s = String::new();
+        for (fi, &foot) in w.feet.iter().enumerate() {
+            let mut tot_imp = 0.0f32;
+            let mut pts: Vec<(f32, f32, f32, f32, f32)> = Vec::new();
+            for &c in w.bodies[foot].colliders() {
+                if let Some(pair) = w.np.contact_pair(c, w.ground_collider) {
+                    let flip = pair.collider1 != c; // is the foot collider 1 or 2?
+                    for m in &pair.manifolds {
+                        for p in &m.points {
+                            let world = if flip {
+                                w.colliders[pair.collider2].position() * p.local_p2
+                            } else {
+                                w.colliders[pair.collider1].position() * p.local_p1
+                            };
+                            let t_imp = p.data.tangent_impulse.norm();
+                            pts.push((world.x, world.z, p.dist, p.data.impulse, t_imp));
+                            tot_imp += p.data.impulse;
+                        }
+                    }
+                }
+            }
+            let _ = write!(s, " foot{fi}: Fz~{:7.1}N pts[", tot_imp / dt.max(1e-6));
+            for (x, z, d, ni, ti) in &pts {
+                let _ = write!(s, " (x{x:+.3} z{z:+.3} d{d:+.4} N{ni:.3} T{ti:.3})");
+            }
+            let _ = write!(s, " ]");
+        }
+        s
+    }
+
     /// Torso forward speed in the body frame (m/s) — the "is it actually walking"
     /// signal. Projects world linear velocity onto the body's forward (+X) axis.
     pub fn base_forward_speed(&self) -> f32 {

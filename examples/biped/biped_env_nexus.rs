@@ -655,6 +655,9 @@ fn build_env_scene(
             hi += pad;
             let he = ((hi - lo) * 0.5).max(Vec3::splat(1e-3));
             let mut center = (hi + lo) * 0.5;
+            if std::env::var("BIPED_DBG_FOOT").is_ok() {
+                eprintln!("[dbgf] link {} box lo {:?} hi {:?} center {:?} he {:?}", b.name, lo, hi, center, he);
+            }
             // Foot collider shape. Default CAPSULE (rounded sole): nexus's flat box
             // foot caught on its sharp edges at foot-strike, so a dynamic gait
             // diverged at the ankles in MuJoCo (whose sole is 6 ROUNDED capsules) —
@@ -927,6 +930,13 @@ fn build_env_scene(
     // launch (~16 J from nothing) — see the 2026-07-27 pop investigation.
     sp.normalized_allowed_linear_error =
         env_f32("BIPED_ALLOWED_LIN_ERR").unwrap_or(sp.normalized_allowed_linear_error);
+    // Contact prediction distance (speculative-contact margin, rapier default
+    // 2mm). With the stiff normal holding equilibrium penetration ~0, a box
+    // foot tilted a fraction of a degree lifts its far-edge corners past 2mm
+    // and the manifold collapses to ONE EDGE (zero pitch moment capacity ->
+    // the foot rocks). PhysX ships contactOffset ~2cm for exactly this.
+    sp.normalized_prediction_distance =
+        env_f32("BIPED_PREDICTION").unwrap_or(sp.normalized_prediction_distance);
     sp.normalized_max_corrective_velocity =
         env_f32("BIPED_MAX_CORR_VEL").unwrap_or(sp.normalized_max_corrective_velocity);
 
@@ -3465,7 +3475,21 @@ impl BipedNexusBatchEnv {
     /// (`inv_lhs` = 1/(J·M⁻¹·Jᵀ), `rhs`, accumulated `impulse`, jacobians) and
     /// the per-batch active counts. Diagnoses the WebGpu contact-solve blow-up.
     pub async fn dbg_mb_contacts(&mut self) -> (Vec<u32>, Vec<NexusMbContact>) {
-        unimplemented!("dbg_mb_contacts: constraint-count tensor absent on the upstream base — probe not ported")
+        let cbuf = self
+            .state
+            .multibodies_mut()
+            .dbg_contact_constraints()
+            .buffer();
+        // SAFETY: MultibodyContactConstraint is Pod (plain f32/u32 fields);
+        // zeroed is a valid bit pattern. Debug-only readback scratch.
+        let mut v: Vec<NexusMbContact> = (0..cbuf.len())
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
+        self.gpu
+            .slow_read_buffer(cbuf, &mut v)
+            .await
+            .expect("mb contact constraints readback");
+        (Vec::new(), v)
     }
 
     /// DEBUG: world pose of every body for all envs (spawn-divergence check:
