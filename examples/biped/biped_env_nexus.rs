@@ -1636,9 +1636,14 @@ impl BipedNexusBatchEnv {
             .set_implicit_coriolis(implicit_coriolis);
         // Decomposed refresh probe: implicit mode's per-substep dynamics +
         // constraint rebuild cadence with the explicit (coriolis-free) kernels.
+        let refresh_mode = std::env::var("NEXUS_SUBSTEP_REFRESH").unwrap_or_default();
         state
             .multibodies_mut()
-            .set_substep_refresh(std::env::var("NEXUS_SUBSTEP_REFRESH").as_deref() == Ok("1"));
+            .set_substep_refresh(refresh_mode == "1");
+        // "2": light split-cadence — constraints per substep, M/LU per sim-step.
+        state
+            .multibodies_mut()
+            .set_substep_refresh_light(refresh_mode == "2");
 
         // Seed per-DOF Coulomb joint friction (MJCF `frictionloss`) into the
         // multibody. Env-major `[env][dof]` layout matching the velocity section:
