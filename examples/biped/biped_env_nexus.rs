@@ -920,6 +920,15 @@ fn build_env_scene(
     sp.contact_natural_frequency =
         env_f32("BIPED_CONTACT_NF").unwrap_or(dr.contact_natural_frequency);
     sp.contact_damping_ratio = env_f32("BIPED_CONTACT_DR").unwrap_or(dr.contact_damping_ratio);
+    // Penetration-recovery knobs (A/B vs the Rapier game defaults 1mm/10m/s).
+    // MuJoCo has NO velocity-level depenetration (critically-damped soft constraint
+    // only); Isaac clamps max_depenetration_velocity to ~1 m/s in RL configs. The
+    // 10 m/s default converts a 2mm spawn overlap into a ~0.6 m/s whole-robot
+    // launch (~16 J from nothing) — see the 2026-07-27 pop investigation.
+    sp.normalized_allowed_linear_error =
+        env_f32("BIPED_ALLOWED_LIN_ERR").unwrap_or(sp.normalized_allowed_linear_error);
+    sp.normalized_max_corrective_velocity =
+        env_f32("BIPED_MAX_CORR_VEL").unwrap_or(sp.normalized_max_corrective_velocity);
 
     // Build the index table from the canonical joint ordering.
     let mut actuated: Vec<(u32, String)> = Vec::with_capacity(NUM_JOINTS);
