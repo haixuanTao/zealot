@@ -317,10 +317,13 @@ name = "contact_probe"
 path = "examples/biped/contact_probe.rs"
 required-features = ["gpu", "biped_gpu"]
 
-# Local dimforge forks — mirrors nexus-rl's workspace patch table so nexus3d
-# (and vortx) resolve to the exact sources they're built against there. zealot
-# and nexus-rl are sibling checkouts under the same parent dir, so the relative
-# paths match. Only consulted when a GPU feature pulls these crates into the graph.
+# Local dimforge trees — sibling checkouts under the same parent dir:
+# nexus-unified (branch fix/mb-solver-consistency), khal-unified (khal/unified),
+# vortx-unified (vortx/unified); all archived on the haixuanTao forks. Only
+# consulted when a GPU feature pulls these crates into the graph. The native-CUDA
+# cubins are built separately by scripts/full_unified_chain.sh (upstream NVlabs
+# cuda-oxide, unified host-target interception) and embedded at build time via
+# CUDA_OXIDE_SHADERS_PTX_<CRATE>.
 [patch.crates-io]
 # naga 29 MSL backend miscompiles rust-gpu `while` loops on Metal: the
 # hoisted continuing block re-evaluates the `break_if` condition after the

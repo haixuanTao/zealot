@@ -502,6 +502,30 @@ cargo run --release --example rollout_e2e_bench --features "gpu biped_gpu" -- <n
 cargo install cargo-gpu
 ```
 
+### Native CUDA (cuda-oxide)
+
+The native-CUDA fast path embeds prebuilt sm_120 cubins of the nexus + vortx
+shader crates. They are compiled by **upstream NVlabs
+[cuda-oxide](https://github.com/NVlabs/cuda-oxide)** through its unified
+host-target interception (no nvptx64 cross-target step, no compiler fork) and
+lowered with full O3 (`opt` -> `llc` -> `ptxas`). The whole chain is one
+script:
+
+```sh
+scripts/full_unified_chain.sh   # backend -> .ll -> O3 cubins -> trainer
+```
+
+Prerequisites: sibling checkouts `../nexus-unified`, `../vortx-unified`,
+`../khal-unified` (see the `[patch.crates-io]` table), a CUDA >= 12.8 `ptxas`,
+and libdevice. Until NVlabs/cuda-oxide PRs
+[#518](https://github.com/NVlabs/cuda-oxide/pull/518) and
+[#520](https://github.com/NVlabs/cuda-oxide/pull/520) merge, the backend is
+built from the `local/unified-bridge` branch of
+[haixuanTao/cuda-oxide](https://github.com/haixuanTao/cuda-oxide) (= upstream
+main + those two commits). Cubins are embedded at trainer build time via
+`CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D` / `..._VORTX_SHADERS` — rebuild
+the trainer after rebuilding cubins.
+
 ## Development
 
 Versioned git hooks in `.githooks/` enforce formatting, warnings, and tests.
