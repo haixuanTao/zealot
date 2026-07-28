@@ -256,7 +256,7 @@ def main():
         o[16:28] = q - DEFAULT_POS
         o[28:40] = 0.0 if ep_t == 0 else (q - prev_q) / CONTROL_DT
         o[40:43] = projected_gravity(quat)
-        ph = (max(0, ep_t - 1) * CONTROL_DT / gait_period_for(CMD[0])) % 1.0
+        ph = (max(0, ep_t - 1) * CONTROL_DT / gait_period_for((CMD[0]**2 + CMD[1]**2) ** 0.5)) % 1.0
         o[43], o[44] = np.sin(2 * np.pi * ph), np.cos(2 * np.pi * ph)
 
         if frames_hist is None:
