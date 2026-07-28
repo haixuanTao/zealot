@@ -2799,6 +2799,12 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(0.0);
+        // Leg-interpenetration termination distance (BIPED_SELF_COLL_TERM,
+        // 0 disables). 0.05 m between link centers ≈ colliders overlapping.
+        let sc_term = std::env::var("BIPED_SELF_COLL_TERM")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.05);
         let sc_dt = self.task.control_dt();
         // Torque (effort) penalty: we're PD position-controlled and had NO cost
         // on joint torque, so the policy reward-hacks strained high-torque poses
@@ -2873,8 +2879,21 @@ impl BipedNexusBatchEnv {
                         .map_or(0.0, |ter| ter.strip_for(e).height(p.x, p.y));
                     p.z - gh < illegal_z
                 });
-                let fell =
-                    illegal || self.task.fell_over(&state.base) || !state.base.height.is_finite();
+                // E-stop termination: legs truly interpenetrating (any L/R pair
+                // inside `sc_term`). Neither engine has leg-leg collision, so on
+                // hardware this state is an operator emergency stop — train the
+                // same contract. The soft `sc_weight` ring (below) keeps this
+                // rare after the first few hundred iters.
+                let crossed = sc_term > 0.0
+                    && self.idx.self_collision_pairs.iter().any(|&(a, b)| {
+                        let pa = poses[env_base + a as usize].translation;
+                        let pb = poses[env_base + b as usize].translation;
+                        (pa - pb).length_squared() < sc_term * sc_term
+                    });
+                let fell = illegal
+                    || crossed
+                    || self.task.fell_over(&state.base)
+                    || !state.base.height.is_finite();
                 let rb = self.task.reward(&state, &self.cmd[e]);
                 let mut reward = rb.total();
                 let mut comps = [0.0f32; NUM_REWARD_COMPS];
