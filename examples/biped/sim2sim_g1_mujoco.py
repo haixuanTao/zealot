@@ -62,17 +62,20 @@ MODEL_XML = _model_xml()
 PHYS_DT = 1.0 / 200.0
 DECIMATION = 4
 CONTROL_DT = PHYS_DT * DECIMATION
-GAIT_PERIOD = float(os.environ.get("S2S_GAIT_PERIOD", "0.7"))
-# Speed-coupled cadence parity: when the policy trained with
-# BIPED_GAIT_PERIOD_FAST, the deploy clock must lerp the period by |cmd|/0.5
-# exactly like the env. Defaults to GAIT_PERIOD = constant cadence.
-GAIT_PERIOD_FAST = float(os.environ.get("S2S_GAIT_PERIOD_FAST", str(GAIT_PERIOD)))
-
-FREEZE_STAND = os.environ.get("S2S_GAIT_FREEZE_STAND") == "1"
+# Gait clock — derived from the command, exact mirror of the trainer env
+# (biped_env_nexus.rs): phase FROZEN below 0.1 m/s commanded; else the period
+# lerps 0.8 s (at 0.1 m/s) -> 0.55 s (at 0.5 m/s). Deterministic from command
+# history; no estimator. Policies trained before 2026-07-28 used a fixed
+# free-running 0.7 s clock instead (S2S_LEGACY_CLOCK=1 restores it).
+GAIT_PERIOD_SLOW = 0.8
+GAIT_PERIOD_FAST = 0.55
+LEGACY_CLOCK = os.environ.get("S2S_LEGACY_CLOCK") == "1"
 
 def gait_period_for(cmd_speed: float) -> float:
-    s = min(abs(cmd_speed), 0.5) / 0.5
-    return GAIT_PERIOD + (GAIT_PERIOD_FAST - GAIT_PERIOD) * s
+    if LEGACY_CLOCK:
+        return 0.7
+    t = (min(abs(cmd_speed), 0.5) - 0.1) / 0.4
+    return GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * max(t, 0.0)
 HIST = 5
 FALL_Z = 0.45
 TILT_LIMIT = np.deg2rad(70.0)
@@ -260,7 +263,7 @@ def main():
         o[28:40] = 0.0 if ep_t == 0 else (q - prev_q) / CONTROL_DT
         o[40:43] = projected_gravity(quat)
         cmd_speed = (CMD[0]**2 + CMD[1]**2) ** 0.5
-        if FREEZE_STAND and cmd_speed < 0.1:
+        if cmd_speed < 0.1 and not LEGACY_CLOCK:
             ph = frozen_phase
         else:
             ph = (max(0, ep_t - 1) * CONTROL_DT / gait_period_for(cmd_speed)) % 1.0
