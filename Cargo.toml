@@ -67,6 +67,3 @@ khal = { path = "../khal-unified/crates/khal" }
 khal-std = { path = "../khal-unified/crates/khal-std" }
 khal-derive = { path = "../khal-unified/crates/khal-derive" }
 #glamx = { git = "https://github.com/dimforge/glamx", branch = "bytemuck" }
-
-[patch."https://github.com/haixuanTao/cuda-oxide.git"]
-cuda-device = { path = "../cuda-oxide-upstreaming/crates/cuda-device" }
