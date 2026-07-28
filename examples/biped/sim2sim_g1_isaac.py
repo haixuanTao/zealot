@@ -27,13 +27,31 @@ POLICY = sys.argv[1] if len(sys.argv) > 1 else "/tmp/biped_policy_gpu.safetensor
 OUT = sys.argv[2] if len(sys.argv) > 2 else "/tmp/g1_sim2sim_isaac.mp4"
 SECONDS = float(sys.argv[3]) if len(sys.argv) > 3 else 20.0
 
-URDF = os.path.expanduser(
-    "~/Documents/work/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf")
+# MuJoCo-flattened playground feetonly MJCF (defaults resolved, contact/
+# sensor/keyframe stripped, trained passive dynamics baked into the leg
+# joints) → USD via isaacsim.asset.importer.mjcf, cached under /tmp.
+# The old URDF route is dead on the Isaac Sim 6.0.1 install (no
+# URDFParseAndImportFile command, unitree_ros checkout gone).
+FLAT_XML = ("/home/champagne/rt_build/bench-venv/lib/python3.12/site-packages/"
+            "mujoco_playground/_src/locomotion/g1/xmls/_g1_isaac_flat.xml")
+USD_DIR = "/tmp/g1_isaac_usd"
+USD_FILE = os.path.join(USD_DIR, "_g1_isaac_flat", "_g1_isaac_flat.usda")
 
 PHYS_DT = 1.0 / 200.0
 DECIMATION = 4
 CONTROL_DT = PHYS_DT * DECIMATION
-GAIT_PERIOD = 0.7
+GAIT_PERIOD_SLOW = 0.8
+GAIT_PERIOD_FAST = 0.55
+LEGACY_CLOCK = os.environ.get("S2S_LEGACY_CLOCK") == "1"
+
+
+def gait_period_for(cmd_speed: float) -> float:
+    if LEGACY_CLOCK:
+        return 0.7
+    t = (min(abs(cmd_speed), 0.5) - 0.1) / 0.4
+    return GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * max(t, 0.0)
+
+
 HIST = 5
 FALL_Z = 0.45
 TILT_LIMIT = np.deg2rad(70.0)
@@ -157,23 +175,32 @@ def main():
         from isaacsim.sensors.camera import Camera
     from pxr import PhysxSchema, UsdLux, UsdPhysics
 
-    enable_extension("isaacsim.asset.importer.urdf")
+    enable_extension("isaacsim.asset.importer.mjcf")
+    app.update()
+
+    if not os.path.exists(USD_FILE):
+        from isaacsim.asset.importer.mjcf import MJCFImporter, MJCFImporterConfig
+        mcfg = MJCFImporterConfig(mjcf_path=FLAT_XML, fix_base=False,
+                                  allow_self_collision=False)
+        mcfg.usd_path = USD_DIR
+        MJCFImporter(mcfg).import_mjcf()
+    assert os.path.exists(USD_FILE), USD_FILE
 
     world = World(physics_dt=PHYS_DT, rendering_dt=CONTROL_DT * RENDER_EVERY,
                   stage_units_in_meters=1.0)
     GroundPlane(prim_path="/World/ground", z_position=0.0,
                 color=np.array([0.25, 0.25, 0.28]))
 
-    _, cfg = omni.kit.commands.execute("URDFCreateImportConfig")
-    cfg.fix_base = False
-    cfg.import_inertia_tensor = True
-    ok, prim_path = omni.kit.commands.execute(
-        "URDFParseAndImportFile", urdf_path=URDF, import_config=cfg,
-        get_articulation_root=True)
-    if not ok or not prim_path:
-        raise RuntimeError(f"URDF import failed (ok={ok}, prim={prim_path})")
-
+    from isaacsim.core.utils.stage import add_reference_to_stage
+    add_reference_to_stage(USD_FILE, "/World/g1")
     stage = omni.usd.get_context().get_stage()
+    prim_path = None
+    for p in stage.Traverse():
+        if str(p.GetPath()).startswith("/World/g1") and p.HasAPI(UsdPhysics.ArticulationRootAPI):
+            prim_path = str(p.GetPath())
+            break
+    if not prim_path:
+        raise RuntimeError("no articulation root under /World/g1")
     # Passive-dynamics parity with the trained spec (same fix as the MuJoCo
     # harness): PhysX joint friction 0, armature 0.02 on the policy joints —
     # the URDF import otherwise leaves PhysX defaults / URDF damping that
@@ -221,7 +248,7 @@ def main():
         jp = np.zeros(n)
         jp[pol_d] = DEFAULT_POS
         yaw = rng.uniform(-0.3, 0.3)
-        robot.set_world_pose(position=np.array([0.0, 0.0, 0.76]),
+        robot.set_world_pose(position=np.array([0.0, 0.0, 0.79]),
                              orientation=np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]))
         robot.set_linear_velocity(np.zeros(3))
         robot.set_angular_velocity(np.zeros(3))
@@ -238,8 +265,10 @@ def main():
              "-pix_fmt", "yuv420p", OUT], stdin=subprocess.PIPE)
 
     reset()
+    frozen_phase = 0.0
     ep_t = 0
     act_hist = [np.zeros(12), np.zeros(12)]
+    vel_track = []  # per-step (body_vx, body_vy, yaw_rate)
     prev_q = np.asarray(robot.get_joint_positions())[pol_d].copy()
     frames_hist = None
     attempts, survived = 1, []
@@ -258,7 +287,12 @@ def main():
         o[16:28] = q - DEFAULT_POS
         o[28:40] = 0.0 if ep_t == 0 else (q - prev_q) / CONTROL_DT
         o[40:43] = projected_gravity(quat)
-        ph = (max(0, ep_t - 1) * CONTROL_DT / GAIT_PERIOD) % 1.0
+        cmd_speed = (CMD[0] ** 2 + CMD[1] ** 2 + CMD[2] ** 2) ** 0.5
+        if cmd_speed < 0.1 and not LEGACY_CLOCK:
+            ph = frozen_phase
+        else:
+            ph = (max(0, ep_t - 1) * CONTROL_DT / gait_period_for(cmd_speed)) % 1.0
+            frozen_phase = ph
         o[43], o[44] = np.sin(2 * np.pi * ph), np.cos(2 * np.pi * ph)
 
         if frames_hist is None:
@@ -295,6 +329,13 @@ def main():
                 ff.stdin.write(np.ascontiguousarray(rgba[:, :, :3]).tobytes())
 
         p, quat2 = robot.get_world_pose()
+        qw, qx, qy, qz = np.asarray(quat2)
+        base_yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+        lv = np.asarray(robot.get_linear_velocity())
+        av = np.asarray(robot.get_angular_velocity())
+        vel_track.append((np.cos(base_yaw) * lv[0] + np.sin(base_yaw) * lv[1],
+                          -np.sin(base_yaw) * lv[0] + np.cos(base_yaw) * lv[1],
+                          av[2]))
         z = np.asarray(p)[2]
         up = projected_gravity(np.asarray(quat2))
         tilt = np.arccos(np.clip(-up[2], -1.0, 1.0))
@@ -323,6 +364,26 @@ def main():
     else:
         print(f"\nno falls in {SECONDS:.0f}s")
     print(f"video → {OUT}")
+    mpath = os.environ.get("S2S_METRICS_JSON")
+    if mpath:
+        p, _ = robot.get_world_pose()
+        final_d = float(np.linalg.norm(np.asarray(p)[:2] - dist0))
+        eps = [{"seconds": float(t2), "traveled_m": float(d2), "end": why}
+               for (t2, d2, why) in survived]
+        eps.append({"seconds": ep_t * CONTROL_DT, "traveled_m": final_d,
+                    "end": "clip_end"})
+        vt = np.array(vel_track) if vel_track else np.zeros((1, 3))
+        with open(mpath, "w") as f:
+            json.dump({
+                "engine": "isaacsim-physx",
+                "model_xml": FLAT_XML,
+                "policy": POLICY,
+                "command": [float(c) for c in CMD],
+                "clip_seconds": SECONDS,
+                "falls": sum(1 for e in eps if e["end"] == "fell"),
+                "mean_body_vel": [float(v) for v in vt.mean(axis=0)],
+                "episodes": eps,
+            }, f, indent=1)
     app.close()
 
 
