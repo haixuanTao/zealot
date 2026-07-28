@@ -1188,6 +1188,16 @@ pub struct BipedNexusBatchEnv {
     gait_phase: Vec<f32>,
     /// Seconds per full gait cycle (both feet step once). BIPED_GAIT_PERIOD.
     gait_period: f32,
+    /// Gait period at the full 0.5 m/s command (BIPED_GAIT_PERIOD_FAST).
+    /// Defaults to `gait_period` = cadence independent of speed; setting it
+    /// lower makes cadence scale with commanded speed (period lerped by
+    /// |cmd|/0.5, like biological gait). The deploy/sim2sim clock must mirror
+    /// the same function of the command.
+    gait_period_fast: f32,
+    /// Per-env period multiplier, resampled at reset when
+    /// BIPED_GAIT_PERIOD_DR=<frac> (x U(1-frac, 1+frac)); 1.0 = off.
+    gait_period_mult: Vec<f32>,
+    gait_period_dr: f32,
     /// Global control-step counter (for push-perturbation scheduling).
     global_step: u64,
     /// Debug-only per-foot stance-phase tracker (env 0). Tracks, while a foot is
@@ -1810,6 +1820,14 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.7);
+        let gait_period_fast = std::env::var("BIPED_GAIT_PERIOD_FAST")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(gait_period);
+        let gait_period_dr: f32 = std::env::var("BIPED_GAIT_PERIOD_DR")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
         let reset_vel = std::env::var("BIPED_RESET_VEL").is_ok_and(|v| v == "1");
         if reset_vel {
             println!("reset-velocity randomization ENABLED (AGILE reset_base/joints: lin ±0.25, ang ±0.5, joints ±1.0)");
@@ -1899,6 +1917,9 @@ impl BipedNexusBatchEnv {
             last_td_foot,
             gait_phase,
             gait_period,
+            gait_period_fast,
+            gait_period_mult: vec![1.0; num_envs],
+            gait_period_dr,
             global_step: 0,
             dbg_stance: Vec::new(),
             push_vel,
@@ -3036,9 +3057,17 @@ impl BipedNexusBatchEnv {
             if c.td_foot >= 0 {
                 self.last_td_foot[e] = c.td_foot;
             }
-            // Advance the gait clock (wraps at 1).
+            // Advance the gait clock (wraps at 1). Period optionally lerps
+            // toward `gait_period_fast` with commanded speed and carries the
+            // per-env DR multiplier.
+            let speed = (self.cmd[e].vx * self.cmd[e].vx + self.cmd[e].vy * self.cmd[e].vy)
+                .sqrt()
+                .min(0.5)
+                / 0.5;
+            let period = (self.gait_period + (self.gait_period_fast - self.gait_period) * speed)
+                * self.gait_period_mult[e];
             self.gait_phase[e] =
-                (self.gait_phase[e] + self.task.control_dt() / self.gait_period).fract();
+                (self.gait_phase[e] + self.task.control_dt() / period).fract();
             self.prev_joint_pos[e] = c.new_joint_pos;
             self.has_prev_joint_pos[e] = true;
             // Snapshot poses for this env into prev_body_poses for the next
@@ -3209,6 +3238,11 @@ impl BipedNexusBatchEnv {
         self.sensed_force[env] = [0.5 * self.robot.total_mass * 9.81; NUM_FEET];
         self.last_td_foot[env] = -1;
         self.gait_phase[env] = 0.0;
+        self.gait_period_mult[env] = if self.gait_period_dr > 0.0 {
+            1.0 + self.rng[env].range(-self.gait_period_dr, self.gait_period_dr)
+        } else {
+            1.0
+        };
         // Actuator delay: resample the lag for the new episode (from the
         // DEDICATED delay stream — the command/DR stream stays untouched) and
         // mark fresh so the first post-reset command applies from substep 0

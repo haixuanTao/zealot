@@ -62,7 +62,15 @@ MODEL_XML = _model_xml()
 PHYS_DT = 1.0 / 200.0
 DECIMATION = 4
 CONTROL_DT = PHYS_DT * DECIMATION
-GAIT_PERIOD = 0.7
+GAIT_PERIOD = float(os.environ.get("S2S_GAIT_PERIOD", "0.7"))
+# Speed-coupled cadence parity: when the policy trained with
+# BIPED_GAIT_PERIOD_FAST, the deploy clock must lerp the period by |cmd|/0.5
+# exactly like the env. Defaults to GAIT_PERIOD = constant cadence.
+GAIT_PERIOD_FAST = float(os.environ.get("S2S_GAIT_PERIOD_FAST", str(GAIT_PERIOD)))
+
+def gait_period_for(cmd_speed: float) -> float:
+    s = min(abs(cmd_speed), 0.5) / 0.5
+    return GAIT_PERIOD + (GAIT_PERIOD_FAST - GAIT_PERIOD) * s
 HIST = 5
 FALL_Z = 0.45
 TILT_LIMIT = np.deg2rad(70.0)
@@ -248,7 +256,7 @@ def main():
         o[16:28] = q - DEFAULT_POS
         o[28:40] = 0.0 if ep_t == 0 else (q - prev_q) / CONTROL_DT
         o[40:43] = projected_gravity(quat)
-        ph = (max(0, ep_t - 1) * CONTROL_DT / GAIT_PERIOD) % 1.0
+        ph = (max(0, ep_t - 1) * CONTROL_DT / gait_period_for(CMD[0])) % 1.0
         o[43], o[44] = np.sin(2 * np.pi * ph), np.cos(2 * np.pi * ph)
 
         if frames_hist is None:
