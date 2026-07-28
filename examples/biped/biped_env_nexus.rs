@@ -2805,6 +2805,13 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(0.05);
+        // Joint-velocity fault (BIPED_DOF_VEL_TERM, multiplier on each
+        // joint's hardware vel_limit; 0 disables). Real actuators fault past
+        // rated speed — flail-speed swings end the episode like an e-stop.
+        let vel_term: f32 = std::env::var("BIPED_DOF_VEL_TERM")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0);
         let sc_dt = self.task.control_dt();
         // Torque (effort) penalty: we're PD position-controlled and had NO cost
         // on joint torque, so the policy reward-hacks strained high-torque poses
@@ -2890,8 +2897,14 @@ impl BipedNexusBatchEnv {
                         let pb = poses[env_base + b as usize].translation;
                         (pa - pb).length_squared() < sc_term * sc_term
                     });
+                let vel_fault = vel_term > 0.0
+                    && (0..NUM_JOINTS).any(|i| {
+                        state.joint_vel[i].abs()
+                            > self.task.robot.joints[i].vel_limit * vel_term
+                    });
                 let fell = illegal
                     || crossed
+                    || vel_fault
                     || self.task.fell_over(&state.base)
                     || !state.base.height.is_finite();
                 let rb = self.task.reward(&state, &self.cmd[e]);
