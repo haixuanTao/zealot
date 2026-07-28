@@ -246,6 +246,7 @@ def main():
     frozen_phase = 0.0
     ep_t = 0          # control steps since episode start
     act_hist = [np.zeros(12), np.zeros(12)]  # [t-2, t-1]
+    vel_track = []  # per-step (body_vx, body_vy, yaw_rate) for direction-aware metrics
     prev_q = data.qpos[pol_q].copy()
     frames_hist = None  # 5-frame obs history (list, oldest→newest)
     attempts, survived = 1, []
@@ -295,6 +296,15 @@ def main():
         renderer.update_scene(data, camera=cam)
         ff.stdin.write(renderer.render().tobytes())
 
+        # --- heading-frame velocity tracking (direction-aware, unlike traveled_m) ---
+        qw, qx, qy, qz = data.qpos[free_q + 3:free_q + 7]
+        base_yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+        free_d = model.jnt_dofadr[0]
+        wvx, wvy = data.qvel[free_d], data.qvel[free_d + 1]
+        vel_track.append((np.cos(base_yaw) * wvx + np.sin(base_yaw) * wvy,
+                          -np.sin(base_yaw) * wvx + np.cos(base_yaw) * wvy,
+                          data.qvel[free_d + 5]))
+
         # --- fall / timeout check ---
         z = data.qpos[free_q + 2]
         up = projected_gravity(data.qpos[free_q + 3:free_q + 7])
@@ -324,6 +334,7 @@ def main():
         eps = [{"seconds": float(t), "traveled_m": float(d), "end": why}
                for (t, d, why) in survived]
         eps.append({"seconds": final_t, "traveled_m": final_d, "end": "clip_end"})
+        vt = np.array(vel_track) if vel_track else np.zeros((1, 3))
         with open(mpath, "w") as f:
             _json.dump({
                 "engine": "mujoco",
@@ -332,6 +343,7 @@ def main():
                 "command": [float(c) for c in CMD],
                 "clip_seconds": SECONDS,
                 "falls": sum(1 for e in eps if e["end"] == "fell"),
+                "mean_body_vel": [float(v) for v in vt.mean(axis=0)],
                 "episodes": eps,
             }, f, indent=1)
     if survived:
