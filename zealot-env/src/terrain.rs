@@ -22,6 +22,13 @@
 //! - **Wave**: `h = A/2·cos(2πy/λ) + A/2·sin(2πx/λ)`, `A = 0.01 + 0.24·d`,
 //!   `λ = 8/3 m` (row 19 ≈ ±0.24 m peaks), patch-local coordinates.
 //!
+//! Under every family, each patch additionally carries an up-only
+//! **pyramid-slope DC bias** ([`SLOPE_GRADE_MAX`]·d grade toward a ~2 m apex
+//! plateau, zero at patch borders): the families are zero-mean noise a stride
+//! integrates away, while a sustained grade forces the policy to hold an
+//! explicit counter-lean — making constant lean/drift biases observable to
+//! the reward (and exposing every gradient direction: ±x, ±y, diagonals).
+//!
 //! The curriculum is AGILE's exactly: per env, traveled distance (chord sum
 //! between command resamples) > 4 m counts a success, < 2 m a failure
 //! (cumulative, not consecutive); 4 successes promote, 10 failures demote,
@@ -42,6 +49,16 @@ pub const STRIP_X0: f32 = PATCH;
 pub const STRIP_HALF_W: f32 = PATCH / 2.0;
 /// Thickness of the closed terrain slab below z=0.
 pub const SLAB_BOTTOM: f32 = -0.05;
+/// Max pyramid-slope grade (rise/run) at difficulty 1 (~14°). The slope is a
+/// per-patch DC bias superimposed under EVERY family: zero-mean bump noise
+/// integrates out over a stride, so a policy's constant lean/drift biases are
+/// invisible to it — a sustained grade is the disturbance that makes them
+/// observable to the reward. Up-only (heights ≥ family field) so the flat
+/// z = 0 backstop cuboid and slab bottom stay valid.
+pub const SLOPE_GRADE_MAX: f32 = 0.25;
+/// Ramp run from patch edge before the apex plateau (m): apex ≤ 0.75 m, with
+/// a ~2 m flat top so the apex is standable.
+pub const SLOPE_RAMP: f32 = 3.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TerrainFamily {
@@ -180,6 +197,24 @@ impl TerrainStrip {
                             heights[j * (nx + 1) + i] = quantize(h);
                         }
                     }
+                }
+            }
+
+            // Pyramid-slope DC bias under the family field (see
+            // SLOPE_GRADE_MAX): h += g·min(L∞ distance to patch border,
+            // SLOPE_RAMP), g = SLOPE_GRADE_MAX·d. Zero at every patch border,
+            // so rows and the strip edges stay continuous.
+            let g = SLOPE_GRADE_MAX * ((p as f32 + rng.range(0.0, 1.0)) / ROWS as f32);
+            for i in i0..=i1.min(nx) {
+                let lx = (i as f32 * hs) - PATCH * p as f32;
+                for j in 0..=ny {
+                    let ly = j as f32 * hs;
+                    let edge = lx
+                        .min(PATCH - lx)
+                        .min(ly.min(2.0 * STRIP_HALF_W - ly))
+                        .clamp(0.0, SLOPE_RAMP);
+                    let idx = j * (nx + 1) + i;
+                    heights[idx] = quantize(heights[idx] + g * edge);
                 }
             }
         }
@@ -398,40 +433,75 @@ mod tests {
         (lo, hi)
     }
 
+    /// Slope apex bound for a row: g_max · ramp (+q for quantization).
+    fn apex(row: u32) -> f32 {
+        SLOPE_GRADE_MAX * ((row as f32 + 1.0) / ROWS as f32) * SLOPE_RAMP
+    }
+
     #[test]
     fn boxes_amplitude_pins() {
         let s = strip(TerrainFamily::Boxes);
-        // Row 0: d < 0.05 → g < 2 mm (quantized: 0 or ±5 mm edge cases).
+        // Row 0: d < 0.05 → g < 2 mm cells (+ slope apex ≤ 37.5 mm).
         let (lo, hi) = row_extremes(&s, 0);
-        assert!(hi <= 0.006 && lo >= -0.006, "row0 boxes {lo}..{hi}");
-        // Row 19: d ∈ [0.95, 1) → g ≈ 0.038..0.04; heights within ±g.
+        assert!(hi <= 0.006 + apex(0) && lo >= -0.006, "row0 boxes {lo}..{hi}");
+        // Row 19: cells within ±0.04, plus slope apex ≤ 0.75.
         let (lo, hi) = row_extremes(&s, 19);
-        assert!(hi <= 0.0405 && lo >= -0.0405, "row19 boxes {lo}..{hi}");
-        assert!(hi > 0.02 && lo < -0.02, "row19 boxes should be rough: {lo}..{hi}");
+        assert!(hi <= 0.0405 + apex(19) && lo >= -0.0405, "row19 boxes {lo}..{hi}");
+        // Cell jitter must survive on the apex plateau (slope is constant
+        // there, so any spread is the checker field): ±1 m around center.
+        let (cx, _) = TerrainStrip::patch_center(19);
+        let (mut plo, mut phi) = (f32::MAX, f32::MIN);
+        let mut rng = Lcg::new(11);
+        for _ in 0..2000 {
+            let h = s.height(cx + rng.range(-1.0, 1.0), rng.range(-1.0, 1.0));
+            plo = plo.min(h);
+            phi = phi.max(h);
+        }
+        assert!(phi - plo > 0.03, "row19 boxes plateau should stay rough: {plo}..{phi}");
     }
 
     #[test]
     fn rough_amplitude_pins() {
         let s = strip(TerrainFamily::Rough);
-        // One-sided: heights ≥ 0 everywhere (interpolation preserves bounds).
+        // One-sided family + up-only slope: heights ≥ 0 everywhere.
         let (lo0, hi0) = row_extremes(&s, 0);
-        assert!(lo0 >= -1e-6 && hi0 <= 0.2 * 0.05 + VERTICAL_SCALE, "row0 rough {lo0}..{hi0}");
+        assert!(lo0 >= -1e-6 && hi0 <= 0.2 * 0.05 + apex(0) + VERTICAL_SCALE, "row0 rough {lo0}..{hi0}");
         let (lo19, hi19) = row_extremes(&s, 19);
-        assert!(lo19 >= -1e-6, "rough is one-sided: {lo19}");
-        assert!(hi19 <= 0.2 + VERTICAL_SCALE, "row19 rough max {hi19}");
+        assert!(lo19 >= -1e-6, "rough+slope is one-sided: {lo19}");
+        assert!(hi19 <= 0.2 + apex(19) + VERTICAL_SCALE, "row19 rough max {hi19}");
         assert!(hi19 > 0.09, "row19 rough should reach near 0.2·d: {hi19}");
     }
 
     #[test]
     fn wave_amplitude_pins() {
         let s = strip(TerrainFamily::Wave);
-        // Row 19: A ≈ 0.238..0.25 → extremes near ±A.
+        // Row 19: family ±A ≈ ±0.25, plus slope apex ≤ 0.75 on the high side.
         let (lo, hi) = row_extremes(&s, 19);
-        assert!(hi <= 0.25 + VERTICAL_SCALE && lo >= -(0.25 + VERTICAL_SCALE), "row19 wave {lo}..{hi}");
-        assert!(hi > 0.17 && lo < -0.17, "row19 wave peaks: {lo}..{hi}");
-        // Row 0: A ≈ 0.01..0.022.
+        assert!(hi <= 0.25 + apex(19) + VERTICAL_SCALE && lo >= -(0.25 + VERTICAL_SCALE), "row19 wave {lo}..{hi}");
+        // Wave troughs survive near patch borders where the slope ramps to 0.
+        assert!(hi > 0.17 && lo < -0.08, "row19 wave peaks: {lo}..{hi}");
+        // Row 0: A ≈ 0.01..0.022 (+ slope apex ≤ 37.5 mm).
         let (lo, hi) = row_extremes(&s, 0);
-        assert!(hi <= 0.025 && lo >= -0.025, "row0 wave {lo}..{hi}");
+        assert!(hi <= 0.025 + apex(0) && lo >= -0.025, "row0 wave {lo}..{hi}");
+    }
+
+    #[test]
+    fn slope_bias_pins() {
+        // The DC slope is present under EVERY family: the row-19 patch center
+        // sits near the apex (g·ramp ∈ [0.71, 0.75) minus family lows ≥ −0.25),
+        // while row 0 stays near-flat. Borders stay ~0 (continuity).
+        for f in [TerrainFamily::Boxes, TerrainFamily::Rough, TerrainFamily::Wave] {
+            let s = strip(f);
+            let (cx, cy) = TerrainStrip::patch_center(19);
+            let h = s.height(cx, cy);
+            assert!(h > 0.4, "{f:?} row19 apex should carry the slope: {h}");
+            let (cx0, cy0) = TerrainStrip::patch_center(0);
+            let h0 = s.height(cx0, cy0);
+            assert!(h0.abs() <= 0.08, "{f:?} row0 should stay near-flat: {h0}");
+            // Patch border (x = start of row 19's patch, mid-y): slope term 0.
+            let hb = s.height(STRIP_X0 + PATCH * 19.0, cy);
+            assert!(hb.abs() <= 0.26, "{f:?} border should have no slope: {hb}");
+        }
     }
 
     #[test]
