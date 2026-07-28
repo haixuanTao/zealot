@@ -10,3 +10,4 @@ wandb/
 vast_nexus_ptx/
 
 bench/**/*.mp4
+target-cuda/

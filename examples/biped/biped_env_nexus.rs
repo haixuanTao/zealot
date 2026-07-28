@@ -1307,7 +1307,7 @@ pub struct BipedNexusBatchEnv {
 }
 
 /// Number of logged reward components (see [`REWARD_COMP_NAMES`]).
-pub const NUM_REWARD_COMPS: usize = 29;
+pub const NUM_REWARD_COMPS: usize = 28;
 
 /// Names of the per-component reward terms, in `rlog_comps` / `RewardLog::comps`
 /// order. The first 20 mirror `RewardBreakdown`'s live terms; the last four are
@@ -1340,7 +1340,6 @@ pub const REWARD_COMP_NAMES: [&str; NUM_REWARD_COMPS] = [
     "termination",
     "power",         // Σ|τ·q̇| mechanical-power (energy / cost-of-transport) penalty
     "gait_clock",    // dense periodic swing/stance-matching reward
-    "com_centering", // CoM-over-support-foot (low-ankle-torque single-support)
     "stand_planted", // per-airborne-foot penalty at standing command (balance, don't step)
     "feet_yaw_diff", // WBC feet_yaw_diff_l2: L/R foot yaw splay penalty
 ];
@@ -1425,12 +1424,6 @@ impl BipedNexusBatchEnv {
             .and_then(|s| s.parse::<f32>().ok())
         {
             task.weights.stand_planted = w;
-        }
-        if let Some(w) = std::env::var("BIPED_COM_CENTERING_W")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-        {
-            task.weights.com_centering = w;
         }
         // Balance-don't-step at stand: per-airborne-foot penalty while the
         // command is standing (NEGATIVE, e.g. -1.0; 0 = off). Pair with a
@@ -2906,9 +2899,8 @@ impl BipedNexusBatchEnv {
                 comps[18] = rb.feet_yaw_mean;
                 comps[19] = rb.feet_distance;
                 comps[25] = rb.gait_clock;
-                comps[26] = rb.com_centering;
-                comps[27] = rb.stand_planted;
-                comps[28] = rb.feet_yaw_diff;
+                comps[26] = rb.stand_planted;
+                comps[27] = rb.feet_yaw_diff;
                 if fell {
                     comps[23] = self.task.weights.termination;
                     reward += self.task.weights.termination;

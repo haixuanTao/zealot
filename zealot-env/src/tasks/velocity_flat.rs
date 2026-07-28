@@ -359,7 +359,7 @@ pub struct RewardWeights {
     pub single_support: f32,
     /// Penalty (per airborne foot, per step) while the command is STANDING.
     /// Makes the policy absorb small pushes with ankle/hip torque (feet
-    /// planted, CoM shifted — see `com_centering`) instead of dance-stepping
+    /// planted, CoM shifted) instead of dance-stepping
     /// in place. MODERATE by design: for a big shove a protective step (brief
     /// penalty) must stay cheaper than falling (termination), mirroring the
     /// human ankle→hip→step strategy ladder. 0 = off.
@@ -395,12 +395,6 @@ pub struct RewardWeights {
     /// the feet offset by half a cycle, `1 - 2·swing_ratio` of the cycle is
     /// double-support — the built-in "both feet down in the middle".
     pub gait_swing_ratio: f32,
-    /// CoM-centering reward: keeps the base (CoM proxy) horizontally over the
-    /// support point (centroid of contacting feet). With the CoM over the stance
-    /// foot, the gravitational moment about the ankle ≈ 0, so single-support needs
-    /// almost no ankle torque — letting the fragile 15 N·m ankle hold one-foot
-    /// balance instead of saturating. This is what lets a real step survive.
-    pub com_centering: f32,
 }
 
 impl Default for RewardWeights {
@@ -503,8 +497,6 @@ impl Default for RewardWeights {
             // swing window is penalized, so lifting on schedule
             // is clearly worth more than staying planted.
             gait_swing_ratio: 0.4, // 40% swing per foot → 20% double-support overlap
-            com_centering: 2.0,    // keep CoM over the support foot → ~0 ankle torque
-                                   // in single-support (fragile 15 N·m ankle can hold it)
         }
     }
 }
@@ -514,7 +506,7 @@ impl RewardWeights {
     /// (`BIPED_AGILE_REWARDS=1`). AGILE has NO stepping rewards — locomotion
     /// emerges from sharp tracking + terrain — so every zealot-only shaping
     /// term (gait_clock, air_time, single_support, bilateral_symmetry,
-    /// com_centering, pose, forward_progress) is zeroed here. Terms AGILE has
+    /// pose, forward_progress) is zeroed here. Terms AGILE has
     /// that we can't express (action_rate_rate, root_acc, dof_vel_limits,
     /// torque family — those live in the env's BIPED_TORQUE_W/POWER_W hooks)
     /// are noted at the call site. `flight` carries AGILE's `jumping` weight.
@@ -549,7 +541,6 @@ impl RewardWeights {
             feet_distance_ref: 0.2,
             gait_clock: 0.0,
             gait_swing_ratio: 0.4,
-            com_centering: 0.0,
         }
     }
 }
@@ -656,8 +647,6 @@ pub struct RewardBreakdown {
     /// Periodic gait-clock contribution (dense reward for matching each foot's
     /// swing/stance to the gait phase).
     pub gait_clock: f32,
-    /// CoM-centering contribution (CoM over the support point → low ankle torque).
-    pub com_centering: f32,
 }
 
 impl RewardBreakdown {
@@ -687,7 +676,6 @@ impl RewardBreakdown {
             + self.feet_yaw_diff
             + self.feet_distance
             + self.gait_clock
-            + self.com_centering
     }
 }
 
@@ -1229,31 +1217,6 @@ impl VelocityFlatTask {
             0.0
         };
 
-        // CoM centering: keep the base (CoM proxy) over the support point — the
-        // centroid of whatever feet are in contact. Offset → 0 means the CoM is
-        // over the base of support, so the ankle needs ~no torque to hold balance
-        // (crucial in single-support, where an off-center CoM saturated the 15 N·m
-        // ankle). exp kernel, active whenever at least one foot is down.
-        const COM_STD: f32 = 0.12;
-        let mut sx = 0.0;
-        let mut sy = 0.0;
-        let mut nc = 0u32;
-        for f in &state.feet {
-            if f.contact {
-                sx += f.pos_xy[0];
-                sy += f.pos_xy[1];
-                nc += 1;
-            }
-        }
-        let com_centering = if nc > 0 {
-            let dx = state.base.pos_xy[0] - sx / nc as f32;
-            let dy = state.base.pos_xy[1] - sy / nc as f32;
-            let d2 = dx * dx + dy * dy;
-            self.weights.com_centering * (-d2 / (COM_STD * COM_STD)).exp() * dt
-        } else {
-            0.0
-        };
-
         RewardBreakdown {
             track_lin_vel,
             track_ang_vel,
@@ -1278,7 +1241,6 @@ impl VelocityFlatTask {
             feet_yaw_diff,
             feet_distance,
             gait_clock,
-            com_centering,
         }
     }
 
