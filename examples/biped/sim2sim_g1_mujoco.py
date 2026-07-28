@@ -262,7 +262,7 @@ def main():
         o[16:28] = q - DEFAULT_POS
         o[28:40] = 0.0 if ep_t == 0 else (q - prev_q) / CONTROL_DT
         o[40:43] = projected_gravity(quat)
-        cmd_speed = (CMD[0]**2 + CMD[1]**2) ** 0.5
+        cmd_speed = (CMD[0]**2 + CMD[1]**2 + CMD[2]**2) ** 0.5  # incl. yaw, like the env
         if cmd_speed < 0.1 and not LEGACY_CLOCK:
             ph = frozen_phase
         else:

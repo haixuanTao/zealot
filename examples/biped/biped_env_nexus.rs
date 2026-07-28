@@ -3043,8 +3043,10 @@ impl BipedNexusBatchEnv {
             // 0.55 s at the full 0.5 m/s (stride rate carries part of the
             // speed, as in biological gait). Deterministic from command
             // history: any deploy stack reproduces it without an estimator.
-            let cmd_speed =
-                (self.cmd[e].vx * self.cmd[e].vx + self.cmd[e].vy * self.cmd[e].vy).sqrt();
+            // Same magnitude the task's standing predicate uses (INCLUDING
+            // yaw rate) — a turn-in-place command must tick the clock, or the
+            // gait reward scores against a frozen phase.
+            let cmd_speed = self.cmd[e].speed();
             if cmd_speed >= 0.1 {
                 let t = ((cmd_speed.min(0.5)) - 0.1) / 0.4;
                 let period = GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * t;
