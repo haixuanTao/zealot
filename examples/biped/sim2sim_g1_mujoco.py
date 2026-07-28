@@ -68,6 +68,8 @@ GAIT_PERIOD = float(os.environ.get("S2S_GAIT_PERIOD", "0.7"))
 # exactly like the env. Defaults to GAIT_PERIOD = constant cadence.
 GAIT_PERIOD_FAST = float(os.environ.get("S2S_GAIT_PERIOD_FAST", str(GAIT_PERIOD)))
 
+FREEZE_STAND = os.environ.get("S2S_GAIT_FREEZE_STAND") == "1"
+
 def gait_period_for(cmd_speed: float) -> float:
     s = min(abs(cmd_speed), 0.5) / 0.5
     return GAIT_PERIOD + (GAIT_PERIOD_FAST - GAIT_PERIOD) * s
@@ -238,6 +240,7 @@ def main():
     )
 
     reset()
+    frozen_phase = 0.0
     ep_t = 0          # control steps since episode start
     act_hist = [np.zeros(12), np.zeros(12)]  # [t-2, t-1]
     prev_q = data.qpos[pol_q].copy()
@@ -256,7 +259,12 @@ def main():
         o[16:28] = q - DEFAULT_POS
         o[28:40] = 0.0 if ep_t == 0 else (q - prev_q) / CONTROL_DT
         o[40:43] = projected_gravity(quat)
-        ph = (max(0, ep_t - 1) * CONTROL_DT / gait_period_for((CMD[0]**2 + CMD[1]**2) ** 0.5)) % 1.0
+        cmd_speed = (CMD[0]**2 + CMD[1]**2) ** 0.5
+        if FREEZE_STAND and cmd_speed < 0.1:
+            ph = frozen_phase
+        else:
+            ph = (max(0, ep_t - 1) * CONTROL_DT / gait_period_for(cmd_speed)) % 1.0
+            frozen_phase = ph
         o[43], o[44] = np.sin(2 * np.pi * ph), np.cos(2 * np.pi * ph)
 
         if frames_hist is None:

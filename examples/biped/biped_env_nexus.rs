@@ -1198,6 +1198,12 @@ pub struct BipedNexusBatchEnv {
     /// BIPED_GAIT_PERIOD_DR=<frac> (x U(1-frac, 1+frac)); 1.0 = off.
     gait_period_mult: Vec<f32>,
     gait_period_dr: f32,
+    /// BIPED_GAIT_FREEZE_STAND=1: hold the gait phase while the command is
+    /// standing (speed < 0.1) instead of free-running — the obs clock stops
+    /// "asking for" swings the reward no longer pays for, making stand a
+    /// distinct observation state. Phase resumes from where it froze on a
+    /// move command. Deploy stays deterministic from command history.
+    gait_freeze_stand: bool,
     /// Global control-step counter (for push-perturbation scheduling).
     global_step: u64,
     /// Debug-only per-foot stance-phase tracker (env 0). Tracks, while a foot is
@@ -1828,6 +1834,7 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
+        let gait_freeze_stand = std::env::var("BIPED_GAIT_FREEZE_STAND").as_deref() == Ok("1");
         let reset_vel = std::env::var("BIPED_RESET_VEL").is_ok_and(|v| v == "1");
         if reset_vel {
             println!("reset-velocity randomization ENABLED (AGILE reset_base/joints: lin ±0.25, ang ±0.5, joints ±1.0)");
@@ -1920,6 +1927,7 @@ impl BipedNexusBatchEnv {
             gait_period_fast,
             gait_period_mult: vec![1.0; num_envs],
             gait_period_dr,
+            gait_freeze_stand,
             global_step: 0,
             dbg_stance: Vec::new(),
             push_vel,
@@ -3060,14 +3068,16 @@ impl BipedNexusBatchEnv {
             // Advance the gait clock (wraps at 1). Period optionally lerps
             // toward `gait_period_fast` with commanded speed and carries the
             // per-env DR multiplier.
-            let speed = (self.cmd[e].vx * self.cmd[e].vx + self.cmd[e].vy * self.cmd[e].vy)
-                .sqrt()
-                .min(0.5)
-                / 0.5;
-            let period = (self.gait_period + (self.gait_period_fast - self.gait_period) * speed)
-                * self.gait_period_mult[e];
-            self.gait_phase[e] =
-                (self.gait_phase[e] + self.task.control_dt() / period).fract();
+            let cmd_speed =
+                (self.cmd[e].vx * self.cmd[e].vx + self.cmd[e].vy * self.cmd[e].vy).sqrt();
+            if !(self.gait_freeze_stand && cmd_speed < 0.1) {
+                let speed = (cmd_speed.min(0.5)) / 0.5;
+                let period = (self.gait_period
+                    + (self.gait_period_fast - self.gait_period) * speed)
+                    * self.gait_period_mult[e];
+                self.gait_phase[e] =
+                    (self.gait_phase[e] + self.task.control_dt() / period).fract();
+            }
             self.prev_joint_pos[e] = c.new_joint_pos;
             self.has_prev_joint_pos[e] = true;
             // Snapshot poses for this env into prev_body_poses for the next
