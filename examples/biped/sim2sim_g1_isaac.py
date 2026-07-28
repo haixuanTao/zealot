@@ -91,6 +91,17 @@ HELD = [
     ("wrist", 4.0, 0.2, 25.0),
 ]
 
+# Playground "home" keyframe pose for the held joints (arms bent, not
+# hanging straight) — matches the MuJoCo harness's keyframe hold.
+HELD_HOME = {
+    "left_shoulder_pitch_joint": 0.2,
+    "left_shoulder_roll_joint": 0.2,
+    "left_elbow_joint": 1.28,
+    "right_shoulder_pitch_joint": 0.2,
+    "right_shoulder_roll_joint": -0.2,
+    "right_elbow_joint": 1.28,
+}
+
 
 def load_safetensors(path):
     """Pure-numpy safetensors reader (the Isaac venv has no pip)."""
@@ -227,13 +238,13 @@ def main():
     pol_kp = np.zeros(12); pol_kd = np.zeros(12); pol_eff = np.zeros(12)
     for i, jn in enumerate(POLICY_JOINTS):
         pol_kp[i], pol_kd[i], pol_eff[i] = leg_gains(jn)
-    held = []  # (dof, kp, kd, eff) — target 0 (URDF zero pose)
+    held = []  # (dof, kp, kd, eff, q_home from the playground keyframe)
     for d, jn in enumerate(names):
         if jn in POLICY_JOINTS:
             continue
         for frag, kp, kd, eff in HELD:
             if frag in jn:
-                held.append((d, kp, kd, eff))
+                held.append((d, kp, kd, eff, HELD_HOME.get(jn, 0.0)))
                 break
     print(f"policy joints: 12, held joints: {len(held)}, total dofs: {n}")
 
@@ -247,6 +258,8 @@ def main():
     def reset():
         jp = np.zeros(n)
         jp[pol_d] = DEFAULT_POS
+        for d, _, _, _, qh in held:
+            jp[d] = qh
         yaw = rng.uniform(-0.3, 0.3)
         robot.set_world_pose(position=np.array([0.0, 0.0, 0.79]),
                              orientation=np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]))
@@ -308,8 +321,8 @@ def main():
             tau = np.zeros(n)
             tl = pol_kp * (target - jq[pol_d]) - pol_kd * jv[pol_d]
             tau[pol_d] = np.clip(tl, -pol_eff, pol_eff)
-            for d, kp, kd, eff in held:
-                tau[d] = np.clip(kp * (0.0 - jq[d]) - kd * jv[d], -eff, eff)
+            for d, kp, kd, eff, qh in held:
+                tau[d] = np.clip(kp * (qh - jq[d]) - kd * jv[d], -eff, eff)
             robot.apply_action(ArticulationAction(joint_efforts=tau))
             world.step(render=False)
 

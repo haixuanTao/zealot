@@ -80,6 +80,18 @@ HELD = [
     ("wrist", 4.0, 0.2, 25.0),
 ]
 
+# Playground "home" keyframe pose for the held joints (arms bent, not
+# hanging) — the MuJoCo harness holds these via the keyframe; zeros put the
+# arms in a visibly wrong straight-down pose and shift the CoM.
+HELD_HOME = {
+    "left_shoulder_pitch_joint": 0.2,
+    "left_shoulder_roll_joint": 0.2,
+    "left_elbow_joint": 1.28,
+    "right_shoulder_pitch_joint": 0.2,
+    "right_shoulder_roll_joint": -0.2,
+    "right_elbow_joint": 1.28,
+}
+
 
 def gait_period_for(cmd_speed):
     if LEGACY_CLOCK:
@@ -203,7 +215,7 @@ def main():
     for i, n in enumerate(POLICY_JOINTS):
         pol_kp[i], pol_kd[i], pol_eff[i] = leg_gains(n)
 
-    held = []  # (dof_idx, kp, kd, eff, q_home=0 — playground home is zeros for upper body)
+    held = []  # (dof_idx, kp, kd, eff, q_home from the playground keyframe)
     for j in robot.joints:
         n = j.name
         if n in POLICY_JOINTS or j.n_dofs != 1:
@@ -211,7 +223,8 @@ def main():
         for frag, kp, kd, eff in HELD:
             if frag in n:
                 idx = j.dofs_idx_local if hasattr(j, "dofs_idx_local") else [j.dof_idx_local]
-                held.append((int(np.atleast_1d(np.asarray(idx))[0]), kp, kd, eff, 0.0))
+                held.append((int(np.atleast_1d(np.asarray(idx))[0]), kp, kd, eff,
+                             HELD_HOME.get(n, 0.0)))
                 break
     print(f"policy joints: 12, held joints: {len(held)}")
 
@@ -226,7 +239,8 @@ def main():
         robot.set_quat(np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]))
         robot.set_dofs_position(DEFAULT_POS, pol_idx)
         if held:
-            robot.set_dofs_position(np.zeros(len(held)), [h[0] for h in held])
+            robot.set_dofs_position(np.array([h[4] for h in held]),
+                                    [h[0] for h in held])
         robot.zero_all_dofs_velocity()
 
     n_ctrl = int(SECONDS / CONTROL_DT)
