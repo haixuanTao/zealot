@@ -1410,6 +1410,12 @@ impl BipedNexusBatchEnv {
         {
             task.weights.feet_distance = w;
         }
+        if let Some(w) = std::env::var("BIPED_W_FOOT_ORIENTATION")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.foot_orientation = w;
+        }
         if let Some(w) = std::env::var("BIPED_COM_CENTERING_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
