@@ -517,12 +517,10 @@ scripts/full_unified_chain.sh   # backend -> .ll -> O3 cubins -> trainer
 
 Prerequisites: sibling checkouts `../nexus-unified`, `../vortx-unified`,
 `../khal-unified` (see the `[patch.crates-io]` table), a CUDA >= 12.8 `ptxas`,
-and libdevice. Until NVlabs/cuda-oxide PRs
-[#518](https://github.com/NVlabs/cuda-oxide/pull/518) and
-[#520](https://github.com/NVlabs/cuda-oxide/pull/520) merge, the backend is
-built from the `local/unified-bridge` branch of
-[haixuanTao/cuda-oxide](https://github.com/haixuanTao/cuda-oxide) (= upstream
-main + those two commits). Cubins are embedded at trainer build time via
+and libdevice. The backend builds from stock
+[NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide) `main` (>= `6247276`;
+our two blocking fixes, [#518](https://github.com/NVlabs/cuda-oxide/pull/518)
+and [#520](https://github.com/NVlabs/cuda-oxide/pull/520), merged 2026-07-28). Cubins are embedded at trainer build time via
 `CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D` / `..._VORTX_SHADERS` — rebuild
 the trainer after rebuilding cubins.
 
