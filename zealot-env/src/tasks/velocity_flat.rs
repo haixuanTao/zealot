@@ -283,19 +283,29 @@ impl CommandSampler {
         // sampling puts almost no probability on SLOW commands relative to
         // the reward's sharp kernel, and the terrain curriculum pays for
         // travel — the 30k-iter policy learned exactly two speeds (0 and
-        // ~±1 m/s), saturating every magnitude in between. Scaling a
-        // fraction of draws into [0.15, 0.5]× forces the slow-precision
-        // regime into the data so magnitude tracking has something to
-        // learn from.
+        // ~±1 m/s), saturating every magnitude in between. Slow draws are
+        // rescaled onto a speed in [0.12, 0.3]: the quasi-static regime where
+        // single-support balance is hardest (and sim2sim falls live), kept
+        // strictly above the 0.1 standing threshold so the gait clock runs.
         let slow_prob: f32 = std::env::var("BIPED_SLOW_PROB")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.25);
         if rng.chance(slow_prob) {
-            let k = rng.range(0.15, 0.5);
-            cmd.vx *= k;
-            cmd.vy *= k;
-            cmd.yaw_rate *= k;
+            let target = rng.range(0.12, 0.3);
+            let speed = cmd.speed();
+            if speed > 1e-6 {
+                let k = target / speed;
+                cmd.vx *= k;
+                cmd.vy *= k;
+                cmd.yaw_rate *= k;
+            }
+        }
+        // A draw below the 0.1 standing threshold is contradictory: the gait
+        // clock freezes and stand_planted engages while tracking still asks
+        // for motion. Snap it to a true stand.
+        if cmd.speed() < 0.1 {
+            return VelocityCommand::default();
         }
         cmd
     }
