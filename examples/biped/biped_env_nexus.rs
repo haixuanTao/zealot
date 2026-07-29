@@ -2812,6 +2812,14 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(1.0);
+        // Mechanical-power fault (BIPED_POWER_TERM, watts of Σ|τ·q̇| in one
+        // control step; 0 disables). Calibration: walking ≈ 350 W, the
+        // stand-tremor pathology ≈ 2000 W — sustained dither burns past the
+        // threshold while honest locomotion never approaches it.
+        let power_term: f32 = std::env::var("BIPED_POWER_TERM")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(3000.0);
         let sc_dt = self.task.control_dt();
         // Torque (effort) penalty: we're PD position-controlled and had NO cost
         // on joint torque, so the policy reward-hacks strained high-torque poses
@@ -2902,9 +2910,22 @@ impl BipedNexusBatchEnv {
                         state.joint_vel[i].abs()
                             > self.task.robot.joints[i].vel_limit * vel_term
                     });
+                let power_fault = power_term > 0.0 && {
+                    let q_target = self.task.joint_targets(&actions[e]);
+                    let mut p = 0.0f32;
+                    for i in 0..NUM_JOINTS {
+                        let j = &self.task.robot.joints[i];
+                        let tau = (j.kp * (q_target[i] - state.joint_pos[i])
+                            - j.kd * state.joint_vel[i])
+                            .clamp(-j.effort_limit, j.effort_limit);
+                        p += (tau * state.joint_vel[i]).abs();
+                    }
+                    p > power_term
+                };
                 let fell = illegal
                     || crossed
                     || vel_fault
+                    || power_fault
                     || self.task.fell_over(&state.base)
                     || !state.base.height.is_finite();
                 let rb = self.task.reward(&state, &self.cmd[e]);
