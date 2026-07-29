@@ -126,6 +126,67 @@ a {
   cursor: default;
 }
 
+/* GitHub link + star count */
+.ghBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 0.82rem;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.ghBtn:hover {
+  background: #eaf1f1;
+  border-color: #c8d5d5;
+  color: var(--ink);
+}
+
+.ghMark {
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+}
+
+.ghStars {
+  padding-left: 0.45rem;
+  margin-left: 0.1rem;
+  border-left: 1px solid var(--line);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ghBtnLarge {
+  padding: 0.6rem 1.4rem;
+  font-size: 1rem;
+  font-weight: 600;
+  background: var(--teal);
+  border-color: var(--teal);
+  color: #fff;
+}
+
+.ghBtnLarge:hover {
+  background: var(--teal-dark);
+  border-color: var(--teal-dark);
+  color: #fff;
+}
+
+.ghBtnLarge .ghMark {
+  width: 1.15rem;
+  height: 1.15rem;
+}
+
+.ghBtnLarge .ghStars {
+  border-left-color: rgba(255, 255, 255, 0.35);
+  color: rgba(255, 255, 255, 0.85);
+}
+
 .warning {
   padding: 0.7rem 1rem;
   background: #fff8e6;
