@@ -49,13 +49,21 @@ pub const STRIP_X0: f32 = PATCH;
 pub const STRIP_HALF_W: f32 = PATCH / 2.0;
 /// Thickness of the closed terrain slab below z=0.
 pub const SLAB_BOTTOM: f32 = -0.05;
-/// Max pyramid-slope grade (rise/run) at difficulty 1 (~14°). The slope is a
+/// Max pyramid-slope grade (rise/run) at difficulty 1 (~7°, override with
+/// `BIPED_SLOPE_GRADE`). Sized by the ANKLE BUDGET, not by ambition: flat
+/// walking already runs the ankle at ~34° of dorsiflexion against a 50° hard
+/// limit, and climbing a grade of X° costs roughly another X°. At the old
+/// 0.25 (14°) the joint reached ~48° — on its endstop — so steep rows both
+/// forced limit contact and (with the limit e-stops) truncated episodes,
+/// which the distance-based curriculum then read as failure and demoted.
+/// Terrain peaked at level 14.7 and retreated while terminations rose 69%.
+/// 0.125 keeps ~9° of ankle margin at the top row. The slope is a
 /// per-patch DC bias superimposed under EVERY family: zero-mean bump noise
 /// integrates out over a stride, so a policy's constant lean/drift biases are
 /// invisible to it — a sustained grade is the disturbance that makes them
 /// observable to the reward. Up-only (heights ≥ family field) so the flat
 /// z = 0 backstop cuboid and slab bottom stay valid.
-pub const SLOPE_GRADE_MAX: f32 = 0.25;
+pub const SLOPE_GRADE_MAX: f32 = 0.125;
 /// Ramp run from patch edge before the apex plateau (m): apex ≤ 0.75 m, with
 /// a ~2 m flat top so the apex is standable.
 pub const SLOPE_RAMP: f32 = 3.0;
@@ -204,7 +212,11 @@ impl TerrainStrip {
             // SLOPE_GRADE_MAX): h += g·min(L∞ distance to patch border,
             // SLOPE_RAMP), g = SLOPE_GRADE_MAX·d. Zero at every patch border,
             // so rows and the strip edges stay continuous.
-            let g = SLOPE_GRADE_MAX * ((p as f32 + rng.range(0.0, 1.0)) / ROWS as f32);
+            let gmax = std::env::var("BIPED_SLOPE_GRADE")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(SLOPE_GRADE_MAX);
+            let g = gmax * ((p as f32 + rng.range(0.0, 1.0)) / ROWS as f32);
             for i in i0..=i1.min(nx) {
                 let lx = (i as f32 * hs) - PATCH * p as f32;
                 for j in 0..=ny {
@@ -494,7 +506,7 @@ mod tests {
             let s = strip(f);
             let (cx, cy) = TerrainStrip::patch_center(19);
             let h = s.height(cx, cy);
-            assert!(h > 0.4, "{f:?} row19 apex should carry the slope: {h}");
+            assert!(h > 0.2, "{f:?} row19 apex should carry the slope: {h}");
             let (cx0, cy0) = TerrainStrip::patch_center(0);
             let h0 = s.height(cx0, cy0);
             assert!(h0.abs() <= 0.08, "{f:?} row0 should stay near-flat: {h0}");
