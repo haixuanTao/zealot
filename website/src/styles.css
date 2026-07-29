@@ -126,65 +126,84 @@ a {
   cursor: default;
 }
 
-/* GitHub link + star count */
-.ghBtn {
+/* GitHub star widget — ghbtns.com shape: "Star" button + count bubble
+   with a little pointer aimed back at it. */
+.ghWidget {
   display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.35rem 0.7rem;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: #fff;
-  color: var(--ink);
-  font-size: 0.82rem;
-  text-decoration: none;
+  align-items: stretch;
+  font-size: 0.78rem;
+  line-height: 1;
   white-space: nowrap;
-  transition: background 0.15s, border-color 0.15s;
 }
 
-.ghBtn:hover {
-  background: #eaf1f1;
-  border-color: #c8d5d5;
-  color: var(--ink);
+.ghStarBtn,
+.ghCount {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.32rem 0.55rem;
+  border: 1px solid #d5d5d5;
+  border-radius: 4px;
+  background: linear-gradient(#fcfcfc, #eff3f6);
+  color: #24292e;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.ghStarBtn:hover {
+  background: linear-gradient(#eff3f6, #e6ebf1);
+  border-color: #cfd3d6;
+  color: #24292e;
+  text-decoration: none;
+}
+
+.ghCount {
+  position: relative;
+  margin-left: 0.6rem;
+  background: #fff;
+  font-weight: 400;
+  color: #24292e;
+}
+
+/* The pointer: a bordered square rotated 45deg, half tucked behind the
+   bubble so only the two outer edges read as an arrow. */
+.ghCount::before {
+  content: '';
+  position: absolute;
+  left: -4px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin-top: -3px;
+  background: #fff;
+  border-left: 1px solid #d5d5d5;
+  border-bottom: 1px solid #d5d5d5;
+  transform: rotate(45deg);
+}
+
+.ghCount:hover {
+  color: var(--teal);
+  text-decoration: none;
 }
 
 .ghMark {
-  width: 1rem;
-  height: 1rem;
+  width: 0.95rem;
+  height: 0.95rem;
   flex: none;
 }
 
-.ghStars {
-  padding-left: 0.45rem;
-  margin-left: 0.1rem;
-  border-left: 1px solid var(--line);
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
+.ghWidgetLarge {
+  font-size: 0.95rem;
 }
 
-.ghBtnLarge {
-  padding: 0.6rem 1.4rem;
-  font-size: 1rem;
-  font-weight: 600;
-  background: var(--teal);
-  border-color: var(--teal);
-  color: #fff;
+.ghWidgetLarge .ghStarBtn,
+.ghWidgetLarge .ghCount {
+  padding: 0.55rem 0.9rem;
 }
 
-.ghBtnLarge:hover {
-  background: var(--teal-dark);
-  border-color: var(--teal-dark);
-  color: #fff;
-}
-
-.ghBtnLarge .ghMark {
-  width: 1.15rem;
-  height: 1.15rem;
-}
-
-.ghBtnLarge .ghStars {
-  border-left-color: rgba(255, 255, 255, 0.35);
-  color: rgba(255, 255, 255, 0.85);
+.ghWidgetLarge .ghMark {
+  width: 1.1rem;
+  height: 1.1rem;
 }
 
 .warning {
