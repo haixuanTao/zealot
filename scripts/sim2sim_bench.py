@@ -1,31 +1,50 @@
 #!/usr/bin/env python3
 """Cross-engine sim2sim benchmark for a zealot G1 checkpoint.
 
-Runs the SAME policy closed-loop in (a) nexus (source engine, current
+Runs the SAME policy closed-loop in the source engine (nexus, current
 production physics: d4 + 4 substeps + NEXUS_SUBSTEP_REFRESH, NF240/DR1,
-depenetration clamp) and (b) MuJoCo (mujoco_playground's official G1 29-DOF
-feetonly scene), at a fixed command set, and emits per-run metrics JSON plus
-a combined markdown/CSV table ready for release.
+depenetration clamp) and in every available foreign engine — MuJoCo
+(mujoco_playground's official G1 29-DOF feetonly scene), Genesis, and
+Isaac Sim (PhysX) — at a fixed command set, and emits per-run metrics JSON
+plus a combined markdown/CSV table ready for release.
+
+The signed body-frame forward velocity (`body_vx`) is the load-bearing
+column: traveled distance alone cannot distinguish tracking from
+anti-tracking (the v16 backward-walk exploit was invisible to it).
 
 Usage:
   python3 scripts/sim2sim_bench.py <checkpoint.safetensors> <label> [outdir]
 
-Requires: target/release/examples/biped_render_nexus (features gpu,biped_gpu),
-a python with mujoco + mujoco_playground (BENCH_PY env, default
-~/rt_build/bench-venv/bin/python), ffmpeg on PATH.
+Engines are skipped with a warning when their python is missing:
+  MuJoCo:  BENCH_PY   (default ~/rt_build/bench-venv/bin/python)
+  Genesis: GENESIS_PY (default ~/rt_build/nyx-venv/bin/python)
+  Isaac:   ISAAC_PY   (default ~/rt_build/isaac-venv/bin/python)
+Requires target/release/examples/biped_render_nexus (features gpu,biped_gpu)
+and ffmpeg on PATH.
 """
 import json, math, os, subprocess, sys
 
 CKPT = os.path.abspath(sys.argv[1])
 LABEL = sys.argv[2] if len(sys.argv) > 2 else "unlabeled"
 OUT = os.path.abspath(sys.argv[3] if len(sys.argv) > 3 else f"bench/sim2sim/{LABEL}")
-BENCH_PY = os.environ.get("BENCH_PY", os.path.expanduser("~/rt_build/bench-venv/bin/python"))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLIP_S = 15
-COMMANDS = [("stand", "0,0,0"), ("walk04", "0.4,0,0"), ("walk08", "0.8,0,0")]
+COMMANDS = [("stand", "0,0,0"), ("slow02", "0.2,0,0"),
+            ("walk04", "0.4,0,0"), ("walk08", "0.8,0,0")]
+
+# (engine, harness script, python env var, default python, extra env)
+FOREIGN = [
+    ("mujoco", "examples/biped/sim2sim_g1_mujoco.py", "BENCH_PY",
+     "~/rt_build/bench-venv/bin/python", {"MUJOCO_GL": "egl"}),
+    ("genesis", "examples/biped/sim2sim_g1_genesis.py", "GENESIS_PY",
+     "~/rt_build/nyx-venv/bin/python", {}),
+    ("isaacsim-physx", "examples/biped/sim2sim_g1_isaac.py", "ISAAC_PY",
+     "~/rt_build/isaac-venv/bin/python",
+     {"ACCEPT_EULA": "Y", "OMNI_KIT_ACCEPT_EULA": "YES", "PRIVACY_CONSENT": "Y"}),
+]
 
 # nexus eval env: production physics, nominal DR, flat ground, no actuation
-# delay (the MuJoCo leg models none), fixed command.
+# delay (the foreign models carry none), fixed command.
 NEXUS_ENV = {
     "KHAL_BACKEND": "webgpu", "BIPED_RENDER_ENVS": "1",
     "BIPED_ROBOT": "g1_29dof_agile", "BIPED_OBS_HISTORY": "5",
@@ -38,6 +57,9 @@ NEXUS_ENV = {
 
 def pitch(qx, qy, qz, qw):
     return math.degrees(math.asin(max(-1.0, min(1.0, 2 * (qw * qy - qz * qx)))))
+
+def yaw_of(qx, qy, qz, qw):
+    return math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
 
 def nexus_leg(name, cmd):
     steps = CLIP_S * 50
@@ -52,6 +74,10 @@ def nexus_leg(name, cmd):
     upto = fall if fall is not None else len(b)
     x0, y0 = b[0][0], b[0][1]
     traveled = math.hypot(b[upto-1][0]-x0, b[upto-1][1]-y0)
+    fwd = 0.0
+    for t in range(max(upto - 1, 0)):
+        yw = yaw_of(*b[t][3:7])
+        fwd += math.cos(yw) * (b[t+1][0] - b[t][0]) + math.sin(yw) * (b[t+1][1] - b[t][1])
     ankles = [i for i, n in enumerate(names) if "ankle_pitch" in n]
     apin = sum(1 for t in range(upto) for i in ankles if joints[t][i] < -0.8)
     return {
@@ -59,48 +85,60 @@ def nexus_leg(name, cmd):
         "survived_s": round(upto * 0.02, 2), "fell": fall is not None,
         "traveled_m": round(traveled, 3),
         "mean_speed": round(traveled / max(upto * 0.02, 1e-6), 3),
+        "body_vx": round(fwd / max((upto - 1) * 0.02, 1e-6), 3),
         "max_pitch_deg": round(max(abs(pitch(*f[3:7])) for f in b[:upto]), 2),
         "ankle_pinned_frac": round(apin / max(upto * len(ankles), 1), 3),
     }
 
-def mujoco_leg(name, cmd):
-    mjson = f"{OUT}/mujoco_{name}.metrics.json"
-    env = dict(os.environ, BIPED_CMD=cmd, S2S_METRICS_JSON=mjson, MUJOCO_GL="egl")
-    subprocess.run([BENCH_PY, f"{ROOT}/examples/biped/sim2sim_g1_mujoco.py",
-                    CKPT, f"{OUT}/mujoco_{name}.mp4", str(CLIP_S)],
+def foreign_leg(engine, script, py, extra_env, name, cmd):
+    mjson = f"{OUT}/{engine}_{name}.metrics.json"
+    env = dict(os.environ, BIPED_CMD=cmd, S2S_METRICS_JSON=mjson, **extra_env)
+    subprocess.run([py, f"{ROOT}/{script}",
+                    CKPT, f"{OUT}/{engine}_{name}.mp4", str(CLIP_S)],
                    env=env, check=True, capture_output=True)
     m = json.load(open(mjson))
     eps = m["episodes"]
     total_s = sum(e["seconds"] for e in eps)
     total_d = sum(e["traveled_m"] for e in eps)
     longest = max(e["seconds"] for e in eps)
+    vx = m.get("mean_body_vel", [0.0, 0.0, 0.0])[0]
     return {
-        "engine": "mujoco", "command": cmd, "clip_seconds": CLIP_S,
+        "engine": engine, "command": cmd, "clip_seconds": CLIP_S,
         "survived_s": round(longest, 2), "fell": m["falls"] > 0,
         "falls": m["falls"],
         "traveled_m": round(total_d, 3),
         "mean_speed": round(total_d / max(total_s, 1e-6), 3),
+        "body_vx": round(vx, 3),
     }
 
 def main():
     os.makedirs(OUT, exist_ok=True)
+    engines = []
+    for engine, script, var, default, extra in FOREIGN:
+        py = os.environ.get(var, os.path.expanduser(default))
+        if os.path.exists(py):
+            engines.append((engine, script, py, extra))
+        else:
+            print(f"SKIP {engine}: no python at {py} (set {var})")
     results = {"label": LABEL, "checkpoint": os.path.basename(CKPT), "runs": []}
     for name, cmd in COMMANDS:
-        for leg in (nexus_leg, mujoco_leg):
-            r = leg(name, cmd)
+        legs = [lambda n=name, c=cmd: nexus_leg(n, c)]
+        legs += [lambda e=e, s=s, p=p, x=x, n=name, c=cmd: foreign_leg(e, s, p, x, n, c)
+                 for (e, s, p, x) in engines]
+        for leg in legs:
+            r = leg()
             r["run"] = name
             results["runs"].append(r)
-            print(f'{r["engine"]:>6} {name:>7}: survived {r["survived_s"]:>5}s'
-                  f'  fell={r["fell"]}  speed {r["mean_speed"]} m/s')
+            print(f'{r["engine"]:>14} {name:>7}: survived {r["survived_s"]:>5}s'
+                  f'  fell={r["fell"]}  body_vx {r["body_vx"]:+.2f} m/s')
     with open(f"{OUT}/results.json", "w") as f:
         json.dump(results, f, indent=1)
-    # markdown table
     lines = [f"# sim2sim benchmark — {LABEL}", "",
-             "| run | engine | survived (s) | fell | mean speed (m/s) | commanded vx |",
+             "| run | engine | survived (s) | fell | body vx (m/s) | commanded vx |",
              "|---|---|---:|---|---:|---:|"]
     for r in results["runs"]:
         lines.append(f'| {r["run"]} | {r["engine"]} | {r["survived_s"]} | '
-                     f'{"yes" if r["fell"] else "no"} | {r["mean_speed"]} | '
+                     f'{"yes" if r["fell"] else "no"} | {r["body_vx"]:+.2f} | '
                      f'{r["command"].split(",")[0]} |')
     open(f"{OUT}/results.md", "w").write("\n".join(lines) + "\n")
     print(f"\nwrote {OUT}/results.json + results.md")
