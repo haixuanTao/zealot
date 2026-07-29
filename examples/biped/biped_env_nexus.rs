@@ -37,7 +37,12 @@ use rapier3d::prelude::*;
 use rayon::prelude::*;
 use roxmltree::Node;
 use std::collections::HashMap;
+// `std::time::Instant::now()` panics on wasm32-unknown-unknown; `web-time`
+// forwards to `performance.now()` there and re-exports std everywhere else.
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 use zealot_env::obs_history::ObsHistory;
 use zealot_env::rng::Lcg;
 use zealot_env::terrain::{TerrainCurriculum, TerrainFamily, TerrainStrip};
@@ -53,6 +58,32 @@ use zealot_env::tasks::velocity_flat::{
 // the inner solver loop doubles the per-step kernel work for marginal stability
 // gain at our timescales.
 const SOLVER_ITERS: u32 = 8;
+
+/// Programmatic override for `BIPED_DECIMATION` — for wasm demos, where env
+/// vars can't be set (`std::env::set_var` panics on wasm32-unknown-unknown).
+pub static DECIMATION_OVERRIDE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Programmatic overrides for the `BIPED_*` sim-param knobs (same wasm
+/// rationale as [`DECIMATION_OVERRIDE`]). Consulted BEFORE the process
+/// environment by the sim-param reads in `build_scene`.
+pub static ENV_OVERRIDES: std::sync::OnceLock<
+    std::collections::HashMap<&'static str, &'static str>,
+> = std::sync::OnceLock::new();
+
+/// `std::env::var` with the [`ENV_OVERRIDES`] table taking precedence. Every
+/// `BIPED_*`/`NEXUS_*` knob in this file reads through this, so wasm demos
+/// (no process environment) can configure the env in code.
+fn env_var(k: &str) -> Result<String, std::env::VarError> {
+    if let Some(v) = ENV_OVERRIDES.get().and_then(|m| m.get(k)) {
+        return Ok((*v).to_string());
+    }
+    std::env::var(k)
+}
+
+/// [`env_var`], `Option`-shaped.
+fn env_or_override(k: &str) -> Option<String> {
+    env_var(k).ok()
+}
 
 /// Per-phase wall-time accumulators populated by `BipedNexusBatchEnv::step`.
 /// Use `take_step_timings` to read + reset. `Instant::now()` is cheap (~50 ns
@@ -272,7 +303,7 @@ pub fn parse_mjcf(xml: &str) -> Vec<MjBody> {
 /// MJCF path for the robot selected by `BIPED_ROBOT` (see
 /// [`RobotSpec::from_env`]); `BIPED_MJCF` overrides it with an explicit path.
 pub fn default_mjcf_path() -> String {
-    if let Ok(p) = std::env::var("BIPED_MJCF") {
+    if let Ok(p) = env_var("BIPED_MJCF") {
         return p;
     }
     RobotSpec::from_env().mjcf_path().to_string_lossy().into_owned()
@@ -339,7 +370,7 @@ pub fn load_mesh_hulls(mjcf: &mut [MjBody], xml: &str) {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
-    let asset_dir = std::env::var("BIPED_MESH_DIR")
+    let asset_dir = env_var("BIPED_MESH_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| base.join(meshdir));
     for b in mjcf.iter_mut() {
@@ -534,31 +565,92 @@ fn build_env_scene(
     let mut colliders = ColliderSet::new();
     let impulse = ImpulseJointSet::new();
     let mut multibody = MultibodyJointSet::new();
+    // (joint handle, injected angle) pairs collected while inserting joints —
+    // consumed by the BIPED_INIT_POSE coordinate seeding below.
+    let mut init_joint_handles: Vec<(MultibodyJointHandle, f32)> = Vec::new();
 
     // FK world poses with initial-pose jitter on the root: yaw + roll + pitch
     // + height. Joint angles stay at neutral (the multibody rest pose).
     // Composing intrinsic ZYX so yaw is the outermost rotation (the typical
     // RL convention — yaw randomises heading, roll/pitch perturb upright).
+    // BIPED_INIT_RP="roll,pitch" (rad) adds a fixed base tilt on top of the
+    // template's sampled spawn orientation — snapshot replay of a real-robot
+    // IMU attitude (see BIPED_INIT_POSE below).
+    let (init_roll, init_pitch) = env_var("BIPED_INIT_RP")
+        .ok()
+        .and_then(|s| {
+            let (r, p) = s.split_once(',')?;
+            Some((r.trim().parse().ok()?, p.trim().parse().ok()?))
+        })
+        .unwrap_or((0.0f32, 0.0f32));
     let root_rot = Rotation::from_rotation_z(dr.spawn_yaw)
-        * Rotation::from_rotation_y(dr.spawn_pitch)
-        * Rotation::from_rotation_x(dr.spawn_roll);
+        * Rotation::from_rotation_y(dr.spawn_pitch + init_pitch)
+        * Rotation::from_rotation_x(dr.spawn_roll + init_roll);
     // BIPED_FREEFALL_Z lifts the spawn clear of the ground so the robot is in
     // TRUE contact-free free-fall — the clean g/M-consistency test (pre-contact
     // generalized accel `a` must equal pure free-fall: base linear = g, all joints
     // ≈ 0). Diagnostic only.
-    let ff_z: f32 = std::env::var("BIPED_FREEFALL_Z")
+    let ff_z: f32 = env_var("BIPED_FREEFALL_Z")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
     let root_pos = Vec3::new(0.0, 0.0, robot.spawn_z + dr.spawn_z_offset + ff_z);
     let root_pose = Pose::from_parts(root_pos, root_rot);
+    // BIPED_INIT_POSE="left_knee_joint=0.59;left_elbow_joint=1.4;..." spawns
+    // the scene with the named hinges rotated to the given angles (rad) —
+    // snapshot replay of a real-robot pose. Every hinge in these models turns
+    // about the CHILD's local +Z, so the rotation composes after `local_quat`;
+    // the multibody picks the joint coordinate up from the relative body poses
+    // at insertion, and `joint_angles_for` reads it back unchanged because
+    // `actuated_rest_quat` stays the UNROTATED MJCF local quat. Unknown joint
+    // names are ignored. When set, the whole robot is auto-shifted vertically
+    // so the lowest sole point spawns 2 mm above the ground (the recorded z of
+    // the real base is unknown — feet-on-floor is the reconstruction).
+    let init_pose: HashMap<String, f32> = env_var("BIPED_INIT_POSE")
+        .map(|s| {
+            s.split(';')
+                .filter_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    Some((k.trim().to_string(), v.trim().parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut world: Vec<Pose> = Vec::with_capacity(mjcf.len());
     for b in mjcf {
         let w = match b.parent {
             None => root_pose,
-            Some(p) => world[p] * Pose::from_parts(b.local_pos, b.local_quat),
+            Some(p) => {
+                let q0 = b
+                    .joint
+                    .as_deref()
+                    .and_then(|j| init_pose.get(j).copied())
+                    .unwrap_or(0.0);
+                world[p]
+                    * Pose::from_parts(
+                        b.local_pos,
+                        b.local_quat * Rotation::from_rotation_z(q0),
+                    )
+            }
         };
         world.push(w);
+    }
+    if !init_pose.is_empty() {
+        let mut min_z = f32::INFINITY;
+        for (i, b) in mjcf.iter().enumerate() {
+            for (a, c, r) in &b.capsules {
+                for p in [a, c] {
+                    let z = (world[i] * *p).z - r;
+                    min_z = min_z.min(z);
+                }
+            }
+        }
+        if min_z.is_finite() {
+            let dz = 0.002 - min_z;
+            for w in &mut world {
+                *w = Pose::from_parts(w.translation + Vec3::new(0.0, 0.0, dz), w.rotation);
+            }
+        }
     }
 
     let mut handles = Vec::with_capacity(mjcf.len());
@@ -577,7 +669,7 @@ fn build_env_scene(
         let (d, o) = (b.inertia_diag, b.inertia_offdiag);
         // DIAG-INERTIA A/B (diagnostic): zero the off-diagonals to isolate the
         // principal-frame inertia from other effects.
-        let o = if std::env::var("BIPED_DIAG_INERTIA").is_ok() {
+        let o = if env_var("BIPED_DIAG_INERTIA").is_ok() {
             Vec3::ZERO
         } else {
             o
@@ -655,7 +747,7 @@ fn build_env_scene(
             hi += pad;
             let he = ((hi - lo) * 0.5).max(Vec3::splat(1e-3));
             let mut center = (hi + lo) * 0.5;
-            if std::env::var("BIPED_DBG_FOOT").is_ok() {
+            if env_var("BIPED_DBG_FOOT").is_ok() {
                 eprintln!("[dbgf] link {} box lo {:?} hi {:?} center {:?} he {:?}", b.name, lo, hi, center, he);
             }
             // Foot collider shape. Default CAPSULE (rounded sole): nexus's flat box
@@ -675,7 +767,7 @@ fn build_env_scene(
             let foot_shape = match dr.foot_shape_id {
                 1 => "box".to_string(),
                 2 => "capsule".to_string(),
-                _ => std::env::var("BIPED_FOOT_SHAPE").unwrap_or_else(|_| "capsule".to_string()),
+                _ => env_or_override("BIPED_FOOT_SHAPE").unwrap_or_else(|| "capsule".to_string()),
             };
             let convex_cb = if foot_shape == "convex" && !b.mesh_pts.is_empty() {
                 ColliderBuilder::convex_hull(&b.mesh_pts)
@@ -708,9 +800,31 @@ fn build_env_scene(
                 };
                 let radius = he_arr[wide_ax].max(1e-3);
                 let half_height = (he_arr[long_ax] - radius).max(1e-3);
-                // Preserve the sole-bottom height: capsule bottom is center−radius
-                // vs the box's center−he[tax]; shift the center up by the difference.
-                let shift = radius - he_arr[tax];
+                // Preserve the sole-bottom height ON THE SOLE SIDE of the
+                // thickness axis. The sole plane lies on whichever side of the
+                // link origin the rail centerlines sit (the ankle joint is
+                // always above the sole), so `down` = sign of the centerline
+                // plane along `tax`. The capsule's sole-side extreme is
+                // center ± radius vs the box's center ± he[tax]; shift the
+                // center so those coincide. Shifting toward the WRONG side
+                // (the old unconditional `+= radius − he`) leaves the capsule
+                // 2·(radius − he) too thick under the sole — the G1's
+                // converter frame has the sole on the +axis side and the robot
+                // rode ~4 cm above the ground on an invisible fat foot.
+                let center_tax = match tax {
+                    0 => center.x,
+                    1 => center.y,
+                    _ => center.z,
+                };
+                let mut down = if center_tax >= 0.0 { 1.0 } else { -1.0 };
+                // BIPED_FOOT_FAT=1: replicate the PRE-FIX collider (shift
+                // toward the wrong side → capsule 2·(radius−he) thicker under
+                // the sole). A/B knob for comparing against results taken
+                // before the sole-side fix — e.g. the champagne stand tuning.
+                if env_or_override("BIPED_FOOT_FAT").as_deref() == Some("1") {
+                    down = -down;
+                }
+                let shift = (radius - he_arr[tax]) * -down;
                 match tax {
                     0 => center.x += shift,
                     1 => center.y += shift,
@@ -755,7 +869,7 @@ fn build_env_scene(
     // boundary — a degenerate brace that doesn't balance and doesn't transfer to
     // MuJoCo. Real limits (the per-joint MJCF range) force genuine balance,
     // matching WBC's soft_joint_pos_limit_factor=0.9. ~1.7x iter cost.
-    let joint_limits_on = std::env::var("BIPED_JOINT_LIMITS")
+    let joint_limits_on = env_var("BIPED_JOINT_LIMITS")
         .map(|v| v != "0")
         .unwrap_or(true);
     for (i, b) in mjcf.iter().enumerate() {
@@ -805,7 +919,7 @@ fn build_env_scene(
         // instead of PD-holding them. The held-gains default is underdamped:
         // during a passive stand the arms swing ~7cm in 1.6s — a moving-COM
         // disturbance that alone drives a constant base-pitch drift.
-        let lock_held = spec.is_none() && std::env::var("BIPED_LOCK_HELD").is_ok();
+        let lock_held = spec.is_none() && env_var("BIPED_LOCK_HELD").is_ok();
         let axes = if lock_held {
             locked | JointAxesMask::ANG_Z
         } else {
@@ -831,7 +945,7 @@ fn build_env_scene(
         // survives the full 6 s in MuJoCo (vs 1.7 s on AccelerationBased — the
         // inertia-decoupled tracking the policy used to overfit to). Opt back into
         // the old AccelerationBased motor with BIPED_ACCEL_MOTOR=1 for A/B.
-        let motor_model = if std::env::var("BIPED_ACCEL_MOTOR").is_ok() {
+        let motor_model = if env_or_override("BIPED_ACCEL_MOTOR").is_some() {
             MotorModel::AccelerationBased
         } else {
             MotorModel::ForceBased
@@ -845,16 +959,37 @@ fn build_env_scene(
         // the MuJoCo transfer model and the real robot use. No runtime scaling.
         // BIPED_KP_SCALE / BIPED_KD_SCALE remain only as optional diagnostics
         // (default 1.0); leave them unset for the production gains.
-        let kp_scale: f32 = std::env::var("BIPED_KP_SCALE")
-            .ok()
+        let kp_scale: f32 = env_or_override("BIPED_KP_SCALE")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
-        let kd_scale: f32 = std::env::var("BIPED_KD_SCALE")
-            .ok()
+        let kd_scale: f32 = env_or_override("BIPED_KD_SCALE")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
+        // Held (non-action) joints hold target 0 by default — Unitree's
+        // joint-zero convention, which for the arms is the elbows-bent-90°
+        // CAD zero. BIPED_HELD_POSE=natural holds the upper body at the
+        // model's "stand" keyframe instead (arms at the sides, elbows
+        // relaxed) — cosmetic for demos; the MuJoCo sim2sim harness holds
+        // the same natural pose and the policy is indifferent. Policy
+        // joints' targets are overwritten every control step either way.
+        let hold_target = if env_or_override("BIPED_HELD_POSE").as_deref() == Some("natural") {
+            const NATURAL: &[(&str, f32)] = &[
+                ("left_shoulder_pitch_joint", 0.2),
+                ("left_shoulder_roll_joint", 0.2),
+                ("left_elbow_joint", 1.28),
+                ("right_shoulder_pitch_joint", 0.2),
+                ("right_shoulder_roll_joint", -0.2),
+                ("right_elbow_joint", 1.28),
+            ];
+            NATURAL
+                .iter()
+                .find(|(n, _)| jname.as_str() == *n)
+                .map_or(0.0, |&(_, a)| a)
+        } else {
+            0.0
+        };
         if !lock_held {
-            joint.set_motor_position(JointAxis::AngZ, 0.0, kp * kp_scale, kd * kd_scale);
+            joint.set_motor_position(JointAxis::AngZ, hold_target, kp * kp_scale, kd * kd_scale);
             joint.set_motor_max_force(JointAxis::AngZ, effort);
         }
         // Enforce the free axis's position limits — OFF by default (set
@@ -871,10 +1006,39 @@ fn build_env_scene(
             let (lo, hi) = b.joint_range.unwrap_or(pos_limit);
             joint.set_limits(JointAxis::AngZ, [lo, hi]);
         }
-        multibody.insert(handles[parent], handles[i], joint, true);
+        let jh = multibody.insert(handles[parent], handles[i], joint, true);
+        if let (Some(jh), Some(&q0)) = (jh, init_pose.get(jname.as_str())) {
+            if q0 != 0.0 {
+                init_joint_handles.push((jh, q0));
+            }
+        }
         mb_link_of_mjcf.insert(i, next_mb_link);
         name_to_link.insert(jname.clone(), next_mb_link);
         next_mb_link += 1;
+    }
+
+    // BIPED_INIT_POSE part 2: seed the multibody's GENERALIZED COORDINATES to
+    // match the injected body poses. Joint insertion always starts every
+    // coordinate at zero regardless of where the bodies sit, and the solver
+    // runs FK from coordinates — without this the whole robot snaps back to
+    // the neutral pose on step 1 (straight legs punch ~10 cm into the ground
+    // and the depenetration launches it airborne).
+    if let Some(&(h0, _)) = init_joint_handles.first() {
+        let targets: Vec<(usize, f32)> = init_joint_handles
+            .iter()
+            .filter_map(|&(h, q0)| {
+                let (mb, link_id) = multibody.get(h)?;
+                Some((mb.link(link_id)?.assembly_id(), q0))
+            })
+            .collect();
+        if let Some((mb, _)) = multibody.get_mut(h0) {
+            let mut disp = vec![0.0f32; mb.ndofs()];
+            for (aid, q0) in targets {
+                disp[aid] = q0;
+            }
+            mb.apply_displacements(&disp);
+            mb.forward_kinematics(&bodies, true);
+        }
     }
 
     // Ground (Z-up). With terrain on, the cuboid stretches to backstop the
@@ -927,11 +1091,10 @@ fn build_env_scene(
     // Sim params: per-env contact softness via DR. Env overrides let us A/B the
     // contact-solver knobs against the WBC-AGILE-matched config without a rebuild
     // each time (BIPED_SOLVER_ITERS / BIPED_CONTACT_NF / BIPED_CONTACT_DR).
-    let env_f32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
+    let env_f32 = |k: &str| env_or_override(k).and_then(|s| s.parse::<f32>().ok());
     let mut sp = RbdSimParams::default();
     sp.dt = task_dt;
-    sp.num_solver_iterations = std::env::var("BIPED_SOLVER_ITERS")
-        .ok()
+    sp.num_solver_iterations = env_or_override("BIPED_SOLVER_ITERS")
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(SOLVER_ITERS);
     sp.contact_natural_frequency =
@@ -1364,7 +1527,7 @@ impl BipedNexusBatchEnv {
         // Convex-hull foot collider path: load the link meshes once so the scene
         // builder can hull them (BIPED_FOOT_SHAPE=convex). Default capsule path
         // skips this entirely.
-        if std::env::var("BIPED_FOOT_SHAPE").as_deref() == Ok("convex") {
+        if env_var("BIPED_FOOT_SHAPE").as_deref() == Ok("convex") {
             load_mesh_hulls(&mut mjcf, mjcf_xml);
         }
         let robot = RobotSpec::from_env();
@@ -1376,9 +1539,10 @@ impl BipedNexusBatchEnv {
         // vary ONLY how often the contact manifold is refreshed — the
         // deconfounding test for the "stale multibody contact across substeps"
         // hypothesis. Diagnostic only.
-        if let Some(d) = std::env::var("BIPED_DECIMATION")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
+        if let Some(d) = DECIMATION_OVERRIDE
+            .get()
+            .copied()
+            .or_else(|| env_var("BIPED_DECIMATION").ok().and_then(|s| s.parse().ok()))
         {
             task.decimation = d;
             task.sim_dt = 0.02 / d as f32;
@@ -1388,13 +1552,13 @@ impl BipedNexusBatchEnv {
         // PERIOD is BIPED_GAIT_PERIOD (read below — larger = slower,
         // lower-frequency weight transfer). These two shape how hard the
         // policy locks to that clock and the swing/stance split:
-        if let Some(w) = std::env::var("BIPED_GAIT_CLOCK_W")
+        if let Some(w) = env_var("BIPED_GAIT_CLOCK_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
         {
             task.weights.gait_clock = w;
         }
-        if let Some(sr) = std::env::var("BIPED_GAIT_SWING_RATIO")
+        if let Some(sr) = env_var("BIPED_GAIT_SWING_RATIO")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
         {
@@ -1404,13 +1568,13 @@ impl BipedNexusBatchEnv {
         // (slow gait clocks) are only cheap for the fragile ankles if the
         // CoM rides over the stance foot — raise this together with
         // BIPED_GAIT_PERIOD.
-        if let Some(w) = std::env::var("BIPED_W_FEET_DISTANCE")
+        if let Some(w) = env_var("BIPED_W_FEET_DISTANCE")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
         {
             task.weights.feet_distance = w;
         }
-        if let Some(w) = std::env::var("BIPED_COM_CENTERING_W")
+        if let Some(w) = env_var("BIPED_COM_CENTERING_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
         {
@@ -1420,7 +1584,7 @@ impl BipedNexusBatchEnv {
         // command is standing (NEGATIVE, e.g. -1.0; 0 = off). Pair with a
         // raised BIPED_STAND_PROB so the policy actually trains the quiet
         // stance, and with pushes on so it learns the ankle/hip strategy.
-        if let Some(w) = std::env::var("BIPED_STAND_PLANTED_W")
+        if let Some(w) = env_var("BIPED_STAND_PLANTED_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
         {
@@ -1433,7 +1597,7 @@ impl BipedNexusBatchEnv {
         // points per collider pair before the solvers (training-grade
         // approximation; flat-ground contacts unaffected). Biggest terrain
         // perf lever — the mb contact-constraint kernels scale with points.
-        if std::env::var("BIPED_CONTACT_REDUCE").as_deref() == Ok("1") {
+        if env_var("BIPED_CONTACT_REDUCE").as_deref() == Ok("1") {
             pipeline.contact_reduction = true;
             println!("contact reduction ENABLED (per-pair manifolds merged to ≤4 points)");
         }
@@ -1448,7 +1612,7 @@ impl BipedNexusBatchEnv {
         // pins its contact μ (the render uses this template, so the knob must reach
         // it — otherwise friction A/B on the rendered env is a no-op).
         template_dr[0] = DrParams::default();
-        if let Some(f) = std::env::var("BIPED_FRICTION")
+        if let Some(f) = env_var("BIPED_FRICTION")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
         {
@@ -1459,13 +1623,26 @@ impl BipedNexusBatchEnv {
         // in ONE SharedShape (cloned across that family's envs so nexus dedupes
         // the mesh buffers to 3 uploads). ORIENTED pseudo-normals are required
         // by the nexus trimesh contact path; the strips are closed slabs.
-        let terrain_on = std::env::var("BIPED_TERRAIN").as_deref() == Ok("1");
+        let terrain_on = env_var("BIPED_TERRAIN").as_deref() == Ok("1");
         let terrain_build = if terrain_on {
             let t0 = Instant::now();
+            // BIPED_TERRAIN_AMP (amplitude multiplier, default 1) and
+            // BIPED_TERRAIN_SLOPE_DEG (uphill grade along +X, default 0):
+            // demo-facing shape knobs; defaults reproduce training terrain.
+            let params = zealot_env::terrain::TerrainParams {
+                amp: env_var("BIPED_TERRAIN_AMP")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(1.0),
+                slope: env_var("BIPED_TERRAIN_SLOPE_DEG")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .map_or(0.0, |deg| deg.clamp(0.0, 45.0).to_radians().tan()),
+            };
             let strips = [
-                TerrainStrip::generate(TerrainFamily::Boxes, seed),
-                TerrainStrip::generate(TerrainFamily::Rough, seed),
-                TerrainStrip::generate(TerrainFamily::Wave, seed),
+                TerrainStrip::generate_with(TerrainFamily::Boxes, seed, params),
+                TerrainStrip::generate_with(TerrainFamily::Rough, seed, params),
+                TerrainStrip::generate_with(TerrainFamily::Wave, seed, params),
             ];
             let mk_shape = |verts: Vec<[f32; 3]>, tris: Vec<[u32; 3]>| -> SharedShape {
                 let pts: Vec<_> = verts
@@ -1546,7 +1723,7 @@ impl BipedNexusBatchEnv {
         // (per batch). Required before BIPED_GRAPH capture on terrain — the
         // lazy in-step resize can't run once a CUDA graph is captured, and
         // overflowing pairs are silently dropped (feet sink into the mesh).
-        if let Some(cap) = std::env::var("BIPED_CONTACT_CAP")
+        if let Some(cap) = env_var("BIPED_CONTACT_CAP")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
         {
@@ -1561,12 +1738,12 @@ impl BipedNexusBatchEnv {
         // foot-height proxy (which can't tell a planted foot from one hovering
         // just under the threshold). Threshold BIPED_CONTACT_FORCE_N (default
         // 1.0 N = AGILE's feet_slip contact_threshold).
-        let contact_sense = std::env::var("BIPED_CONTACT_SENSE").is_ok_and(|v| v == "1");
-        let contact_force_n = std::env::var("BIPED_CONTACT_FORCE_N")
+        let contact_sense = env_var("BIPED_CONTACT_SENSE").is_ok_and(|v| v == "1");
+        let contact_force_n = env_var("BIPED_CONTACT_FORCE_N")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(1.0);
-        let solver_iters = std::env::var("BIPED_SOLVER_ITERS")
+        let solver_iters = env_var("BIPED_SOLVER_ITERS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(SOLVER_ITERS);
@@ -1575,7 +1752,7 @@ impl BipedNexusBatchEnv {
         // the sensed impulse is accumulated over the whole physics step →
         // divide by sim_dt. Implicit-coriolis rebuilds per substep → the
         // readout is the last substep's impulse → divide by the substep dt.
-        let implicit_coriolis = std::env::var("BIPED_IMPLICIT_CORIOLIS").as_deref() == Ok("1");
+        let implicit_coriolis = env_var("BIPED_IMPLICIT_CORIOLIS").as_deref() == Ok("1");
         let sensor_inv_dt = if implicit_coriolis {
             solver_iters as f32 / task.sim_dt
         } else {
@@ -1606,7 +1783,7 @@ impl BipedNexusBatchEnv {
         // empty solver dispatches. Under-provisioning is self-healing but bad:
         // the coloring-failed ratchet adds +5. Keep constant per run (graph
         // capture records the pass count).
-        if let Some(mc) = std::env::var("BIPED_MAX_COLORS")
+        if let Some(mc) = env_var("BIPED_MAX_COLORS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
         {
@@ -1628,7 +1805,7 @@ impl BipedNexusBatchEnv {
         //    training iteration @2048 envs.
         // NOTE: this changes the physics slightly — train and eval with the
         // same setting.
-        let implicit_coriolis = std::env::var("BIPED_IMPLICIT_CORIOLIS")
+        let implicit_coriolis = env_var("BIPED_IMPLICIT_CORIOLIS")
             .map(|v| v != "0")
             .unwrap_or(false);
         state
@@ -1636,7 +1813,7 @@ impl BipedNexusBatchEnv {
             .set_implicit_coriolis(implicit_coriolis);
         // Decomposed refresh probe: implicit mode's per-substep dynamics +
         // constraint rebuild cadence with the explicit (coriolis-free) kernels.
-        let refresh_mode = std::env::var("NEXUS_SUBSTEP_REFRESH").unwrap_or_default();
+        let refresh_mode = env_or_override("NEXUS_SUBSTEP_REFRESH").unwrap_or_default();
         state
             .multibodies_mut()
             .set_substep_refresh(refresh_mode == "1");
@@ -1676,7 +1853,7 @@ impl BipedNexusBatchEnv {
         // layout as frictionloss; 0 for the root DOFs. Scaled by BIPED_ARM (A/B).
         {
             let dpb = idx.dofs_per_batch as usize;
-            let arm_scale: f32 = std::env::var("BIPED_ARM")
+            let arm_scale: f32 = env_var("BIPED_ARM")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1.0);
@@ -1767,7 +1944,7 @@ impl BipedNexusBatchEnv {
         // BIPED_MOTOR_DELAY=min,max (or just max → min=0), in physics
         // substeps. `0,0` is a valid ENABLED config (constant zero delay —
         // used by the staging-equivalence check); unset/unparseable = off.
-        let motor_delay: Option<(u32, u32)> = std::env::var("BIPED_MOTOR_DELAY").ok().and_then(
+        let motor_delay: Option<(u32, u32)> = env_var("BIPED_MOTOR_DELAY").ok().and_then(
             |s| {
                 let p: Vec<u32> = s.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
                 match p.as_slice() {
@@ -1794,23 +1971,23 @@ impl BipedNexusBatchEnv {
         let air_time = vec![[0.0f32; NUM_FEET]; num_envs];
         let last_td_foot = vec![-1i8; num_envs];
         let gait_phase = vec![0.0f32; num_envs];
-        let gait_period = std::env::var("BIPED_GAIT_PERIOD")
+        let gait_period = env_var("BIPED_GAIT_PERIOD")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.7);
-        let reset_vel = std::env::var("BIPED_RESET_VEL").is_ok_and(|v| v == "1");
+        let reset_vel = env_var("BIPED_RESET_VEL").is_ok_and(|v| v == "1");
         if reset_vel {
             println!("reset-velocity randomization ENABLED (AGILE reset_base/joints: lin ±0.25, ang ±0.5, joints ±1.0)");
         }
-        let push_vel = std::env::var("BIPED_PUSH_VEL")
+        let push_vel = env_var("BIPED_PUSH_VEL")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
-        let push_interval = std::env::var("BIPED_PUSH_INTERVAL")
+        let push_interval = env_var("BIPED_PUSH_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(175);
-        let push_angvel = std::env::var("BIPED_PUSH_ANGVEL")
+        let push_angvel = env_var("BIPED_PUSH_ANGVEL")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
@@ -1870,7 +2047,22 @@ impl BipedNexusBatchEnv {
                         )
                     })
                     .collect();
-                let curriculum = rng.iter_mut().map(TerrainCurriculum::init).collect();
+                // BIPED_TERRAIN_INIT_LEVEL: fixed starting difficulty (demo
+                // knob; default = AGILE's U{0, 1}). Promotion/demotion still
+                // runs from there.
+                let init_level: Option<u32> = env_var("BIPED_TERRAIN_INIT_LEVEL")
+                    .ok()
+                    .and_then(|s| s.parse().ok());
+                let curriculum = rng
+                    .iter_mut()
+                    .map(|r| {
+                        let mut c = TerrainCurriculum::init(r);
+                        if let Some(l) = init_level {
+                            c.level = l.min(zealot_env::terrain::ROWS as u32 - 1);
+                        }
+                        c
+                    })
+                    .collect();
                 TerrainSetup {
                     strips,
                     curriculum,
@@ -1900,7 +2092,7 @@ impl BipedNexusBatchEnv {
             has_prev_pose,
             foot_sole_local,
             sampler_default,
-            torque_scale: std::env::var("BIPED_TORQUE_W")
+            torque_scale: env_var("BIPED_TORQUE_W")
                 .ok()
                 .and_then(|s| s.parse::<f32>().ok())
                 .unwrap_or(0.1),
@@ -2322,7 +2514,7 @@ impl BipedNexusBatchEnv {
         // feet as permanently airborne). 0.05 sits just above the planted height
         // and well below a real swing (foot_clearance_target 0.08), so a planted
         // foot reads contact and a lifted foot reads swing. Overridable for tuning.
-        let contact_z: f32 = std::env::var("BIPED_CONTACT_Z")
+        let contact_z: f32 = env_var("BIPED_CONTACT_Z")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(self.robot.foot_contact_z);
@@ -2596,7 +2788,7 @@ impl BipedNexusBatchEnv {
         let t = Instant::now();
         let mut ran_physics = false;
         #[cfg(feature = "cuda_backend")]
-        if std::env::var("BIPED_GRAPH").map(|v| v != "0").unwrap_or(true) {
+        if env_var("BIPED_GRAPH").map(|v| v != "0").unwrap_or(true) {
             if let Some(g) = self.physics_graph.as_ref() {
                 g.0.launch().expect("physics graph replay");
                 ran_physics = true;
@@ -2620,7 +2812,7 @@ impl BipedNexusBatchEnv {
             // BIPED_SOLVER_ITERS=1 each pipeline.step is one substep → per-substep
             // foot trajectory. Forces the non-graph path (this branch) implicitly
             // since the trace readback syncs per step.
-            let trace = std::env::var("BIPED_SUBSTEP_TRACE").is_ok();
+            let trace = env_var("BIPED_SUBSTEP_TRACE").is_ok();
             for i in 0..self.task.decimation {
                 let _ = self.pipeline.step(&self.gpu, &mut self.state, None);
                 if trace {
@@ -2769,7 +2961,7 @@ impl BipedNexusBatchEnv {
         // (the −0.03 case) without over-terminating legitimate low stances —
         // 0.06 was too tight and killed the learning gradient. Set large-negative
         // to disable entirely.
-        let illegal_z = std::env::var("BIPED_ILLEGAL_Z")
+        let illegal_z = env_var("BIPED_ILLEGAL_Z")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(0.0);
@@ -2787,11 +2979,11 @@ impl BipedNexusBatchEnv {
         // workspace doesn't self-collide, so an explicit distance penalty is
         // redundant AND competes with learning. Kept as opt-in (`BIPED_SELF_COLL_W`)
         // for cases the limits don't cover (e.g. foot↔torso). margin 0.12 m.
-        let sc_margin = std::env::var("BIPED_SELF_COLL_DIST")
+        let sc_margin = env_var("BIPED_SELF_COLL_DIST")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(0.12);
-        let sc_weight = std::env::var("BIPED_SELF_COLL_W")
+        let sc_weight = env_var("BIPED_SELF_COLL_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(0.0);
@@ -2818,7 +3010,7 @@ impl BipedNexusBatchEnv {
         // Multiplier on the ankle extras. Default 1.0 = AGILE parity (the old
         // 4.0 was tuned against the lerobot-magnitude constants below and
         // would put the G1 ankles 4× over WBC).
-        let ankle_torque_w = std::env::var("BIPED_ANKLE_TORQUE_W")
+        let ankle_torque_w = env_var("BIPED_ANKLE_TORQUE_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(1.0);
@@ -2829,7 +3021,7 @@ impl BipedNexusBatchEnv {
         // magnitudes (5e-4/1.5e-3/6.5e-3 — 10× stronger) and the roll branch
         // matched the lerobot-only name "anklex", which never fires on the
         // G1's `ankle_roll` joints.
-        let env_f32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok());
+        let env_f32 = |k: &str| env_or_override(k).and_then(|s| s.parse::<f32>().ok());
         let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(5e-5);
         let w_ankle_torques = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1e-4);
         let w_ankle_roll_torques = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(1e-3);
@@ -2845,9 +3037,9 @@ impl BipedNexusBatchEnv {
         // zealot-only term — WBC-AGILE has NO power cost; its gait economy is
         // the torque family above). Default now 0 = AGILE parity; the legacy
         // name `BIPED_POWER_W` is still honored if set.
-        let power_w: f32 = std::env::var("BIPED_MECH_POWER_W")
+        let power_w: f32 = env_var("BIPED_MECH_POWER_W")
             .ok()
-            .or_else(|| std::env::var("BIPED_POWER_W").ok())
+            .or_else(|| env_var("BIPED_POWER_W").ok())
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
         let cpb_idx = self.idx.colliders_per_batch as usize;
@@ -2993,7 +3185,7 @@ impl BipedNexusBatchEnv {
         // encoder quantization / IMU noise so the policy can't overfit to
         // pixel-perfect proprioception. Amplitudes mirror Isaac Lab's UniformNoise
         // for proprioceptive humanoid obs; BIPED_OBS_NOISE scales them (0 = off).
-        let obs_noise: f32 = std::env::var("BIPED_OBS_NOISE")
+        let obs_noise: f32 = env_var("BIPED_OBS_NOISE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
@@ -3078,7 +3270,7 @@ impl BipedNexusBatchEnv {
         self.timings.steps += 1;
         // Per-step so the stance-phase path/drift accumulation is real (each call
         // does 2 readbacks — fine for a short diagnostic run, not for training).
-        if std::env::var("BIPED_DEBUG_CONTACT").is_ok() {
+        if env_var("BIPED_DEBUG_CONTACT").is_ok() {
             self.debug_contact_impulses().await;
         }
         outs
@@ -3225,7 +3417,7 @@ impl BipedNexusBatchEnv {
             critic_obs[NUM_JOINTS..NUM_JOINTS + 4].copy_from_slice(&c);
             // Opt-in self-check: confirm the cached obs equals the live readback
             // path bit-for-bit (run once with BIPED_VERIFY_RESET=1 to validate).
-            if std::env::var("BIPED_VERIFY_RESET").is_ok() {
+            if env_var("BIPED_VERIFY_RESET").is_ok() {
                 let poses = self.slurp_poses().await;
                 let (feet, _) = self.compute_feet_from_poses(env, &poses);
                 let (mut state, _) = self.read_state_from_poses(env, &poses);
@@ -3384,6 +3576,88 @@ impl BipedNexusBatchEnv {
 
     /// `(position, quaternion xyzw)` of the torso for env `e`. Mirrors
     /// `BipedEnv::base_pose`.
+    /*
+     * GPU-resident rollout accessors (browser demo's GPU-obs path): expose
+     * the physics buffers + a physics-only step so an external obs-assembly
+     * kernel + GPU policy can close the control loop without any per-step
+     * host readback.
+     */
+
+    /// The khal backend the physics runs on.
+    pub fn gpu_backend(&self) -> &khal::backend::GpuBackend {
+        &self.gpu
+    }
+
+    /// Absolute assembly-dof index of each policy joint (root 6 DOFs first).
+    pub fn actuated_assembly_dofs(&self) -> [u32; NUM_JOINTS] {
+        self.idx.joint_dof_offset
+    }
+
+    /// Multibody link id of each policy joint's child link.
+    pub fn actuated_link_ids(&self) -> Vec<u32> {
+        self.idx.actuated.iter().map(|(l, _)| *l).collect()
+    }
+
+    /// GPU buffers the obs-assembly kernel reads, from one borrow:
+    /// (generalized coordinates, per-link SoA workspace).
+    pub fn resident_buffers(
+        &mut self,
+    ) -> (
+        &vortx::tensor::Tensor<f32>,
+        &vortx::tensor::Tensor<nexus3d::rbd::glamx::Vec4>,
+    ) {
+        let mb = self.state.multibodies_mut();
+        // Two disjoint field borrows through one &mut — split via raw parts.
+        let dv: *const vortx::tensor::Tensor<f32> = mb.dof_values();
+        let ws = mb.links_workspace_buffer();
+        // SAFETY: both point into `mb`'s distinct fields; neither aliases the
+        // other, and the returned lifetimes are tied to &mut self.
+        (unsafe { &*dv }, ws)
+    }
+
+    /// Scatter policy PD targets (row-major [12 × n], radians) from a GPU
+    /// buffer straight into the motor constraints — the GPU analog of the
+    /// per-env `stage_motor_position` + `flush_links_static`.
+    pub fn scatter_targets_gpu(&mut self, targets: &vortx::tensor::Tensor<f32>) {
+        let links = self.actuated_link_ids();
+        self.state
+            .multibodies_mut()
+            .scatter_motor_targets_gpu(&self.gpu, targets, &links, JointAxis::AngZ as u32)
+            .expect("scatter_motor_targets_gpu");
+    }
+
+    /// Encode the target scatter into an existing encoder (single-submit
+    /// control steps).
+    pub fn encode_scatter_targets(
+        &mut self,
+        enc: &mut <KhalGpuBackend as Backend>::Encoder,
+        targets: &vortx::tensor::Tensor<f32>,
+    ) {
+        let links = self.actuated_link_ids();
+        // Split borrow: the encoder call needs &self.gpu and &mut multibodies.
+        let gpu: *const KhalGpuBackend = &self.gpu;
+        self.state
+            .multibodies_mut()
+            .encode_scatter_motor_targets(
+                unsafe { &*gpu },
+                enc,
+                targets,
+                &links,
+                JointAxis::AngZ as u32,
+            )
+            .expect("encode_scatter_motor_targets");
+    }
+
+    /// Advance physics one control step (`decimation` substeps) WITHOUT any
+    /// observation/reward readback — motor targets must already be staged
+    /// (e.g. via [`Self::scatter_targets_gpu`]).
+    pub fn step_physics_only(&mut self) {
+        for _ in 0..self.task.decimation {
+            let _ = self.pipeline.step(&self.gpu, &mut self.state, None);
+        }
+        self.global_step += 1;
+    }
+
     pub fn base_pose_for(&self, e: usize, poses: &[NexusPose]) -> ([f32; 3], [f32; 4]) {
         let cpb = self.idx.colliders_per_batch as usize;
         let pose = &poses[e * cpb + self.idx.torso_link as usize];
@@ -3612,12 +3886,50 @@ impl BipedNexusBatchEnv {
 /// WebGPU. Override with `KHAL_BACKEND=cuda|webgpu`. The nexus + vortx cubins are
 /// embedded at build time via the per-crate `CUDA_OXIDE_SHADERS_PTX_*` env vars.
 async fn make_backend() -> KhalGpuBackend {
+    // In the browser (wasm), asking for desktop-sized buffer limits can exceed
+    // the adapter's caps and fail device creation outright. The web demo runs
+    // a single env, so 256 MB is plenty; the shader-side limits stay.
+    #[cfg(target_arch = "wasm32")]
+    const MAX_BUFFER: u64 = 256 * 1024 * 1024;
+    #[cfg(not(target_arch = "wasm32"))]
+    const MAX_BUFFER: u64 = 1_200_000_000;
     let limits = wgpu::Limits {
-        max_buffer_size: 1_200_000_000,
-        max_storage_buffer_binding_size: 1_200_000_000,
+        max_buffer_size: MAX_BUFFER,
+        max_storage_buffer_binding_size: MAX_BUFFER,
         max_storage_buffers_per_shader_stage: 14,
         max_compute_workgroup_storage_size: 19_904,
         ..Default::default()
+    };
+    // Clamp each requested limit to the adapter's (browsers reject requests
+    // above them — e.g. Chrome caps maxStorageBuffersPerShaderStage at 10).
+    #[cfg(target_arch = "wasm32")]
+    let limits = {
+        let instance = wgpu::Instance::default();
+        match instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(adapter) => {
+                let a = adapter.limits();
+                wgpu::Limits {
+                    max_buffer_size: limits.max_buffer_size.min(a.max_buffer_size),
+                    max_storage_buffer_binding_size: limits
+                        .max_storage_buffer_binding_size
+                        .min(a.max_storage_buffer_binding_size),
+                    max_storage_buffers_per_shader_stage: limits
+                        .max_storage_buffers_per_shader_stage
+                        .min(a.max_storage_buffers_per_shader_stage),
+                    max_compute_workgroup_storage_size: limits
+                        .max_compute_workgroup_storage_size
+                        .min(a.max_compute_workgroup_storage_size),
+                    ..limits
+                }
+            }
+            Err(_) => limits,
+        }
     };
     let mut bk = KhalGpuBackend::auto(wgpu::Features::default(), limits)
         .await
@@ -3639,7 +3951,7 @@ async fn make_backend() -> KhalGpuBackend {
 fn eval_cmd_override() -> Option<VelocityCommand> {
     static CMD: std::sync::OnceLock<Option<VelocityCommand>> = std::sync::OnceLock::new();
     *CMD.get_or_init(|| {
-        let v = std::env::var("BIPED_EVAL_CMD").ok()?;
+        let v = env_var("BIPED_EVAL_CMD").ok()?;
         let p: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         (p.len() == 3).then(|| VelocityCommand { vx: p[0], vy: p[1], yaw_rate: p[2] })
     })
@@ -3655,7 +3967,7 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
     // AGILE leaves effort alone), kd ×U(0.8,2.0) per env (theirs is per joint),
     // link mass ×U(0.95,1.05) + pelvis payload +U(−1,5) kg, tilt ±10°, no z
     // jitter. Not modeled: CoM offsets, armature ×U(0,2), continuous wrenches.
-    if std::env::var("BIPED_AGILE_DR").is_ok_and(|v| v == "1") {
+    if env_var("BIPED_AGILE_DR").is_ok_and(|v| v == "1") {
         let pd_scale = 1.0;
         let kd_scale = rng.range(0.8, 2.0);
         let friction = rng.range(0.2, 1.25);
@@ -3688,7 +4000,7 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
     // test whether aggressive spawn DR is what's preventing the policy from
     // getting a learning gradient (the rng draws are still consumed, so dynamics
     // DR and determinism are unchanged).
-    let sdr: f32 = std::env::var("BIPED_SPAWN_DR")
+    let sdr: f32 = env_var("BIPED_SPAWN_DR")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.0);
@@ -3703,7 +4015,7 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
     // (randomize_rigid_body_material) use. Center stays ≈ MuJoCo's default μ=1.
     // (Per-foot and static-vs-dynamic friction would express stick-slip even
     // better, but nexus stores a single Coulomb μ per multibody — engine-blocked.)
-    let friction = match std::env::var("BIPED_FRICTION")
+    let friction = match env_var("BIPED_FRICTION")
         .ok()
         .and_then(|s| s.parse::<f32>().ok())
     {
@@ -3716,7 +4028,7 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
     // BIPED_MASS_DR scales the half-width of the per-link mass randomization
     // (default 1.0 → ±20%). Set 0.0 to disable (mass fixed at nominal); the rng
     // draw is still consumed so other DR + determinism are unchanged.
-    let mdr: f32 = std::env::var("BIPED_MASS_DR")
+    let mdr: f32 = env_var("BIPED_MASS_DR")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.0);
@@ -3738,7 +4050,7 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
         // pin every env to a fixed value (rng draw still consumed) — set both to
         // 30 / 5 to reproduce the old hardcoded path and verify the new binding
         // is bit-identical.
-        contact_natural_frequency: match std::env::var("BIPED_CONTACT_FREQ")
+        contact_natural_frequency: match env_var("BIPED_CONTACT_FREQ")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
         {
@@ -3748,7 +4060,7 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
             }
             None => rng.range(10.0, 50.0),
         },
-        contact_damping_ratio: match std::env::var("BIPED_CONTACT_DAMP")
+        contact_damping_ratio: match env_var("BIPED_CONTACT_DAMP")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
         {
@@ -3778,7 +4090,7 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
         // responds; the distribution is L/R-balanced, so the mirror prior stays
         // valid in expectation.
         pd_scale_per_joint: {
-            let hw: f32 = std::env::var("BIPED_ASYM_DR")
+            let hw: f32 = env_var("BIPED_ASYM_DR")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.15);
@@ -3797,7 +4109,7 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
 /// (the global env default, no draw consumed so existing streams are
 /// unchanged in non-dr mode... draw IS consumed in dr mode only).
 fn sample_foot_shape(rng: &mut Lcg) -> u8 {
-    if std::env::var("BIPED_FOOT_SHAPE").as_deref() == Ok("dr") {
+    if env_var("BIPED_FOOT_SHAPE").as_deref() == Ok("dr") {
         if rng.range(0.0, 1.0) < 0.5 { 1 } else { 2 }
     } else {
         0

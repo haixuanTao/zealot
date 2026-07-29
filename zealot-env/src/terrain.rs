@@ -43,6 +43,23 @@ pub const STRIP_HALF_W: f32 = PATCH / 2.0;
 /// Thickness of the closed terrain slab below z=0.
 pub const SLAB_BOTTOM: f32 = -0.05;
 
+/// Optional terrain-shape overrides (demo knobs; defaults reproduce training
+/// terrain exactly).
+#[derive(Clone, Copy, Debug)]
+pub struct TerrainParams {
+    /// Multiplier on every family's height amplitude (1.0 = training terrain).
+    pub amp: f32,
+    /// Uphill grade along +X as rise-per-meter (tan of the slope angle),
+    /// applied smoothly across the whole strip. 0.0 = flat (training).
+    pub slope: f32,
+}
+
+impl Default for TerrainParams {
+    fn default() -> Self {
+        TerrainParams { amp: 1.0, slope: 0.0 }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TerrainFamily {
     Boxes,
@@ -94,6 +111,14 @@ impl TerrainStrip {
     }
 
     pub fn generate(family: TerrainFamily, seed: u64) -> Self {
+        Self::generate_with(family, seed, TerrainParams::default())
+    }
+
+    /// [`generate`](Self::generate) with explicit shape overrides. The RNG
+    /// draw sequence is independent of `params`, so `amp`/`slope` reshape the
+    /// SAME underlying terrain rather than resampling it.
+    pub fn generate_with(family: TerrainFamily, seed: u64, params: TerrainParams) -> Self {
+        let amp = params.amp.max(0.0);
         let hs = family.grid_spacing();
         let nx = (PATCH * ROWS as f32 / hs).round() as usize;
         let ny = (2.0 * STRIP_HALF_W / hs).round() as usize;
@@ -110,7 +135,7 @@ impl TerrainStrip {
             match family {
                 TerrainFamily::Boxes => {
                     // 0.15 m checker cells; each cell top ~ U(−g, +g), g = 0.04·d.
-                    let g = 0.04 * d;
+                    let g = 0.04 * d * amp;
                     let cell = 0.15f32;
                     let cells_x = (PATCH / cell).floor() as usize; // 53
                     let cells_y = (2.0 * STRIP_HALF_W / cell).floor() as usize;
@@ -133,13 +158,13 @@ impl TerrainStrip {
                 TerrainFamily::Rough => {
                     // U[0.01·d, 0.2·d] (one-sided) on a 0.4 m lattice, smooth
                     // interpolation down to the mesh grid.
-                    let (lo, hi) = (0.01 * d, 0.2 * d);
+                    let (lo, hi) = (0.01 * d * amp, 0.2 * d * amp);
                     let lat = 0.4f32;
                     let ln_x = (PATCH / lat) as usize + 1; // 21 nodes
                     let ln_y = (2.0 * STRIP_HALF_W / lat) as usize + 1;
                     let mut lattice = vec![0.0f32; ln_x * ln_y];
                     // AGILE quantizes to noise_step = 0.1·d.
-                    let step = (0.1 * d).max(VERTICAL_SCALE);
+                    let step = (0.1 * d * amp).max(VERTICAL_SCALE);
                     let n_steps = (((hi - lo) / step).floor() as i32).max(0);
                     for h in lattice.iter_mut() {
                         let k = (rng.range(0.0, 1.0) * (n_steps + 1) as f32) as i32;
@@ -168,7 +193,7 @@ impl TerrainStrip {
                 }
                 TerrainFamily::Wave => {
                     // A/2·cos(2πy/λ) + A/2·sin(2πx/λ), A = 0.01 + 0.24·d.
-                    let a = 0.01 + 0.24 * d;
+                    let a = (0.01 + 0.24 * d) * amp;
                     let lambda = PATCH / 3.0;
                     let tau = std::f32::consts::TAU;
                     for i in i0..=i1.min(nx) {
@@ -180,6 +205,18 @@ impl TerrainStrip {
                             heights[j * (nx + 1) + i] = quantize(h);
                         }
                     }
+                }
+            }
+        }
+
+        // Uphill ramp along +X: smooth across the whole strip (no cliffs at
+        // patch boundaries), zero at the strip entry so the flat origin patch
+        // still meets the terrain flush.
+        if params.slope != 0.0 {
+            for i in 0..=nx {
+                let dz = params.slope * i as f32 * hs;
+                for j in 0..=ny {
+                    heights[j * (nx + 1) + i] += dz;
                 }
             }
         }
@@ -490,6 +527,51 @@ mod tests {
             }
             assert!(checked > 1000, "{fam:?}: too few top-face samples ({checked})");
         }
+    }
+
+    #[test]
+    fn params_amp_and_slope() {
+        // amp = 0 → dead-flat strip (slope off).
+        let flat = TerrainStrip::generate_with(
+            TerrainFamily::Wave,
+            42,
+            TerrainParams { amp: 0.0, slope: 0.0 },
+        );
+        let (lo, hi) = row_extremes(&flat, 19);
+        assert!(lo.abs() < 1e-6 && hi.abs() < 1e-6, "amp=0 flat: {lo}..{hi}");
+
+        // amp = 2 → wave row-19 extremes ≈ 2× the default bounds.
+        let big = TerrainStrip::generate_with(
+            TerrainFamily::Wave,
+            42,
+            TerrainParams { amp: 2.0, slope: 0.0 },
+        );
+        let (lo, hi) = row_extremes(&big, 19);
+        assert!(hi > 0.34 && lo < -0.34, "amp=2 row19 wave peaks: {lo}..{hi}");
+        assert!(hi <= 0.51 && lo >= -0.51, "amp=2 row19 wave bounds: {lo}..{hi}");
+
+        // slope: mean height in a patch rises by ~tan(θ)·Δx per patch; with
+        // amp=0 the surface IS the ramp.
+        let grade = (10.0f32).to_radians().tan();
+        let ramp = TerrainStrip::generate_with(
+            TerrainFamily::Rough,
+            42,
+            TerrainParams { amp: 0.0, slope: grade },
+        );
+        for row in [0u32, 10, 19] {
+            let (cx, _) = TerrainStrip::patch_center(row);
+            let want = grade * (cx - STRIP_X0);
+            let got = ramp.height(cx, 0.0);
+            assert!(
+                (got - want).abs() < 0.02,
+                "row {row}: ramp height {got} vs {want}"
+            );
+        }
+
+        // Params must not change the RNG stream: default params == generate().
+        let a = TerrainStrip::generate(TerrainFamily::Boxes, 42);
+        let b = TerrainStrip::generate_with(TerrainFamily::Boxes, 42, TerrainParams::default());
+        assert_eq!(a.heights, b.heights);
     }
 
     #[test]
