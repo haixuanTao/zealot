@@ -2820,6 +2820,24 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(3000.0);
+        // DC torque-speed envelope fault (BIPED_ENVELOPE_TERM, speed-axis
+        // scale; 0 disables — and it DEFAULTS OFF: with 50 Hz finite-diff
+        // joint velocities, contact aliasing throws single joints past rated
+        // speed for one sample and even healthy gaits "violate" on 92% of
+        // steps (measured). The correct form of this idea is kernel-level DC
+        // torque-speed saturation in the actuator model, not a termination.
+        let env_term: f32 = std::env::var("BIPED_ENVELOPE_TERM")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        // Per-joint instantaneous power fault (BIPED_JOINT_POWER_TERM, watts;
+        // 0 disables). Spikes are the failure mode averages cannot see, and
+        // hardware limits are per actuator: healthy v17-style gait peaks at
+        // ~700 W in the worst joint, the stand-tremor spikes to 20 kW.
+        let joint_power_term: f32 = std::env::var("BIPED_JOINT_POWER_TERM")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1500.0);
         let sc_dt = self.task.control_dt();
         // Torque (effort) penalty: we're PD position-controlled and had NO cost
         // on joint torque, so the policy reward-hacks strained high-torque poses
@@ -2910,22 +2928,47 @@ impl BipedNexusBatchEnv {
                         state.joint_vel[i].abs()
                             > self.task.robot.joints[i].vel_limit * vel_term
                     });
-                let power_fault = power_term > 0.0 && {
+                let (power_fault, envelope_fault) = if power_term > 0.0
+                    || env_term > 0.0
+                    || joint_power_term > 0.0
+                {
                     let q_target = self.task.joint_targets(&actions[e]);
                     let mut p = 0.0f32;
+                    let mut pj_max = 0.0f32;
+                    let mut env_viol = false;
                     for i in 0..NUM_JOINTS {
                         let j = &self.task.robot.joints[i];
                         let tau = (j.kp * (q_target[i] - state.joint_pos[i])
                             - j.kd * state.joint_vel[i])
                             .clamp(-j.effort_limit, j.effort_limit);
-                        p += (tau * state.joint_vel[i]).abs();
+                        let pj = (tau * state.joint_vel[i]).abs();
+                        p += pj;
+                        pj_max = pj_max.max(pj);
+                        if env_term > 0.0 {
+                            let avail = j.effort_limit
+                                * (1.0 - state.joint_vel[i].abs() / (env_term * j.vel_limit))
+                                    .max(0.0);
+                            // only torque WITH the motion direction is motor
+                            // work — braking torque comes for free in a DC
+                            // motor and must not trip the envelope.
+                            if tau * state.joint_vel[i] > 0.0 && tau.abs() > avail {
+                                env_viol = true;
+                            }
+                        }
                     }
-                    p > power_term
+                    (
+                        (power_term > 0.0 && p > power_term)
+                            || (joint_power_term > 0.0 && pj_max > joint_power_term),
+                        env_viol,
+                    )
+                } else {
+                    (false, false)
                 };
                 let fell = illegal
                     || crossed
                     || vel_fault
                     || power_fault
+                    || envelope_fault
                     || self.task.fell_over(&state.base)
                     || !state.base.height.is_finite();
                 let rb = self.task.reward(&state, &self.cmd[e]);
