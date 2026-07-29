@@ -782,11 +782,32 @@ fn build_env_scene(
             .find(|(frag, ..)| jname.contains(frag))
             .map(|&(_, kp, kd, effort)| (kp, kd, effort, (-pi, pi), 0.0))
             .unwrap_or((50.0 * pj, 1.0 * pj, 20.0 * pj, (-pi, pi), 0.0));
+        // Per-family ankle gain override (BIPED_ANKLE_KP / BIPED_ANKLE_KD),
+        // applied before DR. AGILE's ankles are kp 20 / kd 0.2 (roll 0.1) —
+        // with the foot planted the body's ~12 kg·m² reflected inertia makes
+        // that a damping ratio of 0.003-0.006, i.e. effectively UNDAMPED, and
+        // measured stand tremor peaks at 9-10 rad/s there while every other
+        // joint sits near 0.08. unitree_rl_gym's deploy pair (40 / 2.0) gives
+        // ~0.046 planted and stays ~critically damped in swing. Unset = the
+        // spec value (AGILE parity preserved by default).
+        let (ankle_kp_ovr, ankle_kd_ovr) = (
+            std::env::var("BIPED_ANKLE_KP").ok().and_then(|s| s.parse::<f32>().ok()),
+            std::env::var("BIPED_ANKLE_KD").ok().and_then(|s| s.parse::<f32>().ok()),
+        );
         let (kp, kd, effort, pos_limit, spec_damping) = spec
             .map(|s| {
+                let is_ankle = s.name.contains("ankle");
+                let base_kp = match ankle_kp_ovr {
+                    Some(v) if is_ankle => v,
+                    _ => s.kp,
+                };
+                let base_kd = match ankle_kd_ovr {
+                    Some(v) if is_ankle => v,
+                    _ => s.kd,
+                };
                 (
-                    s.kp * dr.pd_scale * pj,
-                    s.kd * dr.pd_scale * dr.kd_scale * pj,
+                    base_kp * dr.pd_scale * pj,
+                    base_kd * dr.pd_scale * dr.kd_scale * pj,
                     s.effort_limit * pj,
                     s.pos_limit,
                     s.damping,
@@ -2854,6 +2875,19 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(0.0);
+        // Endstop-SLAM fault (BIPED_LIMIT_SLAM_VEL, rad/s; 0 disables). Resting
+        // against a position limit is a static load the structure carries, but
+        // ARRIVING at one carries ½Iω² into the gearbox — measured entries hit
+        // 9-10 rad/s ≈ 0.9 J, like dropping the foot 15 cm through the ankle
+        // drive. Terminating on contact would fire within 0.15 s of every
+        // episode (the ankle is inside the band >50% of the time) and bury the
+        // gradient; gating on approach SPEED targets only the damaging case.
+        // 2.0 rad/s ≈ 43 mJ, the energy of a 7 mm drop.
+        let slam_vel: f32 = std::env::var("BIPED_LIMIT_SLAM_VEL")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        const SLAM_BAND: f32 = 0.05; // rad from the hard limit
         // Per-joint instantaneous power fault (BIPED_JOINT_POWER_TERM, watts;
         // 0 disables). Spikes are the failure mode averages cannot see, and
         // hardware limits are per actuator: healthy v17-style gait peaks at
@@ -2952,6 +2986,15 @@ impl BipedNexusBatchEnv {
                         state.joint_vel[i].abs()
                             > self.task.robot.joints[i].vel_limit * vel_term
                     });
+                // Slamming a joint endstop: inside the band AND still moving
+                // into it above the energy threshold.
+                let slam_fault = slam_vel > 0.0
+                    && (0..NUM_JOINTS).any(|i| {
+                        let (lo, hi) = self.task.robot.joints[i].pos_limit;
+                        let (q, v) = (state.joint_pos[i], state.joint_vel[i]);
+                        (q < lo + SLAM_BAND && v < -slam_vel)
+                            || (q > hi - SLAM_BAND && v > slam_vel)
+                    });
                 let (power_fault, envelope_fault) = if power_term > 0.0
                     || env_term > 0.0
                     || joint_power_term > 0.0
@@ -2991,6 +3034,7 @@ impl BipedNexusBatchEnv {
                 let fell = illegal
                     || crossed
                     || vel_fault
+                    || slam_fault
                     || power_fault
                     || envelope_fault
                     || self.task.fell_over(&state.base)
