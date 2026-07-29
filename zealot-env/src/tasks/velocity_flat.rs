@@ -238,11 +238,20 @@ impl Default for CommandSampler {
             // unreachable max command the curriculum forces the policy into a
             // regime where tracking reward is uniformly tiny → it gives up.
             // Override per-axis with BIPED_VX / BIPED_VY / BIPED_YAW ("lo,hi").
-            // Note the yaw default (±0.2) is 5× narrower than WBC-AGILE T1's
-            // ±1.0 — widen via BIPED_YAW when training for heading control.
             lin_vel_x: range_env("BIPED_VX", (-0.5, 0.5)),
             lin_vel_y: range_env("BIPED_VY", (-0.3, 0.3)),
-            ang_vel_z: range_env("BIPED_YAW", (-0.2, 0.2)),
+            // Yaw was ±0.2 through v21 — 5× narrower than WBC-AGILE T1's ±1.0,
+            // and too narrow to learn from: at |yaw| ≤ 0.2 the exp tracking
+            // kernel is nearly satisfied by NOT turning, so `track_ang_vel`
+            // earned only 0.006/step (13% of linear tracking) and v21 turned
+            // the WRONG WAY on a commanded ±0.2 (measured +0.03 / +0.02 rad/s
+            // for ±0.5, −0.05 for +0.2). Raising the weight 5→8 had already
+            // failed to fix it — the problem is the command range, not the
+            // price. ±0.6 gives the kernel something to discriminate while
+            // staying inside what the 12-DOF platform can turn.
+            // NOTE evaluations: ±0.5 was OUTSIDE the old training range, so
+            // every pre-v22 yaw probe at 0.5 was measuring extrapolation.
+            ang_vel_z: range_env("BIPED_YAW", (-0.6, 0.6)),
             // Fraction of command resamples that are a pure STAND (zero). Raising
             // it (BIPED_STAND_PROB) makes the robot stop more often → trains
             // explicit walk→stand→walk (go-stop-go) transitions and gives frequent
@@ -1383,12 +1392,15 @@ mod tests {
         let mut s3 = RobotState::default();
         s3.feet[0].tilt = 1.0; // ~57° off flat
         assert!(task.reward(&s3, &cmd).foot_orientation < 0.0);
-        // The same tilt while airborne → no penalty (only stance feet count).
+        // The penalty is UNGATED: a tilted foot costs the same airborne as in
+        // stance. Gating it to stance let the policy fly a toes-up swing foot
+        // for free, which is exactly the heel-strike posture this term exists
+        // to remove (AGILE's roll-only feet_roll_l2 cannot see it either).
         let mut s4 = RobotState::default();
         s4.feet[0].contact = false;
         s4.feet[0].tilt = 1.0;
         s4.feet[1].contact = false;
-        assert_eq!(task.reward(&s4, &cmd).foot_orientation, 0.0);
+        assert!(task.reward(&s4, &cmd).foot_orientation < 0.0);
         // A foot yawed relative to the base → feet_yaw_mean penalty.
         let mut s5 = RobotState::default();
         s5.feet[0].yaw_rel_base = 0.5;
@@ -1426,7 +1438,7 @@ mod tests {
             let c = s.sample(&mut rng);
             assert!(c.vx.abs() <= 0.8 + 1e-6);
             assert!(c.vy.abs() <= 0.4 + 1e-6);
-            assert!(c.yaw_rate.abs() <= 0.2 + 1e-6);
+            assert!(c.yaw_rate.abs() <= 0.6 + 1e-6);
             if c == VelocityCommand::default() {
                 stands += 1;
             }
