@@ -57,10 +57,28 @@ POLICY_JOINTS = [
     "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
 ]
 DEFAULT_POS = np.array([-0.1, 0.0, 0.0, 0.3, -0.2, 0.0] * 2)
+
+# Open-loop action replay (S2S_ACTION_REPLAY=<nexus rollout json>): ignore the
+# policy and apply a recorded action sequence blind. Cross-engine physics
+# comparison with the controller removed from the loop.
+_REPLAY = None
+if os.environ.get("S2S_ACTION_REPLAY"):
+    with open(os.environ["S2S_ACTION_REPLAY"]) as _f:
+        _REPLAY = np.array(json.load(_f)["actions"], dtype=np.float64)
+
 ACTION_SCALE = 0.5
 
 
+KP_SCALE = float(os.environ.get("S2S_KP_SCALE", "1"))
+KD_SCALE = float(os.environ.get("S2S_KD_SCALE", "1"))
+
+
 def leg_gains(name):
+    kp, kd, eff = _leg_gains_raw(name)
+    return kp * KP_SCALE, kd * KD_SCALE, eff
+
+
+def _leg_gains_raw(name):
     if "knee" in name:
         return 200.0, 5.0, 139.0
     if "hip" in name:
@@ -257,6 +275,8 @@ def main():
     ep_t = 0
     act_hist = [np.zeros(12), np.zeros(12)]
     vel_track = []
+    pitch_track = []
+    traj = []
     prev_q = npy(robot.get_dofs_position(pol_idx))
     frames_hist = None
     attempts, survived = 1, []
@@ -285,6 +305,8 @@ def main():
         else:
             frames_hist = frames_hist[1:] + [o.copy()]
         action = policy.act(np.concatenate(frames_hist))
+        if _REPLAY is not None:
+            action = _REPLAY[min(t, len(_REPLAY) - 1)]
 
         target = DEFAULT_POS + ACTION_SCALE * action
         for _ in range(DECIMATION):
@@ -312,12 +334,14 @@ def main():
         vel_track.append((np.cos(base_yaw) * lv[0] + np.sin(base_yaw) * lv[1],
                           -np.sin(base_yaw) * lv[0] + np.cos(base_yaw) * lv[1],
                           av[2]))
+        pitch_track.append(np.degrees(np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))))
 
         cam.set_pose(pos=(base_p[0] + 2.0, base_p[1] - 1.8, 1.4),
                      lookat=(base_p[0], base_p[1], 0.8))
         rgb = cam.render()[0]
         ff.stdin.write(np.ascontiguousarray(rgb[..., :3]).astype(np.uint8).tobytes())
 
+        traj.append([float(v) for v in base_p[:3]] + [float(v) for v in quat[:4]])
         up = projected_gravity(quat)
         tilt = np.arccos(np.clip(-up[2], -1.0, 1.0))
         if base_p[2] < FALL_Z or tilt > TILT_LIMIT or ep_t >= int(20.0 / CONTROL_DT):
@@ -337,6 +361,10 @@ def main():
     ff.stdin.close()
     ff.wait()
     print(f"video → {OUT}")
+    tpath = os.environ.get("S2S_TRAJ_JSON")
+    if tpath:
+        with open(tpath, "w") as f:
+            json.dump(traj, f)
     mpath = os.environ.get("S2S_METRICS_JSON")
     if mpath:
         base_p = npy(pelvis.get_pos())
@@ -355,6 +383,7 @@ def main():
                 "clip_seconds": SECONDS,
                 "falls": sum(1 for e in eps if e["end"] == "fell"),
                 "mean_body_vel": [float(v) for v in vt.mean(axis=0)],
+                "settled_pitch_deg": float(np.mean(pitch_track[len(pitch_track)//2:])) if pitch_track else 0.0,
                 "episodes": eps,
             }, f, indent=1)
 

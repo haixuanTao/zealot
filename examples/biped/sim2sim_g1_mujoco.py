@@ -33,6 +33,7 @@ Usage:
 defaults: /tmp/biped_policy_gpu.safetensors.best  /tmp/g1_sim2sim_mujoco.mp4  30
 Env: BIPED_CMD="vx,vy,yaw" (default 0.4,0,0)
 """
+import json
 import os
 import subprocess
 import sys
@@ -93,10 +94,28 @@ POLICY_JOINTS = [
     "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
 ]
 DEFAULT_POS = np.array([-0.1, 0.0, 0.0, 0.3, -0.2, 0.0] * 2)
+
+# Open-loop action replay (S2S_ACTION_REPLAY=<nexus rollout json>): ignore the
+# policy and apply a recorded action sequence blind. Cross-engine physics
+# comparison with the controller removed from the loop.
+_REPLAY = None
+if os.environ.get("S2S_ACTION_REPLAY"):
+    with open(os.environ["S2S_ACTION_REPLAY"]) as _f:
+        _REPLAY = np.array(json.load(_f)["actions"], dtype=np.float64)
+
 ACTION_SCALE = 0.5
 
 
+KP_SCALE = float(os.environ.get("S2S_KP_SCALE", "1"))
+KD_SCALE = float(os.environ.get("S2S_KD_SCALE", "1"))
+
+
 def leg_gains(name):
+    kp, kd, eff = _leg_gains_raw(name)
+    return kp * KP_SCALE, kd * KD_SCALE, eff
+
+
+def _leg_gains_raw(name):
     if "knee" in name:
         return 200.0, 5.0, 139.0
     if "hip" in name:
@@ -246,7 +265,9 @@ def main():
     frozen_phase = 0.0
     ep_t = 0          # control steps since episode start
     act_hist = [np.zeros(12), np.zeros(12)]  # [t-2, t-1]
-    vel_track = []  # per-step (body_vx, body_vy, yaw_rate) for direction-aware metrics
+    vel_track = []
+    pitch_track = []
+    traj = []  # per-step (body_vx, body_vy, yaw_rate) for direction-aware metrics
     prev_q = data.qpos[pol_q].copy()
     frames_hist = None  # 5-frame obs history (list, oldest→newest)
     attempts, survived = 1, []
@@ -276,6 +297,8 @@ def main():
         else:
             frames_hist = frames_hist[1:] + [o.copy()]
         action = policy.act(np.concatenate(frames_hist))
+        if _REPLAY is not None:
+            action = _REPLAY[min(t, len(_REPLAY) - 1)]
 
         target = np.clip(DEFAULT_POS + ACTION_SCALE * action, pol_rng[:, 0], pol_rng[:, 1])
 
@@ -304,7 +327,10 @@ def main():
         vel_track.append((np.cos(base_yaw) * wvx + np.sin(base_yaw) * wvy,
                           -np.sin(base_yaw) * wvx + np.cos(base_yaw) * wvy,
                           data.qvel[free_d + 5]))
+        pitch_track.append(np.degrees(np.arcsin(np.clip(2 * (qw * qy - qz * qx), -1, 1))))
 
+        base_p_t = data.qpos[free_q:free_q + 3].copy()
+        traj.append([float(v) for v in base_p_t] + [float(v) for v in data.qpos[free_q + 3:free_q + 7]])
         # --- fall / timeout check ---
         z = data.qpos[free_q + 2]
         up = projected_gravity(data.qpos[free_q + 3:free_q + 7])
@@ -326,6 +352,10 @@ def main():
     ff.stdin.close()
     ff.wait()
     # Structured metrics for benchmark harnesses (S2S_METRICS_JSON=<path>).
+    tpath = os.environ.get("S2S_TRAJ_JSON")
+    if tpath:
+        with open(tpath, "w") as f:
+            json.dump(traj, f)
     mpath = os.environ.get("S2S_METRICS_JSON")
     if mpath:
         import json as _json
@@ -344,6 +374,7 @@ def main():
                 "clip_seconds": SECONDS,
                 "falls": sum(1 for e in eps if e["end"] == "fell"),
                 "mean_body_vel": [float(v) for v in vt.mean(axis=0)],
+                "settled_pitch_deg": float(np.mean(pitch_track[len(pitch_track)//2:])) if pitch_track else 0.0,
                 "episodes": eps,
             }, f, indent=1)
     if survived:

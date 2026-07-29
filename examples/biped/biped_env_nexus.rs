@@ -2070,6 +2070,30 @@ impl BipedNexusBatchEnv {
     /// its feet after each shove, which is what makes the learned equilibrium
     /// ROBUST and engine-agnostic (sim-to-real) rather than a brittle
     /// nexus-specific reflex. Read-modify-write the generalized-velocity section of
+    /// DOF index of each policy joint within an env's `dof_state` slice, in
+    /// canonical `JOINT_NAMES` order (root DOFs occupy 0..6).
+    pub fn policy_joint_dofs(&self) -> [u32; NUM_JOINTS] {
+        self.idx.joint_dof_offset
+    }
+
+    /// TRUE generalized velocities for one env, straight from `dof_state`
+    /// (no finite differencing): `[root_lin(3), root_ang(3), joints…]` in the
+    /// multibody's DOF order, world frame for the root. Used by the
+    /// cross-engine divergence probe, where FD velocity error at the 50 Hz
+    /// control rate is the dominant noise floor.
+    pub async fn true_dof_velocities(&mut self, env: usize) -> Vec<f32> {
+        let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
+        let n = self.n;
+        let total = self.state.multibodies_mut().dof_state().buffer().len();
+        let mut buf = vec![0.0f32; total];
+        self.gpu
+            .slow_read_buffer(self.state.multibodies_mut().dof_state().buffer(), &mut buf)
+            .await
+            .expect("dof_state readback");
+        // Batch-interleaved: dof `d` of env `e` at `d·n + e`.
+        (0..dpb).map(|d| buf[d * n + env]).collect()
+    }
+
     /// `dof_state` (env-major, `dofs_per_batch` DOFs per env; root linear = 0..3,
     /// root angular = 3..6, world frame — rapier free-joint DOF order).
     async fn apply_random_pushes(&mut self) {
