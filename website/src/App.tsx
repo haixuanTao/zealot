@@ -297,8 +297,20 @@ function Demo() {
   );
 }
 
-/// Scroll sections: one image + one block of text each, alternating sides.
-const SLIDES = [
+/// Scroll sections: a block of text plus either a screenshot or, for the
+/// toolchain slide, the compiler cards.
+type Slide = {
+  kicker: string;
+  title: string;
+  body: string;
+  img?: string;
+  /// Fit the image inside the frame (logos) instead of cropping to fill.
+  contain?: boolean;
+  /// Render the GPU compiler cards as this slide's illustration.
+  cards?: boolean;
+};
+
+const SLIDES: Slide[] = [
   {
     img: 'img/slides/nexus-logo.png',
     contain: true,
@@ -313,10 +325,10 @@ const SLIDES = [
     body: 'zealot-rl is the rsl_rl tier rewritten in Rust: the model definition and the whole training pipeline — actor-critic network, autodiff, PPO, GAE, Adam — are Rust, not a Python front-end over a C++ core. It runs on vortx and khal, the same portable GPU layer nexus is built on, so the learning half is no more platform-bound than the physics half.',
   },
   {
-    img: 'img/slides/nexus-fleet.jpg',
+    cards: true,
     kicker: 'GPU ready',
     title: 'One Rust source, every GPU backend',
-    body: 'The kernels are written once, in Rust. rust-gpu compiles them to SPIR-V for WebGPU and Metal; cuda-oxide compiles the verbatim same source to PTX for native CUDA; cutile-rs puts the hot PPO GEMMs on tf32 tensor cores. No second implementation to keep in sync — and on an RTX 5090 the CUDA path runs 2.4–4.3× faster than WebGPU while staying bit-exact against it.',
+    body: 'The kernels are written once, in Rust, then compiled three ways — no second implementation to keep in sync. On an RTX 5090 the native-CUDA path runs 2.4–4.3× faster than WebGPU while staying bit-exact against it.',
   },
   {
     img: 'img/slides/mujoco-sim2sim.jpg',
@@ -324,7 +336,7 @@ const SLIDES = [
     title: 'Cross-checked against MuJoCo and rapier',
     body: 'A policy is only trustworthy if it survives a different solver. The same checkpoint runs sim2sim in the browser on rapier.js and on the official MuJoCo WebAssembly build — the reference engine — walking bit-identical terrain, so you can watch where the engines agree and where they diverge.',
   },
-] as const;
+];
 
 /// The GPU toolchain, named. Same Rust source behind each of these.
 const GPU_STACK = [
@@ -348,51 +360,63 @@ const GPU_STACK = [
   },
 ] as const;
 
-function GpuStack() {
+function GpuChips() {
   return (
-    <section className="gpuStack">
-      <span className="gpuStackLead">
-        <strong>GPU ready</strong> — the same kernels, three compilers
-      </span>
-      <div className="gpuChips">
-        {GPU_STACK.map((t) => (
-          <a
-            className="gpuChip"
-            key={t.name}
-            href={t.href}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <code>{t.name}</code>
-            <span className="gpuChipWhat">{t.what}</span>
-            <span className="gpuChipWhere">{t.where}</span>
-          </a>
-        ))}
-      </div>
-    </section>
+    <div className="gpuChips">
+      {GPU_STACK.map((t) => (
+        <a
+          className="gpuChip"
+          key={t.name}
+          href={t.href}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <code>{t.name}</code>
+          <span className="gpuChipWhat">{t.what}</span>
+          <span className="gpuChipWhere">{t.where}</span>
+        </a>
+      ))}
+    </div>
   );
 }
 
 function Slides() {
   return (
     <section className="slides">
-      {SLIDES.map((s, i) => (
-        <article className={`slide${i % 2 ? ' slideFlip' : ''}`} key={s.title}>
-          <div className="slideMedia">
-            <img
-              src={`${BASE}${s.img}`}
-              alt={s.title}
-              loading="lazy"
-              className={'contain' in s && s.contain ? 'containFit' : undefined}
-            />
-          </div>
+      {SLIDES.map((s, i) => {
+        const text = (
           <div className="slideText">
             <span className="kicker">{s.kicker}</span>
             <h2>{s.title}</h2>
             <p>{s.body}</p>
           </div>
-        </article>
-      ))}
+        );
+
+        // The GPU-toolchain slide carries the compiler table instead of a
+        // screenshot: the three cards ARE its illustration.
+        if (s.cards) {
+          return (
+            <article className="slide slideWide" key={s.title}>
+              {text}
+              <GpuChips />
+            </article>
+          );
+        }
+
+        return (
+          <article className={`slide${i % 2 ? ' slideFlip' : ''}`} key={s.title}>
+            <div className="slideMedia">
+              <img
+                src={`${BASE}${s.img}`}
+                alt={s.title}
+                loading="lazy"
+                className={s.contain ? 'containFit' : undefined}
+              />
+            </div>
+            {text}
+          </article>
+        );
+      })}
     </section>
   );
 }
@@ -410,7 +434,6 @@ function Story() {
   return (
     <main id="more" className="story">
       <Slides />
-      <GpuStack />
       <section className="prose">
         <h2>Robot Learning, All in Rust, All on the GPU</h2>
         <p>

@@ -371,22 +371,18 @@ a {
   }
 }
 
-/* ---------- GPU toolchain strip ---------- */
+/* ---------- GPU toolchain slide: text, then the compiler table ---------- */
 
-.gpuStack {
-  padding: 2.5rem 0 1rem;
-  border-top: 1px solid var(--line);
+/* One column: the cards are the illustration, so give them the full width
+   instead of the narrow media column. */
+.slideWide {
+  grid-template-columns: 1fr;
+  gap: 2.25rem;
+  align-content: center;
 }
 
-.gpuStackLead {
-  display: block;
-  font-size: 0.95rem;
-  color: var(--muted);
-  margin-bottom: 1.1rem;
-}
-
-.gpuStackLead strong {
-  color: var(--ink);
+.slideWide .slideText {
+  max-width: 46rem;
 }
 
 .gpuChips {
