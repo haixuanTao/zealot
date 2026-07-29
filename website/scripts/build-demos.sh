@@ -13,7 +13,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEBSITE_DIR="$(dirname "$SCRIPT_DIR")"
 ZEALOT_DIR="$(dirname "$WEBSITE_DIR")"
-DEMOS_DIR="$WEBSITE_DIR/static/demos"
+DEMOS_DIR="$WEBSITE_DIR/public/demos"
 
 # Colors for output
 RED='\033[0;31m'
@@ -21,7 +21,7 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# demo name (output dir under static/demos/) -> zealot cargo example (the
+# demo name (output dir under public/demos/) -> zealot cargo example (the
 # required feature has the same name as the example).
 DEMOS=(g1_web g1_terrain_web)
 bin_of() {
