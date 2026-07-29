@@ -72,6 +72,30 @@ DEFAULT_POS = np.array([-0.1, 0.0, 0.0, 0.3, -0.2, 0.0] * 2)
 # Open-loop action replay (S2S_ACTION_REPLAY=<nexus rollout json>): ignore the
 # policy and apply a recorded action sequence blind. Cross-engine physics
 # comparison with the controller removed from the loop.
+# Matched-state init (S2S_INIT_FROM="<nexus rollout json>:<step>"): start from
+# a state sampled from a nexus rollout — pose, joint angles, and TRUE
+# velocities (dof_vel/joint_dof_idx, written with BIPED_DUMP_VEL=1). Combined
+# with S2S_ACTION_REPLAY this makes the cross-engine divergence probe.
+_INIT = None
+if os.environ.get("S2S_INIT_FROM"):
+    _p, _s = os.environ["S2S_INIT_FROM"].rsplit(":", 1)
+    with open(_p) as _f:
+        _d = json.load(_f)
+    _k = int(_s)
+    _jdof = _d.get("joint_dof_idx")
+    _dv = _d.get("dof_vel")
+    _jn = _d["joint_names"]
+    _INIT = {
+        "pos": _d["base"][_k][:3],
+        "quat_wxyz": [_d["base"][_k][6]] + _d["base"][_k][3:6],
+        "joints": [_d["joints"][_k][_jn.index(n)] for n in POLICY_JOINTS],
+        "lin": _dv[_k][:3] if _dv else [0.0] * 3,
+        "ang": _dv[_k][3:6] if _dv else [0.0] * 3,
+        "jvel": ([_dv[_k][_jdof[_jn.index(n)]] for n in POLICY_JOINTS]
+                 if _dv and _jdof else [0.0] * 12),
+        "step": _k,
+    }
+
 _REPLAY = None
 if os.environ.get("S2S_ACTION_REPLAY"):
     with open(os.environ["S2S_ACTION_REPLAY"]) as _f:
@@ -283,6 +307,18 @@ def main():
                              orientation=np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]))
         robot.set_linear_velocity(np.zeros(3))
         robot.set_angular_velocity(np.zeros(3))
+        if _INIT is not None:
+            jp[pol_d] = _INIT["joints"]
+            jv = np.zeros(n)
+            jv[pol_d] = _INIT["jvel"]
+            robot.set_world_pose(position=np.array(_INIT["pos"]),
+                                 orientation=np.array(_INIT["quat_wxyz"]))
+            robot.set_joint_positions(jp)
+            robot.set_joint_velocities(jv)
+            robot.set_linear_velocity(np.array(_INIT["lin"]))
+            robot.set_angular_velocity(np.array(_INIT["ang"]))
+            world.step(render=False)
+            return
         robot.set_joint_positions(jp)
         robot.set_joint_velocities(np.zeros(n))
         world.step(render=False)
@@ -334,7 +370,8 @@ def main():
             frames_hist = frames_hist[1:] + [o.copy()]
         action = policy.act(np.concatenate(frames_hist))
         if _REPLAY is not None:
-            action = _REPLAY[min(t, len(_REPLAY) - 1)]
+            _off = _INIT["step"] if _INIT is not None else 0
+            action = _REPLAY[min(_off + t, len(_REPLAY) - 1)]
         target = DEFAULT_POS + ACTION_SCALE * action
 
         for _ in range(DECIMATION):
