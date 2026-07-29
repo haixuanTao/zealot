@@ -1453,6 +1453,16 @@ impl BipedNexusBatchEnv {
         {
             task.weights.stand_planted = w;
         }
+        // Soft joint-limit penalty weight. At the spec default (-0.5) a fully
+        // saturated ankle costs ~0.0009/step per joint — 3-4x below the
+        // ~0.002/step where a term changes behaviour, which is why the policy
+        // parks on the endstop and lets the constraint carry ~97% of the load.
+        if let Some(w) = std::env::var("BIPED_W_DOF_LIMITS")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.dof_pos_limits = w;
+        }
         // Balance-don't-step at stand: per-airborne-foot penalty while the
         // command is standing (NEGATIVE, e.g. -1.0; 0 = off). Pair with a
         // raised BIPED_STAND_PROB so the policy actually trains the quiet
