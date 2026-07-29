@@ -130,7 +130,9 @@ function GitHubButton({large}: {large?: boolean}) {
             d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
           />
         </svg>
-        Star
+        {/* Name the repo in the prose CTA: the paragraph next to it talks
+            about nexus, so a bare "Star" reads as if it were nexus's. */}
+        {large ? 'Star zealot' : 'Star'}
       </a>
       {stars !== null && (
         <a
@@ -308,13 +310,13 @@ const SLIDES = [
     img: 'img/slides/nexus-terrain.jpg',
     kicker: 'zealot-rl',
     title: 'rsl_rl, ported to Rust — and to every GPU',
-    body: 'zealot-rl is the rsl_rl tier of the stack rewritten in Rust: policy network, autodiff and PPO. It runs on vortx and khal, the same portable GPU layer nexus is built on, so the learning half is no more platform-bound than the physics half — the identical code path takes CUDA, Metal or WebGPU.',
+    body: 'zealot-rl is the rsl_rl tier rewritten in Rust: the model definition and the whole training pipeline — actor-critic network, autodiff, PPO, GAE, Adam — are Rust, not a Python front-end over a C++ core. It runs on vortx and khal, the same portable GPU layer nexus is built on, so the learning half is no more platform-bound than the physics half.',
   },
   {
     img: 'img/slides/nexus-fleet.jpg',
-    kicker: 'One source, every backend',
-    title: 'Rust-GPU for shaders, cuda-oxide for CUDA',
-    body: 'The kernels are written once as Rust. Rust-GPU compiles them to SPIR-V for WebGPU and Metal; cuda-oxide compiles the verbatim same source to PTX for native CUDA — no second implementation to keep in sync. On an RTX 5090 the CUDA path runs 2.4–4.3× faster than WebGPU while staying bit-exact against it.',
+    kicker: 'GPU ready',
+    title: 'One Rust source, every GPU backend',
+    body: 'The kernels are written once, in Rust. rust-gpu compiles them to SPIR-V for WebGPU and Metal; cuda-oxide compiles the verbatim same source to PTX for native CUDA; cutile-rs puts the hot PPO GEMMs on tf32 tensor cores. No second implementation to keep in sync — and on an RTX 5090 the CUDA path runs 2.4–4.3× faster than WebGPU while staying bit-exact against it.',
   },
   {
     img: 'img/slides/mujoco-sim2sim.jpg',
@@ -323,6 +325,53 @@ const SLIDES = [
     body: 'A policy is only trustworthy if it survives a different solver. The same checkpoint runs sim2sim in the browser on rapier.js and on the official MuJoCo WebAssembly build — the reference engine — walking bit-identical terrain, so you can watch where the engines agree and where they diverge.',
   },
 ] as const;
+
+/// The GPU toolchain, named. Same Rust source behind each of these.
+const GPU_STACK = [
+  {
+    name: 'rust-gpu',
+    href: 'https://github.com/Rust-GPU/rust-gpu',
+    what: 'Rust → SPIR-V',
+    where: 'WebGPU · Metal · Vulkan',
+  },
+  {
+    name: 'cuda-oxide',
+    href: 'https://github.com/NVlabs/cuda-oxide',
+    what: 'Rust → PTX',
+    where: 'native CUDA',
+  },
+  {
+    name: 'cutile-rs',
+    href: 'https://github.com/NVlabs/cutile-rs',
+    what: 'tiled tf32 GEMMs',
+    where: 'tensor cores',
+  },
+] as const;
+
+function GpuStack() {
+  return (
+    <section className="gpuStack">
+      <span className="gpuStackLead">
+        <strong>GPU ready</strong> — the same kernels, three compilers
+      </span>
+      <div className="gpuChips">
+        {GPU_STACK.map((t) => (
+          <a
+            className="gpuChip"
+            key={t.name}
+            href={t.href}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <code>{t.name}</code>
+            <span className="gpuChipWhat">{t.what}</span>
+            <span className="gpuChipWhere">{t.where}</span>
+          </a>
+        ))}
+      </div>
+    </section>
+  );
+}
 
 function Slides() {
   return (
@@ -361,6 +410,7 @@ function Story() {
   return (
     <main id="more" className="story">
       <Slides />
+      <GpuStack />
       <section className="prose">
         <h2>Robot Learning, All in Rust, All on the GPU</h2>
         <p>
@@ -368,8 +418,9 @@ function Story() {
           physics simulation, observation/reward computation, and the policy network all run on
           the GPU. Physics is <a href="https://nexus.dimforge.com">nexus</a>, dimforge's GPU
           multiphysics engine: compute shaders written in Rust via{' '}
-          <a href="https://github.com/Rust-GPU/rust-gpu">Rust-GPU</a>, executed through WebGPU (or
-          CUDA / Metal natively). No Python, no PyTorch — the whole training loop is Rust.
+          <a href="https://github.com/Rust-GPU/rust-gpu">rust-gpu</a>, executed through WebGPU (or
+          CUDA / Metal natively). No Python, no PyTorch — the model definition and the training
+          pipeline are both Rust, end to end.
         </p>
         <p>
           Because the stack targets WebGPU, the same physics engine compiles to WebAssembly and
@@ -379,8 +430,13 @@ function Story() {
         </p>
         <div className="ctaRow">
           <GitHubButton large />
-          <a className="btn btnOutline" href="https://nexus.dimforge.com">
-            nexus
+          <a
+            className="btn btnOutline"
+            href="https://github.com/dimforge/nexus"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            dimforge/nexus
           </a>
         </div>
       </section>

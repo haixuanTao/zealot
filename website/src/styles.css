@@ -371,6 +371,70 @@ a {
   }
 }
 
+/* ---------- GPU toolchain strip ---------- */
+
+.gpuStack {
+  padding: 2.5rem 0 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.gpuStackLead {
+  display: block;
+  font-size: 0.95rem;
+  color: var(--muted);
+  margin-bottom: 1.1rem;
+}
+
+.gpuStackLead strong {
+  color: var(--ink);
+}
+
+.gpuChips {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.9rem;
+}
+
+@media (max-width: 700px) {
+  .gpuChips {
+    grid-template-columns: 1fr;
+  }
+}
+
+.gpuChip {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.9rem 1.1rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  text-decoration: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.gpuChip:hover {
+  border-color: var(--teal);
+  background: #eef5f5;
+  text-decoration: none;
+}
+
+.gpuChip code {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--teal);
+}
+
+.gpuChipWhat {
+  font-size: 0.9rem;
+  color: var(--ink);
+}
+
+.gpuChipWhere {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
 .prose h2 {
   font-size: 2rem;
   margin: 0 0 1rem;
