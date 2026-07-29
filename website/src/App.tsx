@@ -83,7 +83,22 @@ function Slider(props: {
   );
 }
 
+/// The demo iframes forward downward wheel events instead of zooming, so the
+/// page keeps scrolling even while the cursor is over a canvas.
+function useForwardedScroll() {
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.origin !== location.origin) return;
+      const dy = (e.data as {zealotScroll?: number} | null)?.zealotScroll;
+      if (typeof dy === 'number') window.scrollBy({top: dy});
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
+}
+
 function Demo() {
+  useForwardedScroll();
   const [selected, setSelected] = useState<DemoName>('nexus');
   const [knobs, setKnobs] = useState<Knobs>(DEFAULTS);
   const [applied, setApplied] = useState<Knobs>(DEFAULTS);
@@ -216,6 +231,59 @@ function Demo() {
   );
 }
 
+/// Scroll sections: one image + one block of text each, alternating sides.
+const SLIDES = [
+  {
+    img: 'img/slides/nexus-logo.png',
+    contain: true,
+    kicker: 'nexus',
+    title: '100% Rust simulator, on any GPU',
+    body: "Physics is nexus, dimforge's GPU multiphysics engine: the whole solver is compute shaders written in Rust via Rust-GPU. The same code runs through WebGPU in your browser, and through CUDA or Metal natively — no Python, no CUDA C, no per-backend rewrite.",
+  },
+  {
+    img: 'img/slides/nexus-terrain.jpg',
+    kicker: 'Training',
+    title: 'The simulator is the demo',
+    body: 'Thousands of environments step in parallel on the GPU while PPO — actor-critic MLPs, GAE and Adam, all in Rust — learns from them. What you scrolled past is that exact environment compiled to WebAssembly: the real training simulator, not a recording.',
+  },
+  {
+    img: 'img/slides/nexus-fleet.jpg',
+    kicker: 'Terrain',
+    title: 'Rough ground, generated deterministically',
+    body: 'Box plateaus, waves and noise fields laid out in difficulty rows, harder with distance. Drag the sliders and the terrain regenerates from the same seeded generator every engine shares — so difficulty, roughness and slope mean exactly the same thing in all three.',
+  },
+  {
+    img: 'img/slides/mujoco-sim2sim.jpg',
+    kicker: 'Validation',
+    title: 'Cross-checked against MuJoCo and rapier',
+    body: 'A policy is only trustworthy if it survives a different solver. The same checkpoint runs sim2sim in the browser on rapier.js and on the official MuJoCo WebAssembly build — the reference engine — walking bit-identical terrain, so you can watch where the engines agree and where they diverge.',
+  },
+] as const;
+
+function Slides() {
+  return (
+    <section className="slides">
+      {SLIDES.map((s, i) => (
+        <article className={`slide${i % 2 ? ' slideFlip' : ''}`} key={s.title}>
+          <div className="slideMedia">
+            <img
+              src={`${BASE}${s.img}`}
+              alt={s.title}
+              loading="lazy"
+              className={'contain' in s && s.contain ? 'containFit' : undefined}
+            />
+          </div>
+          <div className="slideText">
+            <span className="kicker">{s.kicker}</span>
+            <h2>{s.title}</h2>
+            <p>{s.body}</p>
+          </div>
+        </article>
+      ))}
+    </section>
+  );
+}
+
 const FEATURES = [
   ['🦿', 'Velocity-Tracking Locomotion', 'The humanoid tracks commanded forward/lateral/turn velocities — steer it live with the command sliders in the demo.'],
   ['⚡', 'GPU-Vectorized Training', 'Thousands of parallel environments step on the GPU through nexus rigid-body physics.'],
@@ -228,6 +296,7 @@ const FEATURES = [
 function Story() {
   return (
     <main id="more" className="story">
+      <Slides />
       <section className="prose">
         <h2>Robot Learning, All in Rust, All on the GPU</h2>
         <p>

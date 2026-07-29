@@ -304,25 +304,31 @@ pub async fn run(cfg: DemoCfg) {
     let mut window = Window::new_with_size("zealot G1 — nexus GPU physics", 1200, 900).await;
     window.set_background_color(Color::new(0.051, 0.169, 0.180, 1.0));
 
-    // Z-up orbit camera (the MJCF scene is Z-up). Terrain: close-follow one
-    // robot, starting framed on its spawn patch (whose ground height depends
-    // on the slope knob); fleet: pulled back to frame the grid.
+    // Z-up orbit camera (the MJCF scene is Z-up). Terrain: close-follow
+    // ROBOT 0 on its own lane, starting framed on its spawn patch (whose
+    // ground height depends on the slope knob). Framing the whole fleet
+    // instead would sit 14 m out, and at that zoom a 0.4 m/s walk covers so
+    // few pixels it reads as a crawl. Scroll to pull back.
     let mut camera = if cfg.terrain {
         let (spawn_x, _) = TerrainStrip::patch_center(cfg.terrain_level.min(19));
         let spawn_z = (cfg.terrain_slope_deg.min(45) as f32).to_radians().tan()
             * (spawn_x - zealot_env::terrain::STRIP_X0);
-        // Multi-robot terrain spreads over three family lanes 9 m apart —
-        // pull the camera back enough to frame them (close-follow only for
-        // a single robot).
-        let (back, up) = if cfg.n_robots > 1 { (14.0, 6.5) } else { (3.5, 2.2) };
+        // Robot 0's lane — same rule as `offset_of` below (env % 3 lanes,
+        // 9 m apart; a lone robot renders at the origin).
+        let lane_y = if cfg.n_robots == 1 { 0.0 } else { -9.0 };
+        let (back, up) = (4.0, 2.2);
         OrbitCamera3d::new(
-            Vec3::new(spawn_x - back * 0.4, -back, spawn_z + up),
-            Vec3::new(spawn_x, 0.0, spawn_z + 0.6),
+            Vec3::new(spawn_x - back * 0.4, lane_y - back, spawn_z + up),
+            Vec3::new(spawn_x, lane_y, spawn_z + 0.6),
         )
     } else {
         OrbitCamera3d::new(Vec3::new(-4.5, -5.5, 3.2), Vec3::new(0.0, 0.0, 0.6))
     };
     camera.set_up_axis(Vec3::Z);
+    // The demo opens already framed on one robot, and the page scrolls under
+    // the canvas — so the wheel may only pull OUT from here. Zooming further
+    // in just buries the camera in the robot and steals the page's scroll.
+    camera.set_min_dist(camera.dist());
 
     let mut scene = SceneNode3d::empty();
     scene.add_directional_light(Vec3::new(1.0, -2.0, -3.0));
@@ -615,6 +621,10 @@ pub async fn run(cfg: DemoCfg) {
         let cpb = poses.len() / n_robots;
         let mut sole_bottom = f32::INFINITY;
         let mut mean_base = Vec3::ZERO;
+        // Camera focus: robot 0 specifically. Following the fleet centroid
+        // means framing lanes 9 m apart, and that zoom level makes a 0.4 m/s
+        // walk read as a crawl — the motion covers too few pixels.
+        let mut focus = Vec3::ZERO;
         for (e, body_nodes) in robots.iter_mut().enumerate() {
             let off = offset_of(e);
             for (i, node) in body_nodes.iter_mut().enumerate() {
@@ -640,6 +650,9 @@ pub async fn run(cfg: DemoCfg) {
                 0.0
             };
             mean_base += Vec3::new(base[0], base[1], base[2]) + off;
+            if e == 0 {
+                focus = Vec3::new(base[0], base[1], base[2]) + off;
+            }
             // Fall / timeout detection from the (already read) render poses —
             // the resident loop has no per-step obs readback to piggyback on.
             let up_z = 1.0 - 2.0 * (brot[0] * brot[0] + brot[1] * brot[1]);
@@ -681,7 +694,7 @@ pub async fn run(cfg: DemoCfg) {
 
         // Camera follows the formation centroid smoothly (z tracks the mean
         // pelvis height minus a hair, so sloped/raised terrain stays framed).
-        let target = Vec3::new(mean_base.x, mean_base.y, mean_base.z - 0.2);
+        let target = Vec3::new(focus.x, focus.y, focus.z - 0.2);
         let at = camera.at();
         camera.set_at(at + (target - at) * 0.08);
 

@@ -145,6 +145,12 @@
       el.addEventListener('pointerup', () => { drag = null; });
       el.addEventListener('wheel', (e) => {
         e.preventDefault();
+        // Scrolling DOWN belongs to the embedding page (the story below the
+        // fold); the wheel only zooms out from the framing we open at.
+        if (e.deltaY > 0 && parent !== window) {
+          parent.postMessage({zealotScroll: e.deltaY}, location.origin);
+          return;
+        }
         cam.dist = Math.min(60, Math.max(2, cam.dist * Math.exp(e.deltaY * 0.001)));
       }, { passive: false });
     }

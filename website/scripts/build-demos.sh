@@ -182,6 +182,20 @@ write_index_html() {
 </head>
 <body>
   <div class="loading" id="loading">Loading WebAssembly (GPU physics)...</div>
+  <script>
+    // The page embedding this demo scrolls; the canvas would otherwise eat
+    // every wheel event. Scrolling DOWN is forwarded to the parent so the
+    // story below the fold stays reachable — the wheel still zooms the
+    // camera OUT (scroll up), which is all that's useful since the demo
+    // opens already framed on one robot.
+    addEventListener('wheel', (e) => {
+      if (e.deltaY > 0 && parent !== window) {
+        e.preventDefault();
+        e.stopPropagation();
+        parent.postMessage({zealotScroll: e.deltaY}, location.origin);
+      }
+    }, {capture: true, passive: false});
+  </script>
   <script type="module">
     import init from './pkg/example.js';
 
