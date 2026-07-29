@@ -1212,6 +1212,13 @@ pub struct BipedNexusBatchEnv {
     /// each step (wraps at 1), reset to 0 on episode reset. Fed to the policy as
     /// (sin,cos) and used by the periodic gait reward to prescribe swing/stance.
     gait_phase: Vec<f32>,
+    /// Consecutive control steps each joint has spent inside its position-limit
+    /// band, per env (`env * NUM_JOINTS + joint`). Atomic so the parallel
+    /// per-env step closure can update its own entries. Drives the
+    /// endstop-DWELL termination: touching a limit is normal in every gait
+    /// (54-66% of frames), but LEANING on one is the standing pathology
+    /// (median dwell 19 steps standing vs 9 walking).
+    limit_dwell: Vec<std::sync::atomic::AtomicU16>,
 
     /// Global control-step counter (for push-perturbation scheduling).
     global_step: u64,
@@ -1824,6 +1831,9 @@ impl BipedNexusBatchEnv {
         let air_time = vec![[0.0f32; NUM_FEET]; num_envs];
         let last_td_foot = vec![-1i8; num_envs];
         let gait_phase = vec![0.0f32; num_envs];
+        let limit_dwell: Vec<std::sync::atomic::AtomicU16> = (0..num_envs * NUM_JOINTS)
+            .map(|_| std::sync::atomic::AtomicU16::new(0))
+            .collect();
         let reset_vel = std::env::var("BIPED_RESET_VEL").is_ok_and(|v| v == "1");
         if reset_vel {
             println!("reset-velocity randomization ENABLED (AGILE reset_base/joints: lin ±0.25, ang ±0.5, joints ±1.0)");
@@ -1912,6 +1922,7 @@ impl BipedNexusBatchEnv {
             sensed_force: vec![[0.5 * robot.total_mass * 9.81; NUM_FEET]; num_envs],
             last_td_foot,
             gait_phase,
+            limit_dwell,
             global_step: 0,
             dbg_stance: Vec::new(),
             push_vel,
@@ -2883,6 +2894,18 @@ impl BipedNexusBatchEnv {
         // episode (the ankle is inside the band >50% of the time) and bury the
         // gradient; gating on approach SPEED targets only the damaging case.
         // 2.0 rad/s ≈ 43 mJ, the energy of a 7 mm drop.
+        // Endstop-DWELL fault (BIPED_LIMIT_DWELL_STEPS, consecutive control
+        // steps inside the band; 0 disables). The free-support exploit is
+        // STATIC — the constraint carries ~97% of the ankle load while the
+        // motor idles — so a velocity gate can't catch it: the policy can
+        // drift onto the stop slowly and lean forever. Terminating on CONTACT
+        // is not an option either (54-66% of frames touch, in every gait).
+        // Dwell separates them: standing leans ~19 steps at a stretch,
+        // walking brushes ~9.
+        let dwell_max: u16 = std::env::var("BIPED_LIMIT_DWELL_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let slam_vel: f32 = std::env::var("BIPED_LIMIT_SLAM_VEL")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
@@ -2986,6 +3009,28 @@ impl BipedNexusBatchEnv {
                         state.joint_vel[i].abs()
                             > self.task.robot.joints[i].vel_limit * vel_term
                     });
+                // Leaning on an endstop: inside the band for `dwell_max`
+                // consecutive control steps (own-env entries only, so the
+                // relaxed atomics never race).
+                let dwell_fault = if dwell_max > 0 {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut hit = false;
+                    for i in 0..NUM_JOINTS {
+                        let (lo, hi) = self.task.robot.joints[i].pos_limit;
+                        let q = state.joint_pos[i];
+                        let c = &self.limit_dwell[e * NUM_JOINTS + i];
+                        if q < lo + SLAM_BAND || q > hi - SLAM_BAND {
+                            if c.fetch_add(1, Relaxed) + 1 >= dwell_max {
+                                hit = true;
+                            }
+                        } else {
+                            c.store(0, Relaxed);
+                        }
+                    }
+                    hit
+                } else {
+                    false
+                };
                 // Slamming a joint endstop: inside the band AND still moving
                 // into it above the energy threshold.
                 let slam_fault = slam_vel > 0.0
@@ -3035,6 +3080,7 @@ impl BipedNexusBatchEnv {
                     || crossed
                     || vel_fault
                     || slam_fault
+                    || dwell_fault
                     || power_fault
                     || envelope_fault
                     || self.task.fell_over(&state.base)
@@ -3066,6 +3112,10 @@ impl BipedNexusBatchEnv {
                 comps[26] = rb.stand_planted;
                 comps[27] = rb.feet_yaw_diff;
                 if fell {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    for i in 0..NUM_JOINTS {
+                        self.limit_dwell[e * NUM_JOINTS + i].store(0, Relaxed);
+                    }
                     comps[23] = self.task.weights.termination;
                     reward += self.task.weights.termination;
                 }
