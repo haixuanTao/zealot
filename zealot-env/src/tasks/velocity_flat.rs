@@ -1500,3 +1500,82 @@ mod tests {
         assert_eq!(task.symmetry_error(&[0.0; NUM_JOINTS]), 0.0);
     }
 }
+
+#[cfg(test)]
+mod moving_gate_tests {
+    use super::*;
+
+    /// The `moving` gate is what keeps every stepping incentive (gait_clock,
+    /// air_time, single_support) OFF at a standing command. If it ever leaks,
+    /// the policy gets paid to march in place. Pin it directly.
+    /// The launchers set these; the struct defaults do not (stand_planted
+    /// shipped at 0 for several generations before v10 turned it on).
+    fn launcher_task() -> VelocityFlatTask {
+        let mut task = VelocityFlatTask::new();
+        task.weights.stand_planted = -1.0;
+        task.weights.gait_clock = 3.0;
+        task.weights.air_time = 1.0;
+        task.weights.single_support = 1.0;
+        task
+    }
+
+    #[test]
+    fn standing_gate_zeroes_every_stepping_term() {
+        let task = launcher_task();
+        // A state that WOULD earn every stepping term if the gate were open:
+        // one foot airborne mid-swing, the other planted, base moving forward.
+        let mut st = RobotState::default();
+        st.feet[0].contact = false;
+        st.feet[0].air_time = 0.1;
+        st.feet[0].height = 0.12;
+        st.feet[1].contact = true;
+        st.base.lin_vel_world = [0.5, 0.0, 0.0];
+        st.phase = 0.25;
+
+        let stand = task.reward(&st, &VelocityCommand::default());
+        assert_eq!(stand.gait_clock, 0.0, "gait_clock leaked at zero command");
+        assert_eq!(stand.air_time, 0.0, "air_time leaked at zero command");
+        // single_support is not gated off at stand -- it INVERTS: planted feet
+        // are rewarded, stepping is penalized. Pin the sign, not a zero.
+        assert!(
+            stand.single_support < 0.0,
+            "single_support should penalize a lifted foot at zero command: {}",
+            stand.single_support
+        );
+        let mut planted = st.clone();
+        planted.feet[0].contact = true;
+        planted.feet[0].air_time = 0.0;
+        assert!(
+            task.reward(&planted, &VelocityCommand::default()).single_support > 0.0,
+            "single_support should REWARD both feet planted at zero command"
+        );
+        // ...and stand_planted must actively CHARGE for the airborne foot.
+        assert!(stand.stand_planted < 0.0, "stand_planted did not charge: {}", stand.stand_planted);
+
+        // Same state under a moving command: the stepping terms come alive, so
+        // the assertions above are testing the GATE, not a dead code path.
+        let moving = task.reward(
+            &st,
+            &VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 },
+        );
+        assert!(moving.gait_clock != 0.0, "gait_clock never fires even when moving");
+        assert_eq!(moving.stand_planted, 0.0, "stand_planted fired while moving");
+    }
+
+    /// Yaw counts toward the speed magnitude, so a pure turn-in-place command
+    /// is MOVING (this was a real v11 bug: the clock froze on linear speed
+    /// only while the task's predicate included yaw).
+    #[test]
+    fn yaw_only_command_counts_as_moving() {
+        let task = launcher_task();
+        let mut st = RobotState::default();
+        st.feet[0].contact = false;
+        st.feet[0].air_time = 0.1;
+        st.feet[1].contact = true;
+        let turn = task.reward(&st, &VelocityCommand { vx: 0.0, vy: 0.0, yaw_rate: 0.4 });
+        assert_eq!(turn.stand_planted, 0.0, "a yaw command was treated as standing");
+        // And a sub-threshold command IS standing.
+        let tiny = task.reward(&st, &VelocityCommand { vx: 0.05, vy: 0.0, yaw_rate: 0.0 });
+        assert!(tiny.stand_planted < 0.0, "a 0.05 command was treated as moving");
+    }
+}
