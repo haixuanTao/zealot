@@ -110,30 +110,43 @@ fn load_visuals() -> std::collections::HashMap<String, Vec<([f32; 4], Vec<Vec3>,
 /// Control-step period — matches `VelocityFlatTask` (50 Hz).
 const DT: f32 = 0.02;
 
-/// Live driving: arrow keys / WASD and any connected gamepad, mapped onto the
-/// policy's velocity command. Browser-only — natively the demo keeps its
-/// slider/preset commands.
+/// Live driving: each arrow / WASD press BUMPS the policy's velocity command
+/// by a fixed step and the command latches, so you steer with taps instead of
+/// holding a key down. Space (or Stand) zeroes it. A gamepad stick overrides
+/// while deflected. Browser-only — natively the demo keeps its presets.
 #[cfg(target_arch = "wasm32")]
 mod drive {
     use std::cell::RefCell;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
 
-    /// forward, back, left(strafe), right(strafe), turn left, turn right.
+    /// Per-press increment, and the range each axis is held within.
+    const STEP: f32 = 0.2;
+    const VX: (f32, f32) = (-0.6, 1.0);
+    const VY: (f32, f32) = (-0.4, 0.4);
+    const YAW: (f32, f32) = (-1.0, 1.0);
+
+    /// The latched command. `None` until the user first drives, so the demo's
+    /// presets/sliders stay in charge before that.
     thread_local! {
-        static KEYS: RefCell<[bool; 6]> = const { RefCell::new([false; 6]) };
+        static CMD: RefCell<Option<[f32; 3]>> = const { RefCell::new(None) };
     }
 
-    fn slot(code: &str) -> Option<usize> {
-        Some(match code {
-            "ArrowUp" | "KeyW" => 0,
-            "ArrowDown" | "KeyS" => 1,
-            "KeyA" => 2,
-            "KeyD" => 3,
-            "ArrowLeft" | "KeyQ" => 4,
-            "ArrowRight" | "KeyE" => 5,
-            _ => return None,
-        })
+    /// Adopt a command set elsewhere (a preset button or slider), so the next
+    /// key press bumps from what the user currently sees.
+    pub fn sync(cmd: [f32; 3]) {
+        CMD.with(|c| *c.borrow_mut() = Some(cmd));
+    }
+
+    fn bump(axis: usize, delta: f32) {
+        CMD.with(|c| {
+            let mut c = c.borrow_mut();
+            let mut cmd = c.unwrap_or([0.0; 3]);
+            cmd[axis] += delta;
+            let (lo, hi) = [VX, VY, YAW][axis];
+            cmd[axis] = cmd[axis].clamp(lo, hi);
+            *c = Some(cmd);
+        });
     }
 
     /// Attach the key listeners once, at startup.
@@ -141,69 +154,54 @@ mod drive {
         let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
             return;
         };
-        for (event, down) in [("keydown", true), ("keyup", false)] {
-            let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
-                move |e: web_sys::KeyboardEvent| {
-                    if let Some(i) = slot(&e.code()) {
-                        // Arrows would otherwise scroll the embedding page.
-                        e.prevent_default();
-                        KEYS.with(|k| k.borrow_mut()[i] = down);
-                    }
-                },
-            );
-            let _ = doc
-                .add_event_listener_with_callback(event, cb.as_ref().unchecked_ref());
-            cb.forget(); // lives for the page's lifetime
-        }
+        let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+            move |e: web_sys::KeyboardEvent| {
+                // Auto-repeat would ramp the command while a key is merely
+                // held; one press should be one step.
+                if e.repeat() {
+                    return;
+                }
+                match e.code().as_str() {
+                    "ArrowUp" | "KeyW" => bump(0, STEP),
+                    "ArrowDown" | "KeyS" => bump(0, -STEP),
+                    "KeyA" => bump(1, STEP),
+                    "KeyD" => bump(1, -STEP),
+                    "ArrowLeft" | "KeyQ" => bump(2, STEP),
+                    "ArrowRight" | "KeyE" => bump(2, -STEP),
+                    "Space" => CMD.with(|c| *c.borrow_mut() = Some([0.0; 3])),
+                    _ => return,
+                }
+                // Arrows/space would otherwise scroll the embedding page.
+                e.prevent_default();
+            },
+        );
+        let _ = doc.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+        cb.forget(); // lives for the page's lifetime
     }
 
-    /// Current command from keys + gamepad, or `None` when nothing is held —
-    /// in which case the demo's own preset/slider command stays in charge.
-    /// Ranges match the command sliders: vx −0.6..1.0, vy ±0.4, yaw ±1.0.
+    /// The command to drive with, or `None` while the user has never touched
+    /// the controls (demo presets stay in charge until then).
     pub fn command() -> Option<[f32; 3]> {
-        let mut cmd = [0.0f32; 3];
-        let mut active = false;
-
-        KEYS.with(|k| {
-            let k = k.borrow();
-            if k[0] { cmd[0] += 0.6; }
-            if k[1] { cmd[0] -= 0.4; }
-            if k[2] { cmd[1] += 0.3; }
-            if k[3] { cmd[1] -= 0.3; }
-            if k[4] { cmd[2] += 0.6; }
-            if k[5] { cmd[2] -= 0.6; }
-            active = k.iter().any(|&d| d);
-        });
-
-        // Gamepad: left stick drives, right stick (or triggers' axis) turns.
-        // Sticks rest near zero but rarely exactly at it — hence the deadzone.
-        if let Some(pads) = web_sys::window()
-            .and_then(|w| w.navigator().get_gamepads().ok())
-        {
+        // A deflected gamepad stick overrides the latched value; sticks rest
+        // near but not exactly at zero, hence the deadzone.
+        if let Some(pads) = web_sys::window().and_then(|w| w.navigator().get_gamepads().ok()) {
             for pad in pads.iter().filter_map(|p| p.dyn_into::<web_sys::Gamepad>().ok()) {
                 let axes = pad.axes();
-                let axis = |i: u32| -> f32 {
-                    axes.get(i).as_f64().unwrap_or(0.0) as f32
-                };
+                let axis = |i: u32| axes.get(i).as_f64().unwrap_or(0.0) as f32;
                 let dead = |v: f32| if v.abs() < 0.15 { 0.0 } else { v };
                 let (lx, ly, rx) = (dead(axis(0)), dead(axis(1)), dead(axis(2)));
                 if lx != 0.0 || ly != 0.0 || rx != 0.0 {
-                    // Stick up is negative on every mapping we care about.
-                    cmd[0] += if -ly > 0.0 { -ly * 1.0 } else { -ly * 0.6 };
-                    cmd[1] += -lx * 0.4;
-                    cmd[2] += -rx * 1.0;
-                    active = true;
+                    // Stick up reads negative on the standard mapping.
+                    let vx = if -ly > 0.0 { -ly * VX.1 } else { -ly * -VX.0 };
+                    return Some([
+                        vx.clamp(VX.0, VX.1),
+                        (-lx * VY.1).clamp(VY.0, VY.1),
+                        (-rx * YAW.1).clamp(YAW.0, YAW.1),
+                    ]);
                 }
             }
         }
-
-        if !active {
-            return None;
-        }
-        cmd[0] = cmd[0].clamp(-0.6, 1.0);
-        cmd[1] = cmd[1].clamp(-0.4, 0.4);
-        cmd[2] = cmd[2].clamp(-1.0, 1.0);
-        Some(cmd)
+        CMD.with(|c| *c.borrow())
     }
 }
 
@@ -643,35 +641,22 @@ pub async fn run(cfg: DemoCfg) {
     let mut hud_realtime = 1.0f32;
 
     drive::install();
-    // Whether the last frame's command came from live input, so releasing the
-    // keys/stick hands control back to the sliders exactly once.
-    let mut driving = false;
+    // Start the latched command at what the demo is already running, so the
+    // first tap bumps up from the visible value instead of from zero.
+    drive::sync(cmd_ui);
 
     while window.render_3d(&mut scene, &mut camera).await {
-        // Live driving (keys / gamepad) outranks the sliders while held.
-        match drive::command() {
-            Some(c) => {
-                driving = true;
-                if cmds.iter().any(|p| *p != c) {
-                    cmd_ui = c;
-                    for e in 0..n_robots {
-                        cmds[e] = c;
-                        env.pin_command_for(e, c[0], c[1], c[2]);
-                        gobs.set_cmd(&backend, e, c).expect("cmd");
-                    }
-                }
-            }
-            None if driving => {
-                // Released: stand still rather than keep the last velocity.
-                driving = false;
-                cmd_ui = [0.0; 3];
+        // Driving: each key press bumped the latched command, so apply it
+        // whenever it differs from what the robots are already running.
+        if let Some(c) = drive::command() {
+            if cmds.iter().any(|p| *p != c) {
+                cmd_ui = c;
                 for e in 0..n_robots {
-                    cmds[e] = cmd_ui;
-                    env.pin_command_for(e, 0.0, 0.0, 0.0);
-                    gobs.set_cmd(&backend, e, cmd_ui).expect("cmd");
+                    cmds[e] = c;
+                    env.pin_command_for(e, c[0], c[1], c[2]);
+                    gobs.set_cmd(&backend, e, c).expect("cmd");
                 }
             }
-            None => {}
         }
 
         if pending_reset {
@@ -928,7 +913,7 @@ pub async fn run(cfg: DemoCfg) {
                             *reset_clicked = true;
                         }
                         ui.label("drag: orbit camera   scroll: zoom out");
-                        ui.label("drive: ↑↓ / WASD, ←→ turn, or a gamepad");
+                        ui.label("drive: tap ↑↓ ±0.2, ←→ turn, space stops");
                     });
             });
         }
@@ -941,6 +926,9 @@ pub async fn run(cfg: DemoCfg) {
                 env.pin_command_for(e, cmds[e][0], cmds[e][1], cmds[e][2]);
                 gobs.set_cmd(&backend, e, cmds[e]).expect("cmd");
             }
+            // Keep the latched drive command in step with the buttons and
+            // sliders, so the next key press bumps from what's on screen.
+            drive::sync(cmd_ui);
         }
         if reset_clicked {
             pending_reset = true;
