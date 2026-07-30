@@ -78,6 +78,8 @@ def gait_period_for(cmd_speed: float) -> float:
     t = (min(abs(cmd_speed), 0.5) - 0.1) / 0.4
     return GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * max(t, 0.0)
 HIST = 5
+# Frame width: 45 for v21-and-earlier, 48 once the gyro was added (v22+).
+# Sniffed from the checkpoint so one harness runs both.
 FALL_Z = 0.45
 TILT_LIMIT = np.deg2rad(70.0)
 W, H = 960, 540
@@ -205,7 +207,10 @@ def projected_gravity(q_wxyz):
 def main():
     policy = Policy(POLICY)
     assert policy.act_dim == 12, policy.act_dim
-    assert policy.obs_dim == 45 * HIST, policy.obs_dim
+    assert policy.obs_dim % HIST == 0, policy.obs_dim
+    frame = policy.obs_dim // HIST
+    assert frame in (45, 48), f"unexpected obs frame width {frame}"
+    print(f"obs frame {frame} ({'with' if frame == 48 else 'no'} gyro)")
 
     model = mujoco.MjModel.from_xml_path(MODEL_XML)
     model.opt.timestep = PHYS_DT
@@ -317,7 +322,7 @@ def main():
         quat = data.qpos[free_q + 3:free_q + 7].copy()
 
         # --- 45-dim obs frame, trainer conventions ---
-        o = np.zeros(45)
+        o = np.zeros(frame)
         o[0:12] = act_hist[0] if ep_t >= 2 else 0.0     # LAG-2 last_action
         o[12:16] = CMD
         o[16:28] = q - DEFAULT_POS
@@ -330,6 +335,16 @@ def main():
             ph = (max(0, ep_t - 1) * CONTROL_DT / gait_period_for(cmd_speed)) % 1.0
             frozen_phase = ph
         o[43], o[44] = np.sin(2 * np.pi * ph), np.cos(2 * np.pi * ph)
+        if frame >= 48:
+            # base angular velocity in the BODY frame. MuJoCo's free joint
+            # reports it in the world frame, so rotate by the base yaw.
+            wq = data.qvel[free_d + 3:free_d + 6]
+            qw2, qx2, qy2, qz2 = quat
+            yaw2 = np.arctan2(2 * (qw2 * qz2 + qx2 * qy2), 1 - 2 * (qy2 * qy2 + qz2 * qz2))
+            c2, s2 = np.cos(-yaw2), np.sin(-yaw2)
+            o[45] = c2 * wq[0] - s2 * wq[1]
+            o[46] = s2 * wq[0] + c2 * wq[1]
+            o[47] = wq[2]
 
         if frames_hist is None:
             frames_hist = [o.copy() for _ in range(HIST)]  # reset-replicate

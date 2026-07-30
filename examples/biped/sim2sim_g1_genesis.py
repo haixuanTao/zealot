@@ -236,7 +236,10 @@ def main():
     import genesis as gs
 
     policy = Policy(POLICY)
-    assert policy.act_dim == 12 and policy.obs_dim == 45 * HIST
+    assert policy.act_dim == 12 and policy.obs_dim % HIST == 0
+    frame = policy.obs_dim // HIST
+    assert frame in (45, 48), f"unexpected obs frame width {frame}"
+    print(f"obs frame {frame} ({'with' if frame == 48 else 'no'} gyro)", flush=True)
 
     gs.init(backend=gs.cpu, logging_level="warning")
     scene = gs.Scene(
@@ -325,7 +328,7 @@ def main():
         q = npy(robot.get_dofs_position(pol_idx))
         quat = npy(pelvis.get_quat())  # genesis: wxyz
 
-        o = np.zeros(45)
+        o = np.zeros(frame)
         o[0:12] = act_hist[0] if ep_t >= 2 else 0.0
         o[12:16] = CMD
         o[16:28] = q - DEFAULT_POS
@@ -338,6 +341,16 @@ def main():
             ph = (max(0, ep_t - 1) * CONTROL_DT / gait_period_for(cmd_speed)) % 1.0
             frozen_phase = ph
         o[43], o[44] = np.sin(2 * np.pi * ph), np.cos(2 * np.pi * ph)
+        if frame >= 48:
+            # base angular velocity, rotated from world into the body frame
+            _w = npy(pelvis.get_ang())
+            _q = quat if 'quat' in dir() else npy(pelvis.get_quat())
+            _yaw = np.arctan2(2 * (_q[0] * _q[3] + _q[1] * _q[2]),
+                              1 - 2 * (_q[2] * _q[2] + _q[3] * _q[3]))
+            _c, _s = np.cos(-_yaw), np.sin(-_yaw)
+            o[45] = _c * _w[0] - _s * _w[1]
+            o[46] = _s * _w[0] + _c * _w[1]
+            o[47] = _w[2]
 
         if frames_hist is None:
             frames_hist = [o.copy() for _ in range(HIST)]

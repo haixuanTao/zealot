@@ -107,8 +107,9 @@ static OBS_H: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
 fn jmirror(v: &[f32]) -> Vec<f32> {
     (0..NUM_JOINTS).map(|i| JSIGN[i] * v[JMIRROR[i]]).collect()
 }
-// obs frame(45): last_action[0:12], cmd[12:16]=(vx,vy,yaw,aux), joint_pos[16:28],
-// joint_vel[28:40], proj_grav[40:43]=(fwd,lat,up), gait_phase[43:45]=(sin,cos).
+// obs frame(48): last_action[0:12], cmd[12:16]=(vx,vy,yaw,aux), joint_pos[16:28],
+// joint_vel[28:40], proj_grav[40:43]=(fwd,lat,up), gait_phase[43:45]=(sin,cos),
+// base_ang_vel[45:48]=(roll,pitch,yaw).
 fn mirror_frame(o: &[f32]) -> Vec<f32> {
     let mut m = o.to_vec();
     m[0..12].copy_from_slice(&jmirror(&o[0..12]));
@@ -119,6 +120,13 @@ fn mirror_frame(o: &[f32]) -> Vec<f32> {
     m[41] = -o[41];
     m[43] = -o[43];
     m[44] = -o[44];
+    // Angular velocity is a PSEUDOVECTOR: under an L/R (sagittal-plane)
+    // mirror the roll and yaw components negate while pitch is preserved --
+    // the same signs the critic's copy already uses.
+    if o.len() > 45 {
+        m[45] = -o[45];
+        m[47] = -o[47];
+    }
     m
 }
 // With BIPED_OBS_HISTORY the actor obs is H stacked 45-frames — the mirror is
@@ -126,17 +134,18 @@ fn mirror_frame(o: &[f32]) -> Vec<f32> {
 fn mirror_obs(o: &[f32]) -> Vec<f32> {
     o.chunks(OBS_FRAME).flat_map(|f| mirror_frame(f)).collect()
 }
-// critic(51) = obs frame(45) + base_lin_vel(3)[fwd,lat,up] + base_ang_vel(3)
-// [roll,pitch,yaw] — single-frame (privileged critic carries no history).
+// critic = obs frame(OBS_FRAME) + base_lin_vel(3)[fwd,lat,up] +
+// base_ang_vel(3)[roll,pitch,yaw] — single-frame (no history).
 fn mirror_critic(c: &[f32]) -> Vec<f32> {
-    let mut m = mirror_frame(&c[0..45]);
-    m.extend_from_slice(&c[45..]);
-    m[46] = -c[46];
-    m[48] = -c[48];
-    m[50] = -c[50];
+    let mut m = mirror_frame(&c[0..OBS_FRAME]);
+    m.extend_from_slice(&c[OBS_FRAME..]);
+    // lin_vel: lateral negates. ang_vel: roll and yaw negate (pseudovector).
+    m[OBS_FRAME + 1] = -c[OBS_FRAME + 1];
+    m[OBS_FRAME + 3] = -c[OBS_FRAME + 3];
+    m[OBS_FRAME + 5] = -c[OBS_FRAME + 5];
     m
 }
-const OBS_FRAME: usize = 45;
+const OBS_FRAME: usize = zealot_env::tasks::velocity_flat::OBS_DIM;
 fn mirror_sample(s: &Sample) -> Sample {
     Sample {
         obs: mirror_obs(&s.obs),

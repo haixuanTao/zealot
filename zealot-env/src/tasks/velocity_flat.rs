@@ -42,7 +42,14 @@ pub const UP: usize = 2;
 /// joint_pos_rel(12) + joint_vel(12) + projected_gravity(3) + gait_phase(2)`.
 /// The trailing 2 are (sin 2πφ, cos 2πφ) of the gait clock so the policy can
 /// time its steps to the periodic gait reward.
-pub const OBS_DIM: usize = NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2;
+// `+ 3` at the end is the base ANGULAR VELOCITY (gyro). Added after v21: the
+// actor had no rotation sense at all — angular velocity was critic-only
+// privileged information — so yaw control was open-loop and the policy could
+// not cancel even its own heading drift (measured: yaw output scattered
+// positive regardless of commanded sign). Every deployed locomotion stack
+// feeds the gyro to the policy; it is free on hardware (IMU).
+pub const OBS_DIM: usize =
+    NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2 + 3;
 /// Action vector length: one position target per leg DOF.
 pub const ACTION_DIM: usize = NUM_JOINTS;
 /// Privileged (critic) observation length: policy obs plus base linear & angular
@@ -884,7 +891,8 @@ impl VelocityFlatTask {
     /// Assemble the 43-dim policy observation into `obs`.
     ///
     /// Layout: `[last_action(12), command(4), joint_pos_rel(12), joint_vel(12),
-    /// projected_gravity(3)]`. `joint_pos_rel = q − default_pos`.
+    /// projected_gravity(3), gait_clock(2), base_ang_vel(3)]`.
+    /// `joint_pos_rel = q − default_pos`.
     pub fn observe(&self, state: &RobotState, cmd: &VelocityCommand, obs: &mut [f32]) {
         debug_assert_eq!(obs.len(), OBS_DIM);
         let mut o = 0;
@@ -915,6 +923,12 @@ impl VelocityFlatTask {
         let ph = state.phase * std::f32::consts::TAU;
         put(obs, &mut o, ph.sin());
         put(obs, &mut o, ph.cos());
+        // Base angular velocity (body frame). Kept LAST so the preceding 45
+        // slots keep their v21 meaning — the mirror transform, the sim2sim
+        // harnesses and the lerobot controller all index by position.
+        for w in self.base_ang_vel_body(&state.base) {
+            put(obs, &mut o, w);
+        }
         debug_assert_eq!(o, OBS_DIM);
     }
 
@@ -1308,13 +1322,14 @@ mod tests {
 
     #[test]
     fn obs_dim_consistent() {
-        assert_eq!(OBS_DIM, 45);
+        assert_eq!(OBS_DIM, 48); // 45 through v21, + base_ang_vel(3) from v22
         assert_eq!(ACTION_DIM, 12);
         let task = VelocityFlatTask::new();
         let mut obs = vec![0.0; OBS_DIM];
         task.observe(&upright_state(), &VelocityCommand::default(), &mut obs);
         // Layout: last_action[0..12], command[12..16], joint_pos_rel[16..28],
-        // joint_vel[28..40], projected_gravity[40..43], gait_phase(sin,cos)[43..45].
+        // joint_vel[28..40], projected_gravity[40..43], gait_phase(sin,cos)[43..45],
+        // base_ang_vel[45..48].
         // Upright, neutral pose, zero command, phase 0 → everything zero except
         // gravity up = -1 and cos(0) = 1.
         assert!(obs.iter().take(40).all(|&x| x == 0.0));
