@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["zealot-env", "zealot-rl"]
+members = ["zealot-env", "zealot-rl", "zealot-obs-shaders", "zealot-gpu-obs"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 zealot-env = { path = "zealot-env" }
 zealot-rl = { path = "zealot-rl" }
+zealot-gpu-obs = { path = "zealot-gpu-obs" }
 
 # The workspace root is also a package: it hosts the runnable examples that
 # exercise the GPU learning stack (vortx + khal). The examples don't depend on
@@ -60,6 +61,16 @@ cuda_backend = ["gpu", "biped_gpu", "khal/cuda", "nexus3d/cuda", "vortx/cuda"]
 # needs tileiras + ptxas 13.3 first on PATH (~/cuda-13.3-tile/bin). See
 # examples/biped/cutile_gemm.rs for the interop details and measured numbers.
 cutile = ["cuda_backend", "dep:cutile", "dep:cutile-compiler", "dep:cuda-core", "dep:cuda-async"]
+# web_demo — shared bits for the website demos (examples/biped/*_web.rs):
+# kiss3d renderer + glamx math on top of the nexus GPU env. Builds natively for
+# dev and to wasm32-unknown-unknown for the website (website/scripts/).
+web_demo = ["biped_gpu", "dep:kiss3d", "dep:glamx", "dep:vortx", "dep:zealot-gpu-obs"]
+# lerobot_biped_web — LeRobot bipedal + embedded trained walking policy.
+lerobot_biped_web = ["web_demo"]
+# g1_web — Unitree G1 fleet walking the released v7 policy (flat ground).
+g1_web = ["web_demo"]
+# g1_terrain_web — single G1 + v7 policy on the rough-terrain strips.
+g1_terrain_web = ["web_demo"]
 
 [dependencies]
 cutile = { path = "../cutile-rs/cutile", optional = true }
@@ -67,6 +78,7 @@ cutile-compiler = { path = "../cutile-rs/cutile-compiler", optional = true }
 cuda-core = { path = "../cutile-rs/cuda-core", optional = true }
 cuda-async = { path = "../cutile-rs/cuda-async", optional = true }
 vortx = { version = "0.3", optional = true }
+zealot-gpu-obs = { path = "zealot-gpu-obs", optional = true }
 khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
 nexus3d = { path = "../nexus-unified/crates/nexus3d", features = ["rbd"], optional = true }
 rapier3d = { version = "0.34", optional = true }
@@ -76,6 +88,32 @@ rayon = { version = "1", optional = true }
 pollster = { version = "0.4", optional = true }
 zealot-env = { workspace = true, optional = true }
 zealot-rl = { workspace = true, optional = true }
+# Renderer for the website demos — same crate the nexus demos website uses, so
+# the wasm/WebGPU path is known-good. glamx 0.3 is kiss3d's math crate (the
+# nexus stack uses its own glamx internally; poses are converted by hand).
+kiss3d = { version = "0.45.1", features = ["egui"], optional = true }
+glamx = { version = "0.3", optional = true }
+
+# wasm-only support crates for the website demos: `web-time` backs the env's
+# step timings (std Instant panics on wasm), `getrandom/js` lets rand seed from
+# the browser, and the panic hook routes panics to the JS console.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1"
+# Window/Location: `?n=`-style demo knobs. The rest drive the demo's live
+# controls: keyboard events off the document, and the Gamepad API polled per
+# frame off the navigator.
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "Document",
+    "EventTarget",
+    "KeyboardEvent",
+    "Navigator",
+    "Gamepad",
+] }
+wasm-bindgen = "0.2"
+getrandom = { version = "0.2", features = ["js"] }
+console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 nalgebra = "0.35"
@@ -341,6 +379,23 @@ vortx = { path = "../vortx-unified" }
 vortx-shaders = { path = "../vortx-unified/vortx-shaders" }
 parry3d = { path = "../parry/crates/parry3d" }
 
+
+# Website demos (see website/): kiss3d viewer + nexus GPU env, embedded
+# assets, native for dev and wasm32 for the browser.
+[[example]]
+name = "lerobot_biped_web"
+path = "examples/biped/lerobot_biped_web.rs"
+required-features = ["lerobot_biped_web"]
+
+[[example]]
+name = "g1_web"
+path = "examples/biped/g1_web.rs"
+required-features = ["g1_web"]
+
+[[example]]
+name = "g1_terrain_web"
+path = "examples/biped/g1_terrain_web.rs"
+required-features = ["g1_terrain_web"]
 
 # Probe rapier foot–ground contact (`--features cpu`).
 [[example]]

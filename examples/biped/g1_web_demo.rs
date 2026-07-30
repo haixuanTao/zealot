@@ -110,6 +110,111 @@ fn load_visuals() -> std::collections::HashMap<String, Vec<([f32; 4], Vec<Vec3>,
 /// Control-step period — matches `VelocityFlatTask` (50 Hz).
 const DT: f32 = 0.02;
 
+/// Live driving: arrow keys / WASD and any connected gamepad, mapped onto the
+/// policy's velocity command. Browser-only — natively the demo keeps its
+/// slider/preset commands.
+#[cfg(target_arch = "wasm32")]
+mod drive {
+    use std::cell::RefCell;
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    /// forward, back, left(strafe), right(strafe), turn left, turn right.
+    thread_local! {
+        static KEYS: RefCell<[bool; 6]> = const { RefCell::new([false; 6]) };
+    }
+
+    fn slot(code: &str) -> Option<usize> {
+        Some(match code {
+            "ArrowUp" | "KeyW" => 0,
+            "ArrowDown" | "KeyS" => 1,
+            "KeyA" => 2,
+            "KeyD" => 3,
+            "ArrowLeft" | "KeyQ" => 4,
+            "ArrowRight" | "KeyE" => 5,
+            _ => return None,
+        })
+    }
+
+    /// Attach the key listeners once, at startup.
+    pub fn install() {
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        for (event, down) in [("keydown", true), ("keyup", false)] {
+            let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+                move |e: web_sys::KeyboardEvent| {
+                    if let Some(i) = slot(&e.code()) {
+                        // Arrows would otherwise scroll the embedding page.
+                        e.prevent_default();
+                        KEYS.with(|k| k.borrow_mut()[i] = down);
+                    }
+                },
+            );
+            let _ = doc
+                .add_event_listener_with_callback(event, cb.as_ref().unchecked_ref());
+            cb.forget(); // lives for the page's lifetime
+        }
+    }
+
+    /// Current command from keys + gamepad, or `None` when nothing is held —
+    /// in which case the demo's own preset/slider command stays in charge.
+    /// Ranges match the command sliders: vx −0.6..1.0, vy ±0.4, yaw ±1.0.
+    pub fn command() -> Option<[f32; 3]> {
+        let mut cmd = [0.0f32; 3];
+        let mut active = false;
+
+        KEYS.with(|k| {
+            let k = k.borrow();
+            if k[0] { cmd[0] += 0.6; }
+            if k[1] { cmd[0] -= 0.4; }
+            if k[2] { cmd[1] += 0.3; }
+            if k[3] { cmd[1] -= 0.3; }
+            if k[4] { cmd[2] += 0.6; }
+            if k[5] { cmd[2] -= 0.6; }
+            active = k.iter().any(|&d| d);
+        });
+
+        // Gamepad: left stick drives, right stick (or triggers' axis) turns.
+        // Sticks rest near zero but rarely exactly at it — hence the deadzone.
+        if let Some(pads) = web_sys::window()
+            .and_then(|w| w.navigator().get_gamepads().ok())
+        {
+            for pad in pads.iter().filter_map(|p| p.dyn_into::<web_sys::Gamepad>().ok()) {
+                let axes = pad.axes();
+                let axis = |i: u32| -> f32 {
+                    axes.get(i).as_f64().unwrap_or(0.0) as f32
+                };
+                let dead = |v: f32| if v.abs() < 0.15 { 0.0 } else { v };
+                let (lx, ly, rx) = (dead(axis(0)), dead(axis(1)), dead(axis(2)));
+                if lx != 0.0 || ly != 0.0 || rx != 0.0 {
+                    // Stick up is negative on every mapping we care about.
+                    cmd[0] += if -ly > 0.0 { -ly * 1.0 } else { -ly * 0.6 };
+                    cmd[1] += -lx * 0.4;
+                    cmd[2] += -rx * 1.0;
+                    active = true;
+                }
+            }
+        }
+
+        if !active {
+            return None;
+        }
+        cmd[0] = cmd[0].clamp(-0.6, 1.0);
+        cmd[1] = cmd[1].clamp(-0.4, 0.4);
+        cmd[2] = cmd[2].clamp(-1.0, 1.0);
+        Some(cmd)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod drive {
+    pub fn install() {}
+    pub fn command() -> Option<[f32; 3]> {
+        None
+    }
+}
+
 /// Env knobs the demo needs regardless of target. `std::env::set_var` PANICS
 /// on wasm32-unknown-unknown, so these go through programmatic overrides. Must
 /// run BEFORE the env is constructed. Decimation 8 → 2.5 ms sim dt — the
@@ -537,7 +642,38 @@ pub async fn run(cfg: DemoCfg) {
     let mut hud_snap_ms = 0.0f32;
     let mut hud_realtime = 1.0f32;
 
+    drive::install();
+    // Whether the last frame's command came from live input, so releasing the
+    // keys/stick hands control back to the sliders exactly once.
+    let mut driving = false;
+
     while window.render_3d(&mut scene, &mut camera).await {
+        // Live driving (keys / gamepad) outranks the sliders while held.
+        match drive::command() {
+            Some(c) => {
+                driving = true;
+                if cmds.iter().any(|p| *p != c) {
+                    cmd_ui = c;
+                    for e in 0..n_robots {
+                        cmds[e] = c;
+                        env.pin_command_for(e, c[0], c[1], c[2]);
+                        gobs.set_cmd(&backend, e, c).expect("cmd");
+                    }
+                }
+            }
+            None if driving => {
+                // Released: stand still rather than keep the last velocity.
+                driving = false;
+                cmd_ui = [0.0; 3];
+                for e in 0..n_robots {
+                    cmds[e] = cmd_ui;
+                    env.pin_command_for(e, 0.0, 0.0, 0.0);
+                    gobs.set_cmd(&backend, e, cmd_ui).expect("cmd");
+                }
+            }
+            None => {}
+        }
+
         if pending_reset {
             pending_reset = false;
             for e in 0..n_robots {
@@ -791,7 +927,8 @@ pub async fn run(cfg: DemoCfg) {
                         if ui.button("Reset").clicked() {
                             *reset_clicked = true;
                         }
-                        ui.label("drag: orbit camera   scroll: zoom");
+                        ui.label("drag: orbit camera   scroll: zoom out");
+                        ui.label("drive: ↑↓ / WASD, ←→ turn, or a gamepad");
                     });
             });
         }
