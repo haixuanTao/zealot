@@ -23,6 +23,18 @@ use crate::cutile_gemm::EncCursor;
 
 const LOG_SQRT_2PI: f32 = 0.918_938_5;
 
+/// Synchronization hooks used by the SONIC PPO updater.
+///
+/// The local implementation is a no-op. A distributed implementation averages
+/// each GPU gradient after backpropagation and sums the small CPU-side
+/// statistics needed to keep advantage normalization and adaptive KL identical
+/// on every rank.
+pub trait PpoSynchronizer {
+    fn world_size(&self) -> usize;
+    fn average_gradient(&mut self, gradient: &mut Tensor<f32>) -> Result<()>;
+    fn all_reduce_sum_f64(&mut self, values: &mut [f64]) -> Result<()>;
+}
+
 fn tensor(backend: &GpuBackend, matrix: &DMatrix<f32>, usage: BufferUsages) -> Tensor<f32> {
     Tensor::matrix_from_na(backend, matrix, usage).expect("upload GPU PPO tensor")
 }
@@ -398,6 +410,7 @@ impl GpuPpoUpdater {
         backend: &GpuBackend,
         actor_critic: &mut ActorCritic,
         batch: &mut [Sample],
+        synchronizer: &mut dyn PpoSynchronizer,
     ) -> Result<GpuPpoStats> {
         let started = std::time::Instant::now();
         anyhow::ensure!(
@@ -409,13 +422,31 @@ impl GpuPpoUpdater {
         let actor_dim = actor_critic.actor.dims[0];
         let critic_dim = actor_critic.critic.dims[0];
 
-        let advantage_mean = batch.iter().map(|s| s.adv).sum::<f32>() / total as f32;
-        let advantage_var = batch
-            .iter()
-            .map(|s| (s.adv - advantage_mean).powi(2))
-            .sum::<f32>()
-            / total as f32;
-        let advantage_std = advantage_var.sqrt().max(1e-6);
+        let (advantage_mean, advantage_std) = if synchronizer.world_size() == 1 {
+            let mean = batch.iter().map(|sample| sample.adv).sum::<f32>() / total as f32;
+            let variance = batch
+                .iter()
+                .map(|sample| (sample.adv - mean).powi(2))
+                .sum::<f32>()
+                / total as f32;
+            (mean, variance.sqrt().max(1e-6))
+        } else {
+            let mut moments = [
+                batch.iter().map(|sample| sample.adv as f64).sum::<f64>(),
+                batch
+                    .iter()
+                    .map(|sample| {
+                        let advantage = sample.adv as f64;
+                        advantage * advantage
+                    })
+                    .sum::<f64>(),
+                total as f64,
+            ];
+            synchronizer.all_reduce_sum_f64(&mut moments)?;
+            let mean = moments[0] / moments[2];
+            let variance = (moments[1] / moments[2] - mean * mean).max(0.0);
+            (mean as f32, (variance.sqrt() as f32).max(1e-6))
+        };
         for sample in batch.iter_mut() {
             sample.adv = (sample.adv - advantage_mean) / advantage_std;
         }
@@ -640,6 +671,26 @@ impl GpuPpoUpdater {
                         &self.ones_column,
                     )?;
                 }
+                if synchronizer.world_size() > 1 {
+                    // NCCL is issued directly on khal's CUDA stream. Submit the
+                    // pending vortx work first so every gradient is produced
+                    // before its all-reduce; the Adam passes queued below then
+                    // naturally wait on the same stream.
+                    encoder.flush();
+                    for gradient in &mut self.actor.weight_grads {
+                        synchronizer.average_gradient(gradient)?;
+                    }
+                    for gradient in &mut self.actor.bias_grads {
+                        synchronizer.average_gradient(gradient)?;
+                    }
+                    for gradient in &mut self.critic.weight_grads {
+                        synchronizer.average_gradient(gradient)?;
+                    }
+                    for gradient in &mut self.critic.bias_grads {
+                        synchronizer.average_gradient(gradient)?;
+                    }
+                    synchronizer.average_gradient(&mut self.log_std_grad)?;
+                }
                 self.actor.adam(
                     backend,
                     &self.adam,
@@ -675,16 +726,22 @@ impl GpuPpoUpdater {
                 .slow_read_vec(self.actor.activations[actor_last + 1].buffer())
                 .await?;
             let log_std = backend.slow_read_vec(self.log_std.buffer()).await?;
-            let mut kl = 0.0;
+            let mut kl_sum = 0.0f32;
             for c in 0..self.minibatch {
                 for k in 0..self.action_dim {
                     let inverse_std = (-log_std[k]).exp();
                     let difference = (current_means[k * self.minibatch + c] - old_last_means[c][k])
                         * inverse_std;
-                    kl += 0.5 * difference * difference;
+                    kl_sum += 0.5 * difference * difference;
                 }
             }
-            kl /= self.minibatch as f32;
+            let kl = if synchronizer.world_size() == 1 {
+                kl_sum / self.minibatch as f32
+            } else {
+                let mut moments = [kl_sum as f64, self.minibatch as f64];
+                synchronizer.all_reduce_sum_f64(&mut moments)?;
+                (moments[0] / moments[1]) as f32
+            };
             last_kl = kl;
             if kl > self.config.desired_kl * 2.0 {
                 self.lr = (self.lr / 1.5).max(self.config.lr_min);

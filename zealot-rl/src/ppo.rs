@@ -135,6 +135,21 @@ impl PendingNorm {
             self.m2[i] += d * (x[i] - self.mean[i]);
         }
     }
+
+    /// Rebuild pending Welford statistics.
+    ///
+    /// This is primarily useful for merging independently collected rollout
+    /// statistics before committing them to a shared normalizer.
+    pub fn from_state(mean: Vec<f32>, m2: Vec<f32>, count: f32) -> Self {
+        debug_assert_eq!(mean.len(), m2.len());
+        debug_assert!(count >= 0.0);
+        Self { mean, m2, count }
+    }
+
+    /// Immutable view of the pending Welford state.
+    pub fn state(&self) -> (&[f32], &[f32], f32) {
+        (&self.mean, &self.m2, self.count)
+    }
 }
 
 impl Normalizer {
@@ -759,6 +774,25 @@ mod tests {
         let (adv, _ret) = gae(&rewards, &values, &dones, 0.0, 0.99, 0.95);
         // adv[0] = r0 - V0 = 1 - 5 = -4 (bootstrap zeroed by done).
         assert!((adv[0] - (-4.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pending_normalizer_state_roundtrips() {
+        let observations = [[1.0, 4.0], [3.0, 8.0], [8.0, -2.0]];
+        let mut pending = PendingNorm::default();
+        for observation in &observations {
+            pending.push(observation);
+        }
+        let (mean, m2, count) = pending.state();
+        let rebuilt = PendingNorm::from_state(mean.to_vec(), m2.to_vec(), count);
+        assert_eq!(rebuilt.state(), pending.state());
+
+        let mut expected = Normalizer::new(2);
+        expected.commit(&mut pending);
+        let mut actual = Normalizer::new(2);
+        let mut rebuilt = rebuilt;
+        actual.commit(&mut rebuilt);
+        assert_eq!(actual.state(), expected.state());
     }
 
     /// A 1-step Gaussian bandit: reward = −‖action − target‖². PPO should pull the

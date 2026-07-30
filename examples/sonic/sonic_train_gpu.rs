@@ -13,12 +13,14 @@
 mod biped_env_nexus;
 #[path = "../biped/cutile_gemm.rs"]
 mod cutile_gemm;
+mod distributed;
 #[path = "../biped/gpu_policy.rs"]
 mod gpu_policy;
 mod gpu_ppo;
 
 use anyhow::{Context, Result, bail};
 use biped_env_nexus::{BipedNexusBatchEnv, default_mjcf_path};
+use distributed::{Distributed, DistributedConfig};
 use gpu_policy::GpuPolicy;
 use gpu_ppo::{GpuPpoConfig, GpuPpoUpdater};
 use std::path::Path;
@@ -42,6 +44,8 @@ fn usage() -> &'static str {
 }
 
 fn main() -> Result<()> {
+    let distributed = DistributedConfig::from_env()?;
+    distributed.configure_cuda_visibility()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let source = args.first().context(usage())?.clone();
     let iterations = args.get(1).map(|s| s.parse()).transpose()?.unwrap_or(5_000);
@@ -53,10 +57,10 @@ fn main() -> Result<()> {
     if num_envs == 0 || iterations == 0 {
         bail!("iterations and num-envs must be positive");
     }
-    pollster::block_on(train(source, iterations, num_envs, checkpoint))
+    pollster::block_on(train(source, iterations, num_envs, checkpoint, distributed))
 }
 
-async fn make_env(num_envs: usize) -> Result<BipedNexusBatchEnv> {
+async fn make_env(num_envs: usize, seed: u64) -> Result<BipedNexusBatchEnv> {
     let robot = std::env::var("BIPED_ROBOT").unwrap_or_default();
     if !matches!(
         robot.as_str(),
@@ -67,7 +71,7 @@ async fn make_env(num_envs: usize) -> Result<BipedNexusBatchEnv> {
     let path = default_mjcf_path();
     let xml =
         std::fs::read_to_string(&path).with_context(|| format!("read whole-body MJCF {path}"))?;
-    let env = BipedNexusBatchEnv::new(&xml, num_envs, 32, 0x50_4e_49_43).await;
+    let env = BipedNexusBatchEnv::new(&xml, num_envs, 32, seed).await;
     if !env.supports_fullbody_control() {
         bail!("selected MJCF does not expose all 25 controlled G1 joints");
     }
@@ -117,6 +121,7 @@ async fn train(
     iterations: usize,
     num_envs: usize,
     checkpoint: String,
+    distributed_config: DistributedConfig,
 ) -> Result<()> {
     let max_motions = std::env::var("SONIC_MAX_MOTIONS")
         .ok()
@@ -124,19 +129,50 @@ async fn train(
         .unwrap_or(4_096);
     let load_started = Instant::now();
     let library = MotionLibrary::load(&source, Some(max_motions))?;
-    println!(
-        "loaded {} motions / {} frames in {:.2}s",
-        library.clips.len(),
-        library.total_frames(),
-        load_started.elapsed().as_secs_f32()
-    );
-    println!("building {num_envs} GPU Nexus environments");
-    let mut env = make_env(num_envs).await?;
+    if distributed_config.is_primary() {
+        println!(
+            "loaded {} motions / {} frames in {:.2}s",
+            library.clips.len(),
+            library.total_frames(),
+            load_started.elapsed().as_secs_f32()
+        );
+        println!(
+            "building {num_envs} GPU Nexus environments per rank ({} rank{})",
+            distributed_config.world_size(),
+            if distributed_config.world_size() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    }
+    let env_seed =
+        0x50_4e_49_43u64 ^ (distributed_config.rank() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut env = make_env(num_envs, env_seed).await?;
     let backend = env.backend().clone();
-    let mut rng = Lcg::new(7);
+    let mut distributed = Distributed::initialize(distributed_config, &backend)?;
+    if distributed.is_primary() && distributed.world_size() > 1 {
+        println!(
+            "initialized synchronous NCCL data parallelism across {} GPUs",
+            distributed.world_size()
+        );
+    }
     let resume = Path::new(&checkpoint).exists();
+    let mut resume_count = [if resume { 1.0 } else { 0.0 }];
+    distributed.sum_metrics(&mut resume_count)?;
+    let resume_count = resume_count[0] as usize;
+    if resume_count != 0 && resume_count != distributed.world_size() {
+        bail!(
+            "checkpoint {checkpoint:?} exists on {resume_count}/{} ranks; use a shared path or \
+             copy the same checkpoint to every node",
+            distributed.world_size()
+        );
+    }
+    let mut init_rng = Lcg::new(7);
     let mut actor_critic = if resume {
-        println!("resuming weights from {checkpoint}");
+        if distributed.is_primary() {
+            println!("resuming weights from {checkpoint}");
+        }
         ActorCritic::load(&checkpoint)?
     } else {
         ActorCritic::new(
@@ -144,9 +180,12 @@ async fn train(
             &[CRITIC_OBS_DIM, 512, 256, 128, 1],
             0.5,
             3e-4,
-            &mut rng,
+            &mut init_rng,
         )
     };
+    let mut rollout_rng = Lcg::new(
+        0x53_4f_4e_49_43 ^ (distributed.rank() as u64).wrapping_mul(0xd1b5_4a32_d192_ed03),
+    );
     validate_policy(&actor_critic)?;
     let mut gpu_policy = GpuPolicy::new(&backend, &actor_critic, num_envs)?;
     let total_samples = num_envs * ROLLOUT_STEPS;
@@ -157,7 +196,10 @@ async fn train(
     let mut updater = GpuPpoUpdater::new(&backend, &actor_critic, total_samples, ppo_config)?;
 
     let mut tasks = vec![MotionTrackingTask::default(); num_envs];
-    let mut clip_ids: Vec<usize> = (0..num_envs).map(|env| env % library.clips.len()).collect();
+    let rank_env_offset = distributed.rank() * num_envs;
+    let mut clip_ids: Vec<usize> = (0..num_envs)
+        .map(|env| (rank_env_offset + env) % library.clips.len())
+        .collect();
     let mut times = vec![0.0f32; num_envs];
     let initial_targets: Vec<_> = clip_ids
         .iter()
@@ -172,19 +214,23 @@ async fn train(
     let mut pending_actor_norm = PendingNorm::default();
     let mut pending_critic_norm = PendingNorm::default();
 
-    println!(
-        "actor={} critic={} action={} rollout={} samples/iter={} minibatches={}",
-        ACTOR_OBS_DIM,
-        CRITIC_OBS_DIM,
-        G1_CONTROLLED_JOINTS,
-        ROLLOUT_STEPS,
-        total_samples,
-        ppo_config.minibatches
-    );
-    println!(
-        "{:>5} {:>8} {:>8} {:>7} {:>7} {:>9} {:>8}",
-        "iter", "reward", "resets", "warmup", "roll_s", "update_s", "steps/s"
-    );
+    if distributed.is_primary() {
+        println!(
+            "actor={} critic={} action={} rollout={} local_samples/iter={} global_samples/iter={} \
+             minibatches={}",
+            ACTOR_OBS_DIM,
+            CRITIC_OBS_DIM,
+            G1_CONTROLLED_JOINTS,
+            ROLLOUT_STEPS,
+            total_samples,
+            total_samples * distributed.world_size(),
+            ppo_config.minibatches
+        );
+        println!(
+            "{:>5} {:>8} {:>8} {:>7} {:>7} {:>9} {:>8}",
+            "iter", "reward", "resets", "warmup", "roll_s", "update_s", "steps/s"
+        );
+    }
 
     for iteration in 0..iterations {
         let iteration_started = Instant::now();
@@ -237,8 +283,8 @@ async fn train(
                 } else if active[e] {
                     let mut action = vec![0.0; G1_CONTROLLED_JOINTS];
                     for joint in 0..G1_CONTROLLED_JOINTS {
-                        action[joint] =
-                            means[e][joint] + actor_critic.log_std[joint].exp() * rng.gauss();
+                        action[joint] = means[e][joint]
+                            + actor_critic.log_std[joint].exp() * rollout_rng.gauss();
                     }
                     let logp = actor_critic.logp(&action, &means[e]);
                     commands.push(tasks[e].joint_targets(&action_array(&action)));
@@ -327,28 +373,50 @@ async fn train(
         }
 
         let stats = updater
-            .update(&backend, &mut actor_critic, &mut batch)
+            .update(&backend, &mut actor_critic, &mut batch, &mut distributed)
             .await?;
+        distributed.synchronize_pending_norm(&mut pending_actor_norm, ACTOR_OBS_DIM)?;
+        distributed.synchronize_pending_norm(&mut pending_critic_norm, CRITIC_OBS_DIM)?;
         actor_critic.obs_norm.commit(&mut pending_actor_norm);
         actor_critic.critic_norm.commit(&mut pending_critic_norm);
         gpu_policy.sync_weights(&backend, &actor_critic);
         let elapsed = iteration_started.elapsed().as_secs_f64();
-        println!(
-            "{:5} {:8.3} {:8} {:7} {:7.2} {:9.2} {:8.0} kl={:.4} lr={:.2e}",
-            iteration + 1,
-            reward_sum / (num_envs * ROLLOUT_STEPS) as f32,
-            resets,
-            warmup_steps,
-            rollout_seconds,
-            stats.seconds,
-            (num_envs * ROLLOUT_STEPS) as f64 / elapsed,
-            stats.kl,
-            stats.lr
-        );
-        if (iteration + 1) % 10 == 0 || iteration + 1 == iterations {
-            actor_critic.save(&checkpoint)?;
+        let mut metrics = [reward_sum as f64, resets as f64, warmup_steps as f64];
+        distributed.sum_metrics(&mut metrics)?;
+        if distributed.is_primary() {
+            let global_samples = total_samples * distributed.world_size();
+            println!(
+                "{:5} {:8.3} {:8} {:7} {:7.2} {:9.2} {:8.0} kl={:.4} lr={:.2e}",
+                iteration + 1,
+                metrics[0] / global_samples as f64,
+                metrics[1] as usize,
+                metrics[2] as usize,
+                rollout_seconds,
+                stats.seconds,
+                global_samples as f64 / elapsed,
+                stats.kl,
+                stats.lr
+            );
+        }
+        let should_save = (iteration + 1) % 10 == 0 || iteration + 1 == iterations;
+        if should_save {
+            let save_result = if distributed.is_primary() {
+                actor_critic.save(&checkpoint)
+            } else {
+                Ok(())
+            };
+            let mut save_failures = [if save_result.is_err() { 1.0 } else { 0.0 }];
+            distributed.sum_metrics(&mut save_failures)?;
+            if save_failures[0] != 0.0 {
+                if let Err(error) = save_result {
+                    return Err(error.into());
+                }
+                bail!("rank 0 failed to save checkpoint {checkpoint:?}");
+            }
         }
     }
-    println!("saved {checkpoint}");
+    if distributed.is_primary() {
+        println!("saved {checkpoint}");
+    }
     Ok(())
 }

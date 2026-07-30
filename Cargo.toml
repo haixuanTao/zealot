@@ -53,6 +53,10 @@ biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "de
 # Used for the all-native end-to-end benchmark (iter_e2e_bench). The cubins are
 # embedded at build time via CUDA_OXIDE_SHADERS_PTX_{NEXUS_RBD_SHADERS3D,VORTX_SHADERS}.
 cuda_backend = ["gpu", "biped_gpu", "khal/cuda", "nexus3d/cuda", "vortx/cuda"]
+# nccl — one-process-per-GPU data-parallel SONIC training. cudarc dynamically
+# loads NCCL at runtime; nccl-02022 selects the oldest ABI bindings it supports
+# so current NCCL 2.x installations can be used without build-time headers.
+nccl = ["cuda_backend", "dep:cudarc", "cudarc/nccl-02022"]
 # cutile — cuTile Rust (NVlabs cutile-rs, sibling checkout pinned at tag
 # v0.2.0): tf32 tensor-core GEMMs for the PPO update, opt-in at runtime with
 # BIPED_CUTILE_GEMM=1. BUILDING with this feature needs CUDA_TOOLKIT_PATH
@@ -66,6 +70,7 @@ cutile = { path = "../cutile-rs/cutile", optional = true }
 cutile-compiler = { path = "../cutile-rs/cutile-compiler", optional = true }
 cuda-core = { path = "../cutile-rs/cuda-core", optional = true }
 cuda-async = { path = "../cutile-rs/cuda-async", optional = true }
+cudarc = { version = "0.19", optional = true }
 vortx = { version = "0.1", optional = true }
 khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
 nexus3d = { path = "../nexus-cuda/crates/nexus3d", features = ["rbd", "from_rapier"], optional = true }

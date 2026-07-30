@@ -3198,6 +3198,7 @@ dependencies = [
  "async-std",
  "cuda-async",
  "cuda-core",
+ "cudarc",
  "cutile",
  "cutile-compiler",
  "khal",
