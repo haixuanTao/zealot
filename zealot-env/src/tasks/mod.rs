@@ -10,8 +10,13 @@
 //! not nexus types, so the whole MDP is unit-testable on the CPU. The vectorized
 //! env loop (a later stage) fills those structs from GPU readback.
 
+pub mod motion_tracking;
 pub mod velocity_flat;
 
+pub use motion_tracking::{
+    MotionClip, MotionFrame, MotionLibrary, MotionLoadError, MotionReference, MotionState,
+    MotionTrackingTask, TrackingReward, G1_CONTROLLED_JOINT_NAMES, G1_CONTROLLED_JOINTS,
+};
 pub use velocity_flat::{
     BaseState, CommandSampler, RewardBreakdown, RewardWeights, RobotState, VelocityCommand,
     VelocityFlatTask,

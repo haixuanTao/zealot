@@ -37,10 +37,14 @@ use rayon::prelude::*;
 use roxmltree::Node;
 use std::collections::HashMap;
 use std::time::Instant;
+use zealot_env::math::quat_rotate_inv;
 use zealot_env::obs_history::ObsHistory;
 use zealot_env::rng::Lcg;
 use zealot_env::terrain::{TerrainCurriculum, TerrainFamily, TerrainStrip};
 use zealot_env::robots::{RobotSpec, NUM_JOINTS};
+use zealot_env::tasks::motion_tracking::{
+    G1_CONTROLLED_JOINT_NAMES, G1_CONTROLLED_JOINTS, MotionState,
+};
 use zealot_env::tasks::velocity_flat::{
     BaseState, CRITIC_OBS_DIM, CommandSampler, FootObs, NUM_FEET, OBS_DIM, RobotState,
     VelocityCommand, VelocityFlatTask,
@@ -504,6 +508,11 @@ pub struct LinkIndices {
     /// is `θ = 2·atan2(rel.z, rel.w)` where
     /// `rel = rest_quat⁻¹ · q_parent⁻¹ · q_child`.
     pub actuated_rest_quat: [Rotation; NUM_JOINTS],
+    /// All 25 live G1 joints in the SONIC motion-tracking order. Empty/zeroed
+    /// for non-full-body robot models.
+    pub fullbody_actuated: [(u32, &'static str); G1_CONTROLLED_JOINTS],
+    pub fullbody_parent_links: [u32; G1_CONTROLLED_JOINTS],
+    pub fullbody_rest_quat: [Rotation; G1_CONTROLLED_JOINTS],
 }
 
 /// Build one env's rapier scene + sim params with the given DR sample.
@@ -985,6 +994,25 @@ fn build_env_scene(
         actuated_rest_quat[k] = mjcf[mjcf_idx].local_quat;
     }
 
+    let mut fullbody_actuated = [(0u32, ""); G1_CONTROLLED_JOINTS];
+    let mut fullbody_parent_links = [0u32; G1_CONTROLLED_JOINTS];
+    let mut fullbody_rest_quat = [Rotation::IDENTITY; G1_CONTROLLED_JOINTS];
+    if G1_CONTROLLED_JOINT_NAMES
+        .iter()
+        .all(|name| name_to_link.contains_key(*name))
+    {
+        for (k, &name) in G1_CONTROLLED_JOINT_NAMES.iter().enumerate() {
+            let mjcf_idx = mjcf
+                .iter()
+                .position(|b| b.joint.as_deref() == Some(name))
+                .unwrap();
+            let parent_mjcf_idx = mjcf[mjcf_idx].parent.unwrap();
+            fullbody_actuated[k] = (*name_to_link.get(name).unwrap(), name);
+            fullbody_parent_links[k] = *mb_link_of_mjcf.get(&parent_mjcf_idx).unwrap();
+            fullbody_rest_quat[k] = mjcf[mjcf_idx].local_quat;
+        }
+    }
+
     let idx = LinkIndices {
         links_per_batch: next_mb_link, // 1 (root) + jointed links
         // 6 root DOFs + one per hinge — counts ALL model joints, not just the
@@ -1002,6 +1030,9 @@ fn build_env_scene(
         mjcf_to_link,
         actuated_parent_links,
         actuated_rest_quat,
+        fullbody_actuated,
+        fullbody_parent_links,
+        fullbody_rest_quat,
     };
 
     let _ = torso_handle;
@@ -1026,6 +1057,14 @@ pub struct StepOut {
     pub reward: f32,
     pub done: bool,
     pub fell: bool,
+}
+
+/// State returned by the SONIC-style 25-joint control surface. This deliberately
+/// sits beside (rather than replaces) `StepOut`, so velocity locomotion keeps its
+/// stable 12-joint API.
+pub struct FullBodyStep {
+    pub state: MotionState,
+    pub body_positions: Vec<[f32; 3]>,
 }
 
 /// Debug-only per-foot stance-phase accumulator (env 0). Records the foot
@@ -1159,6 +1198,8 @@ pub struct BipedNexusBatchEnv {
     /// Initialised lazily to the first-step coords so step 1's vel is 0.
     prev_joint_pos: Vec<[f32; NUM_JOINTS]>,
     has_prev_joint_pos: Vec<bool>,
+    fullbody_prev_joint_pos: Vec<[f32; G1_CONTROLLED_JOINTS]>,
+    fullbody_has_prev_joint_pos: Vec<bool>,
     /// Previous control-step `body_poses` slice per env (one `NexusPose` per
     /// collider in this env's slot). Used to finite-diff base linear /
     /// angular velocity and per-foot linear velocity at the control rate
@@ -1743,6 +1784,8 @@ impl BipedNexusBatchEnv {
             next_push_at: push_interval,
             prev_joint_pos,
             has_prev_joint_pos,
+            fullbody_prev_joint_pos: vec![[0.0; G1_CONTROLLED_JOINTS]; num_envs],
+            fullbody_has_prev_joint_pos: vec![false; num_envs],
             prev_body_poses,
             has_prev_pose,
             foot_sole_local,
@@ -1842,6 +1885,136 @@ impl BipedNexusBatchEnv {
 
     pub fn action_dim(&self) -> usize {
         NUM_JOINTS
+    }
+
+    /// Whether the selected MJCF contains every live G1 whole-body joint.
+    pub fn supports_fullbody_control(&self) -> bool {
+        self.idx
+            .fullbody_actuated
+            .iter()
+            .all(|(link, _)| *link != 0)
+    }
+
+    /// Apply absolute position targets to all 25 live joints and return the
+    /// resulting full-body state. This is the physics seam used by
+    /// `sonic_wbc`; the ordinary locomotion `step` remains unchanged.
+    pub async fn step_fullbody(
+        &mut self,
+        targets: &[[f32; G1_CONTROLLED_JOINTS]],
+    ) -> Vec<FullBodyStep> {
+        assert_eq!(targets.len(), self.n);
+        assert!(
+            self.supports_fullbody_control(),
+            "step_fullbody requires BIPED_ROBOT=g1_29dof or g1_29dof_agile"
+        );
+
+        for (e, row) in targets.iter().enumerate() {
+            for (k, &target) in row.iter().enumerate() {
+                let link = self.idx.fullbody_actuated[k].0;
+                self.state.multibodies_mut().stage_motor_position(
+                    e as u32,
+                    link,
+                    JointAxis::AngZ,
+                    target,
+                );
+            }
+        }
+        self.state
+            .multibodies_mut()
+            .flush_links_static(&self.gpu)
+            .expect("flush full-body motor targets");
+
+        for _ in 0..self.task.decimation {
+            let _ = self.pipeline.step(&self.gpu, &mut self.state, None).await;
+        }
+        self.gpu.synchronize().expect("sync full-body step");
+        self.tick_since_resize += 1;
+        if self.tick_since_resize >= AUTO_RESIZE_PERIOD {
+            self.pipeline
+                .auto_resize_buffers(&self.gpu, &mut self.state)
+                .await;
+            self.tick_since_resize = 0;
+        }
+
+        let poses = self.slurp_poses().await;
+        let stride = self.idx.colliders_per_batch as usize;
+        let dt = self.task.control_dt();
+        let mut out = Vec::with_capacity(self.n);
+        for e in 0..self.n {
+            let base = e * stride;
+            let root = poses[base + self.idx.torso_link as usize];
+            let root_quat = [
+                root.rotation.x,
+                root.rotation.y,
+                root.rotation.z,
+                root.rotation.w,
+            ];
+            let (root_lin_vel, root_ang_vel) = if self.has_prev_pose[e] {
+                let prev = self.prev_body_poses[base + self.idx.torso_link as usize];
+                let dp = (root.translation - prev.translation) / dt;
+                let dq = root.rotation * prev.rotation.conjugate();
+                let sign = if dq.w >= 0.0 { 1.0 } else { -1.0 };
+                (
+                    [dp.x, dp.y, dp.z],
+                    [
+                        2.0 * sign * dq.x / dt,
+                        2.0 * sign * dq.y / dt,
+                        2.0 * sign * dq.z / dt,
+                    ],
+                )
+            } else {
+                ([0.0; 3], [0.0; 3])
+            };
+
+            let mut joint_pos = [0.0; G1_CONTROLLED_JOINTS];
+            for (k, q) in joint_pos.iter_mut().enumerate() {
+                let parent = self.idx.fullbody_parent_links[k] as usize;
+                let child = self.idx.fullbody_actuated[k].0 as usize;
+                let qp = poses[base + parent].rotation;
+                let qc = poses[base + child].rotation;
+                let rel = self.idx.fullbody_rest_quat[k].conjugate() * qp.conjugate() * qc;
+                *q = 2.0 * rel.z.atan2(rel.w);
+            }
+            let joint_vel = if self.fullbody_has_prev_joint_pos[e] {
+                std::array::from_fn(|k| (joint_pos[k] - self.fullbody_prev_joint_pos[e][k]) / dt)
+            } else {
+                [0.0; G1_CONTROLLED_JOINTS]
+            };
+            let body_positions = self
+                .idx
+                .mjcf_to_link
+                .iter()
+                .map(|&link| {
+                    let p = poses[base + link as usize].translation;
+                    [p.x, p.y, p.z]
+                })
+                .collect();
+            out.push(FullBodyStep {
+                state: MotionState {
+                    root_pos: [root.translation.x, root.translation.y, root.translation.z],
+                    root_quat,
+                    root_lin_vel,
+                    root_ang_vel,
+                    projected_gravity: quat_rotate_inv(root_quat, [0.0, 0.0, -1.0]),
+                    joint_pos,
+                    joint_vel,
+                    last_action: targets[e],
+                },
+                body_positions,
+            });
+            self.fullbody_prev_joint_pos[e] = joint_pos;
+            self.fullbody_has_prev_joint_pos[e] = true;
+            self.prev_body_poses[base..base + stride].copy_from_slice(&poses[base..base + stride]);
+            self.has_prev_pose[e] = true;
+        }
+        out
+    }
+
+    /// Reset an environment slot for whole-body tracking.
+    pub async fn reset_fullbody_env(&mut self, env: usize) {
+        let _ = self.reset_env(env).await;
+        self.fullbody_prev_joint_pos[env] = [0.0; G1_CONTROLLED_JOINTS];
+        self.fullbody_has_prev_joint_pos[env] = false;
     }
 
     /// Curriculum hook — scales every env's command range by `s` (mirrors the

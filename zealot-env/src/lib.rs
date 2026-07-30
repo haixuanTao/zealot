@@ -30,7 +30,7 @@ pub mod terrain;
 pub use config::{BodyState, EnvConfig};
 pub use obs_history::ObsHistory;
 pub use robots::{JointSpec, LeRobotBipedal, RobotSpec, NUM_JOINTS};
-pub use tasks::VelocityFlatTask;
+pub use tasks::{MotionTrackingTask, VelocityFlatTask};
 
 /// Crate version — used to sanity-check that the workspace links.
 pub fn version() -> &'static str {

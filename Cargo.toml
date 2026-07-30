@@ -351,3 +351,15 @@ required-features = ["cpu"]
 name = "passive_stand"
 path = "examples/biped/passive_stand.rs"
 required-features = ["gpu", "biped_gpu"]
+
+# SONIC-style future-motion-conditioned whole-body tracking on the G1.
+[[example]]
+name = "sonic_wbc"
+path = "examples/sonic/sonic_wbc.rs"
+required-features = ["biped_gpu"]
+
+# Separate GPU policy + GPU PPO SONIC trainer; locomotion trainer stays intact.
+[[example]]
+name = "sonic_train_gpu"
+path = "examples/sonic/sonic_train_gpu.rs"
+required-features = ["gpu", "biped_gpu"]

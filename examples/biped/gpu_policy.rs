@@ -15,7 +15,7 @@
 use crate::cutile_gemm::{CutileGemm, EncCursor};
 use khal::BufferUsages;
 use khal::Shader;
-use khal::backend::{Backend, Encoder, GpuBackend};
+use khal::backend::{Backend, GpuBackend};
 use nalgebra::DMatrix;
 use vortx::linalg::{Activation, Gemm, OpAssign, OpAssignVariant};
 use vortx::shapes::TensorLayoutBuffers;
@@ -203,22 +203,20 @@ impl GpuPolicy {
         self.critic.sync(backend, &ac.critic);
     }
 
-    /// Batched forward for all `n` envs. `cur` / `cur_c` are the *raw* per-env
-    /// policy / critic observations; normalization uses `ac`'s running stats
-    /// (matching `ActorCritic::mean` / `value`). Returns `(means, values)` with
-    /// one entry per env.
-    pub async fn forward(
+    /// Dynamic-action variant used by whole-body policies. Output dimensions
+    /// come directly from the actor network, so callers are not coupled to the
+    /// locomotion robot's fixed 12-joint array.
+    pub async fn forward_dynamic(
         &mut self,
         backend: &GpuBackend,
         ac: &ActorCritic,
         cur: &[Vec<f32>],
         cur_c: &[Vec<f32>],
-    ) -> anyhow::Result<(Vec<[f32; NUM_JOINTS]>, Vec<f32>)> {
+    ) -> anyhow::Result<(Vec<Vec<f32>>, Vec<f32>)> {
         let n = self.n;
         debug_assert_eq!(cur.len(), n);
         let (obs_dim, crit_dim) = (self.actor.dims[0], self.critic.dims[0]);
 
-        // Normalize on CPU (cheap, O(n·dim)) then pack column-major-by-env.
         let obs_norm: Vec<Vec<f32>> = cur.iter().map(|o| ac.obs_norm.normalize(o)).collect();
         let crit_norm: Vec<Vec<f32>> = cur_c.iter().map(|o| ac.critic_norm.normalize(o)).collect();
         let obs_m = DMatrix::from_fn(obs_dim, n, |r, c| obs_norm[c][r]);
@@ -234,16 +232,41 @@ impl GpuPolicy {
         cur.flush();
         backend.synchronize()?;
 
-        // Outputs are row-major [out x n] -> element (r, e) at index r*n + e.
         let a_out = backend.slow_read_vec(self.actor.output().buffer()).await?;
         let c_out = backend.slow_read_vec(self.critic.output().buffer()).await?;
-        let mut means = vec![[0f32; NUM_JOINTS]; n];
+        let action_dim = *self.actor.dims.last().unwrap();
+        let mut means = vec![vec![0.0; action_dim]; n];
         for e in 0..n {
-            for r in 0..NUM_JOINTS {
+            for r in 0..action_dim {
                 means[e][r] = a_out[r * n + e];
             }
         }
         let values: Vec<f32> = (0..n).map(|e| c_out[e]).collect();
+        Ok((means, values))
+    }
+
+    /// Batched forward for all `n` envs. `cur` / `cur_c` are the *raw* per-env
+    /// policy / critic observations; normalization uses `ac`'s running stats
+    /// (matching `ActorCritic::mean` / `value`). Returns `(means, values)` with
+    /// one entry per env.
+    pub async fn forward(
+        &mut self,
+        backend: &GpuBackend,
+        ac: &ActorCritic,
+        cur: &[Vec<f32>],
+        cur_c: &[Vec<f32>],
+    ) -> anyhow::Result<(Vec<[f32; NUM_JOINTS]>, Vec<f32>)> {
+        let (dynamic, values) = self.forward_dynamic(backend, ac, cur, cur_c).await?;
+        anyhow::ensure!(
+            ac.action_dim() == NUM_JOINTS,
+            "locomotion policy action dim {} != {}",
+            ac.action_dim(),
+            NUM_JOINTS
+        );
+        let means = dynamic
+            .into_iter()
+            .map(|row| row.try_into().expect("validated action dimension"))
+            .collect();
         Ok((means, values))
     }
 }
