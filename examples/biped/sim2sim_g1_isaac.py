@@ -374,8 +374,12 @@ def main():
             frozen_phase = ph
         o[43], o[44] = np.sin(2 * np.pi * ph), np.cos(2 * np.pi * ph)
         if frame >= 48:
-            # base angular velocity, rotated from world into the body frame
-            _w = np.asarray(art.get_angular_velocity())
+            # Base angular velocity. Isaac's get_angular_velocity() reports in
+            # the WORLD frame -- verified by yawing a body 90 deg, commanding
+            # [1,0,0], and finite-differencing the orientation: it rotated about
+            # world x, not body x. So the -yaw rotation below is CORRECT here
+            # (unlike MuJoCo, whose qvel[3:6] is already body-frame).
+            _w = np.asarray(robot.get_angular_velocity())
             _q = np.asarray(quat)
             _yaw = np.arctan2(2 * (_q[0] * _q[3] + _q[1] * _q[2]),
                               1 - 2 * (_q[2] * _q[2] + _q[3] * _q[3]))

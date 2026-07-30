@@ -93,9 +93,19 @@ def nexus_leg(name, cmd):
 def foreign_leg(engine, script, py, extra_env, name, cmd):
     mjson = f"{OUT}/{engine}_{name}.metrics.json"
     env = dict(os.environ, BIPED_CMD=cmd, S2S_METRICS_JSON=mjson, **extra_env)
-    subprocess.run([py, f"{ROOT}/{script}",
-                    CKPT, f"{OUT}/{engine}_{name}.mp4", str(CLIP_S)],
-                   env=env, check=True, capture_output=True)
+    if os.path.exists(mjson):
+        os.remove(mjson)          # never read a stale result from a prior run
+    proc = subprocess.run([py, f"{ROOT}/{script}",
+                           CKPT, f"{OUT}/{engine}_{name}.mp4", str(CLIP_S)],
+                          env=env, capture_output=True, text=True)
+    # Isaac Sim's kit runtime exits 0 even when the embedded python raises, so
+    # the return code is NOT a reliable failure signal -- a missing metrics file
+    # is. Surface the child's traceback instead of dying on FileNotFoundError
+    # several frames away from the actual cause.
+    if not os.path.exists(mjson):
+        tail = "\n".join((proc.stderr or proc.stdout or "").strip().splitlines()[-15:])
+        raise RuntimeError(
+            f"{engine}/{name} wrote no metrics (exit {proc.returncode}):\n{tail}")
     m = json.load(open(mjson))
     eps = m["episodes"]
     total_s = sum(e["seconds"] for e in eps)
@@ -126,7 +136,16 @@ def main():
         legs += [lambda e=e, s=s, p=p, x=x, n=name, c=cmd: foreign_leg(e, s, p, x, n, c)
                  for (e, s, p, x) in engines]
         for leg in legs:
-            r = leg()
+            # One engine failing must not cost the other 15 runs: record the
+            # failure as a run and carry on, so a partial battery is still
+            # readable and missing engines are visible rather than silent.
+            try:
+                r = leg()
+            except Exception as exc:
+                print(f"FAIL {name}: {exc}", flush=True)
+                results["runs"].append({"engine": "?", "run": name,
+                                        "error": str(exc)})
+                continue
             r["run"] = name
             results["runs"].append(r)
             print(f'{r["engine"]:>14} {name:>7}: survived {r["survived_s"]:>5}s'
