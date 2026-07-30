@@ -2974,7 +2974,15 @@ impl BipedNexusBatchEnv {
 // cmd 0.4) is a thermal problem long before it is an electrical one.
 // Extension is free for the knee - the load passes through the joint -
 // so this term prices the crouch itself.
-        let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
+        // SIZING TRAP (v22): this was first set to 1.5e-3, copied from the ankle
+// extra -- but the penalty is tau^2 and the knee runs at ~4.5x the ankle's
+// torque, so the same weight costs ~20x more. At 1.5e-3 a 105 N.m walking
+// peak charges 0.33/step, MORE than the entire positive reward (~0.26): the
+// policy's only survivable answer was to stop using the knee at all
+// (measured: -4 deg through the whole swing, a locked compass gait). Size
+// this by the COST it should impose, not by another joint's weight. 7e-5
+// puts a walking peak at ~0.016/step, comparable to the ankle extra.
+let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);

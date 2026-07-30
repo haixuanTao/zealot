@@ -832,6 +832,15 @@ impl VelocityFlatTask {
         if let Some(v) = env_f32("BIPED_STD_LIN") {
             stds.lin_vel = v;
         }
+        // Width of the height kernel (BIPED_STD_BASE_H, metres). The default
+        // 0.1 is wide enough that a 4 cm undershoot still collects 85% of the
+        // reward, which is why v21 sat 4 cm below its own target and stayed
+        // there. Tightening to ~0.05 makes a crouch cost the height reward
+        // outright -- the direct way to price posture, instead of taxing knee
+        // torque and hoping the posture follows.
+        if let Some(v) = env_f32("BIPED_STD_BASE_H") {
+            stds.base_height = v;
+        }
         Self {
             robot,
             weights,
