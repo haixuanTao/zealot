@@ -782,6 +782,16 @@ impl VelocityFlatTask {
         if let Some(v) = env_f32("BIPED_W_BASE_H") {
             weights.base_height = v;
         }
+        // Target height for the base_height kernel. AGILE's 0.72 is a
+        // bent-knee stance; measured v21 sits 4-9 cm BELOW even that
+        // (0.63-0.68 m vs 0.79 natural) because crouching buys balance
+        // stability and the wide sigma=0.1 kernel makes the undershoot
+        // cheap. 0.75 is the recommended first step up; 0.78+ risks the
+        // straight-knee singularity where the leg loses vertical control
+        // authority.
+        if let Some(v) = env_f32("BIPED_BASE_HEIGHT") {
+            weights.base_height_target = v;
+        }
         // AGILE-alignment override: WBC has NO air-time reward — its gait
         // economy comes from torque/energy regularizers. Paying completed
         // swing DURATION (capped 0.4s ≈ our natural swing) selects for
