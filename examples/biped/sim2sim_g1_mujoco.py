@@ -270,6 +270,7 @@ def main():
     print(f"policy joints: 12, held joints: {len(held)}")
 
     free_q = model.jnt_qposadr[0]  # floating base is joint 0
+    free_d = model.jnt_dofadr[0]   # its first velocity DOF (linear x)
 
     renderer = mujoco.Renderer(model, height=H, width=W)
     cam = mujoco.MjvCamera()
@@ -288,7 +289,6 @@ def main():
         data.qpos[free_q + 3:free_q + 7] = [np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
         data.qvel[:] = 0.0
         if _INIT is not None:
-            free_d = model.jnt_dofadr[0]
             data.qpos[free_q:free_q + 3] = _INIT["pos"]
             data.qpos[free_q + 3:free_q + 7] = _INIT["quat_wxyz"]
             data.qpos[pol_q] = _INIT["joints"]
@@ -336,15 +336,13 @@ def main():
             frozen_phase = ph
         o[43], o[44] = np.sin(2 * np.pi * ph), np.cos(2 * np.pi * ph)
         if frame >= 48:
-            # base angular velocity in the BODY frame. MuJoCo's free joint
-            # reports it in the world frame, so rotate by the base yaw.
-            wq = data.qvel[free_d + 3:free_d + 6]
-            qw2, qx2, qy2, qz2 = quat
-            yaw2 = np.arctan2(2 * (qw2 * qz2 + qx2 * qy2), 1 - 2 * (qy2 * qy2 + qz2 * qz2))
-            c2, s2 = np.cos(-yaw2), np.sin(-yaw2)
-            o[45] = c2 * wq[0] - s2 * wq[1]
-            o[46] = s2 * wq[0] + c2 * wq[1]
-            o[47] = wq[2]
+            # Base angular velocity, BODY frame -- which is exactly what
+            # MuJoCo's free joint already stores in qvel[3:6]. (Verified: set
+            # qvel[3:6]=[1,0,0] on a body yawed 90 deg and mj_objectVelocity
+            # reports [0,1,0] in world.) An earlier version rotated this by
+            # -yaw as if it were world-frame, corrupting roll/pitch and making
+            # every gyro-era policy spin in MuJoCo while nexus showed ~0.
+            o[45:48] = data.qvel[free_d + 3:free_d + 6]
 
         if frames_hist is None:
             frames_hist = [o.copy() for _ in range(HIST)]  # reset-replicate
