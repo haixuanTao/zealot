@@ -307,6 +307,24 @@ impl CommandSampler {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.25);
+        // Arc bias (BIPED_ARC_PROB, default 0.25): with the yaw range widened
+        // to +/-0.6, independent uniform draws still put almost no mass on
+        // CURVED walking -- measured only ~5% of moving commands were strong
+        // arcs (|yaw|>=0.15 with |vx|>=0.3). Explicitly pair a real forward
+        // speed with a real yaw rate so turning-while-walking is in the data
+        // at all, not just turning-in-place.
+        let arc_prob: f32 = std::env::var("BIPED_ARC_PROB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.25);
+        if rng.chance(arc_prob) {
+            let sx = if rng.chance(0.5) { 1.0 } else { -1.0 };
+            let sy = if rng.chance(0.5) { 1.0 } else { -1.0 };
+            cmd.vx = sx * rng.range(0.25, self.lin_vel_x.1.abs().max(0.25));
+            cmd.yaw_rate = sy * rng.range(0.2, self.ang_vel_z.1.abs().max(0.2));
+            cmd.vy = 0.0;
+            return cmd;
+        }
         if rng.chance(slow_prob) {
             let target = rng.range(0.12, 0.3);
             let speed = cmd.speed();
