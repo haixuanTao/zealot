@@ -2967,6 +2967,17 @@ impl BipedNexusBatchEnv {
         let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(5e-5);
         let w_ankle_torques = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1e-4);
         let w_ankle_roll_torques = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(1e-3);
+        // Knee-specific torque extra (BIPED_W_KNEE_TORQUES, per-step weight on
+// tau^2; 0 = off). Unlike the generic ramped leg term this is
+// FULL-STRENGTH from iter 0, like the ankle extras: the knee holds the
+// crouch, and a sustained 105 N.m (75% of the 139 limit measured at
+// cmd 0.4) is a thermal problem long before it is an electrical one.
+// Extension is free for the knee - the load passes through the joint -
+// so this term prices the crouch itself.
+        let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
         // Mechanical-power (energy) penalty weight. Penalizes Σ|τᵢ·q̇ᵢ| — the rate
         // of mechanical work, the principled cost-of-transport proxy. Unlike Στ²
         // (effort, penalized even when static), this only charges for work done in
@@ -3153,10 +3164,11 @@ impl BipedNexusBatchEnv {
                 // while the leg term ramps with the curriculum (`torque_w`). WBC
                 // lerobot base weights: -5e-4 legs, -1.5e-3 ankle pitch, -6.5e-3
                 // ankle roll (coupled, weakest).
-                if torque_w > 0.0 || ankle_torque_w > 0.0 || power_w > 0.0 {
+                if torque_w > 0.0 || ankle_torque_w > 0.0 || power_w > 0.0 || w_knee_torques > 0.0 {
                     let q_target = self.task.joint_targets(&actions[e]);
                     let mut leg_pen = 0.0f32;
                     let mut ankle_pen = 0.0f32;
+                    let mut knee_pen = 0.0f32; // unramped, full-strength like the ankle extras
                     let mut power = 0.0f32; // Σ|τ·q̇| mechanical power (energy rate)
                     for i in 0..NUM_JOINTS {
                         let j = &self.task.robot.joints[i];
@@ -3177,12 +3189,18 @@ impl BipedNexusBatchEnv {
                             }
                             ankle_pen += w * t2;
                         }
+                        if j.name.contains("knee") {
+                            knee_pen += w_knee_torques * t2;
+                        }
                     }
-                    comps[20] = -(torque_w * leg_pen) * sc_dt;
+                    comps[20] = -(torque_w * leg_pen + knee_pen) * sc_dt;
                     comps[21] = -(ankle_torque_w * ankle_pen) * sc_dt;
                     comps[24] = -(power_w * power) * sc_dt;
-                    reward -=
-                        (torque_w * leg_pen + ankle_torque_w * ankle_pen + power_w * power) * sc_dt;
+                    reward -= (torque_w * leg_pen
+                        + knee_pen
+                        + ankle_torque_w * ankle_pen
+                        + power_w * power)
+                        * sc_dt;
                 }
                 let mut obs = vec![0.0; OBS_DIM];
                 self.task.observe(&state, &self.cmd[e], &mut obs);
