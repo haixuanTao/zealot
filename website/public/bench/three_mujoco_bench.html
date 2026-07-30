@@ -43,6 +43,64 @@
     const FALL_Z = 0.45, TILT_COS = Math.cos((70 * Math.PI) / 180);
     const _cmd = (params.get('cmd') || '0.4,0,0').split(',').map(Number);
     const CMD = [_cmd[0] || 0, _cmd[1] || 0, _cmd[2] || 0, 0];
+
+    // ---- Live driving: arrow keys / WASD and any connected gamepad feed the
+    // policy's velocity command, same mapping and ranges as the nexus demo.
+    // Releasing everything commands a stand rather than latching the last
+    // velocity; while nothing is held, the ?cmd= command stays in charge.
+    const BASE_CMD = CMD.slice();
+    const heldKeys = new Set();
+    const DRIVE_KEYS = new Set([
+      'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+      'KeyW', 'KeyS', 'KeyA', 'KeyD', 'KeyQ', 'KeyE',
+    ]);
+    addEventListener('keydown', (e) => {
+      if (!DRIVE_KEYS.has(e.code)) return;
+      e.preventDefault();       // arrows would scroll the embedding page
+      heldKeys.add(e.code);
+    });
+    addEventListener('keyup', (e) => heldKeys.delete(e.code));
+    // Only drop held keys when the page is actually hidden: a plain blur
+    // fires during ordinary focus churn and would cut driving mid-hold.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) heldKeys.clear();
+    });
+
+    let wasDriving = false;
+    function applyDrive() {
+      const has = (...codes) => codes.some((c) => heldKeys.has(c));
+      let vx = 0, vy = 0, yaw = 0, active = heldKeys.size > 0;
+      if (has('ArrowUp', 'KeyW')) vx += 0.6;
+      if (has('ArrowDown', 'KeyS')) vx -= 0.4;
+      if (has('KeyA')) vy += 0.3;
+      if (has('KeyD')) vy -= 0.3;
+      if (has('ArrowLeft', 'KeyQ')) yaw += 0.6;
+      if (has('ArrowRight', 'KeyE')) yaw -= 0.6;
+
+      const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      for (const pad of pads) {
+        if (!pad) continue;
+        const dead = (v) => (Math.abs(v) < 0.15 ? 0 : v);
+        const lx = dead(pad.axes[0] || 0), ly = dead(pad.axes[1] || 0), rx = dead(pad.axes[2] || 0);
+        if (lx || ly || rx) {
+          vx += -ly > 0 ? -ly * 0.6 : -ly * 0.4;   // stick up is negative
+          vy += -lx * 0.3;
+          yaw += -rx * 0.6;
+          active = true;
+        }
+      }
+
+      if (active) {
+        CMD[0] = Math.max(-0.4, Math.min(0.6, vx));
+        CMD[1] = Math.max(-0.3, Math.min(0.3, vy));
+        CMD[2] = Math.max(-0.6, Math.min(0.6, yaw));
+        wasDriving = true;
+      } else if (wasDriving) {
+        CMD[0] = 0; CMD[1] = 0; CMD[2] = 0;   // released: stand
+        wasDriving = false;
+      }
+    }
+
     const POLICY_JOINTS = [
       'left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint',
       'left_knee_joint', 'left_ankle_pitch_joint', 'left_ankle_roll_joint',
@@ -466,6 +524,7 @@
 
     let falls = 0;
     function controlStep() {
+      applyDrive();
       for (const r of robots) {
         const qpos = r.data.qpos, qvel = r.data.qvel;
         const o = new Float64Array(45);
@@ -588,7 +647,7 @@
           `render: ${fps.toFixed(0)} fps   physics+policy: ${ms.toFixed(2)} ms/ctrl-step\n` +
           `sim speed: ${(rt * 100).toFixed(0)}% of real time   falls: ${falls}\n` +
           `mean speed: ${(window.__spdN ? window.__spdAcc / window.__spdN : 0).toFixed(2)} m/s (cmd ${CMD[0]})\n` +
-          `drag: orbit camera   scroll: zoom`;
+          `drag: orbit camera   scroll: zoom   drive: ↑↓←→ / WASD / gamepad`;
         window.__spdAcc = 0; window.__spdN = 0;
         frames = 0; steps = 0; physMs = 0; winT0 = performance.now();
         console.log('[bench] tick');

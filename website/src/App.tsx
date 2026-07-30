@@ -35,7 +35,7 @@ type DemoName = (typeof DEMOS)[number]['name'];
 
 /// Scene knobs. The terrain is baked into each engine's scene at startup, so
 /// changing one reloads the demo iframe with new URL params.
-const DEFAULTS = {n: 3, lvl: 4, amp: 100, slope: 5, terrain: true};
+const DEFAULTS = {n: 3, lvl: 4, amp: 100, slope: 2, terrain: true};
 type Knobs = typeof DEFAULTS;
 
 function demoSrc(name: DemoName, k: Knobs): string {
