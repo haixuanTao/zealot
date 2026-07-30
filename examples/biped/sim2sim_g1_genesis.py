@@ -102,14 +102,21 @@ def leg_gains(name):
     return kp * KP_SCALE, kd * KD_SCALE, eff
 
 
+# Ankle gains are checkpoint-dependent: AGILE-era policies (pre-v19) trained
+# at 20/0.2 (roll 0.1); the v19+ "ankle package" trains at the unitree_rl_gym
+# deploy pair 40/2.0. Default to the deploy pair (current checkpoints);
+# S2S_ANKLE_KP / S2S_ANKLE_KD restore the old actuator for old checkpoints.
+ANKLE_KP = float(os.environ.get("S2S_ANKLE_KP", "40"))
+ANKLE_KD = float(os.environ.get("S2S_ANKLE_KD", "2.0"))
+
+
 def _leg_gains_raw(name):
     if "knee" in name:
         return 200.0, 5.0, 139.0
     if "hip" in name:
         return 100.0, 2.5, 88.0
-    if "ankle_roll" in name:
-        return 20.0, 0.1, 50.0
-    return 20.0, 0.2, 50.0  # ankle_pitch
+    if "ankle" in name:
+        return ANKLE_KP, ANKLE_KD, 50.0
 
 
 HELD = [
