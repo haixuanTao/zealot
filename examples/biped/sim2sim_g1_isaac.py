@@ -37,6 +37,11 @@ FLAT_XML = ("/home/champagne/rt_build/bench-venv/lib/python3.12/site-packages/"
 USD_DIR = "/tmp/g1_isaac_usd"
 USD_FILE = os.path.join(USD_DIR, "_g1_isaac_flat", "_g1_isaac_flat.usda")
 
+# Chase-camera standoff in metres per horizontal axis (eye sits at
+# +CAM_D/-CAM_D from the pelvis). 2.0 was the old hard-coded value and framed
+# the robot too tightly to read in a multi-engine grid.
+CAM_D = float(os.environ.get("S2S_CAM_DIST", "4.5"))
+
 PHYS_DT = 1.0 / 200.0
 DECIMATION = 4
 CONTROL_DT = PHYS_DT * DECIMATION
@@ -416,7 +421,11 @@ def main():
         if not NOVIDEO and t % RENDER_EVERY == 0:
             p, _ = robot.get_world_pose()
             p = np.asarray(p)
-            set_camera_view(eye=[p[0] + 2.0, p[1] - 2.0, 1.1],
+            # Chase camera. The default 2 m offset framed the robot so tightly
+            # that it filled the frame and the ground gave no motion cue --
+            # useless in a side-by-side against the other engines. S2S_CAM_DIST
+            # scales the standoff (metres of horizontal offset per axis).
+            set_camera_view(eye=[p[0] + CAM_D, p[1] - CAM_D, 0.55 * CAM_D],
                             target=[p[0], p[1], 0.6],
                             camera_prim_path="/World/cam")
             world.render()
