@@ -478,10 +478,14 @@ impl Default for RewardWeights {
             // pays the completed-swing duration ONLY at touchdown,
             // so a permanently-raised foot earns nothing → forces
             // real alternating step cycles. Progress+command gated.
-            flight: -1.0,       // keep: no hopping (both feet airborne)
-            stand_planted: 0.0, // OFF by default (A/B via BIPED_STAND_PLANTED_W):
-            // per-airborne-foot penalty while the command is
-            // standing → balance with ankles/hips, not dance-steps.
+            flight: -1.0,        // keep: no hopping (both feet airborne)
+            stand_planted: -1.0, // ON by default: per-airborne-foot penalty
+            // while the command is standing → balance with ankles/hips, not
+            // dance-steps. Without it nothing opposes marching in place at a
+            // stand (tracking pays for zero NET velocity, which a march
+            // satisfies), so the policy learns to jog on the spot whenever it
+            // is told to hold still. -1.0 is the weight the v24 run used;
+            // override with BIPED_W_STAND_PLANTED.
             single_support: 0.5, // REPURPOSED → double-support SETTLE bonus (both feet
             // planted while moving). Modest, so it shapes a
             // "swing → settle → swing" cycle without farmable waddle.
@@ -1329,19 +1333,21 @@ mod tests {
 
     #[test]
     fn obs_dim_consistent() {
-        assert_eq!(OBS_DIM, 45);
+        assert_eq!(OBS_DIM, 48);
         assert_eq!(ACTION_DIM, 12);
         let task = VelocityFlatTask::new();
         let mut obs = vec![0.0; OBS_DIM];
         task.observe(&upright_state(), &VelocityCommand::default(), &mut obs);
         // Layout: last_action[0..12], command[12..16], joint_pos_rel[16..28],
-        // joint_vel[28..40], projected_gravity[40..43], gait_phase(sin,cos)[43..45].
-        // Upright, neutral pose, zero command, phase 0 → everything zero except
-        // gravity up = -1 and cos(0) = 1.
+        // joint_vel[28..40], projected_gravity[40..43], gait_phase(sin,cos)[43..45],
+        // base_ang_vel_body[45..48].
+        // Upright, neutral pose, zero command, phase 0, at rest → everything zero
+        // except gravity up = -1 and cos(0) = 1.
         assert!(obs.iter().take(40).all(|&x| x == 0.0));
         assert!((obs[42] - (-1.0)).abs() < 1e-6, "up component of gravity");
         assert!(obs[43].abs() < 1e-6, "sin(phase 0) = 0");
         assert!((obs[44] - 1.0).abs() < 1e-6, "cos(phase 0) = 1");
+        assert!(obs[45..48].iter().all(|&x| x == 0.0), "gyro at rest");
     }
 
     #[test]
@@ -1423,12 +1429,21 @@ mod tests {
         let mut s3 = RobotState::default();
         s3.feet[0].tilt = 1.0; // ~57° off flat
         assert!(task.reward(&s3, &cmd).foot_orientation < 0.0);
-        // The same tilt while airborne → no penalty (only stance feet count).
+        // The same tilt while AIRBORNE is penalized just as much (AGILE
+        // feet_roll_l2 parity: the term is ungated on contact). Leaving swing
+        // posture free is what let the policy dorsiflex through swing.
         let mut s4 = RobotState::default();
         s4.feet[0].contact = false;
         s4.feet[0].tilt = 1.0;
         s4.feet[1].contact = false;
-        assert_eq!(task.reward(&s4, &cmd).foot_orientation, 0.0);
+        assert_eq!(
+            task.reward(&s4, &cmd).foot_orientation,
+            task.reward(&s3, &cmd).foot_orientation
+        );
+        // Flat soles, airborne or not, cost nothing.
+        let mut s4b = RobotState::default();
+        s4b.feet[0].contact = false;
+        assert_eq!(task.reward(&s4b, &cmd).foot_orientation, 0.0);
         // A foot yawed relative to the base → feet_yaw_mean penalty.
         let mut s5 = RobotState::default();
         s5.feet[0].yaw_rel_base = 0.5;
