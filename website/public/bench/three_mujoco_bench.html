@@ -39,7 +39,10 @@
 
     // ---- Constants (sim2sim_g1_mujoco.py).
     const PHYS_DT = 1 / 200, DECIMATION = 4, DT = PHYS_DT * DECIMATION;
-    // Gait clock, derived from the command exactly as the training env does:
+    // Gait clock. Which one depends on the checkpoint: the command-derived
+    // clock below landed in the same training branch as the gyro observation,
+    // so a 48-wide frame wants it and a 45-wide one (v21 and earlier) keeps
+    // its original free-running 0.7 s period. Derived from the command:
     // a standing command (< 0.1 m/s) FREEZES the phase — standing is its own
     // observation state — and above that the cycle period lerps 0.8 s -> 0.55 s
     // with commanded speed. A free-running clock is a train/deploy mismatch:
@@ -153,14 +156,27 @@
 
     // ---- Policy (same loader as the rapier page).
     const policy = await (async () => {
+      // `?ckpt=` names the policy. Hugging Face is where published zealot
+      // checkpoints live, so its repos get short forms — `owner/repo/file
+      // .safetensors`, or `owner/repo` for the default file — while anything
+      // starting with http is used as-is and a bare name is a local file.
+      // Same rules as the wasm demo's `ckpt_url`.
+      function ckptUrl(spec) {
+        if (/^https?:\/\//.test(spec)) return spec;
+        const p = spec.split('/');
+        if (p.length >= 3) return `https://huggingface.co/${p[0]}/${p[1]}/resolve/main/${p.slice(2).join('/')}`;
+        if (p.length === 2) return `https://huggingface.co/${p[0]}/${p[1]}/resolve/main/g1_walk.safetensors`;
+        return spec + '.safetensors';
+      }
       const ckpt = params.get('ckpt') || 'g1_walk_v24';
-      const resp = await fetch(ckpt + '.safetensors');
+      const resp = await fetch(ckptUrl(ckpt));
       if (!resp.ok) throw new Error('checkpoint fetch failed: ' + ckpt + ' (' + resp.status + ')');
       const buf = await resp.arrayBuffer();
       let sum = 0 >>> 0;
       const u32 = new Uint32Array(buf.slice(0, Math.floor(buf.byteLength / 4) * 4));
       for (let i = 0; i < u32.length; i += 997) sum = (sum ^ u32[i]) >>> 0;
-      window.__ckptInfo = ckpt + ' (' + (buf.byteLength / 1e6).toFixed(2) + ' MB, x' + sum.toString(16) + ')';
+      const shortName = ckpt.split('/').pop().replace(/\.safetensors$/, '');
+      window.__ckptInfo = shortName + ' (' + (buf.byteLength / 1e6).toFixed(2) + ' MB, x' + sum.toString(16) + ')';
       const dv = new DataView(buf);
       const hlen = Number(dv.getBigUint64(0, true));
       const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hlen)));
@@ -559,7 +575,7 @@
         o[42] = -1 + 2 * (ux * t1y - uy * t1x);
         const ph = r.gaitPh;
         o[43] = Math.sin(2 * Math.PI * ph); o[44] = Math.cos(2 * Math.PI * ph);
-        r.gaitPh = gaitAdvance(ph, o[12], o[13]);
+        r.gaitPh = HAS_GYRO ? gaitAdvance(ph, o[12], o[13]) : (ph + DT / 0.7) % 1.0;
         // Gyro: base angular velocity in the BODY frame. A MuJoCo free joint
         // already stores its rotational qvel body-local, so it goes in as-is
         // (this is what an on-robot IMU reads).

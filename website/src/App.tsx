@@ -35,8 +35,46 @@ type DemoName = (typeof DEMOS)[number]['name'];
 
 /// Scene knobs. The terrain is baked into each engine's scene at startup, so
 /// changing one reloads the demo iframe with new URL params.
-const DEFAULTS = {n: 3, lvl: 4, amp: 100, slope: 2, terrain: true};
+const DEFAULTS = {n: 3, lvl: 4, amp: 100, slope: 2, terrain: true, ckpt: ''};
 type Knobs = typeof DEFAULTS;
+
+/// Published zealot policies. Every engine below can load any checkpoint in
+/// here — same weights, three different physics engines — and the demos also
+/// accept `owner/repo/file.safetensors` or a full URL, so this repo is a
+/// default, not a restriction.
+const HF_REPO = 'haixuantao/zealot-g1-locomotion';
+
+type Ckpt = {value: string; label: string};
+
+/// The repo's `.safetensors`, newest first. Best-effort: the Hub API is public
+/// and CORS-enabled, but if it is unreachable the picker just offers the
+/// checkpoint baked into the demo.
+function useHfCheckpoints(): Ckpt[] {
+  const [list, setList] = useState<Ckpt[]>([]);
+  useEffect(() => {
+    let alive = true;
+    fetch(`https://huggingface.co/api/models/${HF_REPO}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        const files: string[] = (d?.siblings ?? [])
+          .map((s: {rfilename: string}) => s.rfilename)
+          .filter((f: string) => f.endsWith('.safetensors'));
+        files.sort().reverse();
+        if (alive)
+          setList(
+            files.map((f) => ({
+              value: `${HF_REPO}/${f}`,
+              label: f.replace(/\.safetensors$/, ''),
+            })),
+          );
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return list;
+}
 
 function demoSrc(name: DemoName, k: Knobs): string {
   const demo = DEMOS.find((d) => d.name === name)!;
@@ -44,7 +82,10 @@ function demoSrc(name: DemoName, k: Knobs): string {
   // The nexus demo is always on terrain; the sim2sim tabs take a flag.
   const query =
     name === 'nexus' ? `?${terrain}&n=${k.n}` : k.terrain ? `?${terrain}&n=${k.n}` : `?n=${k.n}`;
-  return `${BASE}${demo.path}${query}`;
+  // Empty = the checkpoint embedded in the demo. `ckpt` is last so that a
+  // pasted URL keeps working even if it carries its own query string.
+  const ckpt = k.ckpt ? `&ckpt=${encodeURIComponent(k.ckpt)}` : '';
+  return `${BASE}${demo.path}${query}${ckpt}`;
 }
 
 function useUnsupportedBrowser(): string | null {
@@ -162,9 +203,60 @@ function useForwardedScroll() {
   }, []);
 }
 
+/// Policy picker: the published checkpoints, plus a field for any other
+/// Hugging Face repo or URL. Loading one re-runs the SAME weights in whichever
+/// engine is on screen.
+function PolicyPicker({
+  value,
+  onChange,
+  options,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  options: Ckpt[];
+}) {
+  const known = value === '' || options.some((o) => o.value === value);
+  const [custom, setCustom] = useState(!known);
+  return (
+    <label className="knob">
+      <span className="knobLabel">Policy</span>
+      <select
+        className="knobSelect"
+        value={custom ? '__custom' : value}
+        onChange={(e) => {
+          if (e.target.value === '__custom') {
+            setCustom(true);
+          } else {
+            setCustom(false);
+            onChange(e.target.value);
+          }
+        }}
+      >
+        <option value="">g1_walk_v24 (built in)</option>
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label} — 🤗
+          </option>
+        ))}
+        <option value="__custom">Other…</option>
+      </select>
+      {custom && (
+        <input
+          className="knobInput"
+          value={value}
+          placeholder="owner/repo/file.safetensors"
+          spellCheck={false}
+          onChange={(e) => onChange(e.target.value.trim())}
+        />
+      )}
+    </label>
+  );
+}
+
 function Demo() {
   useForwardedScroll();
   const [selected, setSelected] = useState<DemoName>('nexus');
+  const checkpoints = useHfCheckpoints();
   const [knobs, setKnobs] = useState<Knobs>(DEFAULTS);
   const [applied, setApplied] = useState<Knobs>(DEFAULTS);
   const [reloading, setReloading] = useState(false);
@@ -208,6 +300,11 @@ function Demo() {
         </div>
 
         <div className="knobs">
+          <PolicyPicker
+            value={knobs.ckpt}
+            options={checkpoints}
+            onChange={(ckpt) => setKnobs({...knobs, ckpt})}
+          />
           {selected !== 'nexus' && (
             <label className="knob knobCheck">
               <input
@@ -266,7 +363,7 @@ function Demo() {
         ) : (
           <iframe
             ref={iframeRef}
-            key={`${selected}-${applied.n}-${applied.lvl}-${applied.amp}-${applied.slope}-${applied.terrain}`}
+            key={`${selected}-${applied.n}-${applied.lvl}-${applied.amp}-${applied.slope}-${applied.terrain}-${applied.ckpt}`}
             src={demoSrc(selected, applied)}
             title={current.title}
             className="viewerFrame"

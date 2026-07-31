@@ -31,6 +31,23 @@ fn query_int(key: &str) -> Option<i64> {
     None
 }
 
+/// URL query param `key=` as a string (wasm only). Everything up to the next
+/// `&`, still percent-encoded — the demo decodes it.
+#[allow(unused)]
+fn query_str(key: &str) -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(search) = web_sys::window().and_then(|w| w.location().search().ok()) {
+        for kv in search.trim_start_matches('?').split('&') {
+            if let Some(v) = kv.strip_prefix(key) {
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 #[kiss3d::main]
 pub async fn main() {
     g1_web_demo::run(g1_web_demo::DemoCfg {
@@ -42,6 +59,9 @@ pub async fn main() {
         terrain_amp_pct: query_int("amp=").map_or(100, |a| a.clamp(0, 300) as u32),
         // `?slope=` adds an uphill grade along the strip, in degrees.
         terrain_slope_deg: query_int("slope=").map_or(0, |s| s.clamp(0, 20) as u32),
+        // `?ckpt=` runs a published policy instead of the embedded one:
+        // a Hugging Face `owner/repo/file.safetensors`, or a full URL.
+        ckpt: query_str("ckpt="),
     })
     .await
 }

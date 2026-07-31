@@ -109,6 +109,28 @@ a {
   accent-color: var(--teal);
 }
 
+.knobSelect,
+.knobInput {
+  font: inherit;
+  font-size: 0.82rem;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid #d6e0e0;
+  border-radius: 6px;
+  padding: 0.25rem 0.4rem;
+  max-width: 15rem;
+}
+
+.knobInput {
+  width: 15rem;
+}
+
+.knobSelect:focus,
+.knobInput:focus {
+  outline: 2px solid var(--teal);
+  outline-offset: -1px;
+}
+
 .apply {
   padding: 0.35rem 1rem;
   border: none;

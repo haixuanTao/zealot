@@ -15,11 +15,12 @@
 //!   init by the host against a CPU readback.
 //! - `state` (STATE_STRIDE per env): [0..12) prev_q, [12..24) action t−2,
 //!   [24..36) action t−1, [36] episode step counter (f32), [37] gait phase.
-//! - `hist`: 5×48 obs-frame ring per env, slot s = ep % 5.
+//! - `hist`: 5×`frame` obs-frame ring per env, slot s = ep % 5 (allocated at
+//!   the 5×48 maximum; a 45-dim policy uses the first 5×45).
 //! - `consts`: [0..12) actuated dof ids (as f32), [12..24) default_pos,
 //!   [24..36) target lo, [36..48) target hi, [48..273) normalizer mean (225),
 //!   [273..498) normalizer std (225).
-//! - `gemm_input`: row-major [225 × n_envs] — the vortx GEMM a0 buffer.
+//! - `gemm_input`: row-major [5·frame × n_envs] — the vortx GEMM a0 buffer.
 //! - `actions`/`targets`: row-major [12 × n_envs] (matches
 //!   `scatter_motor_targets`).
 //!
@@ -53,12 +54,21 @@ const S_PHASE: usize = 37;
 const GAIT_PERIOD_SLOW: f32 = 0.8;
 /// Gait cycle seconds at the full 0.5 m/s command.
 const GAIT_PERIOD_FAST: f32 = 0.55;
+/// The fixed, free-running period every pre-gyro checkpoint was trained on.
+const GAIT_PERIOD_LEGACY: f32 = 0.7;
 /// Policy joints.
 pub const N_ACT: usize = 12;
 /// Frames of obs history.
 pub const HIST: usize = 5;
-/// Single-frame obs width.
+/// WIDEST single-frame obs the kernel can assemble, and the stride every
+/// fixed-size buffer here is allocated at. The frame a given policy actually
+/// wants is narrower or equal and comes in as the `frame` uniform: v21 and
+/// earlier were 45, v24 added the gyro at [45..48). Checkpoints published
+/// before and after that change both have to load and walk, so the width is a
+/// runtime value, not a rebuild.
 pub const FRAME: usize = 48;
+/// The pre-gyro frame, still used by every v21-and-earlier checkpoint.
+pub const FRAME_NO_GYRO: usize = 45;
 /// consts offsets. C_LINK: child-link id of each policy joint.
 pub const C_LINK: usize = 0;
 pub const C_DEFAULT: usize = 12;
@@ -77,8 +87,8 @@ const WS_LTW: u32 = 5;
 /// quad then angular quad, at workspace quads 11/12).
 const WS_RB_ANGVEL: u32 = 12;
 
-/// Assemble the 48-dim obs frame, update the history ring, and write the
-/// normalized stacked [225 × N] GEMM input. One thread per env.
+/// Assemble the obs frame (`frame` wide), update the history ring, and write
+/// the normalized stacked [5·frame × N] GEMM input. One thread per env.
 #[spirv_bindgen]
 #[spirv(compute(threads(64)))]
 pub fn gpu_assemble_obs(
@@ -92,6 +102,7 @@ pub fn gpu_assemble_obs(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] gemm_input: &mut [f32],
     #[spirv(uniform, descriptor_set = 0, binding = 6)] n_envs: &u32,
     #[spirv(uniform, descriptor_set = 0, binding = 7)] dt: &f32,
+    #[spirv(uniform, descriptor_set = 0, binding = 8)] frame: &u32,
 ) {
     let e = invocation_id.x;
     let n = *n_envs;
@@ -101,6 +112,10 @@ pub fn gpu_assemble_obs(
     let ne = n as usize;
     let eu = e as usize;
     let sb = |i: usize| i * ne + eu; // batch-interleaved slot
+    // Obs width this policy was trained with (45 pre-gyro, 48 with it). The
+    // `o` scratch is always FRAME wide; the loops below stop at `fr`, so the
+    // gyro slots simply never reach the history ring for a 45-dim policy.
+    let fr = *frame as usize;
 
     let ep = state.read(sb(36));
 
@@ -149,13 +164,15 @@ pub fn gpu_assemble_obs(
     o[40] = g[0];
     o[41] = g[1];
     o[42] = g[2];
-    // Gait clock, derived from the command exactly as the training env does
-    // (`biped_env_nexus`, "one command-derived design, no knobs"): a standing
-    // command (< 0.1 m/s) FREEZES the phase, so standing is its own
-    // observation state; above that the cycle period lerps 0.8 s → 0.55 s with
-    // commanded speed. A free-running clock here is a train/deploy mismatch —
-    // the obs keeps asking for swings the policy was trained to stop making,
-    // and the robot marches in place whenever it is told to hold still.
+    // Gait clock. For current policies this is derived from the command
+    // exactly as the training env does (`biped_env_nexus`, "one
+    // command-derived design, no knobs"): a standing command (< 0.1 m/s)
+    // FREEZES the phase, so standing is its own observation state, and above
+    // that the cycle period lerps 0.8 s → 0.55 s with commanded speed. A
+    // free-running clock under such a policy is a train/deploy mismatch — the
+    // obs keeps asking for swings it was trained to stop making, and the robot
+    // marches in place when told to hold still. See the advance step below for
+    // how older checkpoints keep their original fixed-period clock.
     let ph = if ep <= 0.5 {
         0.0
     } else {
@@ -180,15 +197,15 @@ pub fn gpu_assemble_obs(
     // History ring: slot ep%5; on episode start replicate into all slots.
     let slot = (ep as u32 % HIST as u32) as usize;
     let mut r = 0;
-    while r < FRAME {
+    while r < fr {
         if ep <= 0.5 {
             let mut s = 0;
             while s < HIST {
-                hist.write((s * FRAME + r) * ne + eu, o[r]);
+                hist.write((s * fr + r) * ne + eu, o[r]);
                 s += 1;
             }
         } else {
-            hist.write((slot * FRAME + r) * ne + eu, o[r]);
+            hist.write((slot * fr + r) * ne + eu, o[r]);
         }
         r += 1;
     }
@@ -199,10 +216,10 @@ pub fn gpu_assemble_obs(
     while k < HIST {
         let src = (slot + 1 + k) % HIST;
         let mut r = 0;
-        while r < FRAME {
-            let x = hist.read((src * FRAME + r) * ne + eu);
-            let m = consts.read(C_MEAN + k * FRAME + r);
-            let s = consts.read(C_STD + k * FRAME + r);
+        while r < fr {
+            let x = hist.read((src * fr + r) * ne + eu);
+            let m = consts.read(C_MEAN + k * fr + r);
+            let s = consts.read(C_STD + k * fr + r);
             let mut v = (x - m) / s;
             if v > 5.0 {
                 v = 5.0;
@@ -210,7 +227,7 @@ pub fn gpu_assemble_obs(
             if v < -5.0 {
                 v = -5.0;
             }
-            gemm_input.write((k * FRAME + r) * ne + eu, v);
+            gemm_input.write((k * fr + r) * ne + eu, v);
             r += 1;
         }
         k += 1;
@@ -223,14 +240,25 @@ pub fn gpu_assemble_obs(
         j += 1;
     }
 
-    // Advance the gait phase for the next step (frozen at a standing command).
-    let cmd_speed = (o[12] * o[12] + o[13] * o[13]).sqrt();
+    // Advance the gait phase for the next step. WHICH clock depends on the
+    // policy: the command-derived one (freeze at a stand, period lerped with
+    // commanded speed) landed in the same training branch as the gyro
+    // observation, so a 48-wide frame means the checkpoint expects it and a
+    // 45-wide one (v21 and earlier) expects the older free-running fixed
+    // period. Feeding either the wrong clock is a train/deploy mismatch, so
+    // the frame width picks it — published checkpoints of both eras walk.
     let mut next_ph = ph;
-    if cmd_speed >= 0.1 {
-        let capped = if cmd_speed > 0.5 { 0.5 } else { cmd_speed };
-        let t = (capped - 0.1) / 0.4;
-        let period = GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * t;
-        let raw = ph + *dt / period;
+    if fr == FRAME {
+        let cmd_speed = (o[12] * o[12] + o[13] * o[13]).sqrt();
+        if cmd_speed >= 0.1 {
+            let capped = if cmd_speed > 0.5 { 0.5 } else { cmd_speed };
+            let t = (capped - 0.1) / 0.4;
+            let period = GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * t;
+            let raw = ph + *dt / period;
+            next_ph = raw - raw.floor();
+        }
+    } else {
+        let raw = ph + *dt / GAIT_PERIOD_LEGACY;
         next_ph = raw - raw.floor();
     }
     state.write(sb(S_PHASE), next_ph);

@@ -1,0 +1,18 @@
+[package]
+name = "zealot-gpu-obs"
+description = "Host bindings for the zealot GPU observation-assembly kernels."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+zealot-obs-shaders = { path = "../zealot-obs-shaders" }
+khal = { version = "0.2", features = ["derive", "webgpu"] }
+vortx = { version = "0.3" }
+include_dir = { version = "0.7" }
+glamx = { version = "0.3" }
+
+[build-dependencies]
+khal-builder = { version = "0.2" }
+zealot-obs-shaders = { path = "../zealot-obs-shaders" }

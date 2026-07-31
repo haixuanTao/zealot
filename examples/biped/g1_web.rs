@@ -57,6 +57,23 @@ fn dump_terrain(out: &str, x0: f32, x1: f32) {
     println!("wrote {out} ({} tris)", keep.len());
 }
 
+/// URL query param `key=` as a string (wasm only). Everything up to the next
+/// `&`, still percent-encoded — the demo decodes it.
+#[allow(unused)]
+fn query_str(key: &str) -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(search) = web_sys::window().and_then(|w| w.location().search().ok()) {
+        for kv in search.trim_start_matches('?').split('&') {
+            if let Some(v) = kv.strip_prefix(key) {
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 #[kiss3d::main]
 pub async fn main() {
     #[cfg(not(target_arch = "wasm32"))]
@@ -74,6 +91,9 @@ pub async fn main() {
         terrain_level: 4,
         terrain_amp_pct: 100,
         terrain_slope_deg: 0,
+        // `?ckpt=` runs a published policy instead of the embedded one:
+        // a Hugging Face `owner/repo/file.safetensors`, or a full URL.
+        ckpt: query_str("ckpt="),
     })
     .await
 }

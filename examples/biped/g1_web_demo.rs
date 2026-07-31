@@ -38,6 +38,10 @@ pub struct DemoCfg {
     pub terrain_amp_pct: u32,
     /// Uphill slope along the strip in degrees (0 = training terrain).
     pub terrain_slope_deg: u32,
+    /// Where to get the policy from, if not the embedded default. Accepts a
+    /// full URL, a Hugging Face `owner/repo/file.safetensors` (the form the
+    /// website's model picker passes), or `owner/repo` — see [`ckpt_url`].
+    pub ckpt: Option<String>,
 }
 
 use biped_env_nexus::{BipedNexusBatchEnv, parse_mjcf};
@@ -69,6 +73,18 @@ const VISUALS_BIN: &[u8] = include_bytes!("assets/g1_visuals_29dof.bin");
 /// Welford normalizer stats. First policy with the GYRO in its observation —
 /// 48-dim frames instead of 45 — so it needs the matching env/shader obs.
 const POLICY_BIN: &[u8] = include_bytes!("assets/g1_walk_v24.safetensors");
+
+/// What the HUD calls the embedded checkpoint (see `POLICY_BIN`).
+const DEFAULT_CKPT: &str = "g1_walk_v24 (embedded)";
+
+/// Surface a demo-level problem where it can actually be seen: the browser
+/// console, or stderr natively.
+fn log_warn(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::warn_1(&format!("zealot demo: {msg}").into());
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("zealot demo: {msg}");
+}
 
 /// Parse `g1_visuals.bin` → body name → mesh groups (rgba, verts, tris).
 #[allow(clippy::type_complexity)]
@@ -386,6 +402,92 @@ async fn headless_check(cfg: &DemoCfg) {
         }
     }
     println!("headless-check: falls = {falls} over 6 s (0 = walks)");
+}
+
+/// Resolve what the `?ckpt=` knob names into something fetchable.
+///
+/// Hugging Face is the home for published zealot policies, so its repos get
+/// the short forms:
+/// - `owner/repo/some_ckpt.safetensors` → that file on `main`;
+/// - `owner/repo` → `g1_walk.safetensors` in it (a repo can hold many
+///   checkpoints, so the picker normally names one);
+/// - anything starting with `http` is taken as-is, so self-hosted or
+///   release-asset checkpoints work too.
+fn ckpt_url(spec: &str) -> String {
+    let spec = percent_decode(spec);
+    if spec.starts_with("http://") || spec.starts_with("https://") {
+        return spec;
+    }
+    let parts: Vec<&str> = spec.splitn(3, '/').collect();
+    match parts.as_slice() {
+        [owner, repo, file] => {
+            format!("https://huggingface.co/{owner}/{repo}/resolve/main/{file}")
+        }
+        [owner, repo] => {
+            format!("https://huggingface.co/{owner}/{repo}/resolve/main/g1_walk.safetensors")
+        }
+        // Bare name: a checkpoint sitting next to the demo, like the bench
+        // pages' `?ckpt=` has always meant.
+        _ => format!("{spec}.safetensors"),
+    }
+}
+
+/// Minimal `%XX` decoder — the picker hands us an encoded URL, and pulling in
+/// a crate to undo `encodeURIComponent` would be silly.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A human-readable label for the HUD: the file name without extension.
+fn ckpt_label(spec: &str) -> String {
+    let spec = percent_decode(spec);
+    spec.rsplit('/')
+        .next()
+        .unwrap_or(&spec)
+        .trim_end_matches(".safetensors")
+        .to_string()
+}
+
+/// Download a checkpoint. In the browser this is a plain `fetch` (Hugging
+/// Face serves the LFS files with permissive CORS); natively `?ckpt=` names a
+/// file on disk.
+#[cfg(target_arch = "wasm32")]
+async fn fetch_ckpt(url: &str) -> Result<Vec<u8>, String> {
+    use wasm_bindgen::JsCast;
+    let win = web_sys::window().ok_or("no window")?;
+    let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(win.fetch_with_str(url))
+        .await
+        .map_err(|e| format!("fetch failed: {e:?}"))?
+        .dyn_into()
+        .map_err(|_| "not a Response".to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {} for {url}", resp.status()));
+    }
+    let buf = wasm_bindgen_futures::JsFuture::from(
+        resp.array_buffer().map_err(|e| format!("{e:?}"))?,
+    )
+    .await
+    .map_err(|e| format!("body read failed: {e:?}"))?;
+    Ok(js_sys::Uint8Array::new(&buf).to_vec())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn fetch_ckpt(path: &str) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("{path}: {e}"))
 }
 
 /// Render poses read back from the GPU **one frame late**, without ever
@@ -709,9 +811,44 @@ pub async fn run(cfg: DemoCfg) {
         robots.push(body_nodes);
     }
 
-    // Env: N envs, template 0 = DR off. The released v7 policy drives the
-    // legs; waist/arms are PD-held by the env at the AGILE holding gains.
-    let ac = ActorCritic::load_from_bytes(POLICY_BIN).expect("policy checkpoint");
+    // Env: N envs, template 0 = DR off. The policy drives the legs; waist/arms
+    // are PD-held by the env at the AGILE holding gains.
+    //
+    // `?ckpt=` swaps in a published checkpoint (Hugging Face by default). Its
+    // obs width comes from the checkpoint itself, so pre-gyro policies (v21
+    // and earlier, 45×5) and gyro ones (v24 on, 48×5) both just run. A fetch
+    // or parse failure falls back to the embedded default rather than showing
+    // a dead canvas — the HUD says which one is actually driving.
+    let (ac, ckpt_name) = match &cfg.ckpt {
+        Some(spec) => {
+            let url = ckpt_url(spec);
+            match fetch_ckpt(&url).await {
+                Ok(bytes) => match ActorCritic::load_from_bytes(&bytes) {
+                    Ok(ac) => (ac, ckpt_label(spec)),
+                    Err(e) => {
+                        let msg = format!("{} — bad checkpoint: {e}", ckpt_label(spec));
+                        log_warn(&msg);
+                        (
+                            ActorCritic::load_from_bytes(POLICY_BIN).expect("policy checkpoint"),
+                            format!("{DEFAULT_CKPT} (fallback: {msg})"),
+                        )
+                    }
+                },
+                Err(e) => {
+                    log_warn(&e);
+                    (
+                        ActorCritic::load_from_bytes(POLICY_BIN).expect("policy checkpoint"),
+                        format!("{DEFAULT_CKPT} (fallback: {e})"),
+                    )
+                }
+            }
+        }
+        None => (
+            ActorCritic::load_from_bytes(POLICY_BIN).expect("policy checkpoint"),
+            DEFAULT_CKPT.to_string(),
+        ),
+    };
+    let ckpt_name = format!("{ckpt_name} — {}-dim obs", ac.obs_norm.state().0.len());
     let mut env = BipedNexusBatchEnv::new(MJCF_XML, n_robots, 1, 0xC0FFEE).await;
     let mut cmds: Vec<[f32; 3]> = (0..n_robots).map(preset_cmd).collect();
     for e in 0..n_robots {
@@ -1035,6 +1172,7 @@ pub async fn run(cfg: DemoCfg) {
             let reset_clicked = &mut reset_clicked;
             let choice = &mut choice;
             let cmd_ui = &mut cmd_ui;
+            let ckpt_label: &str = &ckpt_name;
             window.draw_ui(move |ctx| {
                 kiss3d::egui::Window::new("zealot G1")
                     .anchor(kiss3d::egui::Align2::LEFT_TOP, [12.0, 12.0])
@@ -1042,11 +1180,11 @@ pub async fn run(cfg: DemoCfg) {
                     .collapsible(false)
                     .show(ctx, |ui| {
                         ui.label(format!(
-                            "{n_robots}× Unitree G1 walking with the v24"
+                            "{n_robots}× Unitree G1 walking on the zealot"
                         ));
-                        ui.label("policy (v24, gyro obs) on the zealot training");
-                        ui.label("env: nexus GPU physics, real Unitree PD gains,");
-                        ui.label("5 ms dt + substep refresh, 50 Hz control.");
+                        ui.label("training env: nexus GPU physics, real Unitree");
+                        ui.label("PD gains, 5 ms dt + substep refresh, 50 Hz.");
+                        ui.label(format!("policy: {ckpt_label}"));
                         ui.separator();
                         ui.horizontal(|ui| {
                             let mut preset = |v: [f32; 3]| {
