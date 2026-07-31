@@ -644,39 +644,6 @@ pub async fn run(cfg: DemoCfg) {
     // Policy input/output magnitudes for the cross-browser diagnostics.
     let (mut dbg_in, mut dbg_out, mut dbg_nan) = (0.0f32, 0.0f32, 0usize);
 
-    // Safari and Firefox run the physics correctly but the GPU policy path
-    // returns wrong actions there (measured: healthy obs magnitudes, actions
-    // that never produce motion), so the robot just stands. Until that kernel
-    // is fixed, those browsers fall back to stepping the env normally and
-    // running the tiny MLP on the CPU — same policy, same physics, a few
-    // hundred microseconds a step for a handful of robots. Force either way
-    // with ?policy=cpu / ?policy=gpu.
-    let cpu_policy = {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let q = web_sys::window()
-                .and_then(|w| w.location().search().ok())
-                .unwrap_or_default();
-            if q.contains("policy=cpu") {
-                true
-            } else if q.contains("policy=gpu") {
-                false
-            } else {
-                let ua = web_sys::window()
-                    .map(|w| w.navigator().user_agent().unwrap_or_default())
-                    .unwrap_or_default();
-                let chromium = ua.contains("Chrome") || ua.contains("Chromium") || ua.contains("Edg");
-                !chromium
-            }
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            false
-        }
-    };
-    // Actions for the CPU path, carried across control steps.
-    let mut cpu_actions: Vec<[f32; NUM_JOINTS]> = vec![[0.0; NUM_JOINTS]; n_robots];
-
     drive::install();
     // Start the latched command at what the demo is already running, so the
     // first tap bumps up from the visible value instead of from zero.
@@ -718,31 +685,19 @@ pub async fn run(cfg: DemoCfg) {
             // Single-submit control step: obs assembly, policy GEMMs, action
             // commit and motor scatter all share ONE command buffer (each
             // submit is a wasm→JS→browser crossing).
-            if cpu_policy {
-                // Classic path: step the env (which returns the stacked obs)
-                // and run the actor on the CPU for the next step's actions.
-                let outs = env.step(&cpu_actions).await;
-                for (e, out) in outs.iter().enumerate() {
-                    let a = ac.mean(&out.obs);
-                    for k in 0..NUM_JOINTS {
-                        cpu_actions[e][k] = a[k];
-                    }
-                }
-            } else {
-                let mut enc = backend.begin_encoding();
-                {
-                    let (_dv, ws) = env.resident_buffers();
-                    gobs.encode_assemble(&mut enc, ws, gpol.actor_input_mut())
-                        .expect("obs assemble");
-                }
-                let mut cur = crate::cutile_gemm::EncCursor::from_encoder(&backend, enc);
-                gpol.encode_actor(&backend, &mut cur).expect("actor");
-                let mut enc = cur.into_encoder().expect("encoder");
-                gobs.encode_commit(&mut enc, gpol.actor_output()).expect("commit");
-                env.encode_scatter_targets(&mut enc, &gobs.targets);
-                backend.submit(enc).expect("submit ctrl step");
-                env.step_physics_only();
+            let mut enc = backend.begin_encoding();
+            {
+                let (_dv, ws) = env.resident_buffers();
+                gobs.encode_assemble(&mut enc, ws, gpol.actor_input_mut())
+                    .expect("obs assemble");
             }
+            let mut cur = crate::cutile_gemm::EncCursor::from_encoder(&backend, enc);
+            gpol.encode_actor(&backend, &mut cur).expect("actor");
+            let mut enc = cur.into_encoder().expect("encoder");
+            gobs.encode_commit(&mut enc, gpol.actor_output()).expect("commit");
+            env.encode_scatter_targets(&mut enc, &gobs.targets);
+            backend.submit(enc).expect("submit ctrl step");
+            env.step_physics_only();
             perf_step_ms_acc += step_t0.elapsed().as_secs_f32() * 1e3;
             perf_steps += 1;
             for e in 0..n_robots {
