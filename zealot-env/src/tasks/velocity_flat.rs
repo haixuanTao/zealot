@@ -872,6 +872,21 @@ impl VelocityFlatTask {
         if let Some(v) = env_f32("BIPED_STD_BASE_H") {
             stds.base_height = v;
         }
+        // Width of the ANGULAR tracking kernel. The default 0.1 is far too
+        // narrow for the +/-0.6 command range: a policy sitting at the measured
+        // 0.06 rad/s scores exp(-(0.4-0.06)^2/0.1^2) = 1e-5 on a 0.4 command,
+        // i.e. NO gradient to climb. Measured on v24 at iter 32-42k, which
+        // never learned to turn despite the gyro, the widened yaw range and 25%
+        // arc sampling -- the arcs sample yaw in [0.2, 0.6], of which only the
+        // 0.2 edge pays anything at all (14%; 0.35 pays 0.02%).
+        //
+        // v22 DID turn (+0.38) because it happened to land inside the basin,
+        // after which a 0.4 command scores 96% and self-reinforces. That is
+        // luck, not a gradient. 0.3 makes a 0.4 command pay 28% from a standing
+        // start, so there is a slope the whole way in.
+        if let Some(v) = env_f32("BIPED_STD_ANG") {
+            stds.ang_vel = v;
+        }
         Self {
             robot,
             weights,

@@ -3266,6 +3266,21 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
                 for v in &mut c.obs[3 * NUM_JOINTS + 4..3 * NUM_JOINTS + 7] {
                     *v += rng.range(-0.05, 0.05) * obs_noise;
                 }
+                // base_ang_vel / gyro [45..48]: ±0.2 rad/s. This block predates
+                // the gyro (added with the 48-dim frame in v22) and stopped at
+                // projected_gravity, so every gyro-era policy trained on a
+                // PERFECT IMU while every other channel was noised -- the one
+                // proprioceptive input with no sim-to-real margin. Measured on
+                // v24: 0.01 rad/s of gyro noise moves the action by 0.016,
+                // ~0.8 N-m of knee torque ripple at action_scale 0.25.
+                // 0.2 completes Isaac Lab's UniformNoise set the amplitudes
+                // above are taken from (joint_pos 0.01 / joint_vel 1.5 /
+                // ang_vel 0.2 / gravity 0.05).
+                if OBS_DIM >= 48 {
+                    for v in &mut c.obs[45..48] {
+                        *v += rng.range(-0.2, 0.2) * obs_noise;
+                    }
+                }
             }
             // Obs history: push the final (noised) frame, emit the stacked
             // window. Must run after the noise block — the history records
