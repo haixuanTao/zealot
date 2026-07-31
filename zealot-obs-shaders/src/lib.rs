@@ -14,7 +14,7 @@
 //!   `nexus src_rbd_shaders/dynamics/multibody/ws_soa.rs` (dim3), verified at
 //!   init by the host against a CPU readback.
 //! - `state` (STATE_STRIDE per env): [0..12) prev_q, [12..24) action t−2,
-//!   [24..36) action t−1, [36] episode step counter (f32).
+//!   [24..36) action t−1, [36] episode step counter (f32), [37] gait phase.
 //! - `hist`: 5×48 obs-frame ring per env, slot s = ep % 5.
 //! - `consts`: [0..12) actuated dof ids (as f32), [12..24) default_pos,
 //!   [24..36) target lo, [36..48) target hi, [48..273) normalizer mean (225),
@@ -44,7 +44,15 @@ use khal_std::macros::{spirv, spirv_bindgen};
 use khal_std::num_traits::Float;
 
 /// f32 slots per env in the `state` buffer.
-pub const STATE_STRIDE: usize = 37;
+pub const STATE_STRIDE: usize = 38;
+/// `state` slot holding the gait-clock phase ∈ [0,1). It is an accumulator,
+/// not a function of the step counter, because the cycle period depends on the
+/// (time-varying) command — see the clock note in `gpu_assemble_obs`.
+const S_PHASE: usize = 37;
+/// Gait cycle seconds at the slowest walking command (0.1 m/s).
+const GAIT_PERIOD_SLOW: f32 = 0.8;
+/// Gait cycle seconds at the full 0.5 m/s command.
+const GAIT_PERIOD_FAST: f32 = 0.55;
 /// Policy joints.
 pub const N_ACT: usize = 12;
 /// Frames of obs history.
@@ -84,7 +92,6 @@ pub fn gpu_assemble_obs(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] gemm_input: &mut [f32],
     #[spirv(uniform, descriptor_set = 0, binding = 6)] n_envs: &u32,
     #[spirv(uniform, descriptor_set = 0, binding = 7)] dt: &f32,
-    #[spirv(uniform, descriptor_set = 0, binding = 8)] gait_period: &f32,
 ) {
     let e = invocation_id.x;
     let n = *n_envs;
@@ -142,9 +149,18 @@ pub fn gpu_assemble_obs(
     o[40] = g[0];
     o[41] = g[1];
     o[42] = g[2];
-    let ph_steps = if ep >= 1.0 { ep - 1.0 } else { 0.0 };
-    let ph_raw = ph_steps * *dt / *gait_period;
-    let ph = ph_raw - ph_raw.floor();
+    // Gait clock, derived from the command exactly as the training env does
+    // (`biped_env_nexus`, "one command-derived design, no knobs"): a standing
+    // command (< 0.1 m/s) FREEZES the phase, so standing is its own
+    // observation state; above that the cycle period lerps 0.8 s → 0.55 s with
+    // commanded speed. A free-running clock here is a train/deploy mismatch —
+    // the obs keeps asking for swings the policy was trained to stop making,
+    // and the robot marches in place whenever it is told to hold still.
+    let ph = if ep <= 0.5 {
+        0.0
+    } else {
+        state.read(sb(S_PHASE))
+    };
     let two_pi = 2.0 * core::f32::consts::PI;
     o[43] = (two_pi * ph).sin();
     o[44] = (two_pi * ph).cos();
@@ -206,6 +222,18 @@ pub fn gpu_assemble_obs(
         state.write(sb(j), q[j]);
         j += 1;
     }
+
+    // Advance the gait phase for the next step (frozen at a standing command).
+    let cmd_speed = (o[12] * o[12] + o[13] * o[13]).sqrt();
+    let mut next_ph = ph;
+    if cmd_speed >= 0.1 {
+        let capped = if cmd_speed > 0.5 { 0.5 } else { cmd_speed };
+        let t = (capped - 0.1) / 0.4;
+        let period = GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * t;
+        let raw = ph + *dt / period;
+        next_ph = raw - raw.floor();
+    }
+    state.write(sb(S_PHASE), next_ph);
 }
 
 /// Post-policy commit: shift the action ring, advance the episode counter,

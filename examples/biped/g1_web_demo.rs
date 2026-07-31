@@ -599,7 +599,6 @@ pub async fn run(cfg: DemoCfg) {
         norm_mean: nmean.to_vec(),
         norm_std: nm2.iter().map(|&v| (v / ncount).max(1e-8).sqrt()).collect(),
         dt: DT,
-        gait_period: 0.7,
         action_scale: spec.joints[0].action_scale,
     };
     let mut gobs = zealot_gpu_obs::GpuObs::new(&backend, n_robots, &obs_cfg).expect("gpu obs");

@@ -274,8 +274,19 @@
     }
 
     const ACTION_SCALE = 0.5;
-    const GAIT_PERIOD = 0.7;
     const DT = 0.02;
+    // Gait clock, derived from the command exactly as the training env does:
+    // a standing command (< 0.1 m/s) FREEZES the phase — standing is its own
+    // observation state — and above that the cycle period lerps 0.8 s -> 0.55 s
+    // with commanded speed. A free-running clock is a train/deploy mismatch:
+    // the obs keeps asking for swings, so the robot marches in place at a stop.
+    const GAIT_SLOW = 0.8, GAIT_FAST = 0.55;
+    function gaitAdvance(ph, vx, vy) {
+      const sp = Math.hypot(vx, vy);
+      if (sp < 0.1) return ph;
+      const t = (Math.min(sp, 0.5) - 0.1) / 0.4;
+      return (ph + DT / (GAIT_SLOW + (GAIT_FAST - GAIT_SLOW) * t)) % 1.0;
+    }
     // Physics-accuracy knobs (?subdt= seconds, ?iters=, ?fiters=, ?cnf= Hz):
     // defaults match the original bench (5 ms substeps, 4 solver iters,
     // rapier's stock ~30 Hz soft contacts). cnf=240 mimics the training
@@ -298,7 +309,7 @@
       const bodies = [];
       const children = model.map(() => []);
       model.forEach((b, i) => { if (b.parent >= 0) children[b.parent].push(i); });
-      const r = { bodies, joints: [], epT: 0, actHist: [new Float64Array(12), new Float64Array(12)], prevQ: new Float64Array(12), hist: null, x0, y0, z0 };
+      const r = { bodies, joints: [], epT: 0, actHist: [new Float64Array(12), new Float64Array(12)], prevQ: new Float64Array(12), hist: null, gaitPh: 0, x0, y0, z0 };
       model.forEach((b, i) => {
         // The body carries the REAL inertial properties from the MJCF
         // (mass, center of mass, principal inertia — colliders stay
@@ -385,6 +396,7 @@
         r.bodies[i].setAngvel({ x: 0, y: 0, z: 0 }, true);
       });
       r.epT = 0;
+      r.gaitPh = 0;
       r.actHist = [new Float64Array(12), new Float64Array(12)];
       r.prevQ.fill(0);
       r.hist = null;
@@ -578,8 +590,9 @@
         _qp.set(rot.x, rot.y, rot.z, rot.w).invert();
         const g = new THREE.Vector3(0, 0, -1).applyQuaternion(_qp);
         o[40] = g.x; o[41] = g.y; o[42] = g.z;
-        const ph = ((Math.max(0, r.epT - 1) * DT) / GAIT_PERIOD) % 1.0;
+        const ph = r.gaitPh;
         o[43] = Math.sin(2 * Math.PI * ph); o[44] = Math.cos(2 * Math.PI * ph);
+        r.gaitPh = gaitAdvance(ph, o[12], o[13]);
         // Gyro: rapier reports angular velocity in WORLD frame, so rotate it
         // into the body frame with the same inverse quat used for gravity —
         // matching the trainer's quat_rotate_inv(orientation, ang_vel_world).

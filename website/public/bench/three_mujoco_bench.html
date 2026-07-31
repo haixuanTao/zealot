@@ -39,7 +39,19 @@
 
     // ---- Constants (sim2sim_g1_mujoco.py).
     const PHYS_DT = 1 / 200, DECIMATION = 4, DT = PHYS_DT * DECIMATION;
-    const GAIT_PERIOD = 0.7, HIST = 5, ACTION_SCALE = 0.5;
+    // Gait clock, derived from the command exactly as the training env does:
+    // a standing command (< 0.1 m/s) FREEZES the phase — standing is its own
+    // observation state — and above that the cycle period lerps 0.8 s -> 0.55 s
+    // with commanded speed. A free-running clock is a train/deploy mismatch:
+    // the obs keeps asking for swings, so the robot marches in place at a stop.
+    const GAIT_SLOW = 0.8, GAIT_FAST = 0.55;
+    function gaitAdvance(ph, vx, vy) {
+      const sp = Math.hypot(vx, vy);
+      if (sp < 0.1) return ph;
+      const t = (Math.min(sp, 0.5) - 0.1) / 0.4;
+      return (ph + DT / (GAIT_SLOW + (GAIT_FAST - GAIT_SLOW) * t)) % 1.0;
+    }
+    const HIST = 5, ACTION_SCALE = 0.5;
     const FALL_Z = 0.45, TILT_COS = Math.cos((70 * Math.PI) / 180);
     const _cmd = (params.get('cmd') || '0.4,0,0').split(',').map(Number);
     const CMD = [_cmd[0] || 0, _cmd[1] || 0, _cmd[2] || 0, 0];
@@ -486,6 +498,7 @@
       r.data.qvel.fill(0);
       mujoco.mj_forward(model, r.data);
       r.epT = 0;
+      r.gaitPh = 0;
       r.actHist = [new Float64Array(12), new Float64Array(12)];
       r.prevQ = new Float64Array(12);
       r.hist = null;
@@ -544,8 +557,9 @@
         o[40] = 0 + 2 * (uy * t1z - uz * t1y);
         o[41] = 0 + 2 * (uz * t1x - ux * t1z);
         o[42] = -1 + 2 * (ux * t1y - uy * t1x);
-        const ph = ((Math.max(0, r.epT - 1) * DT) / GAIT_PERIOD) % 1.0;
+        const ph = r.gaitPh;
         o[43] = Math.sin(2 * Math.PI * ph); o[44] = Math.cos(2 * Math.PI * ph);
+        r.gaitPh = gaitAdvance(ph, o[12], o[13]);
         // Gyro: base angular velocity in the BODY frame. A MuJoCo free joint
         // already stores its rotational qvel body-local, so it goes in as-is
         // (this is what an on-robot IMU reads).
