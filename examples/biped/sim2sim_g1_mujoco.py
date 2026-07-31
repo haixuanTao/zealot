@@ -312,6 +312,9 @@ def main():
     vel_track = []
     pitch_track = []
     traj = []  # per-step (body_vx, body_vy, yaw_rate) for direction-aware metrics
+    foot_track = [] if os.environ.get("S2S_FOOT_JSON") else None
+    _foot_gids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, n)
+                  for n in ("left_foot", "right_foot")]
     prev_q = data.qpos[pol_q].copy()
     frames_hist = None  # 5-frame obs history (list, oldest→newest)
     attempts, survived = 1, []
@@ -384,6 +387,20 @@ def main():
 
         base_p_t = data.qpos[free_q:free_q + 3].copy()
         traj.append([float(v) for v in base_p_t] + [float(v) for v in data.qpos[free_q + 3:free_q + 7]])
+        # Optional foot-posture log (S2S_FOOT_JSON): world height of the toe and
+        # heel corners of each foot box, so "toe-walking vs flat" is measured
+        # from geometry rather than inferred from the ankle joint angle (which
+        # is relative to the shin and says nothing on its own).
+        if foot_track is not None:
+            row = []
+            for gid in _foot_gids:
+                R = data.geom_xmat[gid].reshape(3, 3)
+                c = data.geom_xpos[gid]
+                hx, _, hz = model.geom_size[gid]
+                toe = c + R @ np.array([hx, 0.0, -hz])
+                heel = c + R @ np.array([-hx, 0.0, -hz])
+                row += [float(toe[2]), float(heel[2])]
+            foot_track.append(row)
         # --- fall / timeout check ---
         z = data.qpos[free_q + 2]
         up = projected_gravity(data.qpos[free_q + 3:free_q + 7])
@@ -409,6 +426,12 @@ def main():
     if tpath:
         with open(tpath, "w") as f:
             json.dump(traj, f)
+    fpath = os.environ.get("S2S_FOOT_JSON")
+    if fpath and foot_track is not None:
+        with open(fpath, "w") as f:
+            json.dump({"cols": ["L_toe_z", "L_heel_z", "R_toe_z", "R_heel_z"],
+                       "half_len": float(model.geom_size[_foot_gids[0]][0]),
+                       "rows": foot_track}, f)
     mpath = os.environ.get("S2S_METRICS_JSON")
     if mpath:
         import json as _json
