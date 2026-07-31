@@ -132,10 +132,26 @@ pub struct RobotSpec {
     pub held_joints: &'static [(&'static str, f32, f32, f32)],
 }
 
+/// Programmatic override for [`RobotSpec::from_env`], for targets where
+/// environment variables don't exist (wasm web demos: `std::env::set_var`
+/// panics on wasm32-unknown-unknown). First set wins; call before the env is
+/// constructed.
+static ROBOT_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// See [`ROBOT_OVERRIDE`]. Accepts the same names as `BIPED_ROBOT`.
+pub fn set_robot_override(name: &str) {
+    let _ = ROBOT_OVERRIDE.set(name.to_string());
+}
+
 impl RobotSpec {
-    /// Select the robot from `BIPED_ROBOT` (default: `lerobot`).
+    /// Select the robot from `BIPED_ROBOT` (default: `lerobot`), unless
+    /// [`set_robot_override`] was called (wasm demos).
     pub fn from_env() -> Self {
-        let name = std::env::var("BIPED_ROBOT").unwrap_or_default();
+        let name = ROBOT_OVERRIDE
+            .get()
+            .cloned()
+            .or_else(|| std::env::var("BIPED_ROBOT").ok())
+            .unwrap_or_default();
         match name.as_str() {
             "" | "lerobot" => lerobot_bipedal::lerobot(),
             "g1" | "unitree_g1" => unitree_g1::unitree_g1(),

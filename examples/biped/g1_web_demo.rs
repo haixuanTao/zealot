@@ -64,10 +64,10 @@ const MJCF_XML: &str = include_str!("../../assets/robots/unitree_g1_29dof.xml");
 /// `tools/bake_g1_visuals.py`): per kept body, decimated menagerie meshes.
 const VISUALS_BIN: &[u8] = include_bytes!("assets/g1_visuals_29dof.bin");
 
-/// The v21 walking checkpoint (`v21_45k`, 4.5k iters, 2026-07-29):
-/// ActorCritic weights + Welford normalizer stats, same architecture and
-/// physics config as v7.
-const POLICY_BIN: &[u8] = include_bytes!("assets/g1_walk_v21.safetensors");
+/// The v24 walking checkpoint (2026-07-31, iter 34k): ActorCritic weights +
+/// Welford normalizer stats. First policy with the GYRO in its observation —
+/// 48-dim frames instead of 45 — so it needs the matching env/shader obs.
+const POLICY_BIN: &[u8] = include_bytes!("assets/g1_walk_v24.safetensors");
 
 /// Parse `g1_visuals.bin` → body name → mesh groups (rgba, verts, tris).
 #[allow(clippy::type_complexity)]
@@ -837,9 +837,9 @@ pub async fn run(cfg: DemoCfg) {
                     .collapsible(false)
                     .show(ctx, |ui| {
                         ui.label(format!(
-                            "{n_robots}× Unitree G1 walking with the v21"
+                            "{n_robots}× Unitree G1 walking with the v24"
                         ));
-                        ui.label("policy (v21_45k) on the zealot training");
+                        ui.label("policy (v24, gyro obs) on the zealot training");
                         ui.label("env: nexus GPU physics, real Unitree PD gains,");
                         ui.label("5 ms dt + substep refresh, 50 Hz control.");
                         ui.separator();

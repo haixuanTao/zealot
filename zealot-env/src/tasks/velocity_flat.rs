@@ -42,7 +42,13 @@ pub const UP: usize = 2;
 /// joint_pos_rel(12) + joint_vel(12) + projected_gravity(3) + gait_phase(2)`.
 /// The trailing 2 are (sin 2πφ, cos 2πφ) of the gait clock so the policy can
 /// time its steps to the periodic gait reward.
-pub const OBS_DIM: usize = NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2;
+// `+ 3` at the end is the base ANGULAR VELOCITY (gyro). Added after v21: the
+// actor had no rotation sense at all — angular velocity was critic-only
+// privileged information — so yaw control was open-loop and the policy could
+// not cancel even its own heading drift (measured: yaw output scattered
+// positive regardless of commanded sign). Every deployed locomotion stack
+// feeds the gyro to the policy; it is free on hardware (IMU).
+pub const OBS_DIM: usize = NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2 + 3;
 /// Action vector length: one position target per leg DOF.
 pub const ACTION_DIM: usize = NUM_JOINTS;
 /// Privileged (critic) observation length: policy obs plus base linear & angular
@@ -898,6 +904,12 @@ impl VelocityFlatTask {
         let ph = state.phase * std::f32::consts::TAU;
         put(obs, &mut o, ph.sin());
         put(obs, &mut o, ph.cos());
+        // Base angular velocity (body frame). Kept LAST so the preceding 45
+        // slots keep their v21 meaning — the mirror transform, the sim2sim
+        // harnesses and the lerobot controller all index by position.
+        for w in self.base_ang_vel_body(&state.base) {
+            put(obs, &mut o, w);
+        }
         debug_assert_eq!(o, OBS_DIM);
     }
 

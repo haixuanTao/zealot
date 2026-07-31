@@ -1,0 +1,29 @@
+[package]
+name = "zealot-obs-shaders"
+description = "GPU observation-assembly kernels for the zealot biped env (rust-gpu)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "zealot_obs_shaders"
+build = "build.rs"
+
+[lints]
+rust.unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(target_arch, values("spirv", "nvptx64"))',
+] }
+
+[features]
+default = []
+unsafe_remove_boundchecks = ["khal-std/unsafe_remove_boundchecks"]
+
+[dependencies]
+khal-std = { version = "0.2" }
+
+[build-dependencies]
+khal-std = { version = "0.2" }
+
+# Host-only dependencies (excluded on GPU targets) — the `spirv_bindgen`
+# macro generates khal host bindings when compiled off-GPU.
+[target.'cfg(not(any(target_arch = "spirv", target_arch = "nvptx64")))'.dependencies]
+khal = { version = "0.2", features = ["derive", "webgpu"] }
+bytemuck = { version = "1" }

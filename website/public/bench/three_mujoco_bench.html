@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>three.js + MuJoCo wasm — Unitree G1 walking the v21 policy</title>
+  <title>three.js + MuJoCo wasm — Unitree G1 walking the v24 policy</title>
   <style>
     * { margin: 0; }
     body { background: #0d2b2e; color: #9fd8dc; font-family: ui-monospace, monospace; }
@@ -17,7 +17,7 @@
     // MuJoCo WebAssembly build (@mujoco/mujoco, single-threaded) + three.js
     // WebGL, running the SAME 29-DOF G1 model the Python cross-engine
     // validator uses (mujoco_playground scene_mjx_feetonly, meshes stripped
-    // — see tools/bake_g1_mjcf_web.py) and the SAME v21 policy as the other
+    // — see tools/bake_g1_mjcf_web.py) and the SAME v24 policy as the other
     // demos. The control loop is a 1:1 port of
     // examples/biped/sim2sim_g1_mujoco.py: 45-dim obs frames (lag-2 action,
     // cmd, q−default, finite-diff qd, projected gravity, gait clock) ×
@@ -141,7 +141,7 @@
 
     // ---- Policy (same loader as the rapier page).
     const policy = await (async () => {
-      const ckpt = params.get('ckpt') || 'g1_walk_v21';
+      const ckpt = params.get('ckpt') || 'g1_walk_v24';
       const resp = await fetch(ckpt + '.safetensors');
       if (!resp.ok) throw new Error('checkpoint fetch failed: ' + ckpt + ' (' + resp.status + ')');
       const buf = await resp.arrayBuffer();
@@ -193,7 +193,10 @@
         },
       };
     })();
-    if (policy.obsDim !== 45 * HIST) throw new Error('obs dim ' + policy.obsDim);
+    // v24 and later append the base angular velocity (gyro) to the frame.
+    const FRAME = policy.obsDim / HIST;
+    if (FRAME !== 45 && FRAME !== 48) throw new Error('obs dim ' + policy.obsDim);
+    const HAS_GYRO = FRAME === 48;
 
     // ---- Terrain generator: identical JS port as the rapier page
     // (bit-faithful to zealot-env's TerrainStrip::generate_with, seed
@@ -522,7 +525,7 @@
       applyDrive();
       for (const r of robots) {
         const qpos = r.data.qpos, qvel = r.data.qvel;
-        const o = new Float64Array(45);
+        const o = new Float64Array(FRAME);
         const q = new Float64Array(12);
         for (let j = 0; j < 12; j++) q[j] = qpos[polQ[j]];
         for (let j = 0; j < 12; j++) {
@@ -543,11 +546,17 @@
         o[42] = -1 + 2 * (ux * t1y - uy * t1x);
         const ph = ((Math.max(0, r.epT - 1) * DT) / GAIT_PERIOD) % 1.0;
         o[43] = Math.sin(2 * Math.PI * ph); o[44] = Math.cos(2 * Math.PI * ph);
+        // Gyro: base angular velocity in the BODY frame. A MuJoCo free joint
+        // already stores its rotational qvel body-local, so it goes in as-is
+        // (this is what an on-robot IMU reads).
+        if (HAS_GYRO) {
+          o[45] = qvel[3]; o[46] = qvel[4]; o[47] = qvel[5];
+        }
 
         if (r.hist === null) r.hist = Array.from({ length: HIST }, () => o.slice());
         else { r.hist.shift(); r.hist.push(o.slice()); }
-        const stacked = new Float64Array(45 * HIST);
-        r.hist.forEach((f, k) => stacked.set(f, k * 45));
+        const stacked = new Float64Array(FRAME * HIST);
+        r.hist.forEach((f, k) => stacked.set(f, k * FRAME));
         const action = policy.act(stacked);
 
         const tgt = new Float64Array(12);

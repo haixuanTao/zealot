@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>three.js + rapier.js — Unitree G1 walking the v21 policy</title>
+  <title>three.js + rapier.js — Unitree G1 walking the v24 policy</title>
   <style>
     * { margin: 0; }
     body { background: #0d2b2e; color: #9fd8dc; font-family: ui-monospace, monospace; }
@@ -14,7 +14,7 @@
   <div id="hud">loading…</div>
   <script type="module">
     // The typical three.js physics stack — three.js WebGL + rapier.js (CPU
-    // wasm) — running the REAL Unitree G1 12-DOF model AND the v21 walking
+    // wasm) — running the REAL Unitree G1 12-DOF model AND the v24 walking
     // policy (same one as the wasm fleet demo; override with ?ckpt=),
     // ported 1:1 from examples/biped/sim2sim_g1_mujoco.py:
     // 45-dim obs frames (lag-2 action, cmd, q−default, finite-diff qd,
@@ -58,7 +58,7 @@
     // ---- The walking checkpoint (safetensors: 8-byte header len + JSON
     // header + raw little-endian tensors).
     const policy = await (async () => {
-      const ckpt = new URLSearchParams(location.search).get('ckpt') || 'g1_walk_v21';
+      const ckpt = new URLSearchParams(location.search).get('ckpt') || 'g1_walk_v24';
       const resp = await fetch(ckpt + '.safetensors');
       if (!resp.ok) throw new Error('checkpoint fetch failed: ' + ckpt + ' (' + resp.status + ')');
       const buf = await resp.arrayBuffer();
@@ -112,7 +112,10 @@
       };
     })();
     const HIST = 5;
-    if (policy.obsDim !== 45 * HIST) throw new Error('obs dim ' + policy.obsDim);
+    // v24 and later append the base angular velocity (gyro) to the frame.
+    const FRAME = policy.obsDim / HIST;
+    if (FRAME !== 45 && FRAME !== 48) throw new Error('obs dim ' + policy.obsDim);
+    const HAS_GYRO = FRAME === 48;
 
     // ---- Scene.
     const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -560,7 +563,7 @@
       applyDrive();
       // Per robot: obs → policy → PD target; then 4 torque-PD substeps.
       const targets = robots.map((r) => {
-        const o = new Float64Array(45);
+        const o = new Float64Array(FRAME);
         const q = new Float64Array(12);
         jointIdx.forEach((mi, j) => { q[j] = jointState(r, mi, js).q; });
         for (let j = 0; j < 12; j++) {
@@ -577,11 +580,19 @@
         o[40] = g.x; o[41] = g.y; o[42] = g.z;
         const ph = ((Math.max(0, r.epT - 1) * DT) / GAIT_PERIOD) % 1.0;
         o[43] = Math.sin(2 * Math.PI * ph); o[44] = Math.cos(2 * Math.PI * ph);
+        // Gyro: rapier reports angular velocity in WORLD frame, so rotate it
+        // into the body frame with the same inverse quat used for gravity —
+        // matching the trainer's quat_rotate_inv(orientation, ang_vel_world).
+        if (HAS_GYRO) {
+          const av = r.bodies[0].angvel();
+          const wb = new THREE.Vector3(av.x, av.y, av.z).applyQuaternion(_qp);
+          o[45] = wb.x; o[46] = wb.y; o[47] = wb.z;
+        }
 
         if (r.hist === null) r.hist = Array.from({ length: HIST }, () => o.slice());
         else { r.hist.shift(); r.hist.push(o.slice()); }
-        const stacked = new Float64Array(45 * HIST);
-        r.hist.forEach((f, k) => stacked.set(f, k * 45));
+        const stacked = new Float64Array(FRAME * HIST);
+        r.hist.forEach((f, k) => stacked.set(f, k * FRAME));
         const action = policy.act(stacked);
 
         const tgt = new Float64Array(12);

@@ -21,13 +21,20 @@ pub struct ObsHistory {
     head: Vec<usize>,
 }
 
+/// Programmatic override for `BIPED_OBS_HISTORY` — for wasm demos, where env
+/// vars can't be set (same pattern as `robots::set_robot_override`).
+pub static OBS_HISTORY_OVERRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
 impl ObsHistory {
-    /// Parse `BIPED_OBS_HISTORY`; `None` unless it parses to an `H > 1`.
+    /// Parse `BIPED_OBS_HISTORY` (or [`OBS_HISTORY_OVERRIDE`]); `None` unless
+    /// it resolves to an `H > 1`.
     pub fn from_env(n: usize, dim: usize) -> Option<Self> {
-        let h: usize = std::env::var("BIPED_OBS_HISTORY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
+        let h: usize = OBS_HISTORY_OVERRIDE.get().copied().unwrap_or_else(|| {
+            std::env::var("BIPED_OBS_HISTORY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1)
+        });
         (h > 1).then(|| Self::new(n, h, dim))
     }
 
