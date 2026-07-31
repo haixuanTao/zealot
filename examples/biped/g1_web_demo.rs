@@ -639,6 +639,10 @@ pub async fn run(cfg: DemoCfg) {
     let mut hud_pol_ms = 0.0f32;
     let mut hud_snap_ms = 0.0f32;
     let mut hud_realtime = 1.0f32;
+    // Last frame's physics-truth foot clearance, for the title diagnostics.
+    let mut hud_sole = 0.0f32;
+    // Policy input/output magnitudes for the cross-browser diagnostics.
+    let (mut dbg_in, mut dbg_out, mut dbg_nan) = (0.0f32, 0.0f32, 0usize);
 
     drive::install();
     // Start the latched command at what the demo is already running, so the
@@ -725,6 +729,49 @@ pub async fn run(cfg: DemoCfg) {
             hud_snap_ms = perf_snap_ms_acc / perf_frames.max(1) as f32;
             // Steps actually run vs steps needed for real time (50 Hz).
             hud_realtime = (perf_steps as f32 / (win / DT)).min(1.0);
+            // Diagnostic: mean |value| of the policy's INPUT (normalized obs)
+            // and OUTPUT (actions), read back once a second. This is what
+            // separates "physics broken" from "policy broken" across
+            // browsers — a zero output with a healthy input means the GEMM
+            // path miscompiled, not the sim.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let mabs = |v: &[f32]| {
+                    if v.is_empty() { 0.0 } else {
+                        v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32
+                    }
+                };
+                let inp = backend
+                    .slow_read_vec(gpol.actor_input_mut().buffer())
+                    .await
+                    .unwrap_or_default();
+                let out = backend
+                    .slow_read_vec(gpol.actor_output().buffer())
+                    .await
+                    .unwrap_or_default();
+                dbg_in = mabs(&inp);
+                dbg_out = mabs(&out);
+                dbg_nan = inp.iter().chain(out.iter()).filter(|x| !x.is_finite()).count();
+            }
+            // Mirror the key numbers into the document title: the canvas HUD
+            // is unreadable without a screenshot, and the title can be read
+            // from ANY browser (AppleScript, WebDriver) — which is how the
+            // Safari/Firefox WebGPU behaviour gets diagnosed at all.
+            #[cfg(target_arch = "wasm32")]
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                doc.set_title(&format!(
+                    "z| falls={} sole={:+.3} spd={:.2} cmd={:.2} rt={:.0}% fps={:.0}                      |in|={:.4} |act|={:.4} nan={}",
+                    falls,
+                    hud_sole,
+                    meas_speed,
+                    cmd_ui[0],
+                    hud_realtime * 100.0,
+                    hud_fps,
+                    dbg_in,
+                    dbg_out,
+                    dbg_nan,
+                ));
+            }
             perf_frames = 0;
             perf_steps = 0;
             perf_step_ms_acc = 0.0;
@@ -786,6 +833,7 @@ pub async fn run(cfg: DemoCfg) {
                 fallen.push(e);
             }
         }
+        hud_sole = sole_bottom;
         mean_base /= n_robots as f32;
         // Measured planar speed of the centroid (skip teleport/reset frames —
         // a reset yanks the centroid by meters in one frame).

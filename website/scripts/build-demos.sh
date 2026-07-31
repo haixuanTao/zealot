@@ -183,6 +183,32 @@ write_index_html() {
 <body>
   <div class="loading" id="loading">Loading WebAssembly (GPU physics)...</div>
   <script>
+    // Mirror the first WebGPU/shader error into the tab TITLE. On Safari and
+    // Firefox the devtools console can't be reached from automation, but the
+    // title can (AppleScript / WebDriver) — this is how cross-browser GPU
+    // failures get diagnosed at all. The wasm rewrites the title each second;
+    // this setter appends the captured error to whatever it writes.
+    (() => {
+      let firstErr = '';
+      const nat = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
+      Object.defineProperty(document, 'title', {
+        configurable: true,
+        get: () => nat.get.call(document),
+        set: (v) => nat.set.call(document, firstErr ? v + ' || ' + firstErr : v),
+      });
+      for (const kind of ['error', 'warn']) {
+        const orig = console[kind].bind(console);
+        console[kind] = (...a) => {
+          const s = a.map((x) => (typeof x === 'string' ? x : (x && x.message) || '')).join(' ');
+          if (!firstErr && /invalid|validation|shader|pipeline|error/i.test(s)) {
+            firstErr = (kind + ': ' + s).replace(/\s+/g, ' ').slice(0, 150);
+          }
+          orig(...a);
+        };
+      }
+    })();
+  </script>
+  <script>
     // The page embedding this demo scrolls; the canvas would otherwise eat
     // every wheel event. Scrolling DOWN is forwarded to the parent so the
     // story below the fold stays reachable — the wheel still zooms the
