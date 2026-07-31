@@ -368,8 +368,24 @@ pub struct RewardWeights {
     /// Base-height tracking (exp kernel) — keeps the robot standing tall instead
     /// of crouching to trivially avoid falling.
     pub base_height: f32,
-    /// Target base (torso) height, m (for `base_height`).
+    /// Target base (torso) height, m (for `base_height`) while MOVING.
     pub base_height_target: f32,
+    /// Target base height, m, while STANDING (`cmd.speed() < 0.1`, the same gate
+    /// the gait clock freezes on). Defaults to `base_height_target`, so the
+    /// split is inert until `BIPED_BASE_HEIGHT_STAND` is set.
+    ///
+    /// Standing tall is nearly free in height but expensive in knee angle:
+    /// measured on this robot, height = 0.580*cos(knee/2) + 0.259, so the leg
+    /// ceiling is 0.839 m at knee 0 and the curve goes FLAT as it straightens
+    /// (15 deg -> 0 deg of knee buys only 5 mm). Two consequences:
+    ///   * a target ABOVE ~0.839 is unreachable without hyperextending into the
+    ///     -0.087 rad knee stop. That is what v22 did at 0.841 (locked at -4 deg,
+    ///     60% of frames on the stop, CoT 1.00) -- do not set one.
+    ///   * above ~0.837 the gradient falls under 0.5 mm/deg, so the only way to
+    ///     chase the last millimetres is to ride the stop.
+    /// 0.835 -> ~13.6 deg knee with 18.6 deg of stop margin, 4 mm under the
+    /// ceiling: reachable at a legal knee angle, unlike v22's target.
+    pub base_height_target_stand: f32,
     /// Hip yaw/roll deviation penalty gain (NEGATIVE). L2 penalty on hipz+hipx
     /// deviation from default, always-on — stops the policy from limit-riding the
     /// lateral hips into a splayed brace. (Was an unused full-posture reward.)
@@ -479,6 +495,7 @@ impl Default for RewardWeights {
             // 0.72→0.64 (lower CoM = more stable static stance).
             // 2.0 keeps it tall in BOTH stand and walk.
             base_height_target: 0.72, // WBC DEFAULT_TRUNK_HEIGHT (was 0.62 — crouch bug)
+            base_height_target_stand: 0.72, // = target: split is opt-in
             pose: -8.0,               // hip yaw/roll deviation penalty (anti-limit-ride)
             bilateral_symmetry: 2.0,  // reward L/R-mirrored gait (natural, fixes lopsidedness)
             action_rate: -0.1,        // WBC -0.1 (was -0.25)
@@ -562,6 +579,7 @@ impl RewardWeights {
             upright: 5.0,
             base_height: 2.5,
             base_height_target: 0.72, // AGILE DEFAULT_PELVIS_HEIGHT (bent-knee stance)
+            base_height_target_stand: 0.72, // = target: split is opt-in
             pose: 0.0,
             bilateral_symmetry: 0.0,
             action_rate: -0.25,
@@ -814,8 +832,21 @@ impl VelocityFlatTask {
         // cheap. 0.75 is the recommended first step up; 0.78+ risks the
         // straight-knee singularity where the leg loses vertical control
         // authority.
+        // NOTE: BIPED_BASE_HEIGHT sets BOTH targets, so the historical
+        // single-knob behaviour is preserved exactly. BIPED_BASE_HEIGHT_STAND
+        // is applied AFTER it and overrides the standing one only -- order
+        // matters, do not reorder these two blocks.
         if let Some(v) = env_f32("BIPED_BASE_HEIGHT") {
             weights.base_height_target = v;
+            weights.base_height_target_stand = v;
+        }
+        // Command-conditioned standing height. The policy already prefers a
+        // taller stance than its gait (v24 measured 0.816 standing vs 0.807
+        // walking), so this codifies an existing preference rather than
+        // fighting one. See the field docs for the knee-angle geometry and why
+        // anything above ~0.837 rides the knee stop.
+        if let Some(v) = env_f32("BIPED_BASE_HEIGHT_STAND") {
+            weights.base_height_target_stand = v;
         }
         // AGILE-alignment override: WBC has NO air-time reward — its gait
         // economy comes from torque/energy regularizers. Paying completed
@@ -1005,8 +1036,19 @@ impl VelocityFlatTask {
         let upright = self.weights.upright * (-tilt_err / self.stds.upright.powi(2)).exp() * dt;
 
         // Base height: stand tall (exp kernel around the target) so the policy
-        // can't trivially crouch to avoid falling.
-        let h_err = (state.base.height - self.weights.base_height_target).powi(2);
+        // can't trivially crouch to avoid falling. The target is
+        // command-conditioned: standing may ask for a taller, straighter-legged
+        // stance than the gait wants, which cuts the continuous knee holding
+        // torque (measured 28 N-m at a 31 deg stand knee) without forcing the
+        // gait itself higher. Same `cmd.speed() < 0.1` gate the gait clock,
+        // stand_planted and single_support already switch on, so this adds no
+        // new discontinuity -- it rides one that is already there.
+        let h_target = if cmd.speed() < 0.1 {
+            self.weights.base_height_target_stand
+        } else {
+            self.weights.base_height_target
+        };
+        let h_err = (state.base.height - h_target).powi(2);
         let base_height =
             self.weights.base_height * (-h_err / self.stds.base_height.powi(2)).exp() * dt;
 
@@ -1569,6 +1611,51 @@ mod moving_gate_tests {
         );
         assert!(moving.gait_clock != 0.0, "gait_clock never fires even when moving");
         assert_eq!(moving.stand_planted, 0.0, "stand_planted fired while moving");
+    }
+
+    /// The standing height target must apply ONLY at a standing command, and
+    /// must default to the moving target so the split stays inert unless asked
+    /// for. A silent leak here would quietly re-target the whole gait.
+    #[test]
+    fn stand_height_target_is_command_gated() {
+        let mut task = launcher_task();
+        task.weights.base_height = 2.0;
+        task.stds.base_height = 0.05;
+        task.weights.base_height_target = 0.82;
+        task.weights.base_height_target_stand = 0.835;
+
+        // A base sitting exactly at the STANDING target: it should score better
+        // at a standing command than the same height does while moving.
+        let mut st = RobotState::default();
+        st.base.height = 0.835;
+        let standing = task.reward(&st, &VelocityCommand::default()).base_height;
+        let moving = task
+            .reward(&st, &VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 })
+            .base_height;
+        assert!(
+            standing > moving,
+            "0.835 m should score higher standing ({standing}) than moving ({moving})"
+        );
+
+        // Yaw-only is MOVING (same predicate as the gait clock), so a pure turn
+        // must use the walking target, not the standing one.
+        let turning = task
+            .reward(&st, &VelocityCommand { vx: 0.0, vy: 0.0, yaw_rate: 0.4 })
+            .base_height;
+        assert_eq!(turning, moving, "a pure yaw command must use the MOVING target");
+
+        // Default: both targets equal -> command must not change the score.
+        let mut plain = launcher_task();
+        plain.weights.base_height = 2.0;
+        assert_eq!(
+            plain.weights.base_height_target, plain.weights.base_height_target_stand,
+            "the stand target must default to the moving target"
+        );
+        let a = plain.reward(&st, &VelocityCommand::default()).base_height;
+        let b = plain
+            .reward(&st, &VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 })
+            .base_height;
+        assert_eq!(a, b, "split leaked while both targets are equal");
     }
 
     /// Yaw counts toward the speed magnitude, so a pure turn-in-place command
