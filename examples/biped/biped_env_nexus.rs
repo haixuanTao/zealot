@@ -3615,6 +3615,14 @@ impl BipedNexusBatchEnv {
         (unsafe { &*dv }, ws)
     }
 
+    /// The `body_poses` buffer `snapshot()` reads. Exposed so a renderer can
+    /// pipeline that readback itself (start the copy at the end of one frame,
+    /// take the result at the start of the next) instead of fencing on the
+    /// blocking `snapshot()`.
+    pub fn body_poses_buffer(&self) -> &khal::backend::GpuBuffer<NexusPose> {
+        self.state.body_poses().buffer()
+    }
+
     /// Scatter policy PD targets (row-major [12 × n], radians) from a GPU
     /// buffer straight into the motor constraints — the GPU analog of the
     /// per-env `stage_motor_position` + `flush_links_static`.

@@ -200,8 +200,11 @@ write_index_html() {
         const orig = console[kind].bind(console);
         console[kind] = (...a) => {
           const s = a.map((x) => (typeof x === 'string' ? x : (x && x.message) || '')).join(' ');
-          if (!firstErr && /invalid|validation|shader|pipeline|error/i.test(s)) {
+          if (!firstErr && /invalid|validation|shader|pipeline|error|panic/i.test(s)) {
             firstErr = (kind + ': ' + s).replace(/\s+/g, ' ').slice(0, 150);
+            // Publish straight away: if the wasm loop is what died, it will
+            // never write the title again and the error would be invisible.
+            nat.set.call(document, 'ERR| ' + firstErr);
           }
           orig(...a);
         };

@@ -41,6 +41,7 @@ pub struct DemoCfg {
 }
 
 use biped_env_nexus::{BipedNexusBatchEnv, parse_mjcf};
+use nexus3d::rbd::math::Pose as NexusPose;
 use glamx::{Pose3, Rot3, Vec3};
 use kiss3d::camera::OrbitCamera3d;
 use kiss3d::color::Color;
@@ -208,6 +209,7 @@ mod drive {
 #[cfg(not(target_arch = "wasm32"))]
 mod drive {
     pub fn install() {}
+    pub fn sync(_cmd: [f32; 3]) {}
     pub fn command() -> Option<[f32; 3]> {
         None
     }
@@ -384,6 +386,145 @@ async fn headless_check(cfg: &DemoCfg) {
         }
     }
     println!("headless-check: falls = {falls} over 6 s (0 = walks)");
+}
+
+/// Render poses read back from the GPU **one frame late**, without ever
+/// blocking on the GPU.
+///
+/// `env.snapshot()` fences: it submits a copy and then waits for the whole
+/// queue — every control step this frame, each with its physics substeps — to
+/// retire, and for the map callback to come back through the browser's task
+/// queue. That wait was ~90 ms/frame against ~1.5 ms of actual encode work,
+/// i.e. the demo spent its frame watching the GPU rather than feeding it.
+///
+/// Nothing on screen needs *this* frame's poses. So the copy is started at the
+/// end of a frame and the result is taken at the start of the next one; if it
+/// has not landed yet the previous poses are drawn again. The robot is one
+/// 20 ms control step stale, which is invisible, and the CPU and GPU finally
+/// run at the same time.
+///
+/// WebGPU-backed only (the browser demo, and native Metal/Vulkan through
+/// wgpu). On any other backend `poll` falls back to the blocking snapshot.
+struct PoseStream {
+    /// Persistent MAP_READ staging buffer — the map/unmap cycle is per frame,
+    /// so allocating one here keeps it out of the frame.
+    staging: Option<wgpu::Buffer>,
+    /// Set by the map callback when the copy is readable.
+    rx: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    /// Most recent poses; drawn again on frames where the map is still in
+    /// flight.
+    poses: Vec<NexusPose>,
+    /// Frames the renderer reused stale poses (HUD diagnostic).
+    stale_frames: u32,
+    /// Whether the poses changed this frame. Anything that differentiates
+    /// them (the measured-speed EMA) must skip the frames where they did not,
+    /// or it averages in a zero displacement that never happened.
+    fresh: bool,
+    /// Sim time the poses in hand were captured at, and the one the in-flight
+    /// copy will carry. Differentiating poses against WALL time is wrong here:
+    /// a snapshot is taken at the end of some earlier frame and read one or
+    /// more frames later, so wall time between two reads is not the sim time
+    /// between the two captures. Sim time is exact and frame-rate independent.
+    captured_at: f32,
+    pending_at: f32,
+}
+
+impl PoseStream {
+    fn new(poses: Vec<NexusPose>) -> Self {
+        Self { staging: None, rx: None, poses, stale_frames: 0, fresh: true, captured_at: 0.0, pending_at: 0.0 }
+    }
+
+    /// The wgpu handles, if this backend is WebGPU.
+    fn wgpu_parts<'a>(
+        backend: &'a khal::backend::GpuBackend,
+        buf: &'a khal::backend::GpuBuffer<NexusPose>,
+    ) -> Option<(&'a wgpu::Device, &'a wgpu::Queue, &'a wgpu::Buffer)> {
+        match (backend, buf) {
+            (khal::backend::GpuBackend::WebGpu(w), khal::backend::GpuBuffer::WebGpu(b)) => {
+                Some((w.device(), w.queue(), b))
+            }
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// Take a completed readback if one landed, then start the next one.
+    /// Returns `false` if this backend has no pipelined path.
+    fn pump(
+        &mut self,
+        backend: &khal::backend::GpuBackend,
+        src: &khal::backend::GpuBuffer<NexusPose>,
+        sim_time: f32,
+    ) -> bool {
+        let Some((device, queue, src)) = Self::wgpu_parts(backend, src) else {
+            return false;
+        };
+        self.fresh = false;
+        let bytes = src.size();
+        let staging = self.staging.get_or_insert_with(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("zealot_pose_readback"),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+
+        // Native backends only make map callbacks progress when the device is
+        // polled; in the browser the runtime drives them and this is a no-op.
+        khal::backend::Backend::poll(backend);
+
+        // Landed? Copy it out and free the buffer for the next request.
+        if let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    {
+                        let view = staging.slice(..).get_mapped_range();
+                        let n = (view.len() / core::mem::size_of::<NexusPose>())
+                            .min(self.poses.len());
+                        // SAFETY: `Pose` is plain old data (khal reads it the
+                        // same way); the mapped range may be under-aligned for
+                        // it, so copy bytes rather than casting.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                view.as_ptr(),
+                                self.poses.as_mut_ptr() as *mut u8,
+                                n * core::mem::size_of::<NexusPose>(),
+                            );
+                        }
+                    }
+                    staging.unmap();
+                    self.rx = None;
+                    self.stale_frames = 0;
+                    self.fresh = true;
+                    self.captured_at = self.pending_at;
+                }
+                // Map failed: drop the request and try again next frame.
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    staging.unmap();
+                    self.rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.stale_frames += 1,
+            }
+        }
+
+        // Idle → queue the next copy behind this frame's physics and ask for
+        // the map. No await: the result is picked up on a later frame.
+        if self.rx.is_none() {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zealot_pose_copy"),
+            });
+            enc.copy_buffer_to_buffer(src, 0, staging, 0, bytes);
+            queue.submit([enc.finish()]);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.try_send(r);
+            });
+            self.rx = Some(rx);
+            self.pending_at = sim_time;
+        }
+        true
+    }
 }
 
 /// Demo entry point — the thin `g1_web`/`g1_terrain_web` examples call this
@@ -623,7 +764,7 @@ pub async fn run(cfg: DemoCfg) {
     // frames are skipped).
     let mut cmd_ui: [f32; 3] = [0.4, 0.0, 0.0];
     let mut prev_mean_base: Option<Vec3> = None;
-    let mut prev_frame_t = Instant::now();
+    let mut prev_poses_at = 0.0f32;
     let mut meas_speed = 0.0f32;
     // Perf HUD: rolling averages over ~1 s windows. A control step = 1 env
     // GPU sim step (decimation substeps + solve) + N policy forwards + obs.
@@ -647,6 +788,10 @@ pub async fn run(cfg: DemoCfg) {
     // Start the latched command at what the demo is already running, so the
     // first tap bumps up from the visible value instead of from zero.
     drive::sync(cmd_ui);
+
+    // One blocking snapshot to prime the pipeline; every frame after this one
+    // reads back without waiting.
+    let mut pose_stream = PoseStream::new(env.snapshot().await);
 
     while window.render_3d(&mut scene, &mut camera).await {
         // Driving: each key press bumped the latched command, so apply it
@@ -706,8 +851,10 @@ pub async fn run(cfg: DemoCfg) {
             steps_this_frame += 1;
         }
         if sim_time < wall - 0.25 {
+            // Fell too far behind to catch up; drop the debt rather than
+            // spiral. `hud_realtime` is measured over the 1 s window below,
+            // which already reflects the lost steps.
             sim_time = wall;
-            hud_realtime = 0.0; // fell behind and clamped this frame
         }
 
         // Perf HUD bookkeeping (~1 s windows).
@@ -781,9 +928,18 @@ pub async fn run(cfg: DemoCfg) {
 
         // Sync render poses from the physics snapshot (batch-major layout:
         // env e's colliders start at e·colliders_per_batch; the robot's
-        // bodies are the first `mjcf.len()` of them).
+        // bodies are the first `mjcf.len()` of them). Pipelined: this takes
+        // the copy started last frame and starts the next one, never waiting
+        // on the GPU — see `PoseStream`.
         let snap_t0 = Instant::now();
-        let poses = env.snapshot().await;
+        if !pose_stream.pump(&backend, env.body_poses_buffer(), sim_time) {
+            pose_stream.poses = env.snapshot().await;
+            pose_stream.fresh = true;
+            pose_stream.captured_at = sim_time;
+        }
+        let poses_fresh = pose_stream.fresh;
+        let poses_at = pose_stream.captured_at;
+        let poses = &pose_stream.poses;
         perf_snap_ms_acc += snap_t0.elapsed().as_secs_f32() * 1e3;
         let cpb = poses.len() / n_robots;
         let mut sole_bottom = f32::INFINITY;
@@ -834,11 +990,13 @@ pub async fn run(cfg: DemoCfg) {
         }
         hud_sole = sole_bottom;
         mean_base /= n_robots as f32;
-        // Measured planar speed of the centroid (skip teleport/reset frames —
-        // a reset yanks the centroid by meters in one frame).
-        {
-            let now = Instant::now();
-            let dt = (now - prev_frame_t).as_secs_f32();
+        // Measured planar speed of the centroid, differentiated ONLY across
+        // frames that carried new poses: the readback is pipelined, so a frame
+        // may redraw the previous poses, and pairing a two-frame displacement
+        // with a one-frame dt reads as double the real speed. Teleport/reset
+        // frames are skipped too — a reset yanks the centroid by meters.
+        if poses_fresh {
+            let dt = poses_at - prev_poses_at;
             if let Some(prev) = prev_mean_base {
                 if dt > 1e-3 && fallen.is_empty() {
                     let d = mean_base - prev;
@@ -849,7 +1007,7 @@ pub async fn run(cfg: DemoCfg) {
                 }
             }
             prev_mean_base = Some(mean_base);
-            prev_frame_t = now;
+            prev_poses_at = poses_at;
         }
         for &e in &fallen {
             let _ = env.reset_env(e).await;
