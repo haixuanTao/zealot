@@ -57,7 +57,27 @@ pub const SLAB_BOTTOM: f32 = -0.05;
 /// forced limit contact and (with the limit e-stops) truncated episodes,
 /// which the distance-based curriculum then read as failure and demoted.
 /// Terrain peaked at level 14.7 and retreated while terminations rose 69%.
-/// 0.125 keeps ~9° of ankle margin at the top row. The slope is a
+/// 0.125 keeps ~9° of ankle margin at the top row.
+///
+/// UPDATE (v24 final, iter 50k): that 34° figure is stale. Measured on the
+/// finished v24 policy, flat walking peaks at only **25.8°** of dorsiflexion
+/// — 8° less than the policy that failed at 0.25, bought by the v19 ankle
+/// package and the taller/straighter stance. The budget at the top row is
+/// therefore:
+///   0.125 (7°)  -> peak ~33°, 17° margin   (very conservative now)
+///   0.268 (15°) -> peak ~41°,  9° margin   (the ORIGINAL design margin)
+///   0.35  (19°) -> peak ~45°,  5° margin   (into e-stop territory)
+/// So 15° is defensible for a policy that walks like v24's, and was NOT
+/// defensible for the one that failed. Set it per-run via BIPED_SLOPE_GRADE
+/// rather than moving this constant: a fresh policy walks nothing like a
+/// converged one, and the default must stay safe for iteration 0.
+///
+/// Failure signature to watch for, from the 0.25 attempt: terrain level
+/// climbs, peaks, then RETREATS while term_fell rises — the limit e-stops
+/// truncate episodes, the distance-based curriculum reads truncation as
+/// failure, and it demotes. If that appears, the grade is over budget.
+///
+/// The slope is a
 /// per-patch DC bias superimposed under EVERY family: zero-mean bump noise
 /// integrates out over a stride, so a policy's constant lean/drift biases are
 /// invisible to it — a sustained grade is the disturbance that makes them
