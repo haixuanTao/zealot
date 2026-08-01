@@ -109,6 +109,22 @@ a {
   accent-color: var(--teal);
 }
 
+.policy {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.policyStatus {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.policyStatusBad {
+  color: #b4544c;
+}
+
 .knobSelect,
 .knobInput {
   font: inherit;
@@ -122,7 +138,7 @@ a {
 }
 
 .knobInput {
-  width: 15rem;
+  width: 13rem;
 }
 
 .knobSelect:focus,

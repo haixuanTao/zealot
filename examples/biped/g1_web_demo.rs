@@ -404,32 +404,120 @@ async fn headless_check(cfg: &DemoCfg) {
     println!("headless-check: falls = {falls} over 6 s (0 = walks)");
 }
 
-/// Resolve what the `?ckpt=` knob names into something fetchable.
+/// What `?ckpt=` pointed at: either a specific file, or a whole Hugging Face
+/// repo whose newest checkpoint we should go and find.
+enum CkptRef {
+    /// Ready to download.
+    File(String),
+    /// A repo id like `owner/name` — ask the Hub what is in it.
+    Repo(String),
+}
+
+/// Parse anything a person might paste. The point is that a handle copied off
+/// a model page, the page URL itself, a link to one file in it, or a direct
+/// URL somewhere else entirely all mean "run this policy".
 ///
-/// Hugging Face is the home for published zealot policies, so its repos get
-/// the short forms:
-/// - `owner/repo/some_ckpt.safetensors` → that file on `main`;
-/// - `owner/repo` → `g1_walk.safetensors` in it (a repo can hold many
-///   checkpoints, so the picker normally names one);
-/// - anything starting with `http` is taken as-is, so self-hosted or
-///   release-asset checkpoints work too.
-fn ckpt_url(spec: &str) -> String {
+/// - `owner/repo`                                 → newest checkpoint in it
+/// - `owner/repo/sub/dir/ckpt.safetensors`        → that file, on `main`
+/// - `https://huggingface.co/owner/repo`          → newest checkpoint in it
+/// - `.../blob/main/x.safetensors` (the page URL)  → that file
+/// - `.../resolve/main/x.safetensors` (raw)       → that file
+/// - any other `http(s)` URL                       → fetched as-is
+/// - a bare word                                  → a file beside the demo
+fn parse_ckpt(spec: &str) -> CkptRef {
     let spec = percent_decode(spec);
+    let spec = spec.trim().trim_end_matches('/');
+
+    // Hub URLs: reduce to the handle forms below, keeping the revision.
+    let hub = spec
+        .strip_prefix("https://huggingface.co/")
+        .or_else(|| spec.strip_prefix("http://huggingface.co/"))
+        .or_else(|| spec.strip_prefix("https://hf.co/"))
+        .or_else(|| spec.strip_prefix("hf.co/"))
+        .or_else(|| spec.strip_prefix("hf:"));
+    if let Some(rest) = hub {
+        // Strip a query string (`?download=true` comes with the copy button).
+        let rest = rest.split('?').next().unwrap_or(rest);
+        let p: Vec<&str> = rest.split('/').collect();
+        return match p.as_slice() {
+            // owner/repo/{blob,resolve}/rev/path…
+            [owner, repo, kind, rev, path @ ..]
+                if (*kind == "blob" || *kind == "resolve") && !path.is_empty() =>
+            {
+                CkptRef::File(format!(
+                    "https://huggingface.co/{owner}/{repo}/resolve/{rev}/{}",
+                    path.join("/")
+                ))
+            }
+            // owner/repo/tree/rev… — a folder view; still just the repo.
+            [owner, repo, ..] => CkptRef::Repo(format!("{owner}/{repo}")),
+            _ => CkptRef::File(spec.to_string()),
+        };
+    }
     if spec.starts_with("http://") || spec.starts_with("https://") {
-        return spec;
+        return CkptRef::File(spec.to_string());
     }
-    let parts: Vec<&str> = spec.splitn(3, '/').collect();
-    match parts.as_slice() {
-        [owner, repo, file] => {
-            format!("https://huggingface.co/{owner}/{repo}/resolve/main/{file}")
-        }
-        [owner, repo] => {
-            format!("https://huggingface.co/{owner}/{repo}/resolve/main/g1_walk.safetensors")
-        }
-        // Bare name: a checkpoint sitting next to the demo, like the bench
-        // pages' `?ckpt=` has always meant.
-        _ => format!("{spec}.safetensors"),
+    let p: Vec<&str> = spec.splitn(3, '/').collect();
+    match p.as_slice() {
+        [owner, repo, path] => CkptRef::File(format!(
+            "https://huggingface.co/{owner}/{repo}/resolve/main/{path}"
+        )),
+        [owner, repo] => CkptRef::Repo(format!("{owner}/{repo}")),
+        // Bare name: a checkpoint sitting next to the demo, which is what the
+        // bench pages' `?ckpt=` has always meant.
+        _ => CkptRef::File(format!("{spec}.safetensors")),
     }
+}
+
+/// Pull `"rfilename": "…"` values out of a Hub model response. A dependency-
+/// free scan rather than a JSON parser: this is the only field we want, and
+/// the demo ships as a wasm module where every crate costs download size.
+fn rfilenames(json: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = json;
+    while let Some(i) = rest.find("\"rfilename\"") {
+        rest = &rest[i + "\"rfilename\"".len()..];
+        let Some(q1) = rest.find('"') else { break };
+        let after = &rest[q1 + 1..];
+        let Some(q2) = after.find('"') else { break };
+        out.push(after[..q2].to_string());
+        rest = &after[q2 + 1..];
+    }
+    out
+}
+
+/// Order checkpoints newest-first by the numbers in their names, so
+/// `g1_v24_iter32780` beats `g1_v21_iter4560` beats `g1_v19_iter2740` without
+/// anyone having to follow a naming convention exactly.
+fn newest_first(files: &mut [String]) {
+    fn nums(s: &str) -> Vec<u64> {
+        let mut v = Vec::new();
+        let mut cur = String::new();
+        for c in s.chars() {
+            if c.is_ascii_digit() {
+                cur.push(c);
+            } else if !cur.is_empty() {
+                v.push(cur.parse().unwrap_or(0));
+                cur.clear();
+            }
+        }
+        if !cur.is_empty() {
+            v.push(cur.parse().unwrap_or(0));
+        }
+        v
+    }
+    files.sort_by(|a, b| nums(b).cmp(&nums(a)).then_with(|| b.cmp(a)));
+}
+
+/// A human-readable label for the HUD: the file name without extension.
+fn ckpt_label(spec: &str) -> String {
+    let spec = percent_decode(spec);
+    let spec = spec.trim_end_matches('/');
+    spec.rsplit('/')
+        .next()
+        .unwrap_or(spec)
+        .trim_end_matches(".safetensors")
+        .to_string()
 }
 
 /// Minimal `%XX` decoder — the picker hands us an encoded URL, and pulling in
@@ -452,14 +540,41 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A human-readable label for the HUD: the file name without extension.
-fn ckpt_label(spec: &str) -> String {
-    let spec = percent_decode(spec);
-    spec.rsplit('/')
-        .next()
-        .unwrap_or(&spec)
-        .trim_end_matches(".safetensors")
-        .to_string()
+/// Turn a spec into a downloadable URL, asking the Hub for the repo contents
+/// when only a handle was given.
+async fn resolve_ckpt(spec: &str) -> Result<String, String> {
+    match parse_ckpt(spec) {
+        CkptRef::File(url) => Ok(url),
+        CkptRef::Repo(repo) => {
+            let api = format!("https://huggingface.co/api/models/{repo}");
+            let body = fetch_text(&api)
+                .await
+                .map_err(|e| format!("{repo}: {e}"))?;
+            let mut files: Vec<String> = rfilenames(&body)
+                .into_iter()
+                .filter(|f| f.ends_with(".safetensors"))
+                .collect();
+            if files.is_empty() {
+                return Err(format!("{repo}: no .safetensors in the repo"));
+            }
+            newest_first(&mut files);
+            Ok(format!(
+                "https://huggingface.co/{repo}/resolve/main/{}",
+                files[0]
+            ))
+        }
+    }
+}
+
+/// Resolve → download → parse, with the failure reason kept intact so the HUD
+/// can show it. The obs width comes from the file, so v21-era (45×5) and
+/// v24-era (48×5) checkpoints both load.
+async fn load_ckpt(spec: &str) -> Result<(ActorCritic, String), String> {
+    let url = resolve_ckpt(spec).await?;
+    let bytes = fetch_ckpt(&url).await?;
+    let ac = ActorCritic::load_from_bytes(&bytes)
+        .map_err(|e| format!("{}: not a zealot checkpoint ({e})", ckpt_label(&url)))?;
+    Ok((ac, ckpt_label(&url)))
 }
 
 /// Download a checkpoint. In the browser this is a plain `fetch` (Hugging
@@ -488,6 +603,18 @@ async fn fetch_ckpt(url: &str) -> Result<Vec<u8>, String> {
 #[cfg(not(target_arch = "wasm32"))]
 async fn fetch_ckpt(path: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+}
+
+/// The Hub's model API, for turning a handle into a file list.
+#[cfg(target_arch = "wasm32")]
+async fn fetch_text(url: &str) -> Result<String, String> {
+    let bytes = fetch_ckpt(url).await?;
+    String::from_utf8(bytes).map_err(|e| format!("bad response: {e}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn fetch_text(_url: &str) -> Result<String, String> {
+    Err("resolving a repo handle needs the browser build".to_string())
 }
 
 /// Render poses read back from the GPU **one frame late**, without ever
@@ -820,29 +947,16 @@ pub async fn run(cfg: DemoCfg) {
     // or parse failure falls back to the embedded default rather than showing
     // a dead canvas — the HUD says which one is actually driving.
     let (ac, ckpt_name) = match &cfg.ckpt {
-        Some(spec) => {
-            let url = ckpt_url(spec);
-            match fetch_ckpt(&url).await {
-                Ok(bytes) => match ActorCritic::load_from_bytes(&bytes) {
-                    Ok(ac) => (ac, ckpt_label(spec)),
-                    Err(e) => {
-                        let msg = format!("{} — bad checkpoint: {e}", ckpt_label(spec));
-                        log_warn(&msg);
-                        (
-                            ActorCritic::load_from_bytes(POLICY_BIN).expect("policy checkpoint"),
-                            format!("{DEFAULT_CKPT} (fallback: {msg})"),
-                        )
-                    }
-                },
-                Err(e) => {
-                    log_warn(&e);
-                    (
-                        ActorCritic::load_from_bytes(POLICY_BIN).expect("policy checkpoint"),
-                        format!("{DEFAULT_CKPT} (fallback: {e})"),
-                    )
-                }
+        Some(spec) => match load_ckpt(spec).await {
+            Ok((ac, label)) => (ac, label),
+            Err(e) => {
+                log_warn(&e);
+                (
+                    ActorCritic::load_from_bytes(POLICY_BIN).expect("policy checkpoint"),
+                    format!("{DEFAULT_CKPT} (fallback: {e})"),
+                )
             }
-        }
+        },
         None => (
             ActorCritic::load_from_bytes(POLICY_BIN).expect("policy checkpoint"),
             DEFAULT_CKPT.to_string(),
@@ -1276,5 +1390,95 @@ pub async fn run(cfg: DemoCfg) {
         if reset_clicked {
             pending_reset = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod ckpt_tests {
+    use super::*;
+
+    fn file(spec: &str) -> String {
+        match parse_ckpt(spec) {
+            CkptRef::File(u) => u,
+            CkptRef::Repo(r) => panic!("{spec} parsed as repo {r}, wanted a file"),
+        }
+    }
+    fn repo(spec: &str) -> String {
+        match parse_ckpt(spec) {
+            CkptRef::Repo(r) => r,
+            CkptRef::File(u) => panic!("{spec} parsed as file {u}, wanted a repo"),
+        }
+    }
+
+    #[test]
+    fn handles_and_urls_people_actually_paste() {
+        let want = "https://huggingface.co/haixuantao/zealot-g1-locomotion/resolve/main/g1_v24.safetensors";
+        // The handle off the model page, with the file named.
+        assert_eq!(file("haixuantao/zealot-g1-locomotion/g1_v24.safetensors"), want);
+        // The page URL for that file ("blob"), and the raw one ("resolve").
+        assert_eq!(
+            file("https://huggingface.co/haixuantao/zealot-g1-locomotion/blob/main/g1_v24.safetensors"),
+            want
+        );
+        assert_eq!(file(&format!("{want}?download=true")), want);
+        // Bare handle, page URL, folder view, hf.co short domain, trailing
+        // slash: all just "this repo".
+        for spec in [
+            "haixuantao/zealot-g1-locomotion",
+            "https://huggingface.co/haixuantao/zealot-g1-locomotion",
+            "https://huggingface.co/haixuantao/zealot-g1-locomotion/tree/main",
+            "https://hf.co/haixuantao/zealot-g1-locomotion/",
+            "hf:haixuantao/zealot-g1-locomotion",
+        ] {
+            assert_eq!(repo(spec), "haixuantao/zealot-g1-locomotion", "{spec}");
+        }
+        // A non-Hub URL is taken at its word, and a bare word is a local file.
+        assert_eq!(file("https://example.org/p.safetensors"), "https://example.org/p.safetensors");
+        assert_eq!(file("g1_walk_v24"), "g1_walk_v24.safetensors");
+        // Percent-encoded, the way the picker passes it through the query.
+        assert_eq!(repo("haixuantao%2Fzealot-g1-locomotion"), "haixuantao/zealot-g1-locomotion");
+    }
+
+    #[test]
+    fn revision_and_subfolder_survive() {
+        assert_eq!(
+            file("https://huggingface.co/o/r/blob/v2.0/ckpts/deep/p.safetensors"),
+            "https://huggingface.co/o/r/resolve/v2.0/ckpts/deep/p.safetensors"
+        );
+        assert_eq!(
+            file("o/r/ckpts/deep/p.safetensors"),
+            "https://huggingface.co/o/r/resolve/main/ckpts/deep/p.safetensors"
+        );
+    }
+
+    #[test]
+    fn newest_checkpoint_wins() {
+        let mut f = vec![
+            "g1_v19_iter2740.safetensors".to_string(),
+            "g1_v24_iter32780.safetensors".to_string(),
+            "g1_v21_iter4560.safetensors".to_string(),
+            "g1_v21_iter21k.safetensors".to_string(),
+        ];
+        newest_first(&mut f);
+        assert_eq!(f[0], "g1_v24_iter32780.safetensors");
+        // iter 4560 > iter 21 (the "21k" name only carries the digits 21).
+        assert_eq!(f[1], "g1_v21_iter4560.safetensors");
+        assert_eq!(f[3], "g1_v19_iter2740.safetensors");
+    }
+
+    #[test]
+    fn file_list_comes_out_of_the_hub_response() {
+        let body = r#"{"id":"o/r","siblings":[{"rfilename":"README.md"},
+            {"rfilename":"g1_v24.safetensors"},{"rfilename":"g1_v24.onnx"}]}"#;
+        assert_eq!(rfilenames(body), ["README.md", "g1_v24.safetensors", "g1_v24.onnx"]);
+    }
+
+    #[test]
+    fn label_is_the_file_stem() {
+        assert_eq!(ckpt_label("o/r/g1_v24_iter32780.safetensors"), "g1_v24_iter32780");
+        assert_eq!(
+            ckpt_label("https://huggingface.co/o/r/resolve/main/a/b.safetensors"),
+            "b"
+        );
     }
 }

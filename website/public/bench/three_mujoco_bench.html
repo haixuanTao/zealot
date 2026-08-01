@@ -156,26 +156,63 @@
 
     // ---- Policy (same loader as the rapier page).
     const policy = await (async () => {
-      // `?ckpt=` names the policy. Hugging Face is where published zealot
-      // checkpoints live, so its repos get short forms — `owner/repo/file
-      // .safetensors`, or `owner/repo` for the default file — while anything
-      // starting with http is used as-is and a bare name is a local file.
-      // Same rules as the wasm demo's `ckpt_url`.
-      function ckptUrl(spec) {
-        if (/^https?:\/\//.test(spec)) return spec;
+      // What `?ckpt=` points at. A handle copied off a model page, the page
+      // URL, a link to one file in it, or a direct URL elsewhere all mean
+      // "run this policy" — same rules as the wasm demo's `parse_ckpt`.
+      // A bare `owner/repo` asks the Hub what is in the repo and takes the
+      // newest checkpoint by the numbers in the filenames.
+      function parseCkpt(spec) {
+        spec = decodeURIComponent(spec).trim().replace(/\/+$/, '');
+        const hub = spec.match(/^(?:https?:\/\/(?:huggingface\.co|hf\.co)\/|hf\.co\/|hf:)(.+)$/);
+        if (hub) {
+          const p = hub[1].split('?')[0].split('/');
+          if (p.length > 4 && (p[2] === 'blob' || p[2] === 'resolve'))
+            return {url: `https://huggingface.co/${p[0]}/${p[1]}/resolve/${p[3]}/${p.slice(4).join('/')}`};
+          if (p.length >= 2) return {repo: `${p[0]}/${p[1]}`};
+        }
+        if (/^https?:\/\//.test(spec)) return {url: spec};
         const p = spec.split('/');
-        if (p.length >= 3) return `https://huggingface.co/${p[0]}/${p[1]}/resolve/main/${p.slice(2).join('/')}`;
-        if (p.length === 2) return `https://huggingface.co/${p[0]}/${p[1]}/resolve/main/g1_walk.safetensors`;
-        return spec + '.safetensors';
+        if (p.length >= 3) return {url: `https://huggingface.co/${p[0]}/${p[1]}/resolve/main/${p.slice(2).join('/')}`};
+        if (p.length === 2) return {repo: spec};
+        return {url: spec + '.safetensors'};
+      }
+
+      // Newest first by the numbers in the name, so g1_v24_iter32780 beats
+      // g1_v21_iter4560 without demanding an exact naming convention.
+      function newestFirst(files) {
+        const nums = (s) => (s.match(/\d+/g) ?? []).map(Number);
+        return files.sort((a, b) => {
+          const [x, y] = [nums(a), nums(b)];
+          for (let i = 0; i < Math.max(x.length, y.length); i++) {
+            const d = (y[i] ?? -1) - (x[i] ?? -1);
+            if (d) return d;
+          }
+          return b.localeCompare(a);
+        });
+      }
+
+      async function ckptUrl(spec) {
+        const ref = parseCkpt(spec);
+        if (ref.url) return ref.url;
+        const meta = await fetch(`https://huggingface.co/api/models/${ref.repo}`);
+        if (!meta.ok) throw new Error(`${ref.repo}: Hub lookup failed (${meta.status})`);
+        const files = newestFirst(
+          ((await meta.json()).siblings ?? [])
+            .map((s) => s.rfilename)
+            .filter((f) => f.endsWith('.safetensors')),
+        );
+        if (!files.length) throw new Error(`${ref.repo}: no .safetensors in the repo`);
+        return `https://huggingface.co/${ref.repo}/resolve/main/${files[0]}`;
       }
       const ckpt = params.get('ckpt') || 'g1_walk_v24';
-      const resp = await fetch(ckptUrl(ckpt));
+      const url = await ckptUrl(ckpt);
+      const resp = await fetch(url);
       if (!resp.ok) throw new Error('checkpoint fetch failed: ' + ckpt + ' (' + resp.status + ')');
       const buf = await resp.arrayBuffer();
       let sum = 0 >>> 0;
       const u32 = new Uint32Array(buf.slice(0, Math.floor(buf.byteLength / 4) * 4));
       for (let i = 0; i < u32.length; i += 997) sum = (sum ^ u32[i]) >>> 0;
-      const shortName = ckpt.split('/').pop().replace(/\.safetensors$/, '');
+      const shortName = url.split('?')[0].split('/').pop().replace(/\.safetensors$/, '');
       window.__ckptInfo = shortName + ' (' + (buf.byteLength / 1e6).toFixed(2) + ' MB, x' + sum.toString(16) + ')';
       const dv = new DataView(buf);
       const hlen = Number(dv.getBigUint64(0, true));

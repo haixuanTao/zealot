@@ -38,36 +38,114 @@ type DemoName = (typeof DEMOS)[number]['name'];
 const DEFAULTS = {n: 3, lvl: 4, amp: 100, slope: 2, terrain: true, ckpt: ''};
 type Knobs = typeof DEFAULTS;
 
+/// The page's own query string seeds the knobs, and Apply writes them back, so
+/// a link like `…/zealot/?ckpt=owner/repo&n=1` opens on that policy — pointing
+/// someone at a checkpoint is just sending them a URL.
+function knobsFromUrl(): Knobs {
+  if (typeof location === 'undefined') return DEFAULTS;
+  const q = new URLSearchParams(location.search);
+  const num = (k: keyof Knobs, lo: number, hi: number) => {
+    const v = Number(q.get(k));
+    return q.has(k) && Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.round(v))) : null;
+  };
+  return {
+    n: num('n', 1, 20) ?? DEFAULTS.n,
+    lvl: num('lvl', 0, 19) ?? DEFAULTS.lvl,
+    amp: num('amp', 0, 300) ?? DEFAULTS.amp,
+    slope: num('slope', 0, 20) ?? DEFAULTS.slope,
+    terrain: q.get('terrain') !== '0',
+    ckpt: q.get('ckpt') ?? DEFAULTS.ckpt,
+  };
+}
+
+/// Reflect the applied scene into the address bar without adding history
+/// entries — the link in the URL bar is always the one to share.
+function writeUrl(k: Knobs) {
+  if (typeof history === 'undefined') return;
+  const q = new URLSearchParams();
+  (Object.keys(DEFAULTS) as (keyof Knobs)[]).forEach((key) => {
+    if (k[key] !== DEFAULTS[key]) q.set(key, String(k[key] === true ? 1 : k[key] === false ? 0 : k[key]));
+  });
+  const qs = q.toString();
+  history.replaceState(null, '', qs ? `${location.pathname}?${qs}` : location.pathname);
+}
+
 /// Published zealot policies. Every engine below can load any checkpoint in
 /// here — same weights, three different physics engines — and the demos also
 /// accept `owner/repo/file.safetensors` or a full URL, so this repo is a
 /// default, not a restriction.
 const HF_REPO = 'haixuantao/zealot-g1-locomotion';
 
-type Ckpt = {value: string; label: string};
+type Ckpt = {value: string; label: string; repo: string};
 
-/// The repo's `.safetensors`, newest first. Best-effort: the Hub API is public
-/// and CORS-enabled, but if it is unreachable the picker just offers the
-/// checkpoint baked into the demo.
+/// Anything a person might paste, reduced to "which repo" or "which file".
+/// Mirrors the demos' own parser, so the field accepts a handle copied off a
+/// model page, the page URL, a link to one file, or a direct URL elsewhere.
+export function parseCkpt(spec: string): {repo?: string; url?: string} {
+  const clean = spec.trim().replace(/\/+$/, '');
+  if (!clean) return {};
+  const hub = clean.match(/^(?:https?:\/\/(?:huggingface\.co|hf\.co)\/|hf\.co\/|hf:)(.+)$/);
+  if (hub) {
+    const p = hub[1].split('?')[0].split('/');
+    if (p.length > 4 && (p[2] === 'blob' || p[2] === 'resolve'))
+      return {url: `https://huggingface.co/${p[0]}/${p[1]}/resolve/${p[3]}/${p.slice(4).join('/')}`};
+    if (p.length >= 2) return {repo: `${p[0]}/${p[1]}`};
+  }
+  if (/^https?:\/\//.test(clean)) return {url: clean};
+  const p = clean.split('/');
+  if (p.length >= 3)
+    return {url: `https://huggingface.co/${p[0]}/${p[1]}/resolve/main/${p.slice(2).join('/')}`};
+  if (p.length === 2) return {repo: clean};
+  return {url: clean};
+}
+
+/// Newest first by the numbers in the filename — `g1_v24_iter32780` before
+/// `g1_v21_iter4560` — so a repo's latest checkpoint is the one preselected.
+export function newestFirst(files: string[]): string[] {
+  const nums = (s: string) => (s.match(/\d+/g) ?? []).map(Number);
+  return [...files].sort((a, b) => {
+    const [x, y] = [nums(a), nums(b)];
+    for (let i = 0; i < Math.max(x.length, y.length); i++) {
+      const d = (y[i] ?? -1) - (x[i] ?? -1);
+      if (d) return d;
+    }
+    return b.localeCompare(a);
+  });
+}
+
+/// The `.safetensors` in a Hugging Face repo, newest first. The Hub API is
+/// public and CORS-clean, so this works straight from the browser.
+async function listRepo(repo: string): Promise<Ckpt[]> {
+  const r = await fetch(`https://huggingface.co/api/models/${repo}`);
+  if (!r.ok)
+    throw new Error(
+      // The Hub answers 401 for a repo that does not exist as well as for a
+      // private one — from out here they are the same thing.
+      r.status === 404 || r.status === 401
+        ? 'no such public repo'
+        : `Hub lookup failed (${r.status})`,
+    );
+  const files = newestFirst(
+    ((await r.json()).siblings ?? [])
+      .map((s: {rfilename: string}) => s.rfilename)
+      .filter((f: string) => f.endsWith('.safetensors')),
+  );
+  if (!files.length) throw new Error('no .safetensors in that repo');
+  return files.map((f) => ({
+    value: `${repo}/${f}`,
+    label: f.replace(/\.safetensors$/, ''),
+    repo,
+  }));
+}
+
+/// The default repo's checkpoints, loaded once for the dropdown. Best-effort:
+/// if the Hub is unreachable the picker still offers the built-in policy.
 function useHfCheckpoints(): Ckpt[] {
   const [list, setList] = useState<Ckpt[]>([]);
   useEffect(() => {
     let alive = true;
-    fetch(`https://huggingface.co/api/models/${HF_REPO}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => {
-        const files: string[] = (d?.siblings ?? [])
-          .map((s: {rfilename: string}) => s.rfilename)
-          .filter((f: string) => f.endsWith('.safetensors'));
-        files.sort().reverse();
-        if (alive)
-          setList(
-            files.map((f) => ({
-              value: `${HF_REPO}/${f}`,
-              label: f.replace(/\.safetensors$/, ''),
-            })),
-          );
-      })
+    listRepo(HF_REPO)
+      .then((l) => alive && setList(l))
       .catch(() => {});
     return () => {
       alive = false;
@@ -203,9 +281,10 @@ function useForwardedScroll() {
   }, []);
 }
 
-/// Policy picker: the published checkpoints, plus a field for any other
-/// Hugging Face repo or URL. Loading one re-runs the SAME weights in whichever
-/// engine is on screen.
+/// Policy picker. The dropdown holds the published checkpoints; the field
+/// below takes ANY Hugging Face handle or URL — paste `owner/repo` and the
+/// repo's checkpoints are looked up and folded into the dropdown, newest
+/// preselected, so every checkpoint someone publishes is one paste away.
 function PolicyPicker({
   value,
   onChange,
@@ -215,41 +294,82 @@ function PolicyPicker({
   onChange: (v: string) => void;
   options: Ckpt[];
 }) {
-  const known = value === '' || options.some((o) => o.value === value);
-  const [custom, setCustom] = useState(!known);
+  const [text, setText] = useState('');
+  const [found, setFound] = useState<Ckpt[]>([]);
+  const [status, setStatus] = useState<{msg: string; bad?: boolean} | null>(null);
+
+  // Resolve once typing pauses — the whole thing behind one debounce, so a
+  // half-typed handle never fires a lookup or overwrites the selection.
+  useEffect(() => {
+    const spec = text.trim();
+    if (!spec) {
+      setStatus(null);
+      setFound([]);
+      return;
+    }
+    let alive = true;
+    const t = setTimeout(() => {
+      const {repo, url} = parseCkpt(spec);
+      if (url) {
+        setFound([{value: url, label: url.split('/').pop() ?? url, repo: 'URL'}]);
+        setStatus({msg: 'direct link — Apply to run it'});
+        onChange(url);
+        return;
+      }
+      if (!repo) return;
+      setStatus({msg: `looking up ${repo}…`});
+      listRepo(repo)
+        .then((list) => {
+          if (!alive) return;
+          setFound(list);
+          setStatus({
+            msg: `${list.length} checkpoint${list.length === 1 ? '' : 's'} in ${repo}`,
+          });
+          onChange(list[0].value); // newest
+        })
+        .catch((e) => {
+          if (!alive) return;
+          setFound([]);
+          setStatus({msg: `${repo}: ${e.message}`, bad: true});
+        });
+    }, 500);
+    return () => {
+      alive = false;
+      clearTimeout(t);
+    };
+    // `onChange` is recreated each render; re-running on it would refetch per
+    // keystroke, which is exactly what the debounce is here to prevent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text]);
+
+  // Anything found by pasting joins the built-in list, without duplicates.
+  const all = [...options, ...found.filter((f) => !options.some((o) => o.value === f.value))];
+
   return (
-    <label className="knob">
-      <span className="knobLabel">Policy</span>
-      <select
-        className="knobSelect"
-        value={custom ? '__custom' : value}
-        onChange={(e) => {
-          if (e.target.value === '__custom') {
-            setCustom(true);
-          } else {
-            setCustom(false);
-            onChange(e.target.value);
-          }
-        }}
-      >
-        <option value="">g1_walk_v24 (built in)</option>
-        {options.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label} — 🤗
-          </option>
-        ))}
-        <option value="__custom">Other…</option>
-      </select>
-      {custom && (
-        <input
-          className="knobInput"
-          value={value}
-          placeholder="owner/repo/file.safetensors"
-          spellCheck={false}
-          onChange={(e) => onChange(e.target.value.trim())}
-        />
+    <div className="policy">
+      <label className="knob">
+        <span className="knobLabel">Policy</span>
+        <select className="knobSelect" value={value} onChange={(e) => onChange(e.target.value)}>
+          <option value="">g1_walk_v24 (built in)</option>
+          {all.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+              {o.repo === HF_REPO ? ' — 🤗' : o.repo === 'URL' ? ' — link' : ` — 🤗 ${o.repo}`}
+            </option>
+          ))}
+        </select>
+      </label>
+      <input
+        className="knobInput"
+        value={text}
+        placeholder="or paste a 🤗 handle / URL"
+        spellCheck={false}
+        onChange={(e) => setText(e.target.value)}
+      />
+      {status && (
+        <span className={`policyStatus${status.bad ? ' policyStatusBad' : ''}`}>{status.msg}</span>
       )}
-    </label>
+    </div>
   );
 }
 
@@ -257,8 +377,8 @@ function Demo() {
   useForwardedScroll();
   const [selected, setSelected] = useState<DemoName>('nexus');
   const checkpoints = useHfCheckpoints();
-  const [knobs, setKnobs] = useState<Knobs>(DEFAULTS);
-  const [applied, setApplied] = useState<Knobs>(DEFAULTS);
+  const [knobs, setKnobs] = useState<Knobs>(knobsFromUrl);
+  const [applied, setApplied] = useState<Knobs>(knobsFromUrl);
   const [reloading, setReloading] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const unsupported = useUnsupportedBrowser();
@@ -347,7 +467,12 @@ function Demo() {
           <button
             className="apply"
             disabled={!dirty}
-            onClick={() => remount(() => setApplied(knobs))}
+            onClick={() =>
+              remount(() => {
+                setApplied(knobs);
+                writeUrl(knobs);
+              })
+            }
           >
             {dirty ? 'Apply' : 'Applied'}
           </button>
