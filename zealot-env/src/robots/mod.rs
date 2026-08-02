@@ -133,10 +133,29 @@ pub struct RobotSpec {
 }
 
 impl RobotSpec {
-    /// Select the robot from `BIPED_ROBOT` (default: `lerobot`).
+    /// Select the robot from `BIPED_ROBOT` (default: `lerobot`), then apply
+    /// `BIPED_ACTION_SCALE` if set.
+    ///
+    /// **The scale is easy to misread from the source.** The base
+    /// `unitree_g1()` spec says 0.25, but every G1 generation this campaign has
+    /// run uses `BIPED_ROBOT=g1_29dof_agile`, which chains through
+    /// `unitree_g1_agile()` — and that overwrites EVERY joint with 0.5 as one
+    /// of its AGILE deltas. So v19/v21/v24/v26 all trained at **0.5**, not the
+    /// 0.25 the base spec advertises. (This was mis-stated in the published
+    /// model card; 0.25 would halve every commanded joint excursion on
+    /// hardware.) Read `unitree_g1_agile()` before quoting a number.
+    ///
+    /// Lowering this is NOT a gentle version of the same problem: several terms
+    /// are denominated in ACTION units, not radians. `action_rate` penalises
+    /// (Δaction)², so at 0.25 the same physical motion costs 4x more; and
+    /// `init_noise_std`/`log_std` are action-space too, so exploration covers
+    /// half the physical range. Halving the scale without scaling `action_rate`
+    /// down ~4x changes the optimisation problem, not just the parameterisation
+    /// — and the policy could otherwise just emit 2x larger actions and land on
+    /// identical targets, leaving sensor-noise torque ripple unchanged.
     pub fn from_env() -> Self {
         let name = std::env::var("BIPED_ROBOT").unwrap_or_default();
-        match name.as_str() {
+        let mut spec = match name.as_str() {
             "" | "lerobot" => lerobot_bipedal::lerobot(),
             "g1" | "unitree_g1" => unitree_g1::unitree_g1(),
             "g1_agile" => unitree_g1::unitree_g1_agile(),
@@ -146,7 +165,16 @@ impl RobotSpec {
             other => {
                 panic!("unknown BIPED_ROBOT '{other}' (expected lerobot | g1 | g1_agile | g1_29dof | g1_29dof_agile | h2plus)")
             }
+        };
+        if let Ok(v) = std::env::var("BIPED_ACTION_SCALE") {
+            if let Ok(s) = v.parse::<f32>() {
+                assert!(s > 0.0 && s <= 2.0, "BIPED_ACTION_SCALE {s} out of range (0, 2]");
+                for j in &mut spec.joints {
+                    j.action_scale = s;
+                }
+            }
         }
+        spec
     }
 
     /// Default joint positions in canonical order (the home pose targets).
