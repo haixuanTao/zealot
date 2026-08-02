@@ -891,6 +891,14 @@ impl VelocityFlatTask {
         if let Some(v) = env_f32("BIPED_STD_ANG") {
             stds.ang_vel = v;
         }
+        // Action-rate penalty gain (NEGATIVE). Exposed because it is denominated
+        // in ACTION units, not radians: it charges (delta action)^2, so halving
+        // BIPED_ACTION_SCALE makes the same PHYSICAL motion cost 4x more here.
+        // Anyone running action_scale 0.25 must scale this by ~1/4 or the
+        // penalty dominates and the policy simply stops moving.
+        if let Some(v) = env_f32("BIPED_W_ACTION_RATE") {
+            weights.action_rate = v;
+        }
         Self {
             robot,
             weights,
