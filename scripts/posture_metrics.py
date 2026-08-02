@@ -18,6 +18,7 @@ Usage:
     python3 scripts/posture_metrics.py <rollout.json> [action_scale]
 """
 import json
+import os
 import sys
 
 import numpy as np
@@ -32,7 +33,7 @@ DEFAULT_POS = np.array([-0.1, 0, 0, 0.3, -0.2, 0] * 2)
 KNEE_LIMIT = -0.087267                                # rad, the e-stop the knee must stay off
 MASS_KG = 33.34
 G = 9.81
-ACTION_SCALE = 0.5
+ACTION_SCALE = float(os.environ.get("S2S_ACTION_SCALE", "0.5"))
 
 
 def metrics(path, action_scale=ACTION_SCALE):

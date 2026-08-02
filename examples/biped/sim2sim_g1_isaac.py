@@ -111,7 +111,14 @@ if os.environ.get("S2S_ACTION_REPLAY"):
     with open(os.environ["S2S_ACTION_REPLAY"]) as _f:
         _REPLAY = np.array(json.load(_f)["actions"], dtype=np.float64)
 
-ACTION_SCALE = 0.5
+# PD target = clamp(default_pos + ACTION_SCALE * action, joint range).
+# 0.5 is the AGILE value every G1 generation through v26 trained at -- note the
+# BASE unitree_g1() spec says 0.25, but BIPED_ROBOT=g1_29dof_agile chains
+# through unitree_g1_agile(), which overwrites every joint with 0.5. v27+ can
+# train at 0.25 (BIPED_ACTION_SCALE); running a checkpoint at the wrong scale
+# halves or doubles every commanded joint excursion, so this MUST match the
+# scale the checkpoint was trained with.
+ACTION_SCALE = float(os.environ.get("S2S_ACTION_SCALE", "0.5"))
 
 
 KP_SCALE = float(os.environ.get("S2S_KP_SCALE", "1"))
