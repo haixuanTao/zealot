@@ -252,6 +252,16 @@ a {
   font-size: 0.9rem;
 }
 
+/* Quieter than .warning: nothing is wrong, we just picked a different engine
+   for this browser and owe the visitor an explanation. */
+.notice {
+  padding: 0.55rem 1rem;
+  background: #f2f7f7;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+
 .viewer {
   position: relative;
   flex: 1;

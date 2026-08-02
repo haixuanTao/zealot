@@ -166,17 +166,33 @@ function demoSrc(name: DemoName, k: Knobs): string {
   return `${BASE}${demo.path}${query}${ckpt}`;
 }
 
-function useUnsupportedBrowser(): string | null {
-  const [name, setName] = useState<string | null>(null);
-  useEffect(() => {
-    const ua = navigator.userAgent;
-    // Both expose navigator.gpu yet mis-run the physics, so sniff rather
-    // than feature-detect.
-    if (/firefox|fxios/i.test(ua)) setName('Firefox');
-    else if (/safari/i.test(ua) && !/chrome|chromium|android|crios|edg/i.test(ua))
-      setName('Safari');
-  }, []);
-  return name;
+/// Why this browser can't run the nexus demo, if it can't. Safari and Firefox
+/// both expose `navigator.gpu` yet mis-run the physics, so this sniffs rather
+/// than feature-detects; every iOS browser is WebKit underneath whatever name
+/// it wears, so the platform is what counts there, not the brand.
+///
+/// Synchronous on purpose: the answer picks the opening tab, and deciding it
+/// after mount would download the 17 MB WebGPU module before switching away
+/// from it.
+function nexusBlockedBy(): string | null {
+  if (typeof navigator === 'undefined') return null;
+  const ua = navigator.userAgent;
+  // iPadOS reports itself as a Mac; the touch points give it away.
+  const ios =
+    /iphone|ipad|ipod/i.test(ua) || (/macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
+  if (ios) return 'iOS';
+  if (/firefox|fxios/i.test(ua)) return 'Firefox';
+  if (/safari/i.test(ua) && !/chrome|chromium|android|crios|edg/i.test(ua)) return 'Safari';
+  if (!(navigator as {gpu?: unknown}).gpu) return 'this browser';
+  return null;
+}
+
+/// Where to land someone who cannot run the GPU demo. MuJoCo is the closest
+/// match to what nexus shows (0.35 vs 0.36 m/s on the same policy) and the
+/// name people know — but it ships a 9.7 MB wasm, so phones get rapier, which
+/// streams a small module off a CDN and starts almost immediately.
+function fallbackDemo(blocker: string | null): DemoName {
+  return blocker === 'iOS' ? 'rapier' : 'mujoco';
 }
 
 function Slider(props: {
@@ -375,14 +391,19 @@ function PolicyPicker({
 
 function Demo() {
   useForwardedScroll();
-  const [selected, setSelected] = useState<DemoName>('nexus');
+  // Open on an engine this browser can actually run. Safari, Firefox and iOS
+  // get a CPU engine on the front page — the same policy and the same terrain,
+  // just stepped on the CPU — instead of a demo that would fail in front of
+  // them. The nexus tab stays one click away, with the warning.
+  const [blocker] = useState(nexusBlockedBy);
+  const [selected, setSelected] = useState<DemoName>(() =>
+    blocker ? fallbackDemo(blocker) : 'nexus',
+  );
   const checkpoints = useHfCheckpoints();
   const [knobs, setKnobs] = useState<Knobs>(knobsFromUrl);
   const [applied, setApplied] = useState<Knobs>(knobsFromUrl);
   const [reloading, setReloading] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const unsupported = useUnsupportedBrowser();
-  const webgpuMissing = typeof navigator !== 'undefined' && !(navigator as any).gpu;
 
   const current = DEMOS.find((d) => d.name === selected)!;
   const dirty = (Object.keys(DEFAULTS) as (keyof Knobs)[]).some((k) => knobs[k] !== applied[k]);
@@ -397,12 +418,24 @@ function Demo() {
     }, 400);
   };
 
-  const warn =
-    current.needsWebGPU && unsupported
-      ? `This demo does not work on ${unsupported}. Its WebGPU implementation doesn't run the physics correctly — please use Chrome (or another Chromium-based browser).`
-      : current.needsWebGPU && webgpuMissing
-        ? 'WebGPU is not available in this browser. The simulation runs its physics as WebGPU compute shaders and requires Chrome (or another Chromium-based browser).'
-        : null;
+  // On the nexus tab, say it will not work. On a CPU tab, say why that is the
+  // one being shown — otherwise the headline engine is missing with no
+  // explanation.
+  // Every iOS browser is WebKit, so "try Chrome" is useless advice there —
+  // it has to be a desktop.
+  const elsewhere =
+    blocker === 'iOS'
+      ? 'desktop Chrome (or another Chromium-based browser)'
+      : 'Chrome (or another Chromium-based browser)';
+  const warn = !blocker
+    ? null
+    : current.needsWebGPU
+      ? blocker === 'this browser'
+        ? `WebGPU is not available in this browser. The simulation runs its physics as WebGPU compute shaders and requires ${elsewhere}.`
+        : `This demo does not work on ${blocker}. Its WebGPU implementation doesn't run the physics correctly — please use ${elsewhere}.`
+      : {
+          note: `${blocker} can't run the WebGPU demo, so this is the CPU engine — same policy, same terrain, physics stepped on the CPU. For the GPU one, open this page in ${elsewhere}.`,
+        };
 
   return (
     <div className="demo">
@@ -480,7 +513,8 @@ function Demo() {
         </div>
       </div>
 
-      {warn && <div className="warning">{warn}</div>}
+      {typeof warn === 'string' && <div className="warning">{warn}</div>}
+      {warn && typeof warn !== 'string' && <div className="notice">{warn.note}</div>}
 
       <div className="viewer">
         {reloading ? (
