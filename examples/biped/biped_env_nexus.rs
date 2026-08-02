@@ -1142,6 +1142,12 @@ impl TerrainSetup {
 const GAIT_PERIOD_SLOW: f32 = 0.8;
 /// Gait cycle seconds at the full 0.5 m/s command.
 const GAIT_PERIOD_FAST: f32 = 0.55;
+/// Floor on the cycle time when the cap is raised past 0.5 m/s: the
+/// slow->fast interpolation is linear and would extrapolate to 0.36 s at
+/// 0.8 m/s, which is a sprint cadence this robot has never walked at.
+/// 0.40 s at 0.8 m/s is a ~0.16 m step, which is in family with the
+/// 0.14 m step the 0.5 m/s command already uses.
+const GAIT_PERIOD_MIN: f32 = 0.40;
 
 pub struct BipedNexusBatchEnv {
     // Topology + indexing
@@ -1212,6 +1218,10 @@ pub struct BipedNexusBatchEnv {
     /// each step (wraps at 1), reset to 0 on episode reset. Fed to the policy as
     /// (sin,cos) and used by the periodic gait reward to prescribe swing/stance.
     gait_phase: Vec<f32>,
+    /// Speed at which the gait clock reaches its fastest cadence
+    /// (`BIPED_GAIT_SPEED_CAP`, default 0.5 = historical). Raise alongside
+    /// BIPED_VX or higher commands all share one cadence.
+    gait_speed_cap: f32,
     /// Consecutive control steps each joint has spent inside its position-limit
     /// band, per env (`env * NUM_JOINTS + joint`). Atomic so the parallel
     /// per-env step closure can update its own entries. Drives the
@@ -1932,6 +1942,10 @@ impl BipedNexusBatchEnv {
             sensed_force: vec![[0.5 * robot.total_mass * 9.81; NUM_FEET]; num_envs],
             last_td_foot,
             gait_phase,
+            gait_speed_cap: std::env::var("BIPED_GAIT_SPEED_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.5),
             limit_dwell,
             global_step: 0,
             dbg_stance: Vec::new(),
@@ -3305,8 +3319,15 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
             // gait reward scores against a frozen phase.
             let cmd_speed = self.cmd[e].speed();
             if cmd_speed >= 0.1 {
-                let t = ((cmd_speed.min(0.5)) - 0.1) / 0.4;
-                let period = GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * t;
+                // The cap must track the command range: with BIPED_VX raised to
+                // 0.8 but the cap left at 0.5, every command from 0.5 to 0.8
+                // gets an IDENTICAL cadence, so the policy can only go 60%
+                // faster by lengthening its stride. Raise both together.
+                // NOTE: this mapping is part of the observation contract -- the
+                // sim2sim harnesses and the LeRobot controller hardcode it too.
+                let t = ((cmd_speed.min(self.gait_speed_cap)) - 0.1) / 0.4;
+                let period = (GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * t)
+                    .max(GAIT_PERIOD_MIN);
                 self.gait_phase[e] =
                     (self.gait_phase[e] + self.task.control_dt() / period).fract();
             }

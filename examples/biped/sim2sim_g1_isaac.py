@@ -53,8 +53,13 @@ LEGACY_CLOCK = os.environ.get("S2S_LEGACY_CLOCK") == "1"
 def gait_period_for(cmd_speed: float) -> float:
     if LEGACY_CLOCK:
         return 0.7
-    t = (min(abs(cmd_speed), 0.5) - 0.1) / 0.4
-    return GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * max(t, 0.0)
+    # Cap must match the trainer's BIPED_GAIT_SPEED_CAP: the gait clock is part
+    # of the OBSERVATION, so a mismatch feeds the policy a phase it never saw.
+    _cap = float(os.environ.get("S2S_GAIT_SPEED_CAP", "0.5"))
+    t = (min(abs(cmd_speed), _cap) - 0.1) / 0.4
+    # Floor matches the trainer's GAIT_PERIOD_MIN: above a 0.5 cap the linear
+    # lerp would extrapolate to a sprint cadence the robot has never walked.
+    return max(0.40, GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * max(t, 0.0))
 
 
 HIST = 5

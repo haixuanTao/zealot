@@ -764,6 +764,10 @@ pub struct VelocityFlatTask {
     pub min_base_height: f32,
     /// Indices of the hip yaw/roll DOFs (for `action_rate_hipz_hipx`).
     hip_yawroll_idx: [usize; 4],
+    /// `|yaw_rate|` at which the LATERAL half of `bilateral_symmetry` is fully
+    /// released (`BIPED_SYM_YAW_GATE`; 0 = off, historical behaviour). See
+    /// `symmetry_error` for why turning is otherwise taxed by that term.
+    pub sym_yaw_gate: f32,
 }
 
 impl Default for VelocityFlatTask {
@@ -897,6 +901,7 @@ impl VelocityFlatTask {
             tilt_limit: 70.0_f32.to_radians(),
             min_base_height: robot.min_base_height,
             hip_yawroll_idx,
+            sym_yaw_gate: env_f32("BIPED_SYM_YAW_GATE").unwrap_or(0.0),
         }
     }
 
@@ -1084,7 +1089,15 @@ impl VelocityFlatTask {
 
         // Bilateral symmetry: sagittal joints (hipy/knee/ankley) mirror equal,
         // lateral joints (hipz/hipx/anklex) mirror opposite. Reward exp(-error).
-        let sym_err = self.symmetry_error(&state.joint_pos);
+        // Release the LATERAL half of the symmetry term in proportion to the
+        // commanded turn: 1.0 going straight, 0.0 at |yaw_rate| >= the gate.
+        // Off (gate 0) = historical behaviour, lateral at full weight always.
+        let lateral_scale = if self.sym_yaw_gate > 0.0 {
+            (1.0 - cmd.yaw_rate.abs() / self.sym_yaw_gate).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let sym_err = self.symmetry_error(&state.joint_pos, lateral_scale);
         let bilateral_symmetry = self.weights.bilateral_symmetry * (-sym_err).exp() * dt;
 
         // Penalties (negative weights).
@@ -1374,14 +1387,28 @@ impl VelocityFlatTask {
     /// Mirror error: pairs left/right joints via the spec's mirror permutation
     /// and accumulates the squared difference under the family's mirror sign
     /// (sagittal joints mirror equal, lateral joints mirror opposite).
-    fn symmetry_error(&self, q: &[f32; NUM_JOINTS]) -> f32 {
+    /// `lateral_scale` attenuates ONLY the mirror-opposite joints (hip_roll,
+    /// hip_yaw, ankle_roll — `mirror_sign < 0`). Those are "symmetric" when
+    /// `q_L = -q_R`, i.e. mirror images. Turning needs the opposite: both
+    /// hip_yaws rotate the SAME way, so the error is `(q + q)^2 = 4q^2` — the
+    /// worst case for that term. Measured on v26's weights, 0.2 rad of
+    /// coordinated hip yaw costs ~0.005/step against a ~0.002 behaviour
+    /// threshold, so a commanded turn is actively taxed for the one thing it
+    /// must do. The sagittal terms (hip_pitch, knee, ankle_pitch) are what keep
+    /// the gait even and are never attenuated.
+    fn symmetry_error(&self, q: &[f32; NUM_JOINTS], lateral_scale: f32) -> f32 {
         let mut err = 0.0;
         for i in 0..NUM_JOINTS {
             let jr = self.robot.mirror[i];
             if jr <= i {
                 continue; // count each L/R pair once
             }
-            err += (q[i] - self.robot.mirror_sign[i] * q[jr]).powi(2);
+            let e = (q[i] - self.robot.mirror_sign[i] * q[jr]).powi(2);
+            err += if self.robot.mirror_sign[i] < 0.0 {
+                lateral_scale * e
+            } else {
+                e
+            };
         }
         err
     }
@@ -1563,7 +1590,42 @@ mod tests {
     fn symmetry_error_zero_for_mirrored_pose() {
         let task = VelocityFlatTask::new();
         // Neutral pose is trivially symmetric.
-        assert_eq!(task.symmetry_error(&[0.0; NUM_JOINTS]), 0.0);
+        assert_eq!(task.symmetry_error(&[0.0; NUM_JOINTS], 1.0), 0.0);
+    }
+
+    /// The lateral gate must attenuate ONLY the mirror-opposite joints
+    /// (hip_roll/hip_yaw/ankle_roll) and leave the sagittal ones alone --
+    /// otherwise gating a turn also stops enforcing an even gait.
+    #[test]
+    fn lateral_gate_spares_sagittal_symmetry() {
+        let task = VelocityFlatTask::new();
+        // Derive the indices from the SPEC rather than hardcoding a layout --
+        // VelocityFlatTask::new() honours BIPED_ROBOT, so the default here is
+        // lerobot, not the G1, and the joint order differs.
+        let lat = (0..NUM_JOINTS)
+            .find(|&i| task.robot.mirror[i] > i && task.robot.mirror_sign[i] < 0.0)
+            .expect("spec has a mirror-opposite (lateral) pair");
+        let sag = (0..NUM_JOINTS)
+            .find(|&i| task.robot.mirror[i] > i && task.robot.mirror_sign[i] > 0.0)
+            .expect("spec has a mirror-equal (sagittal) pair");
+        let mut q = [0.0; NUM_JOINTS];
+        // Coordinated motion on a LATERAL pair: what turning needs, and the
+        // worst case for a mirror-opposite term.
+        q[lat] = 0.2;
+        q[task.robot.mirror[lat]] = 0.2;
+        let full = task.symmetry_error(&q, 1.0);
+        let released = task.symmetry_error(&q, 0.0);
+        assert!(full > 0.0, "coordinated hip yaw should violate lateral mirror");
+        assert_eq!(released, 0.0, "gate should fully release the lateral term");
+
+        // Sagittal asymmetry must be charged at FULL weight whatever the gate.
+        let mut s = [0.0; NUM_JOINTS];
+        s[sag] = 0.2;
+        assert_eq!(
+            task.symmetry_error(&s, 0.0),
+            task.symmetry_error(&s, 1.0),
+            "sagittal symmetry must not depend on the lateral gate"
+        );
     }
 }
 
