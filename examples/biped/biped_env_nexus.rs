@@ -1536,6 +1536,28 @@ impl BipedNexusBatchEnv {
         {
             task.weights.feet_distance = w;
         }
+        // Foot-clearance weight. DEFAULT 0 -- this reward was dropped once for
+        // being farmed into a one-foot statue (foot held up to collect it; zero
+        // transfer, MuJoCo fell in 0.66 s). The guards that make it safe now
+        // live in the reward (swing-only, air_time < 0.45 s so a held foot
+        // stops earning, moving-gated, capped at the target), and the target
+        // scales with a cued step riser -- but enable it deliberately, and
+        // watch for the statue signature: one foot held, air_time saturating,
+        // clearance high, travel low.
+        if let Some(w) = std::env::var("BIPED_W_FOOT_CLEARANCE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.foot_clearance = w;
+        }
+        // Target for that reward (m). Overridden upward automatically while a
+        // step is cued; this is the flat-ground value.
+        if let Some(t) = std::env::var("BIPED_FOOT_CLEARANCE_TARGET")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.foot_clearance_target = t;
+        }
         if let Some(w) = std::env::var("BIPED_W_FOOT_ORIENTATION")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
