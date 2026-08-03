@@ -99,6 +99,20 @@ if os.environ.get("S2S_ACTION_REPLAY"):
 # scale the checkpoint was trained with.
 ACTION_SCALE = float(os.environ.get("S2S_ACTION_SCALE", "0.5"))
 
+# Upper-body pose the harness HOLDS. Two valid choices, and they are NOT the
+# same robot:
+#   "home" (default) = the playground keyframe / deploy pose, shoulder 0.2,
+#       elbow 1.28 -- which CANCELS the 73.2 deg elbow bend baked into the MJCF
+#       body hierarchy, leaving the arms straight DOWN along the body. This is
+#       what the LeRobot controller and the real robot use.
+#   "rest" = every held joint at 0, i.e. the model's rest pose, which for this
+#       robot is the forearms held OUT IN FRONT (73.2 deg of bend). This is what
+#       zealot training held for v19-v27, before held_home was added.
+# Set S2S_HELD_POSE=rest to evaluate a checkpoint under the geometry it was
+# actually trained with.
+HELD_POSE = os.environ.get("S2S_HELD_POSE", "home")
+
+
 
 KP_SCALE = float(os.environ.get("S2S_KP_SCALE", "1"))
 KD_SCALE = float(os.environ.get("S2S_KD_SCALE", "1"))
@@ -287,8 +301,9 @@ def main():
         for frag, kp, kd, eff in HELD:
             if frag in n:
                 idx = j.dofs_idx_local if hasattr(j, "dofs_idx_local") else [j.dof_idx_local]
+                q_hold = 0.0 if HELD_POSE == "rest" else HELD_HOME.get(n, 0.0)
                 held.append((int(np.atleast_1d(np.asarray(idx))[0]), kp, kd, eff,
-                             HELD_HOME.get(n, 0.0)))
+                             q_hold))
                 break
     print(f"policy joints: 12, held joints: {len(held)}")
 
@@ -364,6 +379,14 @@ def main():
             o[46] = _s * _w[0] + _c * _w[1]
             o[47] = _w[2]
 
+        if frame >= 53:
+            # Step cue (48..53): distance, height, edge sin/cos, valid.
+            # These scenes are FLAT -- there is no step -- so the cue is
+            # reported invalid, which zeroes the whole block. That is the
+            # same pattern the trainer emits when nothing is detected, so a
+            # 53-wide policy runs here exactly as it would with the
+            # RealSense seeing open floor.
+            o[48:53] = 0.0
         if frames_hist is None:
             frames_hist = [o.copy() for _ in range(HIST)]
         else:
