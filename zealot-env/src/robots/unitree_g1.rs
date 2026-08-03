@@ -148,6 +148,7 @@ pub const fn unitree_g1() -> RobotSpec {
             ("right_hip_yaw_link", "left_hip_yaw_link"),
         ],
         held_joints: &[],
+        held_home: &[],
     }
 }
 
@@ -221,6 +222,18 @@ pub const fn unitree_g1_29dof() -> RobotSpec {
         ("shoulder", 40.0, 1.0, 25.0),
         ("elbow", 40.0, 1.0, 25.0),
         ("wrist", 40.0, 1.0, 25.0), // wrist_roll (pitch/yaw are welded)
+    ];
+    // Arms ALONG THE BODY, matching the sim2sim harnesses and the LeRobot
+    // deploy controller. The MJCF bakes a 73.2 deg elbow bend into the body
+    // hierarchy, so holding at q = 0 is NOT a straight arm -- it is the
+    // forearms out in front. elbow = 1.28 cancels that bend (1.1 deg residual,
+    // hand 0.179 m below the shoulder instead of 0.116 m in front of it).
+    // Left/right shoulder_roll are mirrored, so match the sided names.
+    spec.held_home = &[
+        ("left_shoulder_roll", 0.2),
+        ("right_shoulder_roll", -0.2),
+        ("shoulder_pitch", 0.2),
+        ("elbow", 1.28),
     ];
     spec
 }

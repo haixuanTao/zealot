@@ -130,6 +130,18 @@ pub struct RobotSpec {
     /// first matching fragment wins. Joints matching nothing fall back to the
     /// env's generic holding gains. Empty for legs-only models.
     pub held_joints: &'static [(&'static str, f32, f32, f32)],
+    /// Position target for held joints that must NOT sit at the model's rest
+    /// pose: `(name_fragment, target_rad)`, first matching fragment wins,
+    /// anything unmatched holds at 0 (the rest pose).
+    ///
+    /// The G1 MJCF bakes a **73.2 deg elbow bend into the body hierarchy**, so
+    /// q = 0 is NOT a straight arm -- it is the forearms held out in front,
+    /// like carrying a tray. The sim2sim harnesses and the LeRobot deploy
+    /// controller all command elbow = 1.28 rad, which CANCELS that built-in
+    /// bend and leaves the arm straight down along the body (1.1 deg of bend,
+    /// hand 0.179 m below the shoulder). Training at 0 therefore ran a
+    /// different upper-body geometry than every evaluator and the real robot.
+    pub held_home: &'static [(&'static str, f32)],
 }
 
 impl RobotSpec {

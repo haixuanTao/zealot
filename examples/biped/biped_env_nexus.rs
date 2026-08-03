@@ -874,8 +874,26 @@ fn build_env_scene(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
+        // Held joints hold at the spec's `held_home` target, falling back to 0
+        // (the model's rest pose). For the G1 this puts the arms ALONG THE BODY
+        // rather than out in front: the MJCF bakes a 73.2 deg elbow bend into
+        // the body hierarchy, so q = 0 is a bent arm, and elbow = 1.28 cancels
+        // it. Every sim2sim harness and the LeRobot controller already command
+        // 1.28; training held 0, so it ran a different upper-body geometry than
+        // every evaluator and the real robot.
+        let hold_target = robot
+            .held_home
+            .iter()
+            .find(|(frag, _)| jname.contains(frag))
+            .map(|&(_, t)| t)
+            .unwrap_or(0.0);
         if !lock_held {
-            joint.set_motor_position(JointAxis::AngZ, 0.0, kp * kp_scale, kd * kd_scale);
+            joint.set_motor_position(
+                JointAxis::AngZ,
+                hold_target,
+                kp * kp_scale,
+                kd * kd_scale,
+            );
             joint.set_motor_max_force(JointAxis::AngZ, effort);
         }
         // Enforce the free axis's position limits — OFF by default (set
