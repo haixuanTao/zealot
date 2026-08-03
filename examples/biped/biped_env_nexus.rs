@@ -881,12 +881,25 @@ fn build_env_scene(
         // it. Every sim2sim harness and the LeRobot controller already command
         // 1.28; training held 0, so it ran a different upper-body geometry than
         // every evaluator and the real robot.
-        let hold_target = robot
-            .held_home
-            .iter()
-            .find(|(frag, _)| jname.contains(frag))
-            .map(|&(_, t)| t)
-            .unwrap_or(0.0);
+        // BIPED_HELD_HOME=0 restores the pre-fix behaviour (every held joint at
+        // the model rest pose = arms OUT IN FRONT). Required to evaluate v19-v27
+        // checkpoints, which were TRAINED that way -- without it, rebuilding the
+        // render binary silently re-poses those policies and their numbers stop
+        // matching every measurement taken before this change.
+        let held_home_on = std::env::var("BIPED_HELD_HOME")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let hold_target = if held_home_on {
+            robot
+                .held_home
+                .iter()
+                .find(|(frag, _)| jname.contains(frag))
+                .map(|&(_, t)| t)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
         if !lock_held {
             joint.set_motor_position(
                 JointAxis::AngZ,
