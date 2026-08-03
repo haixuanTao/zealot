@@ -1343,10 +1343,30 @@ impl VelocityFlatTask {
         //   (3) moving                — never at zero command (no stamping in place).
         const FOOT_REST_H: f32 = 0.035;
         const MAX_SWING_S: f32 = 0.45;
+        // REWARDING THE STEP. While a step-up is cued and close, raise the
+        // clearance target to the riser plus a margin, so "enough lift" means
+        // enough to actually clear THIS step rather than a fixed 3 cm. The
+        // reward saturates at the target (lift.min(1.0)), so raising it is
+        // exactly "you must lift higher here" and nothing else changes.
+        //
+        // This reuses the existing term ON PURPOSE. foot_clearance was dropped
+        // once because a static foot-height reward got hacked into a one-foot
+        // statue (foot held up to farm it; zero transfer, MuJoCo fell in
+        // 0.66 s). The guards added in response -- swing-only, air_time <
+        // 0.45 s so a held foot stops earning, moving-gated, capped -- are
+        // right here and apply unchanged. A fresh "reward crossing a step"
+        // term would have none of them.
+        const STEP_CLEAR_MARGIN: f32 = 0.05;
+        let clear_target = if stepping && state.step_cue.height > 0.0 {
+            (state.step_cue.height + STEP_CLEAR_MARGIN)
+                .max(self.weights.foot_clearance_target)
+        } else {
+            self.weights.foot_clearance_target
+        };
         let mut foot_h = 0.0;
         for f in &state.feet {
             if !f.contact && f.air_time < MAX_SWING_S {
-                let lift = (f.height - FOOT_REST_H).max(0.0) / self.weights.foot_clearance_target;
+                let lift = (f.height - FOOT_REST_H).max(0.0) / clear_target;
                 foot_h += lift.min(1.0);
             }
         }
@@ -1677,6 +1697,45 @@ mod tests {
         assert!(
             (50..400).contains(&stands),
             "standing fraction off: {stands}/2000"
+        );
+    }
+
+    /// A cued step-up must RAISE the clearance bar, so the same foot lift that
+    /// saturated the reward on flat ground no longer does. Without this the
+    /// policy is paid the same for a 3 cm lift whether or not there is a 20 cm
+    /// riser in front of it.
+    #[test]
+    fn cued_step_up_raises_the_clearance_bar() {
+        let mut task = VelocityFlatTask::new();
+        task.weights.foot_clearance = 1.0; // off by default; enable to measure
+        task.weights.foot_clearance_target = 0.03;
+
+        // One foot mid-swing at 8 cm -- saturating on flat ground.
+        let mut st = RobotState::default();
+        st.feet[0].contact = false;
+        st.feet[0].air_time = 0.1;
+        st.feet[0].height = 0.08;
+        st.feet[1].contact = true;
+        let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
+
+        let flat = task.reward(&st, &cmd).foot_clearance;
+        let mut stepping = st;
+        stepping.step_cue = StepCue {
+            distance: 0.3, height: 0.20, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0,
+        };
+        let on_step = task.reward(&stepping, &cmd).foot_clearance;
+        assert!(
+            on_step < flat,
+            "8 cm of lift should NOT still saturate in front of a 20 cm riser \
+             (flat {flat}, stepping {on_step})"
+        );
+
+        // And a lift that clears the riser earns it back.
+        let mut cleared = stepping;
+        cleared.feet[0].height = 0.20 + 0.05 + 0.035;
+        assert!(
+            (task.reward(&cleared, &cmd).foot_clearance - flat).abs() < 1e-6,
+            "clearing riser + margin should saturate again"
         );
     }
 
