@@ -148,6 +148,11 @@ pub struct TerrainStrip {
     /// Node heights, row-major: `heights[j * (nx+1) + i]` at
     /// `(STRIP_X0 + i·hs, −STRIP_HALF_W + j·hs)`.
     heights: Vec<f32>,
+    /// For [`TerrainFamily::Step`]: each patch's edge-normal angle (world
+    /// frame), indexed by difficulty row. Lets spawn logic place the robot
+    /// BEHIND the edge facing it (the approach-mode envs). Empty for the
+    /// other families.
+    pub step_theta: Vec<f32>,
 }
 
 fn quantize(h: f32) -> f32 {
@@ -163,6 +168,7 @@ impl TerrainStrip {
     pub fn generate(family: TerrainFamily, seed: u64) -> Self {
         let hs = family.grid_spacing();
         let nx = (PATCH * ROWS as f32 / hs).round() as usize;
+        let mut step_theta: Vec<f32> = Vec::new();
         let ny = (2.0 * STRIP_HALF_W / hs).round() as usize;
         // Spread the seed bits — `Lcg::new` ORs bit 0, so raw adjacent seeds
         // (42 vs 43) would otherwise collide.
@@ -240,6 +246,7 @@ impl TerrainStrip {
                     // way steps UP and the other way steps DOWN.
                     let rise = STEP_RISE_MAX * d;
                     let theta = rng.range(0.0, std::f32::consts::TAU);
+                    step_theta.push(theta);
                     let (nx_, ny_) = (theta.cos(), theta.sin());
                     // Patch centre in the same patch-local frame the loop uses.
                     let cx = PATCH * 0.5;
@@ -296,7 +303,7 @@ impl TerrainStrip {
             }
         }
 
-        TerrainStrip { family, hs, nx, ny, heights }
+        TerrainStrip { family, hs, nx, ny, heights, step_theta }
     }
 
     fn node(&self, i: usize, j: usize) -> f32 {

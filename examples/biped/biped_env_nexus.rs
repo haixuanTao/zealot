@@ -2108,7 +2108,7 @@ impl BipedNexusBatchEnv {
         if env.terrain.is_some() {
             for e in 0..num_envs {
                 let t = e % env.templates.len().max(1);
-                let off = env.terrain_spawn_offset(e);
+                let off = env.terrain_spawn_offset(e, t);
                 env.state.reset_env_from_snapshot_offset(
                     &env.gpu,
                     e as u32,
@@ -2126,12 +2126,50 @@ impl BipedNexusBatchEnv {
     /// BIPED_TERRAIN: pick env `e`'s spawn offset — its current level's patch
     /// center plus AGILE's ±2.5 m jitter, lifted to clear the local terrain —
     /// and reset its travel bookkeeping to the new spawn.
-    fn terrain_spawn_offset(&mut self, e: usize) -> Vec3 {
+    fn terrain_spawn_offset(&mut self, e: usize, template: usize) -> Vec3 {
+        // Step-family APPROACH MODE: with probability BIPED_STEP_APPROACH_P
+        // (default 0.5), spawn the robot so its heading POINTS AT the edge from
+        // a short standoff, instead of AGILE's uniform +/-2.5 m jitter (which,
+        // with the edge through the patch centre, spawns the robot ON the edge
+        // line with a random heading -- clean approach->cross->continue
+        // sequences are rare accidents, and the curriculum can promote through
+        // episodes that walked ALONG the edge).
+        //
+        // The reset API has no yaw control, so instead of turning the robot we
+        // pick the spawn point: place it standoff metres BEHIND the patch
+        // centre along its own baked heading (template_dr[t].spawn_yaw), so
+        // walking forward crosses the edge. The heading is uniform across
+        // templates and the edge normal uniform per patch, so approach angles
+        // stay fully diverse -- head-on, oblique, up-side, down-side all occur.
+        let approach_p: f32 = std::env::var("BIPED_STEP_APPROACH_P")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.5);
+        let yaw_t = self
+            .template_dr
+            .get(template)
+            .map(|d| d.spawn_yaw)
+            .unwrap_or(0.0);
         let ter = self.terrain.as_mut().expect("terrain on");
         let level = ter.curriculum[e].level;
         let (cx, cy) = TerrainStrip::patch_center(level);
         let rng = &mut ter.rng[e];
-        let (sx, sy) = (cx + rng.range(-2.5, 2.5), cy + rng.range(-2.5, 2.5));
+        let is_step = matches!(
+            TerrainFamily::of_env(e),
+            TerrainFamily::Step
+        );
+        let (sx, sy) = if is_step && rng.range(0.0, 1.0) < approach_p {
+            let standoff = rng.range(1.0, 2.5);
+            // Lateral jitter perpendicular to the heading, so the crossing
+            // point sweeps along the edge rather than always hitting centre.
+            let lat = rng.range(-1.5, 1.5);
+            (
+                cx - yaw_t.cos() * standoff - yaw_t.sin() * lat,
+                cy - yaw_t.sin() * standoff + yaw_t.cos() * lat,
+            )
+        } else {
+            (cx + rng.range(-2.5, 2.5), cy + rng.range(-2.5, 2.5))
+        };
         // Clearance over a foot-sized neighborhood + a small epsilon: spawn
         // height is relative to flat ground (the template pose), so the offset
         // z lifts the whole robot by the local surface height.
@@ -3597,7 +3635,7 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         if self.terrain.is_some() {
             // Teleport to the env's current difficulty patch (level was
             // already updated by the curriculum when the episode ended).
-            let off = self.terrain_spawn_offset(env);
+            let off = self.terrain_spawn_offset(env, t);
             self.state.reset_env_from_snapshot_offset(
                 &self.gpu,
                 env as u32,
