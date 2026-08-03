@@ -88,20 +88,40 @@ pub const SLOPE_GRADE_MAX: f32 = 0.125;
 /// a ~2 m flat top so the apex is standable.
 pub const SLOPE_RAMP: f32 = 3.0;
 
+/// Max single-step rise at difficulty 1 (m), for [`TerrainFamily::Step`].
+/// 0.20 m is a building stair riser and about the limit of what a 0.79 m-tall
+/// G1 can clear without a hand -- the swing foot must lift the rise PLUS the
+/// clearance margin, and this campaign's policies have managed 70-90 mm of
+/// clearance, so the top rows are deliberately beyond current capability and
+/// the curriculum will park where the policy actually tops out.
+pub const STEP_RISE_MAX: f32 = 0.20;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TerrainFamily {
     Boxes,
     Rough,
     Wave,
+    /// ONE clean edge per patch: a half-plane raised by `STEP_RISE_MAX·d`, with
+    /// the edge normal drawn uniformly in [0, 2π) per patch. The robot meets it
+    /// from whatever direction its command happens to carry it, and crossing
+    /// back down gives the step-down case for free — so a single family covers
+    /// both up and down from any approach angle.
+    ///
+    /// Deliberately NOT stairs: the other three families are zero-mean noise a
+    /// stride integrates away, and the pyramid slope is a sustained DC bias.
+    /// Neither presents a discrete obstacle that has to be cleared in one
+    /// swing, which is the skill this family is for.
+    Step,
 }
 
 impl TerrainFamily {
     /// Fixed per-env family assignment (AGILE: column families are fixed).
     pub fn of_env(env_id: usize) -> Self {
-        match env_id % 3 {
+        match env_id % 4 {
             0 => TerrainFamily::Boxes,
             1 => TerrainFamily::Rough,
-            _ => TerrainFamily::Wave,
+            2 => TerrainFamily::Wave,
+            _ => TerrainFamily::Step,
         }
     }
 
@@ -109,7 +129,9 @@ impl TerrainFamily {
     /// families have ≥0.4 m features.
     pub fn grid_spacing(self) -> f32 {
         match self {
-            TerrainFamily::Boxes => 0.075,
+            // A step edge sampled at 0.2 m becomes a 0.2 m ramp -- the whole
+            // point is that it is discrete, so it needs the fine grid too.
+            TerrainFamily::Boxes | TerrainFamily::Step => 0.075,
             _ => 0.2,
         }
     }
@@ -207,6 +229,29 @@ impl TerrainStrip {
                                 + h10 * tx * (1.0 - ty)
                                 + h01 * (1.0 - tx) * ty
                                 + h11 * tx * ty;
+                            heights[j * (nx + 1) + i] = quantize(h);
+                        }
+                    }
+                }
+                TerrainFamily::Step => {
+                    // One half-plane raised by `rise`, edge through the patch
+                    // centre with a per-patch random normal. Sign of the dot
+                    // product picks which side is up, so a robot crossing one
+                    // way steps UP and the other way steps DOWN.
+                    let rise = STEP_RISE_MAX * d;
+                    let theta = rng.range(0.0, std::f32::consts::TAU);
+                    let (nx_, ny_) = (theta.cos(), theta.sin());
+                    // Patch centre in the same patch-local frame the loop uses.
+                    let cx = PATCH * 0.5;
+                    let cy = PATCH * 0.5;
+                    for i in i0..=i1.min(nx) {
+                        let lx = (i as f32 * hs) - PATCH * p as f32;
+                        for j in 0..=ny {
+                            let ly = j as f32 * hs;
+                            let side = (lx - cx) * nx_ + (ly - cy) * ny_;
+                            // Strictly binary: no interpolation across the
+                            // edge, or the grid turns the step into a ramp.
+                            let h = if side >= 0.0 { rise } else { 0.0 };
                             heights[j * (nx + 1) + i] = quantize(h);
                         }
                     }
@@ -515,6 +560,39 @@ mod tests {
         // Row 0: A ≈ 0.01..0.022 (+ slope apex ≤ 37.5 mm).
         let (lo, hi) = row_extremes(&s, 0);
         assert!(hi <= 0.025 + apex(0) && lo >= -0.025, "row0 wave {lo}..{hi}");
+    }
+
+    /// The step family only teaches stepping if the edge is DISCRETE. If the
+    /// mesh grid interpolates across it the patch becomes a ramp, which the
+    /// existing families already cover and which needs no foot lift at all.
+    /// Pin that some pair of adjacent nodes jumps the full rise.
+    #[test]
+    fn step_edge_is_a_real_discontinuity() {
+        let s = strip(TerrainFamily::Step);
+        // Top row: rise is STEP_RISE_MAX * d, d ~= 1.
+        let level = ROWS - 1;
+        let (cx, cy) = TerrainStrip::patch_center(level as u32);
+        let hs = TerrainFamily::Step.grid_spacing();
+        // Sweep a line through the patch centre and find the largest
+        // node-to-node jump; with a binary half-plane it must be ~the rise.
+        let mut biggest: f32 = 0.0;
+        let n = (PATCH / hs) as i32 / 2;
+        for k in -n..n {
+            let a = s.height(cx + k as f32 * hs, cy);
+            let b = s.height(cx + (k + 1) as f32 * hs, cy);
+            biggest = biggest.max((b - a).abs());
+            let a2 = s.height(cx, cy + k as f32 * hs);
+            let b2 = s.height(cx, cy + (k + 1) as f32 * hs);
+            biggest = biggest.max((b2 - a2).abs());
+        }
+        // The edge normal is random, so at least one of the two sweeps must
+        // cross it. Allow quantization slack but require a real jump.
+        assert!(
+            biggest > 0.5 * STEP_RISE_MAX,
+            "step edge got smoothed into a ramp: biggest adjacent jump {biggest} m, \
+             expected ~{} m",
+            STEP_RISE_MAX
+        );
     }
 
     #[test]
