@@ -804,6 +804,12 @@ pub struct VelocityFlatTask {
     pub min_base_height: f32,
     /// Indices of the hip yaw/roll DOFs (for `action_rate_hipz_hipx`).
     hip_yawroll_idx: [usize; 4],
+    /// Cue distance under which the step-manoeuvre relaxation applies (m).
+    pub step_relax_dist: f32,
+    /// Widened base-height kernel while stepping (m).
+    pub step_std_base_h: f32,
+    /// Widened upright kernel while stepping (rad).
+    pub step_std_upright: f32,
     /// `|yaw_rate|` at which the LATERAL half of `bilateral_symmetry` is fully
     /// released (`BIPED_SYM_YAW_GATE`; 0 = off, historical behaviour). See
     /// `symmetry_error` for why turning is otherwise taxed by that term.
@@ -950,6 +956,10 @@ impl VelocityFlatTask {
             min_base_height: robot.min_base_height,
             hip_yawroll_idx,
             sym_yaw_gate: env_f32("BIPED_SYM_YAW_GATE").unwrap_or(0.0),
+            step_relax_dist: env_f32("BIPED_STEP_RELAX_DIST").unwrap_or(0.6),
+            step_std_base_h: env_f32("BIPED_STEP_STD_BASE_H").unwrap_or(0.15),
+            step_std_upright: env_f32("BIPED_STEP_STD_UPRIGHT")
+                .unwrap_or(25.0_f32.to_radians()),
         }
     }
 
@@ -1112,9 +1122,29 @@ impl VelocityFlatTask {
         let track_ang_vel =
             self.weights.track_ang_vel * (-ang_err / self.stds.ang_vel.powi(2)).exp() * dt;
 
+        // STEP MANOEUVRE GATE. Climbing a step is flatly irrational under the
+        // flat-ground reward: the base MUST rise relative to the surface it is
+        // leaving (no choice of reference foot avoids that), and it MUST pitch
+        // forward to get the swing leg up. Measured against a 0.20 m riser,
+        // holding the normal kernels costs ~0.040/step of base_height plus
+        // ~0.072/step of upright at a 15 deg lean -- together ~42% of all
+        // positive reward, against a ~0.002 behaviour threshold. The policy
+        // would correctly learn to refuse.
+        //
+        // So while a step is cued and close, widen both kernels rather than
+        // moving their targets: the target is still where we want the robot to
+        // END UP, we are only declining to charge it for the transient.
+        let stepping = state.step_cue.valid > 0.5
+            && state.step_cue.distance.abs() < self.step_relax_dist;
+        let (std_h, std_up) = if stepping {
+            (self.step_std_base_h, self.step_std_upright)
+        } else {
+            (self.stds.base_height, self.stds.upright)
+        };
+
         // Upright: horizontal components of projected gravity → 0 when flat.
         let tilt_err = grav[FWD].powi(2) + grav[LAT].powi(2);
-        let upright = self.weights.upright * (-tilt_err / self.stds.upright.powi(2)).exp() * dt;
+        let upright = self.weights.upright * (-tilt_err / std_up.powi(2)).exp() * dt;
 
         // Base height: stand tall (exp kernel around the target) so the policy
         // can't trivially crouch to avoid falling. The target is
@@ -1130,8 +1160,7 @@ impl VelocityFlatTask {
             self.weights.base_height_target
         };
         let h_err = (state.base.height - h_target).powi(2);
-        let base_height =
-            self.weights.base_height * (-h_err / self.stds.base_height.powi(2)).exp() * dt;
+        let base_height = self.weights.base_height * (-h_err / std_h.powi(2)).exp() * dt;
 
         // Hip yaw/roll deviation penalty (reuses the `pose` slot — the WBC port
         // left the full-posture reward at weight 0). The LATERAL hip DOFs (hipz
@@ -1648,6 +1677,44 @@ mod tests {
         assert!(
             (50..400).contains(&stands),
             "standing fraction off: {stands}/2000"
+        );
+    }
+
+    /// The step relaxation must fire ONLY when a step is cued and close, and
+    /// must not change flat-ground reward at all -- otherwise every generation
+    /// trained with the cue enabled is quietly running looser posture kernels
+    /// everywhere, which is not the intent.
+    #[test]
+    fn step_relaxation_is_gated_and_inert_when_no_step() {
+        let mut task = VelocityFlatTask::new();
+        task.weights.base_height = 2.0;
+        task.weights.upright = 4.0;
+        task.stds.base_height = 0.05;
+        task.weights.base_height_target = 0.82;
+        task.weights.base_height_target_stand = 0.82;
+        let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
+
+        // Off the target by 0.20 m -- what crossing a 0.20 m edge looks like.
+        let mut st = RobotState::default();
+        st.base.height = 0.62;
+
+        let no_cue = task.reward(&st, &cmd);
+        let mut cued = st;
+        cued.step_cue = StepCue { distance: 0.3, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
+        let with_cue = task.reward(&cued, &cmd);
+        assert!(
+            with_cue.base_height > no_cue.base_height,
+            "relaxation did not fire while a step was cued and close ({} vs {})",
+            with_cue.base_height, no_cue.base_height
+        );
+
+        // Cue valid but FAR: no relaxation, so the robot is not given a licence
+        // to slouch merely because a step exists somewhere ahead.
+        let mut far = st;
+        far.step_cue = StepCue { distance: 1.4, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
+        assert_eq!(
+            task.reward(&far, &cmd).base_height, no_cue.base_height,
+            "relaxation fired for a step 1.4 m away"
         );
     }
 
