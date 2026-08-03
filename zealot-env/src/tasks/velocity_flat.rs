@@ -48,8 +48,15 @@ pub const UP: usize = 2;
 // not cancel even its own heading drift (measured: yaw output scattered
 // positive regardless of commanded sign). Every deployed locomotion stack
 // feeds the gyro to the policy; it is free on hardware (IMU).
+// `+ 5` at the very end is the STEP CUE (slots 48-52): distance to the edge,
+// its signed height, the edge ORIENTATION as (sin, cos) in the body frame, and
+// a validity flag. Supplied on hardware by a head RealSense: a plane fit plus
+// edge extraction yields all three quantities directly, and unlike a foot
+// probe it gives the edge DIRECTION -- which is what lets the robot meet a
+// step at an angle rather than only head-on. Trained against a terrain oracle
+// with sensor-shaped noise (see `StepCue`).
 pub const OBS_DIM: usize =
-    NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2 + 3;
+    NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2 + 3 + 5;
 /// Action vector length: one position target per leg DOF.
 pub const ACTION_DIM: usize = NUM_JOINTS;
 /// Privileged (critic) observation length: policy obs plus base linear & angular
@@ -144,6 +151,36 @@ impl Default for FootObs {
     }
 }
 
+/// What the head RealSense reports about the step ahead.
+///
+/// Extraction is a SCRIPTED perception step, not something the policy learns:
+/// a plane fit plus edge detection on the depth image yields distance, height
+/// and edge orientation directly. The policy's job is only to EXECUTE the step
+/// given those numbers -- which is why this is 5 floats into the existing MLP
+/// rather than a CNN on raw depth.
+///
+/// `valid = 0` must mean "no step information" and the policy must walk
+/// normally on it -- otherwise a dropped detection on hardware becomes a fall
+/// rather than a refusal.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepCue {
+    /// Horizontal distance from the stance to the edge, m. Meaningless when
+    /// `valid == 0`.
+    pub distance: f32,
+    /// Signed height of the surface beyond the edge, m. Positive = step UP,
+    /// negative = step DOWN.
+    pub height: f32,
+    /// Edge normal direction in the BODY frame, as (sin, cos) of the angle
+    /// between the robot's heading and the edge normal. (0, 1) means the edge
+    /// is square-on. Split into sin/cos rather than a raw angle so it is
+    /// continuous across the +/-pi wrap, and so the mirror transform is a
+    /// clean sign flip on sin alone.
+    pub edge_sin: f32,
+    pub edge_cos: f32,
+    /// 1.0 when a detection succeeded, 0.0 otherwise (no step, or no reading).
+    pub valid: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RobotState {
     /// Base link state.
@@ -166,6 +203,8 @@ pub struct RobotState {
     /// sparse touchdown bonus (air_time) could not, since a step's payoff never
     /// beat the fall risk (the shuffle stayed a stable local optimum).
     pub phase: f32,
+    /// Latest foot-probe report. Zeroed (`valid = 0`) when nothing is known.
+    pub step_cue: StepCue,
 }
 
 impl Default for RobotState {
@@ -178,6 +217,7 @@ impl Default for RobotState {
             prev_action: [0.0; NUM_JOINTS],
             feet: [FootObs::default(); NUM_FEET],
             phase: 0.0,
+            step_cue: StepCue::default(),
         }
     }
 }
@@ -1015,6 +1055,19 @@ impl VelocityFlatTask {
         for w in self.base_ang_vel_body(&state.base) {
             put(obs, &mut o, w);
         }
+        // Step cue LAST, so slots 0-47 keep their v22-v27 meaning. Distance is
+        // clipped: beyond ~1.5 m the exact value carries no useful information
+        // and an unclipped range would waste normalizer resolution on it.
+        // When `valid == 0` the other two are forced to zero, so "no step" is a
+        // single unambiguous pattern rather than stale numbers the policy might
+        // still act on.
+        let cue = state.step_cue;
+        let live = cue.valid > 0.5;
+        put(obs, &mut o, if live { cue.distance.clamp(-0.5, 1.5) } else { 0.0 });
+        put(obs, &mut o, if live { cue.height.clamp(-0.4, 0.4) } else { 0.0 });
+        put(obs, &mut o, if live { cue.edge_sin } else { 0.0 });
+        put(obs, &mut o, if live { cue.edge_cos } else { 0.0 });
+        put(obs, &mut o, if live { 1.0 } else { 0.0 });
         debug_assert_eq!(o, OBS_DIM);
     }
 
@@ -1441,14 +1494,18 @@ mod tests {
 
     #[test]
     fn obs_dim_consistent() {
-        assert_eq!(OBS_DIM, 48); // 45 through v21, + base_ang_vel(3) from v22
+        // 45 through v21; + base_ang_vel(3) from v22; + step_cue(5) from v28.
+        // This is the OBSERVATION CONTRACT -- the three sim2sim harnesses and
+        // the lerobot controller all rebuild this vector by offset, so widening
+        // it means updating them too, not just this number.
+        assert_eq!(OBS_DIM, 53);
         assert_eq!(ACTION_DIM, 12);
         let task = VelocityFlatTask::new();
         let mut obs = vec![0.0; OBS_DIM];
         task.observe(&upright_state(), &VelocityCommand::default(), &mut obs);
         // Layout: last_action[0..12], command[12..16], joint_pos_rel[16..28],
         // joint_vel[28..40], projected_gravity[40..43], gait_phase(sin,cos)[43..45],
-        // base_ang_vel[45..48].
+        // base_ang_vel[45..48], step_cue(dist, h, edge_sin, edge_cos, valid)[48..53].
         // Upright, neutral pose, zero command, phase 0 → everything zero except
         // gravity up = -1 and cos(0) = 1.
         assert!(obs.iter().take(40).all(|&x| x == 0.0));
@@ -1592,6 +1649,45 @@ mod tests {
             (50..400).contains(&stands),
             "standing fraction off: {stands}/2000"
         );
+    }
+
+    /// `valid = 0` must be a single unambiguous "no information" pattern:
+    /// distance and height forced to zero, not stale values. On hardware a
+    /// failed probe hits this path, and the policy must walk normally rather
+    /// than act on whatever the last successful probe said.
+    #[test]
+    fn invalid_step_cue_zeroes_the_whole_block() {
+        let task = VelocityFlatTask::new();
+        let mut st = RobotState::default();
+        let cmd = VelocityCommand::default();
+        let mut obs = vec![0.0; OBS_DIM];
+
+        st.step_cue = StepCue { distance: 0.42, height: 0.18, edge_sin: 0.5, edge_cos: 0.87, valid: 0.0 };
+        task.observe(&st, &cmd, &mut obs);
+        assert_eq!(&obs[OBS_DIM - 5..], &[0.0; 5], "stale cue leaked through valid=0");
+
+        st.step_cue = StepCue { distance: 0.42, height: 0.18, edge_sin: 0.5, edge_cos: 0.87, valid: 1.0 };
+        task.observe(&st, &cmd, &mut obs);
+        assert_eq!(&obs[OBS_DIM - 5..], &[0.42, 0.18, 0.5, 0.87, 1.0]);
+    }
+
+    /// The cue must not disturb the slots every other consumer indexes by
+    /// position -- the sim2sim harnesses and the lerobot controller all read
+    /// 0..48 by offset.
+    #[test]
+    fn step_cue_is_appended_not_inserted() {
+        let task = VelocityFlatTask::new();
+        let mut st = RobotState::default();
+        st.joint_pos[3] = 0.3;
+        let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
+        let mut with = vec![0.0; OBS_DIM];
+        task.observe(&st, &cmd, &mut with);
+        let mut cued = vec![0.0; OBS_DIM];
+        let mut st2 = st;
+        st2.step_cue = StepCue { distance: 1.0, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
+        task.observe(&st2, &cmd, &mut cued);
+        assert_eq!(with[..OBS_DIM - 5], cued[..OBS_DIM - 5],
+                   "setting the step cue changed a pre-existing observation slot");
     }
 
     #[test]

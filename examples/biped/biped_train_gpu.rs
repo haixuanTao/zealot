@@ -127,6 +127,14 @@ fn mirror_frame(o: &[f32]) -> Vec<f32> {
         m[45] = -o[45];
         m[47] = -o[47];
     }
+    // Step cue (48..53): distance, height and validity are mirror-invariant --
+    // an edge 0.4 m ahead and 0.15 m up is the same fact for either chirality.
+    // The edge ORIENTATION is not: a step angled to the left mirrors to one
+    // angled to the right, so sin negates while cos is preserved, same as any
+    // in-plane direction.
+    if o.len() > 50 {
+        m[50] = -o[50]; // edge_sin
+    }
     m
 }
 // With BIPED_OBS_HISTORY the actor obs is H stacked 45-frames — the mirror is

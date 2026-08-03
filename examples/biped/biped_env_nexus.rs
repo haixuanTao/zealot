@@ -1151,7 +1151,7 @@ struct DbgStance {
 /// BIPED_TERRAIN=1 state: the three family strips + per-env curriculum
 /// (WBC-AGILE's terrain_levels_vel_curriculum — see zealot_env::terrain).
 struct TerrainSetup {
-    strips: [TerrainStrip; 3],
+    strips: [TerrainStrip; 4],
     /// Per-env curriculum state (level + success/failure counters).
     curriculum: Vec<TerrainCurriculum>,
     /// Dedicated RNG stream (levels, spawn jitter) — the env's command/DR
@@ -1165,7 +1165,61 @@ struct TerrainSetup {
 
 impl TerrainSetup {
     fn strip_for(&self, env: usize) -> &TerrainStrip {
-        &self.strips[env % 3]
+        &self.strips[env % 4]
+    }
+
+    /// Oracle for the FOOT-CONTACT PROBE the real robot will run: walk a ray
+    /// forward along the heading and report the first discrete height change.
+    ///
+    /// This deliberately models what a probe can actually measure -- distance
+    /// to an edge and the height beyond it -- not what the simulator knows. It
+    /// detects an edge in ANY family, not just Step, so the policy cannot use
+    /// "cue present" as a proxy for "this is the step family".
+    ///
+    /// `EDGE_MIN` is the smallest height change worth reporting: below it the
+    /// feature is terrain roughness the gait already absorbs, and a probe
+    /// would not reliably resolve it either.
+    fn probe(&self, env: usize, x: f32, y: f32, yaw: f32) -> zealot_env::tasks::velocity_flat::StepCue {
+        use zealot_env::tasks::velocity_flat::StepCue;
+        const EDGE_MIN: f32 = 0.04;
+        const RANGE: f32 = 1.5;
+        const DS: f32 = 0.05;
+        let strip = self.strip_for(env);
+        let (cx, sy) = (yaw.cos(), yaw.sin());
+        let h0 = strip.height(x, y);
+        let mut prev = h0;
+        let mut d = DS;
+        while d <= RANGE {
+            let (px, py) = (x + cx * d, y + sy * d);
+            let h = strip.height(px, py);
+            if (h - prev).abs() > EDGE_MIN {
+                // Edge ORIENTATION from the height gradient at the crossing.
+                // The gradient points across the edge (up-slope), which is
+                // exactly the edge normal; a camera's edge extraction recovers
+                // the same direction from the depth discontinuity.
+                let e = 0.10;
+                let gx = strip.height(px + e, py) - strip.height(px - e, py);
+                let gy = strip.height(px, py + e) - strip.height(px, py - e);
+                let n = (gx * gx + gy * gy).sqrt();
+                // Degenerate gradient (edge exactly on the sample grid) -> fall
+                // back to "square-on", which is what a detector would also
+                // report when it cannot resolve the orientation.
+                let (nx, ny) = if n > 1e-6 { (gx / n, gy / n) } else { (cx, sy) };
+                // Rotate the world-frame normal into the body frame.
+                let ec = nx * cx + ny * sy;
+                let es = -nx * sy + ny * cx;
+                return StepCue {
+                    distance: d,
+                    height: h - h0,
+                    edge_sin: es,
+                    edge_cos: ec,
+                    valid: 1.0,
+                };
+            }
+            prev = h;
+            d += DS;
+        }
+        StepCue::default()
     }
 }
 
@@ -1554,6 +1608,7 @@ impl BipedNexusBatchEnv {
                 TerrainStrip::generate(TerrainFamily::Boxes, seed),
                 TerrainStrip::generate(TerrainFamily::Rough, seed),
                 TerrainStrip::generate(TerrainFamily::Wave, seed),
+                TerrainStrip::generate(TerrainFamily::Step, seed),
             ];
             let mk_shape = |verts: Vec<[f32; 3]>, tris: Vec<[u32; 3]>| -> SharedShape {
                 let pts: Vec<_> = verts
@@ -1594,7 +1649,7 @@ impl BipedNexusBatchEnv {
         let mut env_scenes: Vec<EnvScene> = Vec::with_capacity(num_envs);
         for e in 0..num_envs {
             let dr = template_dr[e % num_templates];
-            let tshape = terrain_build.as_ref().map(|(_, shapes, _)| &shapes[e % 3]);
+            let tshape = terrain_build.as_ref().map(|(_, shapes, _)| &shapes[e % 4]);
             let (scene, ix) = build_env_scene(&mjcf, &robot, &dr, task.sim_dt, tshape);
             if idx_out.is_none() {
                 idx_out = Some(ix);
@@ -2413,6 +2468,8 @@ impl BipedNexusBatchEnv {
                 prev_action: self.prev_action[env],
                 feet: [FootObs::default(); NUM_FEET],
                 phase: 0.0, // overwritten with self.gait_phase[env] by the caller
+                // Filled by the caller (needs the terrain + this env's pose).
+                step_cue: Default::default(),
             },
             joint_pos,
         )
@@ -3049,6 +3106,21 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
         let cpb_idx = self.idx.colliders_per_batch as usize;
+        // Step-cue knobs, read once per step rather than per env.
+        // BIPED_STEP_CUE=0 disables the cue entirely (obs slots stay zero), so
+        // a run can be done with the wider observation but no step information
+        // -- the control for "did the cue actually help".
+        let step_cue_on = std::env::var("BIPED_STEP_CUE").as_deref() != Ok("0");
+        // Detector-shaped error. A depth-based edge detector is decent when it
+        // fires and occasionally does not fire at all; training on a clean
+        // oracle would teach the policy to trust it, and the first dropout on
+        // hardware becomes a fall rather than a refusal.
+        let step_cue_dropout: f32 = std::env::var("BIPED_STEP_CUE_DROPOUT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0.10);
+        let step_cue_dn: f32 = std::env::var("BIPED_STEP_CUE_DIST_NOISE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0.03);
+        let step_cue_hn: f32 = std::env::var("BIPED_STEP_CUE_H_NOISE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0.02);
         let computed: Vec<PerEnv> = (0..self.n)
             .into_par_iter()
             .with_min_len(64)
@@ -3057,6 +3129,36 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
                 let (mut state, new_joint_pos) = self.read_state_from_poses(e, &poses);
                 state.feet = feet;
                 state.phase = self.gait_phase[e];
+                // Step cue from the foot-probe oracle, with PROBE-shaped error.
+                // A real probe is accurate when it succeeds (the foot touched
+                // the edge) but fails outright now and then -- foot slips off,
+                // sweep misses, operator probes the wrong spot. So: small
+                // Gaussian-ish noise on both numbers, plus a dropout that
+                // clears the cue entirely. Training on a perfect oracle would
+                // teach the policy to trust it, and the first bad probe on
+                // hardware becomes a fall instead of a refusal.
+                if let Some(t) = self.terrain.as_ref() {
+                    if step_cue_on {
+                        let yaw = {
+                            let q = state.base.orientation;
+                            // q = [x, y, z, w]
+                            (2.0 * (q[3] * q[2] + q[0] * q[1]))
+                                .atan2(1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2]))
+                        };
+                        let mut cue =
+                            t.probe(e, state.base.pos_xy[0], state.base.pos_xy[1], yaw);
+                        if cue.valid > 0.5 {
+                            let r = &mut self.rng[e].clone();
+                            if r.range(0.0, 1.0) < step_cue_dropout {
+                                cue = Default::default();
+                            } else {
+                                cue.distance += r.range(-step_cue_dn, step_cue_dn);
+                                cue.height += r.range(-step_cue_hn, step_cue_hn);
+                            }
+                        }
+                        state.step_cue = cue;
+                    }
+                }
                 let env_base = e * cpb_idx;
                 let illegal = self.idx.illegal_ground_links.iter().any(|&l| {
                     let p = poses[env_base + l as usize].translation;
