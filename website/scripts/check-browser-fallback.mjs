@@ -6,6 +6,7 @@
 //   node scripts/check-browser-fallback.mjs          (against the local preview)
 //   SITE_URL=https://haixuantao.github.io/zealot/ node scripts/check-browser-fallback.mjs
 import puppeteer from 'puppeteer-core';
+import {existsSync} from 'node:fs';
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const URL = process.env.SITE_URL ?? 'http://localhost:3410/zealot/';
 
@@ -47,3 +48,30 @@ for (const [name, ua, touch] of UAS) {
   await page.close();
 }
 await browser.close();
+
+// Spoofed UAs only prove OUR sniffing. Firefox is the one browser here that
+// can be driven for real, and it is where the fallback was reported broken —
+// so run it for real too when it is installed.
+const FF = '/Applications/Firefox.app/Contents/MacOS/firefox';
+if (existsSync(FF)) {
+  const ff = await puppeteer.launch({
+    browser: 'firefox',
+    executablePath: FF,
+    headless: false,
+    protocolTimeout: 120000,
+  });
+  const page = await ff.newPage();
+  await page.goto(URL, {waitUntil: 'load', timeout: 90000});
+  await new Promise((r) => setTimeout(r, 4000));
+  const s = await page.evaluate(() => ({
+    tab: document.querySelector('.tabActive')?.textContent ?? '(none)',
+    script: document.querySelector('script[type=module][src]')?.src.split('/').pop(),
+    notice: !!document.querySelector('.notice'),
+  }));
+  console.log(
+    `${'Firefox (REAL)'.padEnd(26)} tab=${s.tab.padEnd(18)} bundle=${s.script} notice=${s.notice}`,
+  );
+  await ff.close();
+} else {
+  console.log('Firefox not installed — skipped the real-browser pass');
+}

@@ -177,9 +177,14 @@ function demoSrc(name: DemoName, k: Knobs): string {
 function nexusBlockedBy(): string | null {
   if (typeof navigator === 'undefined') return null;
   const ua = navigator.userAgent;
-  // iPadOS reports itself as a Mac; the touch points give it away.
+  // iPadOS reports itself as a Mac; the touch points give it away. Desktop
+  // Chrome/Edge is excluded from that second test by its `Chrome/<version>`
+  // token — iPadOS Chrome says `CriOS` instead — so a Mac that merely has a
+  // touch device attached is not mistaken for an iPad and demoted off the GPU
+  // demo it can actually run.
   const ios =
-    /iphone|ipad|ipod/i.test(ua) || (/macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
+    /iphone|ipad|ipod/i.test(ua) ||
+    (/macintosh/i.test(ua) && navigator.maxTouchPoints > 1 && !/chrome\/\d/i.test(ua));
   if (ios) return 'iOS';
   if (/firefox|fxios/i.test(ua)) return 'Firefox';
   if (/safari/i.test(ua) && !/chrome|chromium|android|crios|edg/i.test(ua)) return 'Safari';
