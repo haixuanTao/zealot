@@ -169,18 +169,35 @@ if quats is not None and names:
     RO = _world_rots("/home/champagne/rt_build/bench-venv/lib/python3.12/"
                      "site-packages/mujoco_menagerie/unitree_g1/g1.xml")
 
+    # Menagerie file names do not all match body names: the waist/torso
+    # meshes carry a _rev_1_0 suffix, and the head is a separate mesh bound to
+    # the torso body (at +[0.004, 0, -0.044] in its frame).
+    STL_ALIAS = {
+        "waist_yaw_link": "waist_yaw_link_rev_1_0",
+        "waist_roll_link": "waist_roll_link_rev_1_0",
+        "torso_link": "torso_link_rev_1_0",
+    }
+    EXTRA = {"torso_link": [("head_link", np.array([0.0039635, 0.0, -0.044]))]}
     for k, nm in enumerate(names):
-        stl = os.path.join(MENAGERIE, nm + ".STL")
+        stl = os.path.join(MENAGERIE, STL_ALIAS.get(nm, nm) + ".STL")
         h = state.insert_body(RigidBodyBuilder.kinematic_position_based().build())
         if os.path.exists(stl) and nm in RZ and nm in RO:
             m = _tm.load_mesh(stl)
             if len(m.faces) > 6000:
                 m = m.simplify_quadric_decimation(1.0 - 6000.0 / len(m.faces))
             C = RZ[nm].T @ RO[nm]
-            V = (np.asarray(m.vertices) @ C.T)
+            V = list(np.asarray(m.vertices) @ C.T)
+            F = list(np.asarray(m.faces))
+            for xnm, xoff in EXTRA.get(nm, []):
+                xm = _tm.load_mesh(os.path.join(MENAGERIE, xnm + ".STL"))
+                if len(xm.faces) > 4000:
+                    xm = xm.simplify_quadric_decimation(1.0 - 4000.0 / len(xm.faces))
+                base = len(V)
+                V.extend((np.asarray(xm.vertices) + xoff) @ C.T)
+                F.extend(np.asarray(xm.faces) + base)
             col = ColliderBuilder.trimesh(
                 [list(map(float, v)) for v in V],
-                [list(map(int, f)) for f in m.faces],
+                [list(map(int, f)) for f in F],
             ).build()
         else:
             col = ColliderBuilder.ball(BALL_R).build()
