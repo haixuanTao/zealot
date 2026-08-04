@@ -51,7 +51,10 @@ fn query_str(key: &str) -> Option<String> {
 #[kiss3d::main]
 pub async fn main() {
     g1_web_demo::run(g1_web_demo::DemoCfg {
-        n_robots: query_int("n=").map_or(10, |n| n.clamp(1, 60) as usize),
+        // Default 1: measured ~98% of real time on an iGPU, where 3+ robots
+        // pay visible sim speed (the site's Robots slider makes that an
+        // explicit choice).
+        n_robots: query_int("n=").map_or(1, |n| n.clamp(1, 60) as usize),
         terrain: true,
         // `?lvl=` picks the spawn difficulty patch (0..=19, default 4).
         terrain_level: query_int("lvl=").map_or(4, |l| l.clamp(0, 19) as u32),
