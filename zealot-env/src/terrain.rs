@@ -741,6 +741,31 @@ mod tests {
         assert!(hi <= 0.025 + apex(0) && lo >= -0.025, "row0 wave {lo}..{hi}");
     }
 
+    /// Dump the step strip's REAL collision mesh to JSON for out-of-band
+    /// inspection (`cargo test dump_step_mesh -- --ignored --nocapture`).
+    /// Exists because the video renderer draws a RESAMPLED height grid, which
+    /// interpolates -- a vertical wall renders as a ramp, so footage cannot
+    /// validate the geometry. Only the triangles can.
+    #[test]
+    #[ignore]
+    fn dump_step_mesh() {
+        let s = strip(TerrainFamily::Step);
+        let (verts, tris) = s.mesh();
+        let mut out = String::from("{\"verts\":[");
+        for (i, v) in verts.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            out.push_str(&format!("[{:.4},{:.4},{:.4}]", v[0], v[1], v[2]));
+        }
+        out.push_str("],\"tris\":[");
+        for (i, t) in tris.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            out.push_str(&format!("[{},{},{}]", t[0], t[1], t[2]));
+        }
+        out.push_str("]}");
+        std::fs::write("/tmp/step_mesh.json", out).unwrap();
+        println!("wrote /tmp/step_mesh.json: {} verts {} tris", verts.len(), tris.len());
+    }
+
     /// The step face must be TRULY VERTICAL in the emitted mesh -- the
     /// shared-vertex grid emission turned it into a one-cell ramp (~53 deg at
     /// 10 cm), which is climbable by toe-wedging and softer than the MuJoCo
