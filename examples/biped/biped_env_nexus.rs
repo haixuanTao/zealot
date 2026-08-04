@@ -1165,7 +1165,23 @@ struct TerrainSetup {
 
 impl TerrainSetup {
     fn strip_for(&self, env: usize) -> &TerrainStrip {
-        &self.strips[env % 4]
+        // Route through of_env() so BIPED_TERRAIN_FAMILY affects the STRIP,
+        // not just the family label. Indexing by env % 4 directly meant the
+        // forced-family eval walked the wrong terrain: env 0 got the Boxes
+        // strip while every log said "step" -- the negative cell heights in a
+        // dumped patch (impossible for the 0-or-rise step field) were the
+        // tell, and the "riser climb" in the first step videos was actually
+        // the Boxes family's pyramid slope.
+        &self.strips[Self::family_index(env)]
+    }
+
+    fn family_index(env: usize) -> usize {
+        match TerrainFamily::of_env(env) {
+            TerrainFamily::Boxes => 0,
+            TerrainFamily::Rough => 1,
+            TerrainFamily::Wave => 2,
+            TerrainFamily::Step => 3,
+        }
     }
 
     /// Oracle for the FOOT-CONTACT PROBE the real robot will run: walk a ray
@@ -1674,7 +1690,7 @@ impl BipedNexusBatchEnv {
         let mut env_scenes: Vec<EnvScene> = Vec::with_capacity(num_envs);
         for e in 0..num_envs {
             let dr = template_dr[e % num_templates];
-            let tshape = terrain_build.as_ref().map(|(_, shapes, _)| &shapes[e % 4]);
+            let tshape = terrain_build.as_ref().map(|(_, shapes, _)| &shapes[TerrainSetup::family_index(e)]);
             let (scene, ix) = build_env_scene(&mjcf, &robot, &dr, task.sim_dt, tshape);
             if idx_out.is_none() {
                 idx_out = Some(ix);
