@@ -235,8 +235,8 @@ def main():
     assert policy.act_dim == 12, policy.act_dim
     assert policy.obs_dim % HIST == 0, policy.obs_dim
     frame = policy.obs_dim // HIST
-    assert frame in (45, 48), f"unexpected obs frame width {frame}"
-    print(f"obs frame {frame} ({'with' if frame == 48 else 'no'} gyro)")
+    assert frame in (45, 48, 53), f"unexpected obs frame width {frame}"
+    print(f"obs frame {frame} ({'no' if frame == 45 else 'with'} gyro{', step cue' if frame >= 53 else ''})")
 
     model = mujoco.MjModel.from_xml_path(MODEL_XML)
     model.opt.timestep = PHYS_DT
