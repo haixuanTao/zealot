@@ -1057,6 +1057,18 @@ pub async fn run(cfg: DemoCfg) {
     // frees the CPU for more frames but the extra frames' GPU work comes out
     // of the physics budget) — 1 per-substep, 2 all-in-one.
     let phys_mode = probe_u32("phys=", 0);
+    // `?prof=1`: per-pass GPU timings. Once a second, ONE control step runs
+    // with timestamp queries (dedicated passes per label — slightly slower,
+    // so only that step), read back without blocking; the accumulated
+    // per-label averages go to the console every 5 s.
+    let prof = probe_u32("prof=", 0) == 1;
+    let mut prof_ts = prof.then(|| khal::backend::GpuTimestamps::new(&backend, 512));
+    let mut prof_acc: std::collections::HashMap<String, (f64, u32)> =
+        std::collections::HashMap::new();
+    let mut prof_steps = 0u32;
+    let mut prof_last_dump = 0u32;
+    let mut prof_pending = false;
+    let mut prof_want = false;
     // `?fused=1`: force nexus's fused colored-sweep kernels (one dispatch per
     // sweep instead of one per colour) — A/B for dispatch-latency-bound GPUs.
     if probe_u32("fused=", 0) == 1 {
@@ -1140,14 +1152,24 @@ pub async fn run(cfg: DemoCfg) {
             backend.submit(enc).expect("submit ctrl step");
             // Physics submit granularity, `?phys=`: 0 per-phase (original),
             // 1 per-substep, 2 all-in-one — measurement knob.
-            match phys_mode {
-                1 => env.step_physics_substep_submits(),
-                2 => {
-                    let mut penc = backend.begin_encoding();
-                    env.step_physics_encoded(&mut penc);
-                    backend.submit(penc).expect("submit physics");
+            match &mut prof_ts {
+                // Profiled step when one was requested and the reader is free.
+                Some(ts) if prof_want && !prof_pending && ts.is_idle() => {
+                    ts.reset();
+                    env.step_physics_profiled(ts);
+                    ts.request_read(&backend);
+                    prof_pending = true;
+                    prof_want = false;
                 }
-                _ => env.step_physics_only(),
+                _ => match phys_mode {
+                    1 => env.step_physics_substep_submits(),
+                    2 => {
+                        let mut penc = backend.begin_encoding();
+                        env.step_physics_encoded(&mut penc);
+                        backend.submit(penc).expect("submit physics");
+                    }
+                    _ => env.step_physics_only(),
+                },
             }
             perf_step_ms_acc += step_t0.elapsed().as_secs_f32() * 1e3;
             perf_steps += 1;
@@ -1162,6 +1184,39 @@ pub async fn run(cfg: DemoCfg) {
             // spiral. `hud_realtime` is measured over the 1 s window below,
             // which already reflects the lost steps.
             sim_time = wall;
+        }
+
+        if let Some(ts) = &mut prof_ts {
+            if prof_pending {
+                if let Some(rows) = ts.try_take(&backend) {
+                    prof_pending = false;
+                    prof_steps += 1;
+                    for r in rows {
+                        let e = prof_acc.entry(r.label).or_insert((0.0, 0));
+                        e.0 += r.duration_ms;
+                        e.1 += 1;
+                    }
+                    if prof_steps >= prof_last_dump + 5 {
+                        prof_last_dump = prof_steps;
+                        let mut rows: Vec<(String, f64, u32)> = prof_acc
+                            .iter()
+                            .map(|(k, (ms, n))| (k.clone(), ms / prof_steps as f64, *n))
+                            .collect();
+                        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+                        let total: f64 = rows.iter().map(|r| r.1).sum();
+                        let mut out = format!(
+                            "[prof] {prof_steps} steps, GPU {total:.2} ms/ctrl-step\n"
+                        );
+                        for (label, ms, n) in rows.iter().take(14) {
+                            out.push_str(&format!(
+                                "[prof]  {ms:7.3} ms  x{:<3} {label}\n",
+                                n / prof_steps
+                            ));
+                        }
+                        log_warn(&out);
+                    }
+                }
+            }
         }
 
         // Perf HUD bookkeeping (~1 s windows).
@@ -1241,6 +1296,7 @@ pub async fn run(cfg: DemoCfg) {
                     dbg_nan,
                 ));
             }
+            prof_want = true;
             perf_frames = 0;
             perf_steps = 0;
             perf_step_ms_acc = 0.0;

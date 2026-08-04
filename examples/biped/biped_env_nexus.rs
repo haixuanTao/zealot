@@ -3680,6 +3680,16 @@ impl BipedNexusBatchEnv {
         self.global_step += 1;
     }
 
+    /// [`Self::step_physics_only`] with per-pass GPU timestamps recorded into
+    /// `ts` — the `?prof=1` breakdown. One profiled step at a time: the
+    /// caller gates on `ts.is_idle()` and reads back non-blockingly.
+    pub fn step_physics_profiled(&mut self, ts: &mut khal::backend::GpuTimestamps) {
+        for _ in 0..self.task.decimation {
+            let _ = self.pipeline.step(&self.gpu, &mut self.state, Some(ts));
+        }
+        self.global_step += 1;
+    }
+
     /// One submit per SUBSTEP (each fully merged internally). The middle
     /// ground between `step_physics_only` (per-PHASE submits, ~10 crossings a
     /// control step) and `step_physics_encoded` (everything in one submit,
@@ -3970,9 +3980,25 @@ async fn make_backend() -> KhalGpuBackend {
             Err(_) => limits,
         }
     };
-    let mut bk = KhalGpuBackend::auto(wgpu::Features::default(), limits)
-        .await
-        .expect("init GPU backend");
+    // TIMESTAMP_QUERY when the adapter offers it: per-pass GPU timings for
+    // the `?prof=1` breakdown (Chrome exposes it; harmless where absent).
+    let feats = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut f = wgpu::Features::default();
+            f |= wgpu::Features::TIMESTAMP_QUERY;
+            f
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        wgpu::Features::default()
+    };
+    let mut bk = match KhalGpuBackend::auto(feats, limits.clone()).await {
+        Ok(bk) => bk,
+        // Adapter without timestamps: fall back rather than fail to start.
+        Err(_) => KhalGpuBackend::auto(wgpu::Features::default(), limits)
+            .await
+            .expect("init GPU backend"),
+    };
     // The WebGPU biped path needs buffer copy-src for state readbacks.
     if let KhalGpuBackend::WebGpu(w) = &mut bk {
         w.force_buffer_copy_src = true;
