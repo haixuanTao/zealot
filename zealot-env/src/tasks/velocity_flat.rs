@@ -1134,8 +1134,23 @@ impl VelocityFlatTask {
         // So while a step is cued and close, widen both kernels rather than
         // moving their targets: the target is still where we want the robot to
         // END UP, we are only declining to charge it for the transient.
+        //
+        // PROGRESS-GATED, and this is load-bearing. The first version relaxed
+        // on proximity alone, and the policy found the hack within 15k iters:
+        // standing inside the relax zone earns near-max posture reward in ANY
+        // pose, so it learned "cue valid -> stop". Measured on the step eval,
+        // same checkpoint, same 10 cm step: cue ON froze at x=0.16 m while cue
+        // OFF (blind) walked to 1.28 m -- the cue made behaviour WORSE, and
+        // the refusal strengthened with training while turning and gait
+        // atrophied alongside it (loitering generalises). Requiring real
+        // motion toward the edge means a loiterer faces the normal kernels and
+        // the zone pays nothing unless the manoeuvre is actually happening.
+        // Threshold 0.1 m/s matches the standing predicate's scale.
+        let toward_step =
+            v[FWD] * state.step_cue.edge_cos + v[LAT] * state.step_cue.edge_sin;
         let stepping = state.step_cue.valid > 0.5
-            && state.step_cue.distance.abs() < self.step_relax_dist;
+            && state.step_cue.distance.abs() < self.step_relax_dist
+            && toward_step > 0.1;
         let (std_h, std_up) = if stepping {
             (self.step_std_base_h, self.step_std_upright)
         } else {
@@ -1716,6 +1731,9 @@ mod tests {
         st.feet[0].air_time = 0.1;
         st.feet[0].height = 0.08;
         st.feet[1].contact = true;
+        // The adaptive bar inherits the progress gate: it only raises while
+        // actually moving toward the edge.
+        st.base.lin_vel_world = [0.4, 0.0, 0.0];
         let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
 
         let flat = task.reward(&st, &cmd).foot_clearance;
@@ -1757,14 +1775,32 @@ mod tests {
         let mut st = RobotState::default();
         st.base.height = 0.62;
 
+        // Moving toward the edge at 0.3 m/s (body +x, edge square-on).
+        st.base.lin_vel_world = [0.3, 0.0, 0.0];
         let no_cue = task.reward(&st, &cmd);
         let mut cued = st;
         cued.step_cue = StepCue { distance: 0.3, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
         let with_cue = task.reward(&cued, &cmd);
         assert!(
             with_cue.base_height > no_cue.base_height,
-            "relaxation did not fire while a step was cued and close ({} vs {})",
+            "relaxation did not fire while approaching a cued step ({} vs {})",
             with_cue.base_height, no_cue.base_height
+        );
+
+        // LOITERING in the zone (cued, close, but stationary) must get the
+        // NORMAL kernels -- this is the reward hack the first version allowed:
+        // the policy learned "cue valid -> stop" because standing in the relax
+        // zone out-paid walking (measured: cue ON froze at x=0.16 m where cue
+        // OFF walked to 1.28 m on the same checkpoint).
+        let mut loiter = cued;
+        loiter.base.lin_vel_world = [0.0, 0.0, 0.0];
+        let still = task.reward(&loiter, &cmd);
+        let mut still_no_cue = st;
+        still_no_cue.base.lin_vel_world = [0.0, 0.0, 0.0];
+        assert_eq!(
+            still.base_height,
+            task.reward(&still_no_cue, &cmd).base_height,
+            "relaxation fired for a stationary robot parked at the edge"
         );
 
         // Cue valid but FAR: no relaxation, so the robot is not given a licence
