@@ -1195,6 +1195,7 @@ impl BipedEnv {
             phase: 0.0,                           // CPU env doesn't use the gait clock
             // CPU env has no terrain, so the probe never reports a step.
             step_cue: Default::default(),
+            step_cue_clean: Default::default(),
         }
     }
 }

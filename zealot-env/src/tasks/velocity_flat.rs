@@ -61,7 +61,15 @@ pub const OBS_DIM: usize =
 pub const ACTION_DIM: usize = NUM_JOINTS;
 /// Privileged (critic) observation length: policy obs plus base linear & angular
 /// velocity in the body frame. Foot/contact privileged terms are deferred.
-pub const CRITIC_OBS_DIM: usize = OBS_DIM + 3 + 3;
+// `+ 5` is the CLEAN step cue: the critic always sees the true edge state,
+// un-noised and never dropped, even while the ACTOR's copy (slots 48..53 of
+// the policy obs) is heavily dropout-masked early in training. Asymmetric
+// actor-critic: the value function credits crossing correctly on steps the
+// actor could not see, so the gradient learns "crossing pays" from blind
+// practice -- the fix for the observed cue->caution trap, where a policy
+// that has not yet learned to climb treats the cue purely as a fall
+// predictor and stops.
+pub const CRITIC_OBS_DIM: usize = OBS_DIM + 3 + 3 + 5;
 
 /// Base (root link) physics state, as read back from nexus each control step.
 #[derive(Clone, Copy, Debug)]
@@ -203,8 +211,10 @@ pub struct RobotState {
     /// sparse touchdown bonus (air_time) could not, since a step's payoff never
     /// beat the fall risk (the shuffle stayed a stable local optimum).
     pub phase: f32,
-    /// Latest foot-probe report. Zeroed (`valid = 0`) when nothing is known.
+    /// Latest step-cue report AS THE ACTOR SEES IT (noised, dropout-masked).
     pub step_cue: StepCue,
+    /// The clean oracle cue, critic-only (asymmetric AC). Zero when unknown.
+    pub step_cue_clean: StepCue,
 }
 
 impl Default for RobotState {
@@ -218,6 +228,7 @@ impl Default for RobotState {
             feet: [FootObs::default(); NUM_FEET],
             phase: 0.0,
             step_cue: StepCue::default(),
+            step_cue_clean: StepCue::default(),
         }
     }
 }
@@ -1089,7 +1100,16 @@ impl VelocityFlatTask {
         let v = self.base_lin_vel_body(&state.base);
         let w = self.base_ang_vel_body(&state.base);
         obs[OBS_DIM..OBS_DIM + 3].copy_from_slice(&v);
-        obs[OBS_DIM + 3..CRITIC_OBS_DIM].copy_from_slice(&w);
+        obs[OBS_DIM + 3..OBS_DIM + 6].copy_from_slice(&w);
+        // Clean cue (see CRITIC_OBS_DIM): from step_cue_clean, which the env
+        // fills with the raw oracle BEFORE actor-side noise and dropout.
+        let cc = state.step_cue_clean;
+        let live = cc.valid > 0.5;
+        obs[OBS_DIM + 6] = if live { cc.distance.clamp(-0.5, 1.5) } else { 0.0 };
+        obs[OBS_DIM + 7] = if live { cc.height.clamp(-0.4, 0.4) } else { 0.0 };
+        obs[OBS_DIM + 8] = if live { cc.edge_sin } else { 0.0 };
+        obs[OBS_DIM + 9] = if live { cc.edge_cos } else { 0.0 };
+        obs[OBS_DIM + 10] = if live { 1.0 } else { 0.0 };
     }
 
     /// Compute the per-term reward for one control step.

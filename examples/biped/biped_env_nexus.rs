@@ -1307,6 +1307,9 @@ pub struct BipedNexusBatchEnv {
     /// (`BIPED_GAIT_SPEED_CAP`, default 0.5 = historical). Raise alongside
     /// BIPED_VX or higher commands all share one cadence.
     gait_speed_cap: f32,
+    /// Trainer-installed dropout override for the actor's step cue (annealed
+    /// exploration schedule). None = the BIPED_STEP_CUE_DROPOUT env default.
+    step_cue_dropout_override: Option<f32>,
     /// Consecutive control steps each joint has spent inside its position-limit
     /// band, per env (`env * NUM_JOINTS + joint`). Atomic so the parallel
     /// per-env step closure can update its own entries. Drives the
@@ -2054,6 +2057,7 @@ impl BipedNexusBatchEnv {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.5),
+            step_cue_dropout_override: None,
             limit_dwell,
             global_step: 0,
             dbg_stance: Vec::new(),
@@ -2182,6 +2186,12 @@ impl BipedNexusBatchEnv {
     #[allow(dead_code)]
     pub fn num_envs(&self) -> usize {
         self.n
+    }
+
+    /// Install the annealed actor-cue dropout for this iteration (see the
+    /// rollout's cue block). The critic's clean copy is unaffected.
+    pub fn set_step_cue_dropout(&mut self, p: f32) {
+        self.step_cue_dropout_override = Some(p.clamp(0.0, 1.0));
     }
 
     /// The shared GPU backend driving the physics. Exposed so a vortx GPU policy
@@ -2530,6 +2540,7 @@ impl BipedNexusBatchEnv {
                 phase: 0.0, // overwritten with self.gait_phase[env] by the caller
                 // Filled by the caller (needs the terrain + this env's pose).
                 step_cue: Default::default(),
+            step_cue_clean: Default::default(),
             },
             joint_pos,
         )
@@ -3175,8 +3186,15 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         // fires and occasionally does not fire at all; training on a clean
         // oracle would teach the policy to trust it, and the first dropout on
         // hardware becomes a fall rather than a refusal.
-        let step_cue_dropout: f32 = std::env::var("BIPED_STEP_CUE_DROPOUT")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(0.10);
+        // Base dropout from the env (deploy-level, default 0.10) unless the
+        // trainer has installed an annealed override (exploration schedule:
+        // hide the cue from the ACTOR early so it practices crossings blind,
+        // then hand the cue back as skill accrues; the critic sees the clean
+        // cue throughout, so the gradient credits crossings either way).
+        let step_cue_dropout: f32 = self.step_cue_dropout_override.unwrap_or_else(|| {
+            std::env::var("BIPED_STEP_CUE_DROPOUT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.10)
+        });
         let step_cue_dn: f32 = std::env::var("BIPED_STEP_CUE_DIST_NOISE")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(0.03);
         let step_cue_hn: f32 = std::env::var("BIPED_STEP_CUE_H_NOISE")
@@ -3207,6 +3225,7 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
                         };
                         let mut cue =
                             t.probe(e, state.base.pos_xy[0], state.base.pos_xy[1], yaw);
+                        state.step_cue_clean = cue; // critic-only, un-noised
                         if cue.valid > 0.5 {
                             let r = &mut self.rng[e].clone();
                             if r.range(0.0, 1.0) < step_cue_dropout {

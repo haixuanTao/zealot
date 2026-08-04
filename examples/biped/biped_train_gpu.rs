@@ -151,6 +151,10 @@ fn mirror_critic(c: &[f32]) -> Vec<f32> {
     m[OBS_FRAME + 1] = -c[OBS_FRAME + 1];
     m[OBS_FRAME + 3] = -c[OBS_FRAME + 3];
     m[OBS_FRAME + 5] = -c[OBS_FRAME + 5];
+    // Clean step cue (+5 tail): edge_sin negates, like the actor copy's.
+    if c.len() > OBS_FRAME + 8 {
+        m[OBS_FRAME + 8] = -c[OBS_FRAME + 8];
+    }
     m
 }
 const OBS_FRAME: usize = zealot_env::tasks::velocity_flat::OBS_DIM;
@@ -853,6 +857,22 @@ fn main() {
             env.set_command_scale(cscale);
             let tscale = ((it as f32 / iters as f32 - 0.4) / 0.5).clamp(0.0, 1.0) * torque_max;
             env.set_torque_scale(tscale);
+            // Annealed ACTOR cue dropout (asymmetric AC exploration schedule):
+            // start near-blind (0.9) so the policy practices crossing steps
+            // before it can learn to fear them -- measured trap: with the cue
+            // visible from iter 0, "cue -> stop" appears within ~1k iters
+            // because on step terrain the cue is a fall predictor, and a
+            // policy that stops never collects the crossing experience that
+            // would flip the value estimate. The CRITIC sees the clean cue
+            // throughout, so blind crossings are still credited correctly.
+            // Linear 0.9 -> 0.1 over the first 30% of the run, then the
+            // deploy-level 0.1 (matching BIPED_STEP_CUE_DROPOUT's default).
+            let cue_hi: f32 = std::env::var("BIPED_STEP_CUE_DROPOUT_INIT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.9);
+            let cue_lo: f32 = std::env::var("BIPED_STEP_CUE_DROPOUT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.10);
+            let cue_frac = (frac / 0.3).clamp(0.0, 1.0);
+            env.set_step_cue_dropout(cue_hi + (cue_lo - cue_hi) * cue_frac);
 
             // ---------------- ROLLOUT (GPU policy forward, host sample) ----------------
             let mut samp: Vec<Vec<Sample>> = (0..n).map(|_| Vec::with_capacity(T)).collect();
