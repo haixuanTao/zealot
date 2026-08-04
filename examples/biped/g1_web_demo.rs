@@ -650,32 +650,35 @@ async fn fetch_text(_url: &str) -> Result<String, String> {
 /// WebGPU-backed only (the browser demo, and native Metal/Vulkan through
 /// wgpu). On any other backend `poll` falls back to the blocking snapshot.
 struct PoseStream {
-    /// Persistent MAP_READ staging buffer — the map/unmap cycle is per frame,
-    /// so allocating one here keeps it out of the frame.
-    staging: Option<wgpu::Buffer>,
-    /// Set by the map callback when the copy is readable.
-    rx: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
-    /// Most recent poses; drawn again on frames where the map is still in
-    /// flight.
+    /// Staging-buffer ring. One copy is kicked EVERY frame (into any free
+    /// slot) and the newest landed one wins — with a single slot the next
+    /// copy could only start after the previous landed, which measured as
+    /// 84% of frames re-drawing a stale pose (the robot visibly animated at
+    /// ~4 Hz while the counter said 25 fps). Three slots cover the ~2-3
+    /// frames a map takes to come back through the browser.
+    slots: Vec<PoseSlot>,
+    /// Most recent poses; drawn again on frames where nothing landed.
     poses: Vec<NexusPose>,
     /// Frames the renderer reused stale poses (HUD diagnostic).
     stale_frames: u32,
-    /// Whether the poses changed this frame. Anything that differentiates
-    /// them (the measured-speed EMA) must skip the frames where they did not,
-    /// or it averages in a zero displacement that never happened.
+    /// Whether the poses changed this frame (see `fresh` uses below).
     fresh: bool,
-    /// Sim time the poses in hand were captured at, and the one the in-flight
-    /// copy will carry. Differentiating poses against WALL time is wrong here:
-    /// a snapshot is taken at the end of some earlier frame and read one or
-    /// more frames later, so wall time between two reads is not the sim time
-    /// between the two captures. Sim time is exact and frame-rate independent.
+    /// Sim time the poses in hand were captured at. Motion must be
+    /// differentiated in SIM time — wall time between reads is not the sim
+    /// time between captures.
     captured_at: f32,
-    pending_at: f32,
+}
+
+struct PoseSlot {
+    staging: wgpu::Buffer,
+    /// `Some` while a copy into this slot is in flight; carries the sim time
+    /// its snapshot was taken at.
+    rx: Option<(std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>, f32)>,
 }
 
 impl PoseStream {
     fn new(poses: Vec<NexusPose>) -> Self {
-        Self { staging: None, rx: None, poses, stale_frames: 0, fresh: true, captured_at: 0.0, pending_at: 0.0 }
+        Self { slots: Vec::new(), poses, stale_frames: 0, fresh: true, captured_at: 0.0 }
     }
 
     /// The wgpu handles, if this backend is WebGPU.
@@ -692,7 +695,7 @@ impl PoseStream {
         }
     }
 
-    /// Take a completed readback if one landed, then start the next one.
+    /// Harvest landed copies (newest wins) and kick this frame's copy.
     /// Returns `false` if this backend has no pipelined path.
     fn pump(
         &mut self,
@@ -705,69 +708,93 @@ impl PoseStream {
         };
         self.fresh = false;
         let bytes = src.size();
-        let staging = self.staging.get_or_insert_with(|| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("zealot_pose_readback"),
-                size: bytes,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        });
-
-        // Native backends only make map callbacks progress when the device is
-        // polled; in the browser the runtime drives them and this is a no-op.
-        khal::backend::Backend::poll(backend);
-
-        // Landed? Copy it out and free the buffer for the next request.
-        if let Some(rx) = &self.rx {
-            match rx.try_recv() {
-                Ok(Ok(())) => {
-                    {
-                        let view = staging.slice(..).get_mapped_range();
-                        let n = (view.len() / core::mem::size_of::<NexusPose>())
-                            .min(self.poses.len());
-                        // SAFETY: `Pose` is plain old data (khal reads it the
-                        // same way); the mapped range may be under-aligned for
-                        // it, so copy bytes rather than casting.
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                view.as_ptr(),
-                                self.poses.as_mut_ptr() as *mut u8,
-                                n * core::mem::size_of::<NexusPose>(),
-                            );
-                        }
-                    }
-                    staging.unmap();
-                    self.rx = None;
-                    self.stale_frames = 0;
-                    self.fresh = true;
-                    self.captured_at = self.pending_at;
-                }
-                // Map failed: drop the request and try again next frame.
-                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    staging.unmap();
-                    self.rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => self.stale_frames += 1,
-            }
+        while self.slots.len() < 3 {
+            self.slots.push(PoseSlot {
+                staging: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("zealot_pose_readback"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                rx: None,
+            });
         }
 
-        // Idle → queue the next copy behind this frame's physics and ask for
-        // the map. No await: the result is picked up on a later frame.
-        if self.rx.is_none() {
+        // Native backends only progress map callbacks when polled; in the
+        // browser the runtime drives them and this is a no-op.
+        khal::backend::Backend::poll(backend);
+
+        // Take every landed copy; keep only the newest snapshot's data.
+        let mut best: Option<usize> = None;
+        for i in 0..self.slots.len() {
+            let Some((rx, at)) = &self.slots[i].rx else { continue };
+            let at = *at;
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    match best {
+                        Some(b) if self.best_at(b) >= at => {
+                            // Older than what we already have: recycle unread.
+                            self.slots[i].staging.unmap();
+                            self.slots[i].rx = None;
+                        }
+                        _ => {
+                            if let Some(b) = best {
+                                self.slots[b].staging.unmap();
+                                self.slots[b].rx = None;
+                            }
+                            best = Some(i);
+                        }
+                    }
+                }
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.slots[i].staging.unmap();
+                    self.slots[i].rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(b) = best {
+            {
+                let view = self.slots[b].staging.slice(..).get_mapped_range();
+                let n = (view.len() / core::mem::size_of::<NexusPose>()).min(self.poses.len());
+                // SAFETY: `Pose` is plain old data; the mapped range may be
+                // under-aligned for it, so copy bytes rather than casting.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        view.as_ptr(),
+                        self.poses.as_mut_ptr() as *mut u8,
+                        n * core::mem::size_of::<NexusPose>(),
+                    );
+                }
+            }
+            self.captured_at = self.best_at(b);
+            self.slots[b].staging.unmap();
+            self.slots[b].rx = None;
+            self.fresh = true;
+            self.stale_frames = 0;
+        } else {
+            self.stale_frames += 1;
+        }
+
+        // Kick this frame's copy into any free slot. All slots busy means the
+        // GPU is several frames behind; adding more copies would not help.
+        if let Some(free) = (0..self.slots.len()).find(|&i| self.slots[i].rx.is_none()) {
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("zealot_pose_copy"),
             });
-            enc.copy_buffer_to_buffer(src, 0, staging, 0, bytes);
+            enc.copy_buffer_to_buffer(src, 0, &self.slots[free].staging, 0, bytes);
             queue.submit([enc.finish()]);
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            self.slots[free].staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
                 let _ = tx.try_send(r);
             });
-            self.rx = Some(rx);
-            self.pending_at = sim_time;
+            self.slots[free].rx = Some((rx, sim_time));
         }
         true
+    }
+
+    fn best_at(&self, i: usize) -> f32 {
+        self.slots[i].rx.as_ref().map_or(f32::MIN, |(_, at)| *at)
     }
 }
 
@@ -1057,6 +1084,19 @@ pub async fn run(cfg: DemoCfg) {
     // frees the CPU for more frames but the extra frames' GPU work comes out
     // of the physics budget) — 1 per-substep, 2 all-in-one.
     let phys_mode = probe_u32("phys=", 0);
+    // Pose readback mode. DEFAULT = per-frame BLOCKING snapshot: every
+    // rendered frame carries a fresh pose at regular sim intervals. The
+    // pipelined path (`?snap=0`) posts higher fps by never fencing — but the
+    // extra frames mostly RE-SHOW old poses (measured 52-84% stale, sim gaps
+    // of 240-450 ms between displayed poses vs ≤170 ms blocking, at equal
+    // sim speed), so the robot looks slower and choppier while the counters
+    // look better. The fence is also natural backpressure: the queue drains
+    // every frame, so input latency stays ~one frame by construction.
+    let snap_block = probe_u32("snap=", 1) == 1;
+    let (mut reg_frames, mut reg_stale) = (0u32, 0u32);
+    let mut reg_last_disp = -1.0f32;
+    let mut reg_max_gap = 0.0f32;
+    let (mut hud_stale_pct, mut hud_gap_ms) = (0.0f32, 0.0f32);
     // `?prof=1`: per-pass GPU timings. Once a second, ONE control step runs
     // with timestamp queries (dedicated passes per label — slightly slower,
     // so only that step), read back without blocking; the accumulated
@@ -1112,7 +1152,7 @@ pub async fn run(cfg: DemoCfg) {
 
         // Advance physics to wall-clock time, at most 4 control steps a
         // frame — and never more than 3 steps ahead of what the GPU has
-        // retired (see `GpuBackpressure`): past that, more submits only add
+        // retired (paced via the pose stream): past that, more submits only add
         // latency the browser answers with tab-level throttling.
         let wall = t0.elapsed().as_secs_f32();
         let mut steps_this_frame = 0;
@@ -1279,13 +1319,15 @@ pub async fn run(cfg: DemoCfg) {
                     khal::backend::webgpu::perf_counters::take();
                 let cps = |v: u32| (v as f32 / win).round();
                 doc.set_title(&format!(
-                    "z| falls={} sole={:+.3} spd={:.2} cmd={:.2} rt={:.0}% fps={:.0} gpu[sub={} pass={} cp={} wr={} map={}] |in|={:.4} |act|={:.4} nan={}",
+                    "z| falls={} sole={:+.3} spd={:.2} cmd={:.2} rt={:.0}% fps={:.0} stale={:.0}% gap={:.0}ms gpu[sub={} pass={} cp={} wr={} map={}] |in|={:.4} |act|={:.4} nan={}",
                     falls,
                     hud_sole,
                     meas_speed,
                     cmd_ui[0],
                     hud_realtime * 100.0,
                     hud_fps,
+                    hud_stale_pct,
+                    hud_gap_ms,
                     cps(c_sub),
                     cps(c_pass),
                     cps(c_copy),
@@ -1296,6 +1338,11 @@ pub async fn run(cfg: DemoCfg) {
                     dbg_nan,
                 ));
             }
+            hud_stale_pct = 100.0 * reg_stale as f32 / reg_frames.max(1) as f32;
+            hud_gap_ms = reg_max_gap * 1e3;
+            reg_frames = 0;
+            reg_stale = 0;
+            reg_max_gap = 0.0;
             prof_want = true;
             perf_frames = 0;
             perf_steps = 0;
@@ -1311,13 +1358,25 @@ pub async fn run(cfg: DemoCfg) {
         // the copy started last frame and starts the next one, never waiting
         // on the GPU — see `PoseStream`.
         let snap_t0 = Instant::now();
-        if !pose_stream.pump(&backend, env.body_poses_buffer(), sim_time) {
+        if snap_block || !pose_stream.pump(&backend, env.body_poses_buffer(), sim_time) {
             pose_stream.poses = env.snapshot().await;
             pose_stream.fresh = true;
             pose_stream.captured_at = sim_time;
         }
         let poses_fresh = pose_stream.fresh;
         let poses_at = pose_stream.captured_at;
+        // Motion regularity: how often the screen re-shows an old pose, and
+        // the worst sim-time jump between consecutive displayed poses. fps/RT
+        // averages hide judder; these two numbers are the judder.
+        reg_frames += 1;
+        if poses_fresh {
+            if reg_last_disp >= 0.0 {
+                reg_max_gap = reg_max_gap.max(poses_at - reg_last_disp);
+            }
+            reg_last_disp = poses_at;
+        } else {
+            reg_stale += 1;
+        }
         let poses = &pose_stream.poses;
         perf_snap_ms_acc += snap_t0.elapsed().as_secs_f32() * 1e3;
         let cpb = poses.len() / n_robots;
