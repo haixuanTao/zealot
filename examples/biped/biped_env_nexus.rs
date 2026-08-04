@@ -1766,11 +1766,16 @@ impl BipedNexusBatchEnv {
                 .collect();
             let (sv, st) = TerrainStrip::flat_stub_mesh();
             let stub = mk_shape(sv, st);
+            let step_in_rotation = std::env::var("BIPED_TERRAIN_STEP")
+                .map(|v| v != "0")
+                .unwrap_or(true);
             println!(
-                "terrain curriculum ENABLED: 4 family strips ({} rows x {} m patches), built in {:.1}s",
+                "terrain curriculum ENABLED: {} family strips ({} rows x {} m patches), built in {:.1}s{}",
+                if step_in_rotation { 4 } else { 3 },
                 zealot_env::terrain::ROWS,
                 zealot_env::terrain::PATCH,
-                t0.elapsed().as_secs_f64()
+                t0.elapsed().as_secs_f64(),
+                if step_in_rotation { "" } else { " [Step parked: BIPED_TERRAIN_STEP=0]" }
             );
             Some((strips, shapes, stub))
         } else {

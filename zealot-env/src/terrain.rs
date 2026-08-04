@@ -130,11 +130,28 @@ impl TerrainFamily {
                 other => panic!("unknown BIPED_TERRAIN_FAMILY '{other}'"),
             };
         }
-        match env_id % 4 {
-            0 => TerrainFamily::Boxes,
-            1 => TerrainFamily::Rough,
-            2 => TerrainFamily::Wave,
-            _ => TerrainFamily::Step,
+        // BIPED_TERRAIN_STEP=0 drops the Step family from the rotation
+        // (envs cycle the three noise families instead). The Step strip's
+        // box-cell TRIMESH is what moved training from ~1.6 to ~2.4-3.0
+        // s/iter (gpuwait 62.5 ms/control step vs the heightfield-era cost):
+        // parking the step skill buys the iteration rate back without
+        // touching the obs contract (the 53-wide cue frame stays, zeroed).
+        let step_on = std::env::var("BIPED_TERRAIN_STEP")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if step_on {
+            match env_id % 4 {
+                0 => TerrainFamily::Boxes,
+                1 => TerrainFamily::Rough,
+                2 => TerrainFamily::Wave,
+                _ => TerrainFamily::Step,
+            }
+        } else {
+            match env_id % 3 {
+                0 => TerrainFamily::Boxes,
+                1 => TerrainFamily::Rough,
+                _ => TerrainFamily::Wave,
+            }
         }
     }
 
