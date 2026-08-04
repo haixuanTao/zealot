@@ -514,6 +514,25 @@ pub struct LinkIndices {
     /// is `θ = 2·atan2(rel.z, rel.w)` where
     /// `rel = rest_quat⁻¹ · q_parent⁻¹ · q_child`.
     pub actuated_rest_quat: [Rotation; NUM_JOINTS],
+
+    /// PD-held non-action joints (G1 waist + arms), in MJCF insertion order —
+    /// the upper-body staging targets for the AMASS arm-motion disturbance
+    /// (BIPED_ARM_MOTION). Empty when the model has none or BIPED_LOCK_HELD
+    /// welded them (no motor to stage).
+    pub held: Vec<HeldJoint>,
+}
+
+/// One PD-held (non-action) joint: enough to restage its motor target.
+#[derive(Clone, Debug)]
+pub struct HeldJoint {
+    pub link: u32,
+    pub name: String,
+    /// The build-time hold target (`held_home` or 0) the joint returns to
+    /// when no clip is playing.
+    pub home: f32,
+    /// MJCF joint range — clip poses are clamped into it (retargeted mocap
+    /// can exceed the robot's mechanical range).
+    pub range: (f32, f32),
 }
 
 /// Build one env's rapier scene + sim params with the given DR sample.
@@ -758,6 +777,10 @@ fn build_env_scene(
     let joint_limits_on = std::env::var("BIPED_JOINT_LIMITS")
         .map(|v| v != "0")
         .unwrap_or(true);
+    // Held (non-action) joints collected as they're built, for the AMASS
+    // upper-body playback (BIPED_ARM_MOTION). Skipped under BIPED_LOCK_HELD
+    // (welded joints carry no motor to restage).
+    let mut held_joints: Vec<HeldJoint> = Vec::new();
     for (i, b) in mjcf.iter().enumerate() {
         let (Some(parent), Some(jname)) = (b.parent, b.joint.as_ref()) else {
             continue;
@@ -922,6 +945,14 @@ fn build_env_scene(
         if joint_limits_on {
             let (lo, hi) = b.joint_range.unwrap_or(pos_limit);
             joint.set_limits(JointAxis::AngZ, [lo, hi]);
+        }
+        if spec.is_none() && !lock_held {
+            held_joints.push(HeldJoint {
+                link: next_mb_link,
+                name: jname.clone(),
+                home: hold_target,
+                range: b.joint_range.unwrap_or(pos_limit),
+            });
         }
         multibody.insert(handles[parent], handles[i], joint, true);
         mb_link_of_mjcf.insert(i, next_mb_link);
@@ -1100,6 +1131,7 @@ fn build_env_scene(
         mjcf_to_link,
         actuated_parent_links,
         actuated_rest_quat,
+        held: held_joints,
     };
 
     let _ = torso_handle;
@@ -1250,6 +1282,18 @@ const GAIT_PERIOD_FAST: f32 = 0.55;
 /// 0.14 m step the 0.5 m/s command already uses.
 const GAIT_PERIOD_MIN: f32 = 0.40;
 
+/// AMASS/SONIC upper-body playback config (see the `arm_motion` field).
+struct ArmMotionCfg {
+    clips: Vec<zealot_env::motion::MotionClip>,
+    /// P(a standing command plays a clip) — BIPED_ARM_MOTION_P, default 0.7:
+    /// most stands get moving arms, but quiet stands stay in the curriculum.
+    p: f32,
+    /// Amplitude blend home→clip — BIPED_ARM_MOTION_SCALE, default 1.0.
+    /// <1 attenuates the retargeted motion toward `held_home` (curriculum
+    /// knob if full-amplitude dance clips topple everything early on).
+    scale: f32,
+}
+
 pub struct BipedNexusBatchEnv {
     // Topology + indexing
     mjcf: Vec<MjBody>,
@@ -1326,6 +1370,28 @@ pub struct BipedNexusBatchEnv {
     /// Trainer-installed dropout override for the actor's step cue (annealed
     /// exploration schedule). None = the BIPED_STEP_CUE_DROPOUT env default.
     step_cue_dropout_override: Option<f32>,
+    /// AMASS/SONIC upper-body playback (BIPED_ARM_MOTION=<clip dir>): while
+    /// the command is "stand", the held waist+arm joints replay a random clip
+    /// window as an unobserved moving-mass disturbance, and the legs must
+    /// balance under it. None = off (bit-identical staging to before).
+    arm_motion: Option<ArmMotionCfg>,
+    /// Dedicated RNG stream (clip choice / start offset / activation roll) so
+    /// enabling playback leaves the command/DR stream untouched.
+    arm_rng: Vec<Lcg>,
+    /// Per-env clip index / playback position (s) / active flag.
+    arm_clip: Vec<u32>,
+    arm_time: Vec<f32>,
+    arm_active: Vec<bool>,
+    /// Home→clip blend, ramped over ~0.5 s on (de)activation so the held
+    /// PD targets never see a step input.
+    arm_blend: Vec<f32>,
+    /// Scratch: one sampled pose (idx.held.len() radians).
+    arm_scratch: Vec<f32>,
+    /// Last staged held-joint targets (`env * held.len() + j`) — mirrored into
+    /// the motor-delay state's held-link slots so the GPU delay kernel swaps
+    /// prev==current (identity) for held links instead of a zero from the
+    /// buffer default.
+    arm_staged: Vec<f32>,
     /// Consecutive control steps each joint has spent inside its position-limit
     /// band, per env (`env * NUM_JOINTS + joint`). Atomic so the parallel
     /// per-env step closure can update its own entries. Drives the
@@ -2020,6 +2086,46 @@ impl BipedNexusBatchEnv {
         } else {
             vec![0; num_envs]
         };
+        // AMASS/SONIC upper-body playback (BIPED_ARM_MOTION=<dir of SONIC
+        // csv clips>). Loaded against the model's held joints BY NAME, so a
+        // clip column set that doesn't cover them fails here, not silently.
+        let arm_motion = std::env::var("BIPED_ARM_MOTION").ok().map(|dir| {
+            assert!(
+                !idx.held.is_empty(),
+                "BIPED_ARM_MOTION needs PD-held joints (unset BIPED_LOCK_HELD, use a 29dof model)"
+            );
+            let fps: f32 = std::env::var("BIPED_ARM_MOTION_FPS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30.0);
+            let names: Vec<String> = idx.held.iter().map(|h| h.name.clone()).collect();
+            let clips = zealot_env::motion::MotionClip::load_dir(
+                std::path::Path::new(&dir),
+                &names,
+                fps,
+            )
+            .expect("BIPED_ARM_MOTION");
+            let p: f32 = std::env::var("BIPED_ARM_MOTION_P")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.7);
+            let scale: f32 = std::env::var("BIPED_ARM_MOTION_SCALE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0);
+            let total_s: f32 = clips.iter().map(|c| c.duration()).sum();
+            println!(
+                "arm-motion playback ENABLED: {} clips ({:.0} s total) driving {} held joints, p={p}, scale={scale}, fps={fps}",
+                clips.len(),
+                total_s,
+                idx.held.len()
+            );
+            ArmMotionCfg { clips, p, scale }
+        });
+        let arm_rng: Vec<Lcg> = (0..num_envs)
+            .map(|e| Lcg::new(seed ^ ((e as u64).wrapping_mul(2654435761)) ^ 0xA53A))
+            .collect();
+        let n_held = idx.held.len();
         let sampler = CommandSampler::default();
         let sampler_default = CommandSampler::default();
 
@@ -2031,6 +2137,14 @@ impl BipedNexusBatchEnv {
             n: num_envs,
             rng,
             sampler,
+            arm_motion,
+            arm_rng,
+            arm_clip: vec![0; num_envs],
+            arm_time: vec![0.0; num_envs],
+            arm_active: vec![false; num_envs],
+            arm_blend: vec![0.0; num_envs],
+            arm_scratch: vec![0.0; n_held],
+            arm_staged: vec![0.0; n_held * num_envs],
             cmd,
             step_count,
             resample_at,
@@ -2120,6 +2234,7 @@ impl BipedNexusBatchEnv {
             env.resample_at[e] = env
                 .sampler
                 .resample_steps(&mut env.rng[e], env.task.control_dt());
+            env.arm_resample(e);
         }
         // BIPED_TERRAIN: teleport every env onto its initial-level patch (the
         // as-built state stands on flat ground at the origin). Uses the same
@@ -2773,8 +2888,85 @@ impl BipedNexusBatchEnv {
         }
     }
 
+    /// Roll the upper-body playback state for env `e` against its CURRENT
+    /// command. Called wherever the command (re)samples: playback only runs
+    /// while standing (`speed() < 0.1` — the same gate as the gait clock and
+    /// stand height), so a walk command always blends the arms back home.
+    fn arm_resample(&mut self, e: usize) {
+        let Some(am) = self.arm_motion.as_ref() else { return };
+        let (n_clips, p) = (am.clips.len(), am.p);
+        let standing = self.cmd[e].speed() < 0.1;
+        if standing && self.arm_rng[e].chance(p) {
+            let c = ((self.arm_rng[e].unit() * n_clips as f32) as usize).min(n_clips - 1);
+            // Random start with runway: uniformly inside the clip minus the
+            // longest plausible stand dwell (a finished clip freezes on its
+            // last frame — legal, just less motion than intended).
+            let dur = self.arm_motion.as_ref().unwrap().clips[c].duration();
+            let t0 = self.arm_rng[e].range(0.0, (dur - 8.0).max(0.0));
+            self.arm_clip[e] = c as u32;
+            self.arm_time[e] = t0;
+            self.arm_active[e] = true;
+        } else {
+            self.arm_active[e] = false; // blends back toward held_home
+        }
+    }
+
+    /// Kill playback INSTANTLY (no blend-out): episode resets respawn the
+    /// held joints at the home pose, so a lingering blend would drag the
+    /// fresh episode's arms through a stale clip pose.
+    fn arm_reset(&mut self, e: usize) {
+        self.arm_active[e] = false;
+        self.arm_blend[e] = 0.0;
+    }
+
+    /// Advance every env's playback one control step and restage the held
+    /// joints' PD targets in the `links_static` mirror (uploaded by the same
+    /// `flush_links_static` that carries the leg targets). No-op when
+    /// BIPED_ARM_MOTION is unset — staging stays bit-identical to before.
+    fn stage_arm_motion(&mut self) {
+        let dt = self.task.control_dt();
+        let Some(am) = &self.arm_motion else { return };
+        let n_held = self.idx.held.len();
+        let mbs = self.state.multibodies_mut();
+        for e in 0..self.n {
+            // Blend ramps over ~0.5 s so (de)activation is never a step
+            // input to the held PDs (their gains are soft; a 1-rad step
+            // would whip the arm and kick the pelvis).
+            let target = if self.arm_active[e] { 1.0 } else { 0.0 };
+            let db = dt / 0.5;
+            let b = self.arm_blend[e];
+            let b = (b + (target - b).clamp(-db, db)).clamp(0.0, 1.0);
+            self.arm_blend[e] = b;
+            if self.arm_active[e] {
+                self.arm_time[e] += dt;
+            }
+            if b <= 0.0 {
+                for (j, h) in self.idx.held.iter().enumerate() {
+                    mbs.stage_motor_position(e as u32, h.link, JointAxis::AngZ, h.home);
+                    self.arm_staged[e * n_held + j] = h.home;
+                }
+                continue;
+            }
+            let clip = &am.clips[self.arm_clip[e] as usize];
+            clip.sample(self.arm_time[e], &mut self.arm_scratch);
+            for (j, h) in self.idx.held.iter().enumerate() {
+                // Blend home→clip, clamp into the joint's mechanical range
+                // (retargeted mocap can exceed it).
+                let q = h.home + b * am.scale * (self.arm_scratch[j] - h.home);
+                let q = q.clamp(h.range.0, h.range.1);
+                mbs.stage_motor_position(e as u32, h.link, JointAxis::AngZ, q);
+                self.arm_staged[e * n_held + j] = q;
+            }
+        }
+    }
+
     pub async fn step(&mut self, actions: &[[f32; NUM_JOINTS]]) -> Vec<StepOut> {
         assert_eq!(actions.len(), self.n);
+
+        // (0) Upper-body playback: restage the held-joint targets FIRST, so
+        // both staging branches below flush them together with the leg
+        // targets in the one links_static upload.
+        self.stage_arm_motion();
 
         // (1) Stage every env's motor targets host-side in the mirror, then
         // push the whole `links_static` buffer in ONE write_buffer call.
@@ -2840,6 +3032,17 @@ impl BipedNexusBatchEnv {
                 for j in 0..NUM_JOINTS {
                     let link = self.idx.actuated[j].0 as usize;
                     self.delay_state_buf[base + 2 + link] = self.delay_prev_targets[e][j];
+                }
+                // Held links: mirror the just-staged playback target into the
+                // prev slot (prev == current → the delay swap is an identity
+                // for the upper body; the buffer default of 0.0 would dip the
+                // elbows toward q=0 for the first k substeps of every step).
+                if self.arm_motion.is_some() {
+                    let n_held = self.idx.held.len();
+                    for (j, h) in self.idx.held.iter().enumerate() {
+                        self.delay_state_buf[base + 2 + h.link as usize] =
+                            self.arm_staged[e * n_held + j];
+                    }
                 }
             }
             let buf = std::mem::take(&mut self.delay_state_buf);
@@ -3014,6 +3217,7 @@ impl BipedNexusBatchEnv {
                     + self
                         .sampler
                         .resample_steps(&mut self.rng[e], self.task.control_dt());
+                self.arm_resample(e);
             }
         }
         self.timings.serial_pre_ns += t.elapsed().as_nanos() as u64;
@@ -3736,6 +3940,8 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
 
         // Reset host state.
         self.cmd[env] = eval_cmd_override().unwrap_or_else(|| self.sampler.sample(&mut self.rng[env]));
+        self.arm_reset(env); // respawn holds home — kill playback instantly
+        self.arm_resample(env); // then re-roll against the fresh command
         self.step_count[env] = 0;
         self.resample_at[env] = self
             .sampler
@@ -3887,6 +4093,20 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         }
         self.foot_sole_local[e] = self.idx.foot_sole_local;
         self.cmd[e] = VelocityCommand::default();
+        self.arm_reset(e); // eval reset: deterministic home arms, no playback
+        // BIPED_EVAL_ARM_CLIP=<idx>: pin clip <idx> from t=0 for THIS eval
+        // rollout (deterministic — no RNG), so renders/evals can show the
+        // upper-body playback that the training-side arm_reset suppresses.
+        if let Some(am) = &self.arm_motion {
+            if let Some(c) = std::env::var("BIPED_EVAL_ARM_CLIP")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                self.arm_clip[e] = c % am.clips.len() as u32;
+                self.arm_time[e] = 0.0;
+                self.arm_active[e] = true;
+            }
+        }
         self.step_count[e] = 0;
         // Pin the resample so the command stays where the caller pins it.
         self.resample_at[e] = u32::MAX;

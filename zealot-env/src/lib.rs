@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod math;
+pub mod motion;
 pub mod obs_history;
 pub mod rng;
 pub mod robots;
