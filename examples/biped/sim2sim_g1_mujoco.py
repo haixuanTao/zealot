@@ -60,6 +60,24 @@ def _model_xml() -> str:
 
 MODEL_XML = _model_xml()
 
+# Step-scene height: the box geometry must MATCH the cue, or the eval measures
+# a policy responding to a lie. (It did: S2S_STEP_H initially only fed the cue
+# while the XML kept a hardcoded 0.10 m riser, so a 5/10/15 cm "sweep" was one
+# 10 cm step three times.) Rewrite the geom to the requested height in a
+# tempfile whenever S2S_STEP_H is set on a step scene.
+if "S2S_STEP_H" in os.environ and "step_scene" in MODEL_XML:
+    import re as _re, tempfile as _tf
+    _h = float(os.environ["S2S_STEP_H"])
+    _src = open(MODEL_XML).read()
+    _src = _re.sub(
+        r'(<geom name="step"[^>]*?pos="[-0-9.]+ [-0-9.]+ )[-0-9.]+(" size="[-0-9.]+ [-0-9.]+ )[-0-9.]+(")',
+        lambda m: f"{m.group(1)}{_h/2:.4f}{m.group(2)}{_h/2:.4f}{m.group(3)}",
+        _src, count=1)
+    _fd, _tmp = _tf.mkstemp(suffix=".xml", dir=os.path.dirname(MODEL_XML))
+    with os.fdopen(_fd, "w") as _f:
+        _f.write(_src)
+    MODEL_XML = _tmp
+
 PHYS_DT = 1.0 / 200.0
 DECIMATION = 4
 CONTROL_DT = PHYS_DT * DECIMATION
@@ -155,6 +173,14 @@ ACTION_SCALE = float(os.environ.get("S2S_ACTION_SCALE", "0.5"))
 # Set S2S_HELD_POSE=rest to evaluate a checkpoint under the geometry it was
 # actually trained with.
 HELD_POSE = os.environ.get("S2S_HELD_POSE", "home")
+
+# Step-crossing eval (g1_step_scene.xml): the scene has ONE box step whose
+# front edge crosses the path at S2S_STEP_EDGE_X with height S2S_STEP_H.
+# When set, the harness computes the 5-slot step cue from this KNOWN geometry
+# -- the same numbers the RealSense detector will produce -- so the eval
+# isolates step EXECUTION from perception. Metrics gain crossed/cross_time.
+STEP_EDGE_X = float(os.environ["S2S_STEP_EDGE_X"]) if "S2S_STEP_EDGE_X" in os.environ else None
+STEP_H = float(os.environ.get("S2S_STEP_H", "0.10"))
 
 
 
@@ -379,13 +405,43 @@ def main():
             o[45:48] = data.qvel[free_d + 3:free_d + 6]
 
         if frame >= 53:
-            # Step cue (48..53): distance, height, edge sin/cos, valid.
-            # These scenes are FLAT -- there is no step -- so the cue is
-            # reported invalid, which zeroes the whole block. That is the
-            # same pattern the trainer emits when nothing is detected, so a
-            # 53-wide policy runs here exactly as it would with the
-            # RealSense seeing open floor.
-            o[48:53] = 0.0
+            if STEP_EDGE_X is None:
+                # Flat scene, no step: cue invalid, whole block zero -- the
+                # same pattern the trainer emits when nothing is detected.
+                o[48:53] = 0.0
+            else:
+                # Known step geometry: edge plane x = STEP_EDGE_X, normal +x
+                # (world). Distance along the HEADING to the plane; height
+                # signed by which side we are on; edge normal rotated into
+                # the body frame. Matches the trainer oracle's conventions.
+                px = data.qpos[free_q]
+                on_top = px > STEP_EDGE_X
+                dist_plane = STEP_EDGE_X - px
+                _w, _x, _y, _z = quat  # MuJoCo order: w x y z
+                hy = 2.0 * (_w * _z + _x * _y)
+                hx = 1.0 - 2.0 * (_y * _y + _z * _z)
+                byaw = np.arctan2(hy, hx)
+                c, sn = np.cos(byaw), np.sin(byaw)
+                # distance along heading (ray to plane); if walking away or
+                # parallel, report invalid like the trainer's ranged probe.
+                denom = c if abs(c) > 1e-3 else None
+                d_head = dist_plane / denom if denom else None
+                if d_head is not None and 0.0 < d_head < 1.5 and not on_top:
+                    o[48] = min(d_head, 1.5)
+                    o[49] = STEP_H
+                    # edge normal +x world -> body frame
+                    o[50] = -sn      # edge_sin
+                    o[51] = c        # edge_cos
+                    o[52] = 1.0
+                elif d_head is not None and on_top and 0.0 < -d_head < 1.5 and c < 0.0:
+                    # facing back off the platform: step DOWN
+                    o[48] = min(-d_head, 1.5)
+                    o[49] = -STEP_H
+                    o[50] = sn
+                    o[51] = -c
+                    o[52] = 1.0
+                else:
+                    o[48:53] = 0.0
         if frames_hist is None:
             frames_hist = [o.copy() for _ in range(HIST)]  # reset-replicate
         else:
@@ -491,6 +547,8 @@ def main():
                 "mean_body_vel": [float(v) for v in vt.mean(axis=0)],
                 "settled_pitch_deg": float(np.mean(pitch_track[len(pitch_track)//2:])) if pitch_track else 0.0,
                 "episodes": eps,
+            "crossed": (float(data.qpos[free_q]) > (STEP_EDGE_X + 0.3)) if STEP_EDGE_X is not None else None,
+            "final_x": float(data.qpos[free_q]),
             }, f, indent=1)
     if survived:
         ts = [s for s, _, _ in survived]
