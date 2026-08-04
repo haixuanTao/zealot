@@ -1544,9 +1544,11 @@ pub async fn run(cfg: DemoCfg) {
                         ui.label(format!("falls: {falls}"));
                         ui.label(format!("sole bottom z (physics): {sole_bottom:+.4}"));
                         ui.label(format!(
-                            "render: {hud_fps:.0} fps   ctrl-step encode (obs+policy+physics): {hud_step_ms:.1} ms"
+                            "{hud_fps:.0} sim frames/s — every frame waits for its physics"
                         ));
-                        ui.label(format!("pose snapshot: {hud_snap_ms:.1} ms/frame"));
+                        ui.label(format!(
+                            "ctrl-step encode: {hud_step_ms:.1} ms   pose fence: {hud_snap_ms:.1} ms/frame"
+                        ));
                         ui.label(format!(
                             "sim speed: {:.0}% of real time ({} robots)",
                             hud_realtime * 100.0,
