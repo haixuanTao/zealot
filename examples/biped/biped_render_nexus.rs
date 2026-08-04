@@ -504,6 +504,23 @@ fn main() {
             })
             .collect();
         let _ = write!(s, "  \"actions\": [{}],\n", act_json.join(","));
+        // Terrain patch around the trajectory, so the offline renderer can
+        // draw the ground (the step riser is otherwise invisible and the
+        // robot appears to levitate as it climbs).
+        {
+            let n = bases.len().max(1);
+            let (mcx, mcy) = (
+                bases.iter().map(|b| b[0]).sum::<f32>() / n as f32,
+                bases.iter().map(|b| b[1]).sum::<f32>() / n as f32,
+            );
+            let (half, hs, hf) = env.terrain_patch_for(0, mcx, mcy, 6.0, 0.15);
+            let vals: Vec<String> = hf.iter().map(|h| format!("{:.3}", h)).collect();
+            let _ = write!(
+                s,
+                "  \"terrain\": {{\"cx\": {:.3}, \"cy\": {:.3}, \"half\": {:.3}, \"hs\": {:.3}, \"heights\": [{}]}},\n",
+                mcx, mcy, half, hs, vals.join(",")
+            );
+        }
         s.push_str("  \"frames\": [\n");
         for (fi, frame) in frames.iter().enumerate() {
             let pts: Vec<String> = frame

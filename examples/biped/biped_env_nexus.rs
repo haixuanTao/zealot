@@ -2188,6 +2188,26 @@ impl BipedNexusBatchEnv {
         self.n
     }
 
+    /// Sample the terrain height field around `(cx, cy)` on a regular grid,
+    /// for the offline renderer to draw the ground the robot actually walked
+    /// on. Returns (half_extent, spacing, row-major heights). Zeros if terrain
+    /// is off.
+    pub fn terrain_patch_for(&self, e: usize, cx: f32, cy: f32, half: f32, hs: f32) -> (f32, f32, Vec<f32>) {
+        let n = (2.0 * half / hs).round() as usize + 1;
+        let mut out = vec![0.0f32; n * n];
+        if let Some(t) = self.terrain.as_ref() {
+            let strip = t.strip_for(e);
+            for j in 0..n {
+                for i in 0..n {
+                    let x = cx - half + i as f32 * hs;
+                    let y = cy - half + j as f32 * hs;
+                    out[j * n + i] = strip.height(x, y);
+                }
+            }
+        }
+        (half, hs, out)
+    }
+
     /// Install the annealed actor-cue dropout for this iteration (see the
     /// rollout's cue block). The critic's clean copy is unaffected.
     pub fn set_step_cue_dropout(&mut self, p: f32) {
@@ -3834,8 +3854,21 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
     /// per-env DR sample the env was originally seeded with.
     pub async fn reset_env_to_default_template(&mut self, e: usize) -> (Vec<f32>, Vec<f32>) {
         assert!(!self.template_snapshots.is_empty());
-        self.state
-            .reset_env_from_snapshot(&self.gpu, e as u32, &self.template_snapshots[0]);
+        // TERRAIN-AWARE. The snapshot is the as-built pose at the ORIGIN, and
+        // the terrain strip starts 8 m away at x = STRIP_X0, so a plain
+        // snapshot reset silently undoes the on-terrain teleport that `new()`
+        // performed -- the rollout then walks on flat ground while every log
+        // line still says "terrain ENABLED". That produced an eval where the
+        // step-cue A/B returned byte-identical numbers for cue on and cue off
+        // because the robot never met a step at all.
+        if self.terrain.is_some() {
+            let off = self.terrain_spawn_offset(e, 0);
+            self.state
+                .reset_env_from_snapshot_offset(&self.gpu, e as u32, &self.template_snapshots[0], off);
+        } else {
+            self.state
+                .reset_env_from_snapshot(&self.gpu, e as u32, &self.template_snapshots[0]);
+        }
         self.foot_sole_local[e] = self.idx.foot_sole_local;
         self.cmd[e] = VelocityCommand::default();
         self.step_count[e] = 0;
