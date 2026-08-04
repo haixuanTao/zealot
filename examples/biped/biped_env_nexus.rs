@@ -3666,6 +3666,37 @@ impl BipedNexusBatchEnv {
         self.global_step += 1;
     }
 
+    /// [`Self::step_physics_only`], recorded into a caller-owned encoder and
+    /// not submitted: the resident demo folds all `decimation` substeps AND
+    /// the obs/policy/scatter work into ONE queue submission. Each submit is
+    /// a wasm→browser crossing (~1 ms of main-thread time in Chrome); at 50
+    /// control steps × ~10 submits/step they were the demo's frame budget.
+    pub fn step_physics_encoded(&mut self, enc: &mut <KhalGpuBackend as khal::backend::Backend>::Encoder) {
+        for _ in 0..self.task.decimation {
+            let _ = self
+                .pipeline
+                .step_encoded(&self.gpu, &mut self.state, None, enc);
+        }
+        self.global_step += 1;
+    }
+
+    /// One submit per SUBSTEP (each fully merged internally). The middle
+    /// ground between `step_physics_only` (per-PHASE submits, ~10 crossings a
+    /// control step) and `step_physics_encoded` (everything in one submit,
+    /// which frees the CPU but stalls the GPU for the whole encode — measured
+    /// as higher fps and LOWER sim throughput). Substep-granular submission
+    /// keeps the GPU chewing substep k while the CPU encodes k+1.
+    pub fn step_physics_substep_submits(&mut self) {
+        for _ in 0..self.task.decimation {
+            let mut enc = self.gpu.begin_encoding();
+            let _ = self
+                .pipeline
+                .step_encoded(&self.gpu, &mut self.state, None, &mut enc);
+            let _ = self.gpu.submit(enc);
+        }
+        self.global_step += 1;
+    }
+
     pub fn base_pose_for(&self, e: usize, poses: &[NexusPose]) -> ([f32; 3], [f32; 4]) {
         let cpb = self.idx.colliders_per_batch as usize;
         let pose = &poses[e * cpb + self.idx.torso_link as usize];

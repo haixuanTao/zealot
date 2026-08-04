@@ -1052,6 +1052,17 @@ pub async fn run(cfg: DemoCfg) {
 
     // `?diag=1` turns on the per-second policy I/O readbacks (see below).
     let diag = probe_u32("diag=", 0) == 1;
+    // Physics submit granularity (`?phys=`): 0 per-phase — the DEFAULT, it
+    // measured best for sim throughput (n=3: 83% RT vs 66% merged; merging
+    // frees the CPU for more frames but the extra frames' GPU work comes out
+    // of the physics budget) — 1 per-substep, 2 all-in-one.
+    let phys_mode = probe_u32("phys=", 0);
+    // `?fused=1`: force nexus's fused colored-sweep kernels (one dispatch per
+    // sweep instead of one per colour) — A/B for dispatch-latency-bound GPUs.
+    if probe_u32("fused=", 0) == 1 {
+        nexus3d::rbd::pipeline::FORCE_FUSED_SWEEPS
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
 
 
     drive::install();
@@ -1127,7 +1138,17 @@ pub async fn run(cfg: DemoCfg) {
             gobs.encode_commit(&mut enc, gpol.actor_output()).expect("commit");
             env.encode_scatter_targets(&mut enc, &gobs.targets);
             backend.submit(enc).expect("submit ctrl step");
-            env.step_physics_only();
+            // Physics submit granularity, `?phys=`: 0 per-phase (original),
+            // 1 per-substep, 2 all-in-one — measurement knob.
+            match phys_mode {
+                1 => env.step_physics_substep_submits(),
+                2 => {
+                    let mut penc = backend.begin_encoding();
+                    env.step_physics_encoded(&mut penc);
+                    backend.submit(penc).expect("submit physics");
+                }
+                _ => env.step_physics_only(),
+            }
             perf_step_ms_acc += step_t0.elapsed().as_secs_f32() * 1e3;
             perf_steps += 1;
             for e in 0..n_robots {
@@ -1197,14 +1218,24 @@ pub async fn run(cfg: DemoCfg) {
             // Safari/Firefox WebGPU behaviour gets diagnosed at all.
             #[cfg(target_arch = "wasm32")]
             if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                // GPU-boundary rates over the window (submits/passes/copies/
+                // uploads/maps per second) — khal's wasm perf counters.
+                let (c_sub, c_pass, c_copy, c_wr, c_map) =
+                    khal::backend::webgpu::perf_counters::take();
+                let cps = |v: u32| (v as f32 / win).round();
                 doc.set_title(&format!(
-                    "z| falls={} sole={:+.3} spd={:.2} cmd={:.2} rt={:.0}% fps={:.0}                      |in|={:.4} |act|={:.4} nan={}",
+                    "z| falls={} sole={:+.3} spd={:.2} cmd={:.2} rt={:.0}% fps={:.0} gpu[sub={} pass={} cp={} wr={} map={}] |in|={:.4} |act|={:.4} nan={}",
                     falls,
                     hud_sole,
                     meas_speed,
                     cmd_ui[0],
                     hud_realtime * 100.0,
                     hud_fps,
+                    cps(c_sub),
+                    cps(c_pass),
+                    cps(c_copy),
+                    cps(c_wr),
+                    cps(c_map),
                     dbg_in,
                     dbg_out,
                     dbg_nan,

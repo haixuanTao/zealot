@@ -35,7 +35,11 @@ type DemoName = (typeof DEMOS)[number]['name'];
 
 /// Scene knobs. The terrain is baked into each engine's scene at startup, so
 /// changing one reloads the demo iframe with new URL params.
-const DEFAULTS = {n: 3, lvl: 4, amp: 100, slope: 2, terrain: true, ckpt: ''};
+// n = 1 by default: measured on an M-series iGPU, one robot runs at ~98% of
+// real time and three at ~83% (the physics is dispatch-latency-bound; the
+// missing 17% needs engine-level kernel fusion, not a setting). The Robots
+// slider makes the trade explicit instead of shipping it as slow-motion.
+const DEFAULTS = {n: 1, lvl: 4, amp: 100, slope: 2, terrain: true, ckpt: ''};
 type Knobs = typeof DEFAULTS;
 
 /// The page's own query string seeds the knobs, and Apply writes them back, so

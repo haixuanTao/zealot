@@ -212,6 +212,18 @@ write_index_html() {
     })();
   </script>
   <script>
+    // Render at a capped pixel ratio. winit sizes the drawing buffer from
+    // window.devicePixelRatio, so a retina display renders 4x the pixels —
+    // measured to matter a lot: the sim and the renderer share one GPU, and
+    // at DPR 2 the WebGL pass eats the budget the physics needs. ?dpr=
+    // overrides (100ths, e.g. 150 = 1.5).
+    (() => {
+      const q = new URLSearchParams(location.search);
+      const dpr = Math.max(0.5, Math.min(3, (Number(q.get('dpr')) || 100) / 100));
+      Object.defineProperty(window, 'devicePixelRatio', {get: () => dpr});
+    })();
+  </script>
+  <script>
     // The page embedding this demo scrolls; the canvas would otherwise eat
     // every wheel event. Scrolling DOWN is forwarded to the parent so the
     // story below the fold stays reachable — the wheel still zooms the
