@@ -1148,7 +1148,7 @@ struct DbgStance {
 /// command, step counter, action history, air-time, sole-normals) lives in
 /// parallel vectors keyed by env index. Reset uses pre-built single-env spawn
 /// templates and `state.reset_env_from(env_i, template)`.
-/// BIPED_TERRAIN=1 state: the three family strips + per-env curriculum
+/// BIPED_TERRAIN=1 state: the four family strips + per-env curriculum
 /// (WBC-AGILE's terrain_levels_vel_curriculum — see zealot_env::terrain).
 struct TerrainSetup {
     strips: [TerrainStrip; 4],
@@ -1622,7 +1622,7 @@ impl BipedNexusBatchEnv {
             template_dr[0].friction = f;
         }
 
-        // BIPED_TERRAIN=1: generate the three family strips once and wrap each
+        // BIPED_TERRAIN=1: generate the four family strips once and wrap each
         // in ONE SharedShape (cloned across that family's envs so nexus dedupes
         // the mesh buffers to 3 uploads). ORIENTED pseudo-normals are required
         // by the nexus trimesh contact path; the strips are closed slabs.
@@ -1657,7 +1657,7 @@ impl BipedNexusBatchEnv {
             let (sv, st) = TerrainStrip::flat_stub_mesh();
             let stub = mk_shape(sv, st);
             println!(
-                "terrain curriculum ENABLED: 3 family strips ({} rows x {} m patches), built in {:.1}s",
+                "terrain curriculum ENABLED: 4 family strips ({} rows x {} m patches), built in {:.1}s",
                 zealot_env::terrain::ROWS,
                 zealot_env::terrain::PATCH,
                 t0.elapsed().as_secs_f64()
