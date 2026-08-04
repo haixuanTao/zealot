@@ -166,6 +166,11 @@ pub struct TerrainStrip {
     /// BEHIND the edge facing it (the approach-mode envs). Empty for the
     /// other families.
     pub step_theta: Vec<f32>,
+    /// Per-patch rise (m), cached at generation. `patch_rise()` used to rescan
+    /// every node in the patch (~11k reads) and `step_cell_height` calls it on
+    /// EVERY height query -- ground-relative height runs per env per step, so
+    /// this was a large hidden CPU cost on step-family envs.
+    pub step_rise: Vec<f32>,
 }
 
 fn quantize(h: f32) -> f32 {
@@ -182,6 +187,7 @@ impl TerrainStrip {
         let hs = family.grid_spacing();
         let nx = (PATCH * ROWS as f32 / hs).round() as usize;
         let mut step_theta: Vec<f32> = Vec::new();
+        let mut step_rise: Vec<f32> = Vec::new();
         let ny = (2.0 * STRIP_HALF_W / hs).round() as usize;
         // Spread the seed bits — `Lcg::new` ORs bit 0, so raw adjacent seeds
         // (42 vs 43) would otherwise collide.
@@ -260,6 +266,7 @@ impl TerrainStrip {
                     let rise = STEP_RISE_MAX * d;
                     let theta = rng.range(0.0, std::f32::consts::TAU);
                     step_theta.push(theta);
+                    step_rise.push(quantize(rise));
                     let (nx_, ny_) = (theta.cos(), theta.sin());
                     // Patch centre in the same patch-local frame the loop uses.
                     let cx = PATCH * 0.5;
@@ -323,7 +330,7 @@ impl TerrainStrip {
             }
         }
 
-        TerrainStrip { family, hs, nx, ny, heights, step_theta }
+        TerrainStrip { family, hs, nx, ny, heights, step_theta, step_rise }
     }
 
     fn node(&self, i: usize, j: usize) -> f32 {
@@ -345,25 +352,10 @@ impl TerrainStrip {
         let ly = cy_w + STRIP_HALF_W;
         let side = (lx - PATCH * 0.5) * theta.cos() + (ly - PATCH * 0.5) * theta.sin();
         if side >= 0.0 {
-            // Rise for this patch: read any node on the raised side is fragile;
-            // heights were generated binary, so take the patch max.
-            self.patch_rise(p)
+            self.step_rise.get(p).copied().unwrap_or(0.0)
         } else {
             0.0
         }
-    }
-
-    /// The (quantized) rise of Step patch `p` -- max node height in the patch.
-    fn patch_rise(&self, p: usize) -> f32 {
-        let i0 = ((PATCH * p as f32) / self.hs) as usize;
-        let i1 = (((PATCH * (p as f32 + 1.0)) / self.hs) as usize).min(self.nx);
-        let mut m = 0.0f32;
-        for i in i0..=i1 {
-            for j in 0..=self.ny {
-                m = m.max(self.node(i, j));
-            }
-        }
-        m
     }
 
     /// TRUE-VERTICAL-FACE mesh for the Step family: every cell is a flat quad
