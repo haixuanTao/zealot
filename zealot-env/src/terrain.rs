@@ -117,6 +117,19 @@ pub enum TerrainFamily {
 impl TerrainFamily {
     /// Fixed per-env family assignment (AGILE: column families are fixed).
     pub fn of_env(env_id: usize) -> Self {
+        // BIPED_TERRAIN_FAMILY forces EVERY env onto one family. For evaluation
+        // only: the renderer records env 0, whose family would otherwise be
+        // fixed at Boxes by the modulo, so there is no other way to roll out
+        // on the step strip.
+        if let Ok(f) = std::env::var("BIPED_TERRAIN_FAMILY") {
+            return match f.to_ascii_lowercase().as_str() {
+                "boxes" => TerrainFamily::Boxes,
+                "rough" => TerrainFamily::Rough,
+                "wave" => TerrainFamily::Wave,
+                "step" => TerrainFamily::Step,
+                other => panic!("unknown BIPED_TERRAIN_FAMILY '{other}'"),
+            };
+        }
         match env_id % 4 {
             0 => TerrainFamily::Boxes,
             1 => TerrainFamily::Rough,
@@ -284,6 +297,13 @@ impl TerrainStrip {
             // SLOPE_GRADE_MAX): h += g·min(L∞ distance to patch border,
             // SLOPE_RAMP), g = SLOPE_GRADE_MAX·d. Zero at every patch border,
             // so rows and the strip edges stay continuous.
+            // The Step family carries NO slope bias: per-cell box emission would
+            // turn a smooth bias into ~2 cm lips at every cell boundary (unwanted
+            // micro-stairs), and the family's purpose is the ISOLATED discrete
+            // edge -- slope-holding is what the other three families train.
+            if matches!(family, TerrainFamily::Step) {
+                continue;
+            }
             let gmax = std::env::var("BIPED_SLOPE_GRADE")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -310,10 +330,145 @@ impl TerrainStrip {
         self.heights[j * (self.nx + 1) + i]
     }
 
+    /// Per-cell height for the box-emitted Step family: the cell is entirely
+    /// at the raised level iff its CENTRE is on the raised side of its patch's
+    /// edge line. Quantizes the edge position to the cell grid (0.075 m) but
+    /// keeps the face exactly vertical.
+    fn step_cell_height(&self, ci: usize, cj: usize) -> f32 {
+        let cx_w = STRIP_X0 + (ci as f32 + 0.5) * self.hs;
+        let cy_w = -STRIP_HALF_W + (cj as f32 + 0.5) * self.hs;
+        let p = ((cx_w - STRIP_X0) / PATCH) as usize;
+        let p = p.min(ROWS - 1);
+        let theta = self.step_theta.get(p).copied().unwrap_or(0.0);
+        // Patch-local coords of the cell centre and the patch centre.
+        let lx = cx_w - (STRIP_X0 + PATCH * p as f32);
+        let ly = cy_w + STRIP_HALF_W;
+        let side = (lx - PATCH * 0.5) * theta.cos() + (ly - PATCH * 0.5) * theta.sin();
+        if side >= 0.0 {
+            // Rise for this patch: read any node on the raised side is fragile;
+            // heights were generated binary, so take the patch max.
+            self.patch_rise(p)
+        } else {
+            0.0
+        }
+    }
+
+    /// The (quantized) rise of Step patch `p` -- max node height in the patch.
+    fn patch_rise(&self, p: usize) -> f32 {
+        let i0 = ((PATCH * p as f32) / self.hs) as usize;
+        let i1 = (((PATCH * (p as f32 + 1.0)) / self.hs) as usize).min(self.nx);
+        let mut m = 0.0f32;
+        for i in i0..=i1 {
+            for j in 0..=self.ny {
+                m = m.max(self.node(i, j));
+            }
+        }
+        m
+    }
+
+    /// TRUE-VERTICAL-FACE mesh for the Step family: every cell is a flat quad
+    /// at its own height (unshared vertices), with explicit wall quads where
+    /// neighbouring cells differ and skirts to the slab bottom at the borders.
+    /// The shared-vertex grid emission turns a node-to-node jump into a ramp
+    /// one cell wide (~53 deg at a 10 cm riser, ~69 deg at 20 cm) -- climbable
+    /// by toe-wedging, which is NOT the skill this family exists to train, and
+    /// softer than the MuJoCo eval scene's true 90 deg box.
+    fn mesh_boxes(&self) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let (nx, ny, hs) = (self.nx, self.ny, self.hs);
+        let mut verts: Vec<[f32; 3]> = Vec::new();
+        let mut tris: Vec<[u32; 3]> = Vec::new();
+        let mut quad = |a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]| {
+            let base = verts.len() as u32;
+            verts.extend_from_slice(&[a, b, c, d]);
+            tris.push([base, base + 1, base + 2]);
+            tris.push([base, base + 2, base + 3]);
+        };
+        let x = |i: usize| STRIP_X0 + i as f32 * hs;
+        let y = |j: usize| -STRIP_HALF_W + j as f32 * hs;
+        let ch = |i: usize, j: usize| self.step_cell_height(i, j);
+        for j in 0..ny {
+            for i in 0..nx {
+                let h = ch(i, j);
+                // Top (CCW from +Z).
+                quad(
+                    [x(i), y(j), h],
+                    [x(i + 1), y(j), h],
+                    [x(i + 1), y(j + 1), h],
+                    [x(i), y(j + 1), h],
+                );
+                // Walls to +X / +Y neighbours where heights differ (outward
+                // winding from the HIGHER cell).
+                if i + 1 < nx {
+                    let hn = ch(i + 1, j);
+                    if (hn - h).abs() > 1e-6 {
+                        let (hi, lo) = (h.max(hn), h.min(hn));
+                        if h > hn {
+                            quad([x(i + 1), y(j), hi], [x(i + 1), y(j + 1), hi],
+                                 [x(i + 1), y(j + 1), lo], [x(i + 1), y(j), lo]);
+                        } else {
+                            quad([x(i + 1), y(j + 1), hi], [x(i + 1), y(j), hi],
+                                 [x(i + 1), y(j), lo], [x(i + 1), y(j + 1), lo]);
+                        }
+                    }
+                }
+                if j + 1 < ny {
+                    let hn = ch(i, j + 1);
+                    if (hn - h).abs() > 1e-6 {
+                        let (hi, lo) = (h.max(hn), h.min(hn));
+                        if h > hn {
+                            quad([x(i + 1), y(j + 1), hi], [x(i), y(j + 1), hi],
+                                 [x(i), y(j + 1), lo], [x(i + 1), y(j + 1), lo]);
+                        } else {
+                            quad([x(i), y(j + 1), hi], [x(i + 1), y(j + 1), hi],
+                                 [x(i + 1), y(j + 1), lo], [x(i), y(j + 1), lo]);
+                        }
+                    }
+                }
+            }
+        }
+        // Border skirts down to the slab bottom, then the slab underside.
+        for i in 0..nx {
+            let h0 = ch(i, 0);
+            quad([x(i), y(0), h0], [x(i), y(0), SLAB_BOTTOM],
+                 [x(i + 1), y(0), SLAB_BOTTOM], [x(i + 1), y(0), h0]);
+            let h1 = ch(i, ny - 1);
+            quad([x(i + 1), y(ny), h1], [x(i + 1), y(ny), SLAB_BOTTOM],
+                 [x(i), y(ny), SLAB_BOTTOM], [x(i), y(ny), h1]);
+        }
+        for j in 0..ny {
+            let h0 = ch(0, j);
+            quad([x(0), y(j + 1), h0], [x(0), y(j + 1), SLAB_BOTTOM],
+                 [x(0), y(j), SLAB_BOTTOM], [x(0), y(j), h0]);
+            let h1 = ch(nx - 1, j);
+            quad([x(nx), y(j), h1], [x(nx), y(j), SLAB_BOTTOM],
+                 [x(nx), y(j + 1), SLAB_BOTTOM], [x(nx), y(j + 1), h1]);
+        }
+        quad(
+            [x(0), y(0), SLAB_BOTTOM],
+            [x(0), y(ny), SLAB_BOTTOM],
+            [x(nx), y(ny), SLAB_BOTTOM],
+            [x(nx), y(0), SLAB_BOTTOM],
+        );
+        (verts, tris)
+    }
+
     /// Exact piecewise-linear surface height at world `(x, y)` — matches the
     /// emitted mesh's triangulation (each cell split along the (i,j)→(i+1,j+1)
     /// diagonal). Returns 0.0 (the flat backstop top) outside the strip.
     pub fn height(&self, x: f32, y: f32) -> f32 {
+        if matches!(self.family, TerrainFamily::Step) {
+            // Must match mesh_boxes(): constant within each cell.
+            let lx = x - STRIP_X0;
+            let ly = y + STRIP_HALF_W;
+            if lx < 0.0 || ly < 0.0 {
+                return 0.0;
+            }
+            let (ci, cj) = ((lx / self.hs) as usize, (ly / self.hs) as usize);
+            if ci >= self.nx || cj >= self.ny {
+                return 0.0;
+            }
+            return self.step_cell_height(ci, cj);
+        }
         let lx = x - STRIP_X0;
         let ly = y + STRIP_HALF_W;
         if lx < 0.0 || ly < 0.0 {
@@ -356,6 +511,9 @@ impl TerrainStrip {
     /// bottom at [`SLAB_BOTTOM`]) — watertight so parry's ORIENTED
     /// pseudo-normals exist (nexus requires them for trimesh contacts).
     pub fn mesh(&self) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        if matches!(self.family, TerrainFamily::Step) {
+            return self.mesh_boxes();
+        }
         let (nx, ny) = (self.nx, self.ny);
         let stride = nx + 1;
         let n_grid = stride * (ny + 1);
@@ -458,7 +616,21 @@ pub const MOVE_DOWN_DISTANCE: f32 = 2.0;
 
 impl TerrainCurriculum {
     /// Initial level ~ U{0, 1} (AGILE's `max_init_terrain_level = 1`).
+    /// BIPED_TERRAIN_LEVEL pins the starting difficulty row (evaluation: a
+    /// controlled riser height instead of the U{0,1} draw).
     pub fn init(rng: &mut Lcg) -> Self {
+        if let Some(l) = std::env::var("BIPED_TERRAIN_LEVEL")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            let mut c = Self::init_inner(rng);
+            c.level = l.min(ROWS as u32 - 1);
+            return c;
+        }
+        Self::init_inner(rng)
+    }
+
+    fn init_inner(rng: &mut Lcg) -> Self {
         let level = if rng.range(0.0, 1.0) < 0.5 { 0 } else { 1 };
         TerrainCurriculum { level, successes: 0, failures: 0 }
     }
@@ -567,6 +739,38 @@ mod tests {
         // Row 0: A ≈ 0.01..0.022 (+ slope apex ≤ 37.5 mm).
         let (lo, hi) = row_extremes(&s, 0);
         assert!(hi <= 0.025 + apex(0) && lo >= -0.025, "row0 wave {lo}..{hi}");
+    }
+
+    /// The step face must be TRULY VERTICAL in the emitted mesh -- the
+    /// shared-vertex grid emission turned it into a one-cell ramp (~53 deg at
+    /// 10 cm), which is climbable by toe-wedging and softer than the MuJoCo
+    /// eval scene's 90 deg box. Pin that the mesh contains genuinely vertical
+    /// triangles carrying at least the top row's full rise.
+    #[test]
+    fn step_face_is_vertical_in_the_mesh() {
+        let s = strip(TerrainFamily::Step);
+        let (verts, tris) = s.mesh();
+        let mut best_drop: f32 = 0.0;
+        for t in &tris {
+            let (a, b, c) = (verts[t[0] as usize], verts[t[1] as usize], verts[t[2] as usize]);
+            let xs = [a[0], b[0], c[0]];
+            let ys = [a[1], b[1], c[1]];
+            let zs = [a[2], b[2], c[2]];
+            let flat_x = (xs[0] - xs[1]).abs() < 1e-6 && (xs[1] - xs[2]).abs() < 1e-6;
+            let flat_y = (ys[0] - ys[1]).abs() < 1e-6 && (ys[1] - ys[2]).abs() < 1e-6;
+            if flat_x || flat_y {
+                let zmin = zs.iter().cloned().fold(f32::INFINITY, f32::min);
+                let zmax = zs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                // Interior walls only (skirts reach SLAB_BOTTOM; exclude them).
+                if zmin >= 0.0 {
+                    best_drop = best_drop.max(zmax - zmin);
+                }
+            }
+        }
+        assert!(
+            best_drop > 0.5 * STEP_RISE_MAX,
+            "no vertical face carrying a real rise found (best {best_drop} m)"
+        );
     }
 
     /// The step family only teaches stepping if the edge is DISCRETE. If the
