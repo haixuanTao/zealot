@@ -1382,9 +1382,15 @@ pub struct BipedNexusBatchEnv {
     arm_clip: Vec<u32>,
     arm_time: Vec<f32>,
     arm_active: Vec<bool>,
-    /// Home→clip blend, ramped over ~0.5 s on (de)activation so the held
-    /// PD targets never see a step input.
+    /// Crossfade progress ∈ [0,1] from `arm_from` toward the current
+    /// destination (clip pose or home), ramped over ~0.5 s. Reset to 0 on
+    /// EVERY destination switch — activation, deactivation, AND a
+    /// stand→stand resample that draws a fresh clip window — so the held
+    /// PD targets never see a step input between unrelated poses.
     arm_blend: Vec<f32>,
+    /// Crossfade source: the held targets staged at the moment of the last
+    /// destination switch (`env * held.len() + j`).
+    arm_from: Vec<f32>,
     /// Scratch: one sampled pose (idx.held.len() radians).
     arm_scratch: Vec<f32>,
     /// Last staged held-joint targets (`env * held.len() + j`) — mirrored into
@@ -2126,6 +2132,7 @@ impl BipedNexusBatchEnv {
             .map(|e| Lcg::new(seed ^ ((e as u64).wrapping_mul(2654435761)) ^ 0xA53A))
             .collect();
         let n_held = idx.held.len();
+        let held_homes: Vec<f32> = idx.held.iter().map(|h| h.home).collect();
         let sampler = CommandSampler::default();
         let sampler_default = CommandSampler::default();
 
@@ -2142,9 +2149,22 @@ impl BipedNexusBatchEnv {
             arm_clip: vec![0; num_envs],
             arm_time: vec![0.0; num_envs],
             arm_active: vec![false; num_envs],
-            arm_blend: vec![0.0; num_envs],
+            // Blend starts settled-at-home (1.0, staged == home): the spawn
+            // pose holds home, so there is nothing to fade from.
+            arm_blend: vec![1.0; num_envs],
+            arm_from: held_homes
+                .iter()
+                .copied()
+                .cycle()
+                .take(n_held * num_envs)
+                .collect(),
             arm_scratch: vec![0.0; n_held],
-            arm_staged: vec![0.0; n_held * num_envs],
+            arm_staged: held_homes
+                .iter()
+                .copied()
+                .cycle()
+                .take(n_held * num_envs)
+                .collect(),
             cmd,
             step_count,
             resample_at,
@@ -2895,6 +2915,7 @@ impl BipedNexusBatchEnv {
     fn arm_resample(&mut self, e: usize) {
         let Some(am) = self.arm_motion.as_ref() else { return };
         let (n_clips, p) = (am.clips.len(), am.p);
+        let n_held = self.idx.held.len();
         let standing = self.cmd[e].speed() < 0.1;
         if standing && self.arm_rng[e].chance(p) {
             let c = ((self.arm_rng[e].unit() * n_clips as f32) as usize).min(n_clips - 1);
@@ -2906,8 +2927,18 @@ impl BipedNexusBatchEnv {
             self.arm_clip[e] = c as u32;
             self.arm_time[e] = t0;
             self.arm_active[e] = true;
-        } else {
-            self.arm_active[e] = false; // blends back toward held_home
+            // New destination (fresh clip window — even stand→stand):
+            // crossfade from wherever the arms are RIGHT NOW, never jump.
+            self.arm_from[e * n_held..(e + 1) * n_held]
+                .copy_from_slice(&self.arm_staged[e * n_held..(e + 1) * n_held]);
+            self.arm_blend[e] = 0.0;
+        } else if self.arm_active[e] {
+            // Deactivating: crossfade back home from the current pose. (An
+            // already-home env stays settled — no pointless re-blend.)
+            self.arm_active[e] = false;
+            self.arm_from[e * n_held..(e + 1) * n_held]
+                .copy_from_slice(&self.arm_staged[e * n_held..(e + 1) * n_held]);
+            self.arm_blend[e] = 0.0;
         }
     }
 
@@ -2915,8 +2946,15 @@ impl BipedNexusBatchEnv {
     /// held joints at the home pose, so a lingering blend would drag the
     /// fresh episode's arms through a stale clip pose.
     fn arm_reset(&mut self, e: usize) {
+        if self.arm_motion.is_none() {
+            return;
+        }
+        let n_held = self.idx.held.len();
         self.arm_active[e] = false;
-        self.arm_blend[e] = 0.0;
+        self.arm_blend[e] = 1.0; // settled at home, nothing to fade from
+        for (j, h) in self.idx.held.iter().enumerate() {
+            self.arm_staged[e * n_held + j] = h.home;
+        }
     }
 
     /// Advance every env's playback one control step and restage the held
@@ -2929,31 +2967,36 @@ impl BipedNexusBatchEnv {
         let n_held = self.idx.held.len();
         let mbs = self.state.multibodies_mut();
         for e in 0..self.n {
-            // Blend ramps over ~0.5 s so (de)activation is never a step
-            // input to the held PDs (their gains are soft; a 1-rad step
-            // would whip the arm and kick the pelvis).
-            let target = if self.arm_active[e] { 1.0 } else { 0.0 };
-            let db = dt / 0.5;
-            let b = self.arm_blend[e];
-            let b = (b + (target - b).clamp(-db, db)).clamp(0.0, 1.0);
+            // Crossfade `arm_from` → destination over ~0.5 s (smoothstep, so
+            // the fade starts and ends with zero velocity). The destination
+            // is the LIVE clip pose (already moving during the fade) or home;
+            // `arm_from` was snapshotted at the last destination switch, so
+            // every transition — activation, deactivation, stand→stand clip
+            // swap — leaves from wherever the arms currently are.
+            let b = (self.arm_blend[e] + dt / 0.5).min(1.0);
             self.arm_blend[e] = b;
+            let s = b * b * (3.0 - 2.0 * b);
             if self.arm_active[e] {
                 self.arm_time[e] += dt;
+                let clip = &am.clips[self.arm_clip[e] as usize];
+                clip.sample(self.arm_time[e], &mut self.arm_scratch);
             }
-            if b <= 0.0 {
-                for (j, h) in self.idx.held.iter().enumerate() {
-                    mbs.stage_motor_position(e as u32, h.link, JointAxis::AngZ, h.home);
-                    self.arm_staged[e * n_held + j] = h.home;
-                }
-                continue;
-            }
-            let clip = &am.clips[self.arm_clip[e] as usize];
-            clip.sample(self.arm_time[e], &mut self.arm_scratch);
             for (j, h) in self.idx.held.iter().enumerate() {
-                // Blend home→clip, clamp into the joint's mechanical range
-                // (retargeted mocap can exceed it).
-                let q = h.home + b * am.scale * (self.arm_scratch[j] - h.home);
-                let q = q.clamp(h.range.0, h.range.1);
+                // Destination: amplitude-scaled clip pose (or home), clamped
+                // into the joint's mechanical range (retargeted mocap can
+                // exceed it).
+                let dest = if self.arm_active[e] {
+                    (h.home + am.scale * (self.arm_scratch[j] - h.home))
+                        .clamp(h.range.0, h.range.1)
+                } else {
+                    h.home
+                };
+                let q = if s >= 1.0 {
+                    dest
+                } else {
+                    let from = self.arm_from[e * n_held + j];
+                    from + s * (dest - from)
+                };
                 mbs.stage_motor_position(e as u32, h.link, JointAxis::AngZ, q);
                 self.arm_staged[e * n_held + j] = q;
             }
@@ -4102,9 +4145,14 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok())
             {
+                let n_held = self.idx.held.len();
                 self.arm_clip[e] = c % am.clips.len() as u32;
                 self.arm_time[e] = 0.0;
                 self.arm_active[e] = true;
+                // Fade in from home (arm_reset above just staged it).
+                self.arm_from[e * n_held..(e + 1) * n_held]
+                    .copy_from_slice(&self.arm_staged[e * n_held..(e + 1) * n_held]);
+                self.arm_blend[e] = 0.0;
             }
         }
         self.step_count[e] = 0;
