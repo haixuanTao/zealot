@@ -177,7 +177,25 @@ if quats is not None and names:
         "waist_roll_link": "waist_roll_link_rev_1_0",
         "torso_link": "torso_link_rev_1_0",
     }
-    EXTRA = {"torso_link": [("head_link", np.array([0.0039635, 0.0, -0.044]))]}
+    # ... and the distal forearm/hand: the 29dof model ends the arm at
+    # wrist_roll (wrist pitch/yaw stripped), but the VISIBLE surfaces live in
+    # the wrist_pitch/wrist_yaw/rubber_hand meshes — without them the arm is
+    # a stump with a floating wrist ring. Weld them onto wrist_roll frozen at
+    # q = 0 (menagerie chain offsets: pitch +0.038, yaw +0.084, hand +0.1255;
+    # no quats anywhere in the chain, so translation-only welds are exact).
+    EXTRA = {
+        "torso_link": [("head_link", np.array([0.0039635, 0.0, -0.044]))],
+        "left_wrist_roll_link": [
+            ("left_wrist_pitch_link", np.array([0.038, 0.0, 0.0])),
+            ("left_wrist_yaw_link", np.array([0.084, 0.0, 0.0])),
+            ("left_rubber_hand", np.array([0.1255, 0.003, 0.0])),
+        ],
+        "right_wrist_roll_link": [
+            ("right_wrist_pitch_link", np.array([0.038, 0.0, 0.0])),
+            ("right_wrist_yaw_link", np.array([0.084, 0.0, 0.0])),
+            ("right_rubber_hand", np.array([0.1255, -0.003, 0.0])),
+        ],
+    }
     for k, nm in enumerate(names):
         stl = os.path.join(MENAGERIE, STL_ALIAS.get(nm, nm) + ".STL")
         h = state.insert_body(RigidBodyBuilder.kinematic_position_based().build())
