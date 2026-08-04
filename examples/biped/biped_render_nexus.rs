@@ -298,6 +298,7 @@ fn main() {
         let (names, edges, feet) = env.skeleton();
 
         let mut frames: Vec<Vec<[f32; 3]>> = Vec::with_capacity(rollout_steps);
+        let mut frame_quats: Vec<Vec<[f32; 4]>> = Vec::with_capacity(rollout_steps);
         let mut bases: Vec<[f32; 7]> = Vec::with_capacity(rollout_steps);
         let mut joints: Vec<[f32; NUM_JOINTS]> = Vec::with_capacity(rollout_steps);
         let dump_vel = std::env::var("BIPED_DUMP_VEL").is_ok();
@@ -323,6 +324,7 @@ fn main() {
             // the step path was switched to the same poses-only path).
             let poses = env.snapshot().await;
             frames.push(env.body_positions_for(0, &poses));
+            frame_quats.push(env.body_rotations_for(0, &poses));
             let (p, q) = env.base_pose_for(0, &poses);
             bases.push([p[0], p[1], p[2], q[0], q[1], q[2], q[3]]);
             joints.push(env.joint_angles_for(0, &poses));
@@ -521,6 +523,16 @@ fn main() {
                 mcx, mcy, half, hs, vals.join(",")
             );
         }
+        s.push_str("  \"frame_quats\": [\n");
+        for (fi, frame) in frame_quats.iter().enumerate() {
+            let pts: Vec<String> = frame
+                .iter()
+                .map(|q| format!("[{:.5},{:.5},{:.5},{:.5}]", q[0], q[1], q[2], q[3]))
+                .collect();
+            let comma = if fi + 1 < frame_quats.len() { "," } else { "" };
+            let _ = write!(s, "    [{}]{}\n", pts.join(","), comma);
+        }
+        s.push_str("  ],\n");
         s.push_str("  \"frames\": [\n");
         for (fi, frame) in frames.iter().enumerate() {
             let pts: Vec<String> = frame

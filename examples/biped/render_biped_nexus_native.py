@@ -119,23 +119,91 @@ else:
     state.insert_collider_in(0, col, ground)
     visual(viewer, state, ground, col)
 
-# --- robot: capsules along edges, balls at joints --------------------------
+# --- robot ------------------------------------------------------------------
+# With per-link quaternions (frame_quats, newer rollouts) the REAL link meshes
+# from mujoco_menagerie's G1 are placed per frame -- the menagerie MJCF binds
+# each mesh at identity in its link frame, so recorded link pose == mesh pose.
+# Old rollouts without quats fall back to the capsule skeleton.
+quats = d.get("frame_quats")
+names = d.get("names", [])
+MENAGERIE = ("/home/champagne/rt_build/bench-venv/lib/python3.12/"
+             "site-packages/mujoco_menagerie/unitree_g1/assets")
+mesh_handles = []
 ball_handles = []
-for _ in range(NB):
-    h = state.insert_body(RigidBodyBuilder.kinematic_position_based().build())
-    col = ColliderBuilder.ball(BALL_R).build()
-    state.insert_collider_in(0, col, h)
-    visual(viewer, state, h, col)
-    ball_handles.append(h)
 edge_handles = []
-for _ in edges:
-    h = state.insert_body(RigidBodyBuilder.kinematic_position_based().build())
-    col = ColliderBuilder.capsule_z(0.1, CAPS_R).build()
-    state.insert_collider_in(0, col, h)
-    visual(viewer, state, h, col)
-    edge_handles.append(h)
+if quats is not None and names:
+    import trimesh as _tm
+    import xml.etree.ElementTree as _ET
+
+    def _q2R(q):
+        w, x, y, z = q
+        return np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ])
+
+    def _world_rots(xml_path):
+        # World rotation of every body at q = 0, by accumulating body quats
+        # down the tree (joints at zero contribute nothing).
+        out = {}
+        root = _ET.parse(xml_path).getroot()
+
+        def rec(el, R):
+            for b in el.findall("body"):
+                q = b.get("quat")
+                Rl = _q2R([float(v) for v in q.split()]) if q else np.eye(3)
+                R2 = R @ Rl
+                out[b.get("name", "")] = R2
+                rec(b, R2)
+
+        rec(root.find("worldbody"), np.eye(3))
+        return out
+
+    # Frame correction: zealot's converter re-frames links so hinge axes are
+    # local +Z; menagerie STLs are modelled in the ORIGINAL Unitree frames.
+    # C_k = R_zealot(0)^T @ R_orig(0) maps mesh vertices into the recorded
+    # link frame. Baked into the vertices directly (visual local_pose has no
+    # quat-from-components constructor in this wheel).
+    RZ = _world_rots("/home/champagne/Documents/work/zealot/assets/robots/unitree_g1_29dof.xml")
+    RO = _world_rots("/home/champagne/rt_build/bench-venv/lib/python3.12/"
+                     "site-packages/mujoco_menagerie/unitree_g1/g1.xml")
+
+    for k, nm in enumerate(names):
+        stl = os.path.join(MENAGERIE, nm + ".STL")
+        h = state.insert_body(RigidBodyBuilder.kinematic_position_based().build())
+        if os.path.exists(stl) and nm in RZ and nm in RO:
+            m = _tm.load_mesh(stl)
+            if len(m.faces) > 6000:
+                m = m.simplify_quadric_decimation(1.0 - 6000.0 / len(m.faces))
+            C = RZ[nm].T @ RO[nm]
+            V = (np.asarray(m.vertices) @ C.T)
+            col = ColliderBuilder.trimesh(
+                [list(map(float, v)) for v in V],
+                [list(map(int, f)) for f in m.faces],
+            ).build()
+        else:
+            col = ColliderBuilder.ball(BALL_R).build()
+        state.insert_collider_in(0, col, h)
+        visual(viewer, state, h, col)
+        mesh_handles.append(h)
+else:
+    for _ in range(NB):
+        h = state.insert_body(RigidBodyBuilder.kinematic_position_based().build())
+        col = ColliderBuilder.ball(BALL_R).build()
+        state.insert_collider_in(0, col, h)
+        visual(viewer, state, h, col)
+        ball_handles.append(h)
+    for _ in edges:
+        h = state.insert_body(RigidBodyBuilder.kinematic_position_based().build())
+        col = ColliderBuilder.capsule_z(0.1, CAPS_R).build()
+        state.insert_collider_in(0, col, h)
+        visual(viewer, state, h, col)
+        edge_handles.append(h)
 
 state.finalize(viewer)
+if quats is not None:
+    quats = np.array(quats, dtype=np.float32)  # (T, NB, 4) xyzw
 
 
 def quat_between_z(a, b):
@@ -165,16 +233,18 @@ ff = subprocess.Popen(
 
 for t in range(T):
     P = frames[t]
-    for k in range(NB):
-        state.set_body_pose(ball_handles[k], vec3(*P[k]), vec4(0, 0, 0, 1), 0)
-    for m, (pa, pb) in enumerate(edges):
-        a, b = P[pa], P[pb]
-        q, ln = quat_between_z(a, b)
-        mid = (a + b) / 2
-        state.set_body_pose(edge_handles[m], vec3(*mid), vec4(*q), 0)
-        # capsule_z half-height is fixed at build; scale visually via z... not
-        # supported per-frame, so length mismatch is accepted: capsules are a
-        # skeleton indication, joints carry the accuracy.
+    if mesh_handles:
+        Q = quats[t]
+        for k in range(NB):
+            state.set_body_pose(mesh_handles[k], vec3(*P[k]), vec4(*Q[k]), 0)
+    else:
+        for k in range(NB):
+            state.set_body_pose(ball_handles[k], vec3(*P[k]), vec4(0, 0, 0, 1), 0)
+        for m, (pa, pb) in enumerate(edges):
+            a, b = P[pa], P[pb]
+            q, ln = quat_between_z(a, b)
+            mid = (a + b) / 2
+            state.set_body_pose(edge_handles[m], vec3(*mid), vec4(*q), 0)
     base = P[0]
     viewer.set_camera(vec3(base[0] + 2.6, base[1] - 2.6, base[2] + 1.2),
                       vec3(base[0], base[1], base[2] - 0.2))

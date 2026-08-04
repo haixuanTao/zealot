@@ -3934,6 +3934,20 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
     /// order (matches `BipedEnv::body_positions` so the python renderer reads
     /// both the same way). Reads from `body_poses` — correct at all times,
     /// including step 0 (before any FK has run).
+    /// Per-link world rotations (x, y, z, w), same ordering as
+    /// [`Self::body_positions_for`]. Needed by the native replay renderer to
+    /// place link MESHES -- positions alone can only place spheres.
+    pub fn body_rotations_for(&self, e: usize, poses: &[NexusPose]) -> Vec<[f32; 4]> {
+        let cpb = self.idx.colliders_per_batch as usize;
+        let base = e * cpb;
+        (0..self.idx.mjcf_to_link.len())
+            .map(|i| {
+                let r = poses[base + i].rotation;
+                [r.x, r.y, r.z, r.w]
+            })
+            .collect()
+    }
+
     pub fn body_positions_for(&self, e: usize, poses: &[NexusPose]) -> Vec<[f32; 3]> {
         let cpb = self.idx.colliders_per_batch as usize;
         let base = e * cpb;
