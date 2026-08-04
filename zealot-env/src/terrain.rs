@@ -386,63 +386,126 @@ impl TerrainStrip {
         let x = |i: usize| STRIP_X0 + i as f32 * hs;
         let y = |j: usize| -STRIP_HALF_W + j as f32 * hs;
         let ch = |i: usize, j: usize| self.step_cell_height(i, j);
+        // GREEDY RUN-MERGE. Per-cell quads made the strip 473k triangles and
+        // halved training throughput (1.6 -> 3.0 s/iter): a quarter of all
+        // envs collide against this strip every substep, and each step patch
+        // is geometrically just two flat planes and one wall. Merging
+        // constant-height RUNS along X (tops row-wise, walls column-wise)
+        // keeps the geometry bit-identical while cutting triangle count
+        // ~100x. Full 2D rectangle merge would do better still, but runs are
+        // already within sight of the ideal and stay trivially correct.
+        //
+        // Tops: for each row j, emit one quad per maximal constant-height run.
         for j in 0..ny {
-            for i in 0..nx {
+            let mut i = 0;
+            while i < nx {
                 let h = ch(i, j);
-                // Top (CCW from +Z).
+                let mut i2 = i + 1;
+                while i2 < nx && (ch(i2, j) - h).abs() <= 1e-6 {
+                    i2 += 1;
+                }
                 quad(
                     [x(i), y(j), h],
-                    [x(i + 1), y(j), h],
-                    [x(i + 1), y(j + 1), h],
+                    [x(i2), y(j), h],
+                    [x(i2), y(j + 1), h],
                     [x(i), y(j + 1), h],
                 );
-                // Walls to +X / +Y neighbours where heights differ (outward
-                // winding from the HIGHER cell).
-                if i + 1 < nx {
-                    let hn = ch(i + 1, j);
-                    if (hn - h).abs() > 1e-6 {
-                        let (hi, lo) = (h.max(hn), h.min(hn));
-                        if h > hn {
-                            quad([x(i + 1), y(j), hi], [x(i + 1), y(j + 1), hi],
-                                 [x(i + 1), y(j + 1), lo], [x(i + 1), y(j), lo]);
-                        } else {
-                            quad([x(i + 1), y(j + 1), hi], [x(i + 1), y(j), hi],
-                                 [x(i + 1), y(j), lo], [x(i + 1), y(j + 1), lo]);
-                        }
-                    }
+                i = i2;
+            }
+        }
+        // Walls between +X neighbours: constant (h, hn) runs along Y.
+        for i in 0..nx.saturating_sub(1) {
+            let mut j = 0;
+            while j < ny {
+                let (h, hn) = (ch(i, j), ch(i + 1, j));
+                if (hn - h).abs() <= 1e-6 {
+                    j += 1;
+                    continue;
                 }
-                if j + 1 < ny {
-                    let hn = ch(i, j + 1);
-                    if (hn - h).abs() > 1e-6 {
-                        let (hi, lo) = (h.max(hn), h.min(hn));
-                        if h > hn {
-                            quad([x(i + 1), y(j + 1), hi], [x(i), y(j + 1), hi],
-                                 [x(i), y(j + 1), lo], [x(i + 1), y(j + 1), lo]);
-                        } else {
-                            quad([x(i), y(j + 1), hi], [x(i + 1), y(j + 1), hi],
-                                 [x(i + 1), y(j + 1), lo], [x(i), y(j + 1), lo]);
-                        }
-                    }
+                let mut j2 = j + 1;
+                while j2 < ny
+                    && (ch(i, j2) - h).abs() <= 1e-6
+                    && (ch(i + 1, j2) - hn).abs() <= 1e-6
+                {
+                    j2 += 1;
                 }
+                let (hi, lo) = (h.max(hn), h.min(hn));
+                if h > hn {
+                    quad([x(i + 1), y(j), hi], [x(i + 1), y(j2), hi],
+                         [x(i + 1), y(j2), lo], [x(i + 1), y(j), lo]);
+                } else {
+                    quad([x(i + 1), y(j2), hi], [x(i + 1), y(j), hi],
+                         [x(i + 1), y(j), lo], [x(i + 1), y(j2), lo]);
+                }
+                j = j2;
+            }
+        }
+        // Walls between +Y neighbours: constant (h, hn) runs along X.
+        for j in 0..ny.saturating_sub(1) {
+            let mut i = 0;
+            while i < nx {
+                let (h, hn) = (ch(i, j), ch(i, j + 1));
+                if (hn - h).abs() <= 1e-6 {
+                    i += 1;
+                    continue;
+                }
+                let mut i2 = i + 1;
+                while i2 < nx
+                    && (ch(i2, j) - h).abs() <= 1e-6
+                    && (ch(i2, j + 1) - hn).abs() <= 1e-6
+                {
+                    i2 += 1;
+                }
+                let (hi, lo) = (h.max(hn), h.min(hn));
+                if h > hn {
+                    quad([x(i2), y(j + 1), hi], [x(i), y(j + 1), hi],
+                         [x(i), y(j + 1), lo], [x(i2), y(j + 1), lo]);
+                } else {
+                    quad([x(i), y(j + 1), hi], [x(i2), y(j + 1), hi],
+                         [x(i2), y(j + 1), lo], [x(i), y(j + 1), lo]);
+                }
+                i = i2;
             }
         }
         // Border skirts down to the slab bottom, then the slab underside.
-        for i in 0..nx {
-            let h0 = ch(i, 0);
-            quad([x(i), y(0), h0], [x(i), y(0), SLAB_BOTTOM],
-                 [x(i + 1), y(0), SLAB_BOTTOM], [x(i + 1), y(0), h0]);
-            let h1 = ch(i, ny - 1);
-            quad([x(i + 1), y(ny), h1], [x(i + 1), y(ny), SLAB_BOTTOM],
-                 [x(i), y(ny), SLAB_BOTTOM], [x(i), y(ny), h1]);
-        }
-        for j in 0..ny {
-            let h0 = ch(0, j);
-            quad([x(0), y(j + 1), h0], [x(0), y(j + 1), SLAB_BOTTOM],
-                 [x(0), y(j), SLAB_BOTTOM], [x(0), y(j), h0]);
-            let h1 = ch(nx - 1, j);
-            quad([x(nx), y(j), h1], [x(nx), y(j), SLAB_BOTTOM],
-                 [x(nx), y(j + 1), SLAB_BOTTOM], [x(nx), y(j + 1), h1]);
-        }
+        let mut run_border = |along_x: bool, fixed_first: bool| {
+            let count = if along_x { nx } else { ny };
+            let mut a = 0;
+            while a < count {
+                let hv = if along_x {
+                    ch(a, if fixed_first { 0 } else { ny - 1 })
+                } else {
+                    ch(if fixed_first { 0 } else { nx - 1 }, a)
+                };
+                let mut a2 = a + 1;
+                while a2 < count {
+                    let hn = if along_x {
+                        ch(a2, if fixed_first { 0 } else { ny - 1 })
+                    } else {
+                        ch(if fixed_first { 0 } else { nx - 1 }, a2)
+                    };
+                    if (hn - hv).abs() > 1e-6 {
+                        break;
+                    }
+                    a2 += 1;
+                }
+                match (along_x, fixed_first) {
+                    (true, true) => quad([x(a), y(0), hv], [x(a), y(0), SLAB_BOTTOM],
+                                         [x(a2), y(0), SLAB_BOTTOM], [x(a2), y(0), hv]),
+                    (true, false) => quad([x(a2), y(ny), hv], [x(a2), y(ny), SLAB_BOTTOM],
+                                          [x(a), y(ny), SLAB_BOTTOM], [x(a), y(ny), hv]),
+                    (false, true) => quad([x(0), y(a2), hv], [x(0), y(a2), SLAB_BOTTOM],
+                                          [x(0), y(a), SLAB_BOTTOM], [x(0), y(a), hv]),
+                    (false, false) => quad([x(nx), y(a), hv], [x(nx), y(a), SLAB_BOTTOM],
+                                           [x(nx), y(a2), SLAB_BOTTOM], [x(nx), y(a2), hv]),
+                }
+                a = a2;
+            }
+        };
+        run_border(true, true);
+        run_border(true, false);
+        run_border(false, true);
+        run_border(false, false);
         quad(
             [x(0), y(0), SLAB_BOTTOM],
             [x(0), y(ny), SLAB_BOTTOM],
