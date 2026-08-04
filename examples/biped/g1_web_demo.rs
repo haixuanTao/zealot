@@ -236,6 +236,21 @@ mod drive {
 /// run BEFORE the env is constructed. Decimation 8 → 2.5 ms sim dt — the
 /// passive stand needs the finer timestep. (Spawn DR is a non-issue: the demo
 /// resets into template 0, which is always the DR-off template.)
+fn probe_u32(key: &str, default: u32) -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(search) = web_sys::window().and_then(|w| w.location().search().ok()) {
+        for kv in search.trim_start_matches('?').split('&') {
+            if let Some(v) = kv.strip_prefix(key) {
+                if let Ok(n) = v.parse::<u32>() {
+                    return n;
+                }
+            }
+        }
+    }
+    let _ = key;
+    default
+}
+
 fn configure_env(terrain: bool, terrain_level: u32, terrain_amp_pct: u32, terrain_slope_deg: u32) {
     zealot_env::robots::set_robot_override("g1_29dof_agile");
     // Deployment-relevant slice of the v7 launch config (launch_v7.sh from the
@@ -1035,6 +1050,10 @@ pub async fn run(cfg: DemoCfg) {
     // Policy input/output magnitudes for the cross-browser diagnostics.
     let (mut dbg_in, mut dbg_out, mut dbg_nan) = (0.0f32, 0.0f32, 0usize);
 
+    // `?diag=1` turns on the per-second policy I/O readbacks (see below).
+    let diag = probe_u32("diag=", 0) == 1;
+
+
     drive::install();
     // Start the latched command at what the demo is already running, so the
     // first tap bumps up from the visible value instead of from zero.
@@ -1068,10 +1087,26 @@ pub async fn run(cfg: DemoCfg) {
             }
         }
 
-        // Advance physics to wall-clock time, at most 4 control steps a frame.
+        // Advance physics to wall-clock time, at most 4 control steps a
+        // frame — and never more than 3 steps ahead of what the GPU has
+        // retired (see `GpuBackpressure`): past that, more submits only add
+        // latency the browser answers with tab-level throttling.
         let wall = t0.elapsed().as_secs_f32();
         let mut steps_this_frame = 0;
-        while sim_time < wall && steps_this_frame < 4 {
+        // Pace on the pose stream: its map landing means the GPU has caught
+        // up to the copy submitted at the end of some recent frame, so its
+        // staleness counts how far the GPU is running behind the loop. While
+        // the GPU is behind, submitting more steps does not make the sim any
+        // faster — it only grows the queue, and with it the delay between a
+        // key press and the robot responding, until the browser throttles the
+        // whole tab. (That unbounded queue was the "super laggy" demo: the
+        // old per-second diagnostic fence used to drain it by accident, and
+        // gating that off exposed it.) The threshold trades sim speed against
+        // input latency; 3 measured best — beyond it, real-time gains flatten
+        // while the frame rate and the responsiveness fall away:
+        //   stale<2  28 fps  62% RT      stale<5  17 fps  92% RT
+        //   stale<3  24 fps  83% RT      stale<8  14 fps  94% RT
+        while sim_time < wall && steps_this_frame < 4 && pose_stream.stale_frames < 3 {
             // GPU-resident control step: obs kernel → policy GEMMs → commit
             // (targets + action ring) → motor scatter → decimation substeps.
             // Encode + submit only; the per-frame render snapshot below is
@@ -1127,12 +1162,18 @@ pub async fn run(cfg: DemoCfg) {
             // Steps actually run vs steps needed for real time (50 Hz).
             hud_realtime = (perf_steps as f32 / (win / DT)).min(1.0);
             // Diagnostic: mean |value| of the policy's INPUT (normalized obs)
-            // and OUTPUT (actions), read back once a second. This is what
-            // separates "physics broken" from "policy broken" across
-            // browsers — a zero output with a healthy input means the GEMM
-            // path miscompiled, not the sim.
+            // and OUTPUT (actions). This is what separates "physics broken"
+            // from "policy broken" across browsers — a zero output with a
+            // healthy input means the GEMM path miscompiled, not the sim.
+            //
+            // OFF unless `?diag=1`: each of these is a blocking readback, i.e.
+            // a full pipeline fence, and doing two of them every second put a
+            // ~60 ms stall into one frame per second. Average frame rate hid
+            // it; the stutter did not. Everything else in the title line is
+            // free (counters the CPU already has), so the cross-browser
+            // channel still works without this.
             #[cfg(target_arch = "wasm32")]
-            {
+            if diag {
                 let mabs = |v: &[f32]| {
                     if v.is_empty() { 0.0 } else {
                         v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32
