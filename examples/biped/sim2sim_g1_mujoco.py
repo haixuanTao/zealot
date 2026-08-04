@@ -110,6 +110,24 @@ W, H = 960, 540
 _cmd = os.environ.get("BIPED_CMD", "0.4,0,0").split(",")
 CMD = np.array([float(_cmd[0]), float(_cmd[1]), float(_cmd[2]), 0.0])
 
+# S2S_CMD_SWITCH="t:vx,vy,wz" — swap the command mid-episode at t seconds.
+# Built for the walk->stand transient study: the gait clock follows the
+# training contract (freezes at its CURRENT phase when speed drops below
+# 0.1), so the policy sees exactly what a real command drop produces.
+_sw = os.environ.get("S2S_CMD_SWITCH")
+CMD_SWITCH = None
+if _sw:
+    _t, _v = _sw.split(":")
+    _vv = [float(x) for x in _v.split(",")]
+    CMD_SWITCH = (float(_t), np.array([_vv[0], _vv[1], _vv[2], 0.0]))
+
+# S2S_TRANS_JSON=<path>: per-control-step transient/impact log —
+# [t, |base angvel|, base z, F_left, F_right] with per-foot normal contact
+# force in N (summed over that foot's active contacts). Slam metric: peak
+# touchdown force in units of body weight; settle metric: |angvel| decay
+# after a command drop.
+TRANS_JSON = os.environ.get("S2S_TRANS_JSON")
+
 # Canonical policy joint order + zealot g1_29dof_agile actuator table
 # (zealot-env/src/robots/unitree_g1.rs — unitree_g1_agile leg deltas applied).
 POLICY_JOINTS = [
@@ -377,7 +395,11 @@ def main():
     attempts, survived = 1, []
     dist0 = data.qpos[free_q:free_q + 2].copy()
 
+    trans_track = [] if TRANS_JSON else None
+
     for t in range(n_ctrl):
+        if CMD_SWITCH is not None and t * CONTROL_DT >= CMD_SWITCH[0]:
+            CMD[:] = CMD_SWITCH[1]
         q = data.qpos[pol_q].copy()
         quat = data.qpos[free_q + 3:free_q + 7].copy()
 
@@ -496,6 +518,24 @@ def main():
                 heel = c + R @ np.array([-hx, 0.0, -hz])
                 row += [float(toe[2]), float(heel[2])]
             foot_track.append(row)
+        if trans_track is not None:
+            # Per-foot normal contact force, N: sum |f_normal| over the
+            # active contacts touching each foot geom (mj_contactForce's
+            # first component is the contact-frame normal force).
+            f6 = np.zeros(6)
+            f_lr = [0.0, 0.0]
+            for ci in range(data.ncon):
+                con = data.contact[ci]
+                for side, gid in enumerate(_foot_gids):
+                    if con.geom1 == gid or con.geom2 == gid:
+                        mujoco.mj_contactForce(model, data, ci, f6)
+                        f_lr[side] += abs(float(f6[0]))
+            trans_track.append([
+                round(t * CONTROL_DT, 4),
+                float(np.linalg.norm(data.qvel[free_d + 3:free_d + 6])),
+                float(data.qpos[free_q + 2]),
+                f_lr[0], f_lr[1],
+            ])
         # --- fall / timeout check ---
         z = data.qpos[free_q + 2]
         up = projected_gravity(data.qpos[free_q + 3:free_q + 7])
@@ -527,6 +567,10 @@ def main():
             json.dump({"cols": ["L_toe_z", "L_heel_z", "R_toe_z", "R_heel_z"],
                        "half_len": float(model.geom_size[_foot_gids[0]][0]),
                        "rows": foot_track}, f)
+    if TRANS_JSON and trans_track is not None:
+        with open(TRANS_JSON, "w") as f:
+            json.dump({"cols": ["t", "angvel", "base_z", "F_left", "F_right"],
+                       "rows": trans_track}, f)
     mpath = os.environ.get("S2S_METRICS_JSON")
     if mpath:
         import json as _json

@@ -1152,6 +1152,8 @@ impl BipedEnv {
                 // CPU env (not the GPU training path) doesn't track gait
                 // alternation; alt_step stays false → no air_time reward here.
                 alt_step: false,
+                // No contact-force sensor on the CPU path → force_rate inert.
+                force_rate: 0.0,
             };
         }
         out

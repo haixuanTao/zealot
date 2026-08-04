@@ -140,6 +140,15 @@ pub struct FootObs {
     /// the air never touches down (no reward), and double-tapping the same foot
     /// (hopping) earns nothing on the repeat. Forces a real alternating gait.
     pub alt_step: bool,
+    /// One-step change in this foot's sensed normal contact force, in BODY
+    /// WEIGHTS per control step (|F_t − F_{t−1}| / (m·g), ≥ 0). Filled by the
+    /// env from the contact-force sensor (BIPED_CONTACT_SENSE); 0 when force
+    /// sensing is off or on the first step after a reset. Drives the
+    /// `force_rate` ground-reaction-smoothness penalty: a hard touchdown is a
+    /// 1–2 BW jump in one step, and the standing tremor is a sustained
+    /// left/right load dither — both are pure force-rate, while calm standing
+    /// and normal gait weight transfer (~0.06–0.12 BW/step) are ~free.
+    pub force_rate: f32,
 }
 
 impl Default for FootObs {
@@ -155,6 +164,7 @@ impl Default for FootObs {
             yaw_rel_base: 0.0,
             pos_xy: [0.0, 0.0],
             alt_step: false,
+            force_rate: 0.0,
         }
     }
 }
@@ -477,6 +487,18 @@ pub struct RewardWeights {
     pub stand_planted: f32,
     /// Foot-slip penalty (horizontal foot speed while in contact).
     pub foot_slip: f32,
+    /// Ground-reaction smoothness penalty (NEGATIVE): per foot, the one-step
+    /// sensed-force change above `force_rate_deadband` (both in body weights
+    /// per control step), squared. Prices the two behaviours v26 shipped with:
+    /// foot-slam touchdowns (measured 0.9 BW mean / 2.1 BW peak first-contact
+    /// jumps in MuJoCo) and the standing tremor (left/right load share
+    /// dithering 0→1 at ~18 Hz with both feet planted — invisible in base
+    /// motion, but exactly a sustained |ΔF|). Deadband keeps normal gait
+    /// weight transfer (~0.06–0.12 BW/step) free, so walking itself is not
+    /// taxed. 0 = off. Needs BIPED_CONTACT_SENSE (no sensor → term is 0).
+    pub force_rate: f32,
+    /// Deadband for `force_rate`, body weights per control step (default 0.15).
+    pub force_rate_deadband: f32,
     /// Foot-clearance penalty (swing-foot height vs target).
     pub foot_clearance: f32,
     /// Target swing-foot clearance height, m (for `foot_clearance`).
@@ -585,6 +607,8 @@ impl Default for RewardWeights {
             single_support: 0.5, // REPURPOSED → double-support SETTLE bonus (both feet
             // planted while moving). Modest, so it shapes a
             // "swing → settle → swing" cycle without farmable waddle.
+            force_rate: 0.0, // off by default — enable with BIPED_W_FORCE_RATE
+            force_rate_deadband: 0.15,
             foot_slip: -1.0, // dialed back from -3.0: -3.0 suppressed motion
             // (slip penalty satisfied by NOT moving → backward
             // drift) rather than inducing lift. The positive
@@ -644,6 +668,8 @@ impl RewardWeights {
             flight: -20.0, // AGILE `jumping`
             single_support: 0.0,
             stand_planted: 0.0,
+            force_rate: 0.0, // no WBC equivalent (their contact_forces cap is absolute, not rate)
+            force_rate_deadband: 0.15,
             foot_slip: -0.05, // AGILE feet_slip
             foot_clearance: 0.0,
             foot_clearance_target: 0.03,
@@ -747,6 +773,8 @@ pub struct RewardBreakdown {
     pub stand_planted: f32,
     /// Foot-slip penalty contribution.
     pub foot_slip: f32,
+    /// Ground-reaction-smoothness (force-rate) penalty contribution.
+    pub force_rate: f32,
     /// Foot-clearance penalty contribution.
     pub foot_clearance: f32,
     /// Flat-foot (sole-tilt) penalty contribution.
@@ -783,6 +811,7 @@ impl RewardBreakdown {
             + self.single_support
             + self.stand_planted
             + self.foot_slip
+            + self.force_rate
             + self.foot_clearance
             + self.foot_orientation
             + self.feet_yaw_mean
@@ -1367,6 +1396,17 @@ impl VelocityFlatTask {
         }
         let foot_slip = self.weights.foot_slip * slip * dt;
 
+        // Ground-reaction smoothness: squared excess |ΔF| (body weights per
+        // control step) above the deadband, per foot. Slam touchdowns and the
+        // standing load-dither tremor both live here; gait weight transfer
+        // stays inside the deadband. See the `force_rate` weight doc.
+        let mut frate = 0.0;
+        for f in &state.feet {
+            let ex = (f.force_rate - self.weights.force_rate_deadband).max(0.0);
+            frate += ex * ex;
+        }
+        let force_rate = self.weights.force_rate * frate * dt;
+
         // Clearance: POSITIVE, capped reward for lifting an ACTIVE SWING foot above
         // its resting height, saturating at foot_clearance_target. Gated three ways
         // so it can't be farmed by holding one foot in the air (which is exactly how
@@ -1520,6 +1560,7 @@ impl VelocityFlatTask {
             single_support,
             stand_planted,
             foot_slip,
+            force_rate,
             foot_clearance,
             foot_orientation,
             feet_yaw_mean,
@@ -1661,6 +1702,7 @@ mod tests {
             yaw_rel_base: 0.0,
             pos_xy: [0.0, 0.0],
             alt_step: false,
+            force_rate: 0.0,
         };
         assert_eq!(task.reward(&s, &cmd).air_time, 0.0);
         // Same swing, but now it ALTERNATED while the base actually tracks the
@@ -1673,6 +1715,24 @@ mod tests {
         let mut s2 = RobotState::default();
         s2.feet[0].planar_speed = 1.0;
         assert!(task.reward(&s2, &cmd).foot_slip < 0.0);
+        // Force-rate: off at weight 0; with a weight, a slam-sized 1.5 BW/step
+        // jump is penalized, while normal gait weight transfer (0.1 BW/step,
+        // inside the deadband) stays free.
+        let mut task_fr = task.clone();
+        task_fr.weights.force_rate = -1.0;
+        let mut s_slam = RobotState::default();
+        s_slam.feet[0].force_rate = 1.5;
+        assert_eq!(task.reward(&s_slam, &cmd).force_rate, 0.0);
+        assert!(task_fr.reward(&s_slam, &cmd).force_rate < 0.0);
+        let mut s_walk = RobotState::default();
+        s_walk.feet[0].force_rate = 0.1;
+        s_walk.feet[1].force_rate = 0.1;
+        assert_eq!(task_fr.reward(&s_walk, &cmd).force_rate, 0.0);
+        // Sustained tremor-sized dither (0.4 BW/step on both feet) is taxed.
+        let mut s_trem = RobotState::default();
+        s_trem.feet[0].force_rate = 0.4;
+        s_trem.feet[1].force_rate = 0.4;
+        assert!(task_fr.reward(&s_trem, &cmd).force_rate < 0.0);
         // A foot tilted onto its edge while in contact → flat-foot penalty.
         let mut s3 = RobotState::default();
         s3.feet[0].tilt = 1.0; // ~57° off flat
