@@ -50,11 +50,13 @@ Derived from the solver source (full analysis with file pointers:
 | Articulated dynamics | generalized coords: CRBA + dense LU, on GPU | generalized coords: CRB + sparse LᵀDL (the reference) | reduced-coord articulations, Featherstone-style | MuJoCo's model via XLA | own solvers (Taichi) |
 | Constraint solver | Soft-TGS (rapier lineage) | convex smooth contact optimization | TGS | MuJoCo-like, with restrictions | own |
 | GPU-batched envs | any GPU: WebGPU / Metal / CUDA, one source | no (CPU; official wasm runs in-browser) | CUDA | GPU/TPU via XLA | CUDA |
-| Cross-checked here | is the trainer | browser + native harness | harness | — | harness |
 
 The load-bearing realism claim: at Unitree's real ankle gains a G1 cannot
 passively stand (MuJoCo reproduces this) — stability at 5 ms comes from the
 per-substep refresh and soft-contact structure, not from inflating gains.
+And the engines above aren't rivals here so much as referees: the same
+checkpoint is stepped through them as sim2sim validation — see
+[the sim2sim discipline](docs/explanation.md#a-policy-is-only-trustworthy-if-it-survives-a-different-solver).
 
 ## Getting started
 
