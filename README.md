@@ -46,7 +46,7 @@ Derived from the solver source (full analysis with file pointers:
 | Articulated dynamics | CRBA + dense LU, on GPU | CRB + sparse LᵀDL (the reference) | Featherstone articulations | MuJoCo's model, via XLA | MuJoCo-style, Taichi kernels |
 | Constraint solver | Soft-TGS (rapier lineage) | convex optimization | TGS | MuJoCo-like, restricted | convex + MPM/FEM/SPH multiphysics |
 | GPU-batched envs | ✓ any GPU — WebGPU / Metal / CUDA | — (CPU) | ✓ CUDA | ✓ GPU/TPU | ✓ CUDA |
-| Runs in the browser | ✓ the GPU sim itself ([live demo](https://haixuantao.github.io/zealot/)) | ✓ wasm build, CPU | — | — | — |
+| Runs in the browser | ✓ the GPU sim itself ([live demo](https://haixuantao.github.io/zealot/)) | ✓ wasm build, CPU ([demo tab](https://haixuantao.github.io/zealot/?tab=mujoco)) | — | — | — |
 | Ray tracing | ✓ built into the viewer | — | ✓ Omniverse RTX | — | ✓ Nyx |
 
 ## Getting started

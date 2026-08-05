@@ -405,9 +405,15 @@ function Demo() {
   // just stepped on the CPU — instead of a demo that would fail in front of
   // them. The nexus tab stays one click away, with the warning.
   const [blocker] = useState(nexusBlockedBy);
-  const [selected, setSelected] = useState<DemoName>(() =>
-    blocker ? fallbackDemo(blocker) : 'nexus',
-  );
+  // `?tab=nexus|rapier|mujoco` deep-links an engine tab (a blocked browser
+  // still falls back off the nexus tab it cannot run).
+  const [selected, setSelected] = useState<DemoName>(() => {
+    const t =
+      typeof location !== 'undefined' ? new URLSearchParams(location.search).get('tab') : null;
+    const wanted = DEMOS.find((d) => d.name === t)?.name;
+    if (wanted && !(wanted === 'nexus' && blocker)) return wanted;
+    return blocker ? fallbackDemo(blocker) : 'nexus';
+  });
   const checkpoints = useHfCheckpoints();
   const [knobs, setKnobs] = useState<Knobs>(knobsFromUrl);
   const [applied, setApplied] = useState<Knobs>(knobsFromUrl);
