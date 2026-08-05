@@ -73,6 +73,10 @@ Three steps — full walkthrough in
 
 ## Documentation
 
-Everything — getting started, guides, API reference, explanation — is at
-[**haixuantao.github.io/zealot/doc**](https://haixuantao.github.io/zealot/doc/).
+API reference (rustdoc):
+[**`zealot_env`**](https://haixuantao.github.io/zealot/doc/zealot_env/) ·
+[**`zealot_rl`**](https://haixuantao.github.io/zealot/doc/zealot_rl/).
+Guides live in [`docs/`](docs/): [getting started](docs/getting-started.md) ·
+[development](docs/development.md) · [benchmarks](docs/benchmarks.md) ·
+[explanation](docs/explanation.md).
 
