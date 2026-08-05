@@ -73,13 +73,6 @@ Three steps — full walkthrough in
 
 ## Documentation
 
-[Diátaxis](https://diataxis.fr) set, hub at
-[**haixuantao.github.io/zealot/doc**](https://haixuantao.github.io/zealot/doc/):
-
-| | |
-| --- | --- |
-| **Getting started** | [docs/getting-started.md](docs/getting-started.md) — demo → training → your checkpoint |
-| **How-to guides** | [building & development](docs/development.md) · [reproducing the benchmarks](docs/benchmarks.md) · [the demo site](website/README.md) |
-| **Reference** | hosted rustdoc: [`zealot_env`](https://haixuantao.github.io/zealot/doc/zealot_env/) · [`zealot_rl`](https://haixuantao.github.io/zealot/doc/zealot_rl/) |
-| **Explanation** | [docs/explanation.md](docs/explanation.md) — how it's built and why |
+Everything — getting started, guides, API reference, explanation — is at
+[**haixuantao.github.io/zealot/doc**](https://haixuantao.github.io/zealot/doc/).
 
