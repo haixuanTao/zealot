@@ -49,7 +49,8 @@ Derived from the solver source (full analysis with file pointers:
 | --- | --- | --- | --- | --- | --- |
 | Articulated dynamics | generalized coords: CRBA + dense LU, on GPU | generalized coords: CRB + sparse LᵀDL (the reference) | reduced-coord articulations, Featherstone-style | MuJoCo's model via XLA | own solvers (Taichi) |
 | Constraint solver | Soft-TGS (rapier lineage) | convex smooth contact optimization | TGS | MuJoCo-like, with restrictions | own |
-| GPU-batched envs | any GPU: WebGPU / Metal / CUDA, one source | no (CPU; official wasm runs in-browser) | CUDA | GPU/TPU via XLA | CUDA |
+| GPU-batched envs | any GPU: WebGPU / Metal / CUDA, one source | no (CPU) | CUDA | GPU/TPU via XLA | CUDA |
+| Runs in the browser | yes — the GPU sim itself, via WebGPU ([live demo](https://haixuantao.github.io/zealot/)) | yes — official wasm build, on CPU (the demo's MuJoCo tab) | no | no | no |
 
 The load-bearing realism claim: at Unitree's real ankle gains a G1 cannot
 passively stand (MuJoCo reproduces this) — stability at 5 ms comes from the
