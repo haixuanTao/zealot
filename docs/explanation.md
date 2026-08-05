@@ -32,6 +32,17 @@ in sync. On an RTX 5090 the native-CUDA path runs 2.4–4.3× faster than WebGPU
 while staying bit-exact against it. The hot PPO GEMMs additionally use
 cuTile tf32 tensor cores.
 
+## Workspace layout
+
+| Crate | Role | Analogy |
+| --- | --- | --- |
+| `zealot-env` | Vectorized environment + MDP layer over nexus's batched `GpuPhysicsPipeline` (observations, actions, rewards, terminations, per-env reset). | Isaac Lab tier |
+| `zealot-rl` | Policy network, autodiff, PPO. | rsl_rl tier |
+| `zealot-obs-shaders` / `zealot-gpu-obs` | GPU observation assembly + action commit (the kernels that keep the browser demo's control loop GPU-resident). | — |
+| `website/` | The [live demo site](https://haixuantao.github.io/zealot/) (not a crate; Vite + React + the wasm demo builds). | — |
+
+nexus itself provides the GPU physics + parallel environments (the Isaac Sim tier).
+
 ## Three layers people conflate
 
 1. **Asset / scene description** — bodies, joints, collision, mass. Ships as

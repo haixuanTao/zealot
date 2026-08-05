@@ -102,17 +102,6 @@ Three steps — full walkthrough in
 | **Reference** | hosted rustdoc: [`zealot_env`](https://haixuantao.github.io/zealot/doc/zealot_env/) · [`zealot_rl`](https://haixuantao.github.io/zealot/doc/zealot_rl/) |
 | **Explanation** | [docs/explanation.md](docs/explanation.md) — how it's built and why |
 
-## Workspace layout
-
-| Crate | Role | Analogy |
-| --- | --- | --- |
-| `zealot-env` | Vectorized environment + MDP layer over nexus's batched `GpuPhysicsPipeline` (observations, actions, rewards, terminations, per-env reset). | Isaac Lab tier |
-| `zealot-rl` | Policy network, autodiff, PPO. | rsl_rl tier |
-| `zealot-obs-shaders` / `zealot-gpu-obs` | GPU observation assembly + action commit (the kernels that keep the browser demo's control loop GPU-resident). | — |
-| `website/` | The [live demo site](https://haixuantao.github.io/zealot/) (not a crate; Vite + React + the wasm demo builds). | — |
-
-nexus itself provides the GPU physics + parallel environments (the Isaac Sim tier).
-
 ## Benchmarks
 
 Full methodology and tables: [docs/benchmarks.md](docs/benchmarks.md). The
