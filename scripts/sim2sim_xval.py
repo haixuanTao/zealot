@@ -30,7 +30,7 @@ import numpy as np
 from safetensors.numpy import load_file
 
 # ----------------------------------------------------------------------------
-# Config shared with the nexus env / cross_engine_eval.py
+# Config shared with the nexus env
 # ----------------------------------------------------------------------------
 HOME = os.path.expanduser("~")
 XML = f"{HOME}/Documents/work/lerobot-humanoid-design/to_real_robot/RL_policy/robot.xml"
