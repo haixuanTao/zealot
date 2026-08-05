@@ -48,12 +48,28 @@ pub const UP: usize = 2;
 // not cancel even its own heading drift (measured: yaw output scattered
 // positive regardless of commanded sign). Every deployed locomotion stack
 // feeds the gyro to the policy; it is free on hardware (IMU).
-pub const OBS_DIM: usize = NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2 + 3;
+// `+ 5` at the very end is the STEP CUE (slots 48-52): distance to the edge,
+// its signed height, the edge ORIENTATION as (sin, cos) in the body frame, and
+// a validity flag. Supplied on hardware by a head RealSense: a plane fit plus
+// edge extraction yields all three quantities directly, and unlike a foot
+// probe it gives the edge DIRECTION -- which is what lets the robot meet a
+// step at an angle rather than only head-on. Trained against a terrain oracle
+// with sensor-shaped noise (see `StepCue`).
+pub const OBS_DIM: usize =
+    NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2 + 3 + 5;
 /// Action vector length: one position target per leg DOF.
 pub const ACTION_DIM: usize = NUM_JOINTS;
 /// Privileged (critic) observation length: policy obs plus base linear & angular
 /// velocity in the body frame. Foot/contact privileged terms are deferred.
-pub const CRITIC_OBS_DIM: usize = OBS_DIM + 3 + 3;
+// `+ 5` is the CLEAN step cue: the critic always sees the true edge state,
+// un-noised and never dropped, even while the ACTOR's copy (slots 48..53 of
+// the policy obs) is heavily dropout-masked early in training. Asymmetric
+// actor-critic: the value function credits crossing correctly on steps the
+// actor could not see, so the gradient learns "crossing pays" from blind
+// practice -- the fix for the observed cue->caution trap, where a policy
+// that has not yet learned to climb treats the cue purely as a fall
+// predictor and stops.
+pub const CRITIC_OBS_DIM: usize = OBS_DIM + 3 + 3 + 5;
 
 /// Base (root link) physics state, as read back from nexus each control step.
 #[derive(Clone, Copy, Debug)]
@@ -124,6 +140,21 @@ pub struct FootObs {
     /// the air never touches down (no reward), and double-tapping the same foot
     /// (hopping) earns nothing on the repeat. Forces a real alternating gait.
     pub alt_step: bool,
+    /// Foot vertical velocity, m/s (world +Z; negative = descending). Env
+    /// finite-diff, 0 on the first step after reset. Drives the
+    /// `touchdown_vz` slam penalty — the KINEMATIC impact term (a slam is a
+    /// foot still descending fast near the ground; kinematics transfer
+    /// across engines far better than contact-sensor forces do).
+    pub vz: f32,
+    /// One-step change in this foot's sensed normal contact force, in BODY
+    /// WEIGHTS per control step (|F_t − F_{t−1}| / (m·g), ≥ 0). Filled by the
+    /// env from the contact-force sensor (BIPED_CONTACT_SENSE); 0 when force
+    /// sensing is off or on the first step after a reset. Drives the
+    /// `force_rate` ground-reaction-smoothness penalty: a hard touchdown is a
+    /// 1–2 BW jump in one step, and the standing tremor is a sustained
+    /// left/right load dither — both are pure force-rate, while calm standing
+    /// and normal gait weight transfer (~0.06–0.12 BW/step) are ~free.
+    pub force_rate: f32,
 }
 
 impl Default for FootObs {
@@ -139,8 +170,40 @@ impl Default for FootObs {
             yaw_rel_base: 0.0,
             pos_xy: [0.0, 0.0],
             alt_step: false,
+            vz: 0.0,
+            force_rate: 0.0,
         }
     }
+}
+
+/// What the head RealSense reports about the step ahead.
+///
+/// Extraction is a SCRIPTED perception step, not something the policy learns:
+/// a plane fit plus edge detection on the depth image yields distance, height
+/// and edge orientation directly. The policy's job is only to EXECUTE the step
+/// given those numbers -- which is why this is 5 floats into the existing MLP
+/// rather than a CNN on raw depth.
+///
+/// `valid = 0` must mean "no step information" and the policy must walk
+/// normally on it -- otherwise a dropped detection on hardware becomes a fall
+/// rather than a refusal.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepCue {
+    /// Horizontal distance from the stance to the edge, m. Meaningless when
+    /// `valid == 0`.
+    pub distance: f32,
+    /// Signed height of the surface beyond the edge, m. Positive = step UP,
+    /// negative = step DOWN.
+    pub height: f32,
+    /// Edge normal direction in the BODY frame, as (sin, cos) of the angle
+    /// between the robot's heading and the edge normal. (0, 1) means the edge
+    /// is square-on. Split into sin/cos rather than a raw angle so it is
+    /// continuous across the +/-pi wrap, and so the mirror transform is a
+    /// clean sign flip on sin alone.
+    pub edge_sin: f32,
+    pub edge_cos: f32,
+    /// 1.0 when a detection succeeded, 0.0 otherwise (no step, or no reading).
+    pub valid: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,6 +218,12 @@ pub struct RobotState {
     pub last_action: [f32; NUM_JOINTS],
     /// Action before that (for the action-rate-of-rate term).
     pub prev_action: [f32; NUM_JOINTS],
+    /// Action before THAT — third point for the true second difference
+    /// (`action_rate_rate` = Σ(a − 2a' + a″)²), the action-side tremor
+    /// penalty: dither is action oscillation, so it's priced at the source
+    /// with no contact sensor in the loop (the sensor-side force_rate term
+    /// bred a straight-leg, transfer-breaking gait).
+    pub prev2_action: [f32; NUM_JOINTS],
     /// Per-foot contact state (left, right).
     pub feet: [FootObs; NUM_FEET],
     /// Gait-clock phase ∈ [0,1), advanced by the env each control step. Drives
@@ -165,6 +234,10 @@ pub struct RobotState {
     /// sparse touchdown bonus (air_time) could not, since a step's payoff never
     /// beat the fall risk (the shuffle stayed a stable local optimum).
     pub phase: f32,
+    /// Latest step-cue report AS THE ACTOR SEES IT (noised, dropout-masked).
+    pub step_cue: StepCue,
+    /// The clean oracle cue, critic-only (asymmetric AC). Zero when unknown.
+    pub step_cue_clean: StepCue,
 }
 
 impl Default for RobotState {
@@ -175,8 +248,11 @@ impl Default for RobotState {
             joint_vel: [0.0; NUM_JOINTS],
             last_action: [0.0; NUM_JOINTS],
             prev_action: [0.0; NUM_JOINTS],
+            prev2_action: [0.0; NUM_JOINTS],
             feet: [FootObs::default(); NUM_FEET],
             phase: 0.0,
+            step_cue: StepCue::default(),
+            step_cue_clean: StepCue::default(),
         }
     }
 }
@@ -244,11 +320,20 @@ impl Default for CommandSampler {
             // unreachable max command the curriculum forces the policy into a
             // regime where tracking reward is uniformly tiny → it gives up.
             // Override per-axis with BIPED_VX / BIPED_VY / BIPED_YAW ("lo,hi").
-            // Note the yaw default (±0.2) is 5× narrower than WBC-AGILE T1's
-            // ±1.0 — widen via BIPED_YAW when training for heading control.
             lin_vel_x: range_env("BIPED_VX", (-0.5, 0.5)),
             lin_vel_y: range_env("BIPED_VY", (-0.3, 0.3)),
-            ang_vel_z: range_env("BIPED_YAW", (-0.2, 0.2)),
+            // Yaw was ±0.2 through v21 — 5× narrower than WBC-AGILE T1's ±1.0,
+            // and too narrow to learn from: at |yaw| ≤ 0.2 the exp tracking
+            // kernel is nearly satisfied by NOT turning, so `track_ang_vel`
+            // earned only 0.006/step (13% of linear tracking) and v21 turned
+            // the WRONG WAY on a commanded ±0.2 (measured +0.03 / +0.02 rad/s
+            // for ±0.5, −0.05 for +0.2). Raising the weight 5→8 had already
+            // failed to fix it — the problem is the command range, not the
+            // price. ±0.6 gives the kernel something to discriminate while
+            // staying inside what the 12-DOF platform can turn.
+            // NOTE evaluations: ±0.5 was OUTSIDE the old training range, so
+            // every pre-v22 yaw probe at 0.5 was measuring extrapolation.
+            ang_vel_z: range_env("BIPED_YAW", (-0.6, 0.6)),
             // Fraction of command resamples that are a pure STAND (zero). Raising
             // it (BIPED_STAND_PROB) makes the robot stop more often → trains
             // explicit walk→stand→walk (go-stop-go) transitions and gives frequent
@@ -289,19 +374,47 @@ impl CommandSampler {
         // sampling puts almost no probability on SLOW commands relative to
         // the reward's sharp kernel, and the terrain curriculum pays for
         // travel — the 30k-iter policy learned exactly two speeds (0 and
-        // ~±1 m/s), saturating every magnitude in between. Scaling a
-        // fraction of draws into [0.15, 0.5]× forces the slow-precision
-        // regime into the data so magnitude tracking has something to
-        // learn from.
+        // ~±1 m/s), saturating every magnitude in between. Slow draws are
+        // rescaled onto a speed in [0.12, 0.3]: the quasi-static regime where
+        // single-support balance is hardest (and sim2sim falls live), kept
+        // strictly above the 0.1 standing threshold so the gait clock runs.
         let slow_prob: f32 = std::env::var("BIPED_SLOW_PROB")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.25);
+        // Arc bias (BIPED_ARC_PROB, default 0.25): with the yaw range widened
+        // to +/-0.6, independent uniform draws still put almost no mass on
+        // CURVED walking -- measured only ~5% of moving commands were strong
+        // arcs (|yaw|>=0.15 with |vx|>=0.3). Explicitly pair a real forward
+        // speed with a real yaw rate so turning-while-walking is in the data
+        // at all, not just turning-in-place.
+        let arc_prob: f32 = std::env::var("BIPED_ARC_PROB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.25);
+        if rng.chance(arc_prob) {
+            let sx = if rng.chance(0.5) { 1.0 } else { -1.0 };
+            let sy = if rng.chance(0.5) { 1.0 } else { -1.0 };
+            cmd.vx = sx * rng.range(0.25, self.lin_vel_x.1.abs().max(0.25));
+            cmd.yaw_rate = sy * rng.range(0.2, self.ang_vel_z.1.abs().max(0.2));
+            cmd.vy = 0.0;
+            return cmd;
+        }
         if rng.chance(slow_prob) {
-            let k = rng.range(0.15, 0.5);
-            cmd.vx *= k;
-            cmd.vy *= k;
-            cmd.yaw_rate *= k;
+            let target = rng.range(0.12, 0.3);
+            let speed = cmd.speed();
+            if speed > 1e-6 {
+                let k = target / speed;
+                cmd.vx *= k;
+                cmd.vy *= k;
+                cmd.yaw_rate *= k;
+            }
+        }
+        // A draw below the 0.1 standing threshold is contradictory: the gait
+        // clock freezes and stand_planted engages while tracking still asks
+        // for motion. Snap it to a true stand.
+        if cmd.speed() < 0.1 {
+            return VelocityCommand::default();
         }
         cmd
     }
@@ -330,8 +443,24 @@ pub struct RewardWeights {
     /// Base-height tracking (exp kernel) — keeps the robot standing tall instead
     /// of crouching to trivially avoid falling.
     pub base_height: f32,
-    /// Target base (torso) height, m (for `base_height`).
+    /// Target base (torso) height, m (for `base_height`) while MOVING.
     pub base_height_target: f32,
+    /// Target base height, m, while STANDING (`cmd.speed() < 0.1`, the same gate
+    /// the gait clock freezes on). Defaults to `base_height_target`, so the
+    /// split is inert until `BIPED_BASE_HEIGHT_STAND` is set.
+    ///
+    /// Standing tall is nearly free in height but expensive in knee angle:
+    /// measured on this robot, height = 0.580*cos(knee/2) + 0.259, so the leg
+    /// ceiling is 0.839 m at knee 0 and the curve goes FLAT as it straightens
+    /// (15 deg -> 0 deg of knee buys only 5 mm). Two consequences:
+    ///   * a target ABOVE ~0.839 is unreachable without hyperextending into the
+    ///     -0.087 rad knee stop. That is what v22 did at 0.841 (locked at -4 deg,
+    ///     60% of frames on the stop, CoT 1.00) -- do not set one.
+    ///   * above ~0.837 the gradient falls under 0.5 mm/deg, so the only way to
+    ///     chase the last millimetres is to ride the stop.
+    /// 0.835 -> ~13.6 deg knee with 18.6 deg of stop margin, 4 mm under the
+    /// ceiling: reachable at a legal knee angle, unlike v22's target.
+    pub base_height_target_stand: f32,
     /// Hip yaw/roll deviation penalty gain (NEGATIVE). L2 penalty on hipz+hipx
     /// deviation from default, always-on — stops the policy from limit-riding the
     /// lateral hips into a splayed brace. (Was an unused full-posture reward.)
@@ -365,13 +494,46 @@ pub struct RewardWeights {
     pub single_support: f32,
     /// Penalty (per airborne foot, per step) while the command is STANDING.
     /// Makes the policy absorb small pushes with ankle/hip torque (feet
-    /// planted, CoM shifted — see `com_centering`) instead of dance-stepping
+    /// planted, CoM shifted) instead of dance-stepping
     /// in place. MODERATE by design: for a big shove a protective step (brief
     /// penalty) must stay cheaper than falling (termination), mirroring the
     /// human ankle→hip→step strategy ladder. 0 = off.
     pub stand_planted: f32,
     /// Foot-slip penalty (horizontal foot speed while in contact).
     pub foot_slip: f32,
+    /// Action second-difference penalty (NEGATIVE): Σ(a − 2a′ + a″)². The
+    /// ACTION-side tremor term — high-frequency dither is literally an
+    /// oscillating action, so this prices it at the policy's output with no
+    /// engine-specific signal in the loop. Complements (does not stack with)
+    /// `action_rate`, which only prices speed of change, not oscillation:
+    /// a smooth fast ramp scores high action_rate but ~0 here. 0 = off.
+    pub action_rate_rate: f32,
+    /// Touchdown-impact penalty (NEGATIVE): per airborne foot below
+    /// `touchdown_vz_h` (m), squared excess descent speed beyond
+    /// `touchdown_vz_ok` (m/s). Kinematic slam term: a soft landing decel-
+    /// erates BEFORE the ground, a slam is still fast at 5 cm. 0 = off.
+    pub touchdown_vz: f32,
+    /// Allowed descent speed at the gate height (m/s, default 0.3).
+    pub touchdown_vz_ok: f32,
+    /// Gate height above local ground (m, default 0.10). NOTE this compares
+    /// against `FootObs.height`, which is the foot link ORIGIN — ~0.035 m
+    /// above the sole even when planted (FOOT_REST_H). The first default
+    /// (0.06) left a ~2 cm trigger window that contact sensing pre-empted:
+    /// the term logged exactly 0 for 100 iters of newborn flailing. 0.10 =
+    /// sole ~6.5 cm up, a real approach window.
+    pub touchdown_vz_h: f32,
+    /// Ground-reaction smoothness penalty (NEGATIVE): per foot, the one-step
+    /// sensed-force change above `force_rate_deadband` (both in body weights
+    /// per control step), squared. Prices the two behaviours v26 shipped with:
+    /// foot-slam touchdowns (measured 0.9 BW mean / 2.1 BW peak first-contact
+    /// jumps in MuJoCo) and the standing tremor (left/right load share
+    /// dithering 0→1 at ~18 Hz with both feet planted — invisible in base
+    /// motion, but exactly a sustained |ΔF|). Deadband keeps normal gait
+    /// weight transfer (~0.06–0.12 BW/step) free, so walking itself is not
+    /// taxed. 0 = off. Needs BIPED_CONTACT_SENSE (no sensor → term is 0).
+    pub force_rate: f32,
+    /// Deadband for `force_rate`, body weights per control step (default 0.15).
+    pub force_rate_deadband: f32,
     /// Foot-clearance penalty (swing-foot height vs target).
     pub foot_clearance: f32,
     /// Target swing-foot clearance height, m (for `foot_clearance`).
@@ -401,12 +563,6 @@ pub struct RewardWeights {
     /// the feet offset by half a cycle, `1 - 2·swing_ratio` of the cycle is
     /// double-support — the built-in "both feet down in the middle".
     pub gait_swing_ratio: f32,
-    /// CoM-centering reward: keeps the base (CoM proxy) horizontally over the
-    /// support point (centroid of contacting feet). With the CoM over the stance
-    /// foot, the gravitational moment about the ankle ≈ 0, so single-support needs
-    /// almost no ankle torque — letting the fragile 15 N·m ankle hold one-foot
-    /// balance instead of saturating. This is what lets a real step survive.
-    pub com_centering: f32,
 }
 
 impl Default for RewardWeights {
@@ -447,6 +603,7 @@ impl Default for RewardWeights {
             // 0.72→0.64 (lower CoM = more stable static stance).
             // 2.0 keeps it tall in BOTH stand and walk.
             base_height_target: 0.72, // WBC DEFAULT_TRUNK_HEIGHT (was 0.62 — crouch bug)
+            base_height_target_stand: 0.72, // = target: split is opt-in
             pose: -8.0,               // hip yaw/roll deviation penalty (anti-limit-ride)
             bilateral_symmetry: 2.0,  // reward L/R-mirrored gait (natural, fixes lopsidedness)
             action_rate: -0.1,        // WBC -0.1 (was -0.25)
@@ -478,17 +635,19 @@ impl Default for RewardWeights {
             // pays the completed-swing duration ONLY at touchdown,
             // so a permanently-raised foot earns nothing → forces
             // real alternating step cycles. Progress+command gated.
-            flight: -1.0,        // keep: no hopping (both feet airborne)
-            stand_planted: -1.0, // ON by default: per-airborne-foot penalty
-            // while the command is standing → balance with ankles/hips, not
-            // dance-steps. Without it nothing opposes marching in place at a
-            // stand (tracking pays for zero NET velocity, which a march
-            // satisfies), so the policy learns to jog on the spot whenever it
-            // is told to hold still. -1.0 is the weight the v24 run used;
-            // override with BIPED_W_STAND_PLANTED.
+            flight: -1.0,       // keep: no hopping (both feet airborne)
+            stand_planted: 0.0, // OFF by default (A/B via BIPED_STAND_PLANTED_W):
+            // per-airborne-foot penalty while the command is
+            // standing → balance with ankles/hips, not dance-steps.
             single_support: 0.5, // REPURPOSED → double-support SETTLE bonus (both feet
             // planted while moving). Modest, so it shapes a
             // "swing → settle → swing" cycle without farmable waddle.
+            action_rate_rate: 0.0, // off — enable with BIPED_W_ACTION_RATE_RATE
+            touchdown_vz: 0.0,     // off — enable with BIPED_W_TOUCHDOWN_VZ
+            touchdown_vz_ok: 0.3,
+            touchdown_vz_h: 0.10,
+            force_rate: 0.0, // off by default — enable with BIPED_W_FORCE_RATE
+            force_rate_deadband: 0.15,
             foot_slip: -1.0, // dialed back from -3.0: -3.0 suppressed motion
             // (slip penalty satisfied by NOT moving → backward
             // drift) rather than inducing lift. The positive
@@ -513,8 +672,6 @@ impl Default for RewardWeights {
             // swing window is penalized, so lifting on schedule
             // is clearly worth more than staying planted.
             gait_swing_ratio: 0.4, // 40% swing per foot → 20% double-support overlap
-            com_centering: 2.0,    // keep CoM over the support foot → ~0 ankle torque
-                                   // in single-support (fragile 15 N·m ankle can hold it)
         }
     }
 }
@@ -524,7 +681,7 @@ impl RewardWeights {
     /// (`BIPED_AGILE_REWARDS=1`). AGILE has NO stepping rewards — locomotion
     /// emerges from sharp tracking + terrain — so every zealot-only shaping
     /// term (gait_clock, air_time, single_support, bilateral_symmetry,
-    /// com_centering, pose, forward_progress) is zeroed here. Terms AGILE has
+    /// pose, forward_progress) is zeroed here. Terms AGILE has
     /// that we can't express (action_rate_rate, root_acc, dof_vel_limits,
     /// torque family — those live in the env's BIPED_TORQUE_W/POWER_W hooks)
     /// are noted at the call site. `flight` carries AGILE's `jumping` weight.
@@ -536,6 +693,7 @@ impl RewardWeights {
             upright: 5.0,
             base_height: 2.5,
             base_height_target: 0.72, // AGILE DEFAULT_PELVIS_HEIGHT (bent-knee stance)
+            base_height_target_stand: 0.72, // = target: split is opt-in
             pose: 0.0,
             bilateral_symmetry: 0.0,
             action_rate: -0.25,
@@ -549,6 +707,12 @@ impl RewardWeights {
             flight: -20.0, // AGILE `jumping`
             single_support: 0.0,
             stand_planted: 0.0,
+            action_rate_rate: 0.0, // WBC has action_rate_rate; weight unknown, keep off
+            touchdown_vz: 0.0,
+            touchdown_vz_ok: 0.3,
+            touchdown_vz_h: 0.10,
+            force_rate: 0.0, // no WBC equivalent (their contact_forces cap is absolute, not rate)
+            force_rate_deadband: 0.15,
             foot_slip: -0.05, // AGILE feet_slip
             foot_clearance: 0.0,
             foot_clearance_target: 0.03,
@@ -559,7 +723,6 @@ impl RewardWeights {
             feet_distance_ref: 0.2,
             gait_clock: 0.0,
             gait_swing_ratio: 0.4,
-            com_centering: 0.0,
         }
     }
 }
@@ -653,6 +816,12 @@ pub struct RewardBreakdown {
     pub stand_planted: f32,
     /// Foot-slip penalty contribution.
     pub foot_slip: f32,
+    /// Ground-reaction-smoothness (force-rate) penalty contribution.
+    pub force_rate: f32,
+    /// Action second-difference (tremor-at-source) penalty contribution.
+    pub action_rate_rate: f32,
+    /// Kinematic touchdown-impact (descent-speed) penalty contribution.
+    pub touchdown_vz: f32,
     /// Foot-clearance penalty contribution.
     pub foot_clearance: f32,
     /// Flat-foot (sole-tilt) penalty contribution.
@@ -666,8 +835,6 @@ pub struct RewardBreakdown {
     /// Periodic gait-clock contribution (dense reward for matching each foot's
     /// swing/stance to the gait phase).
     pub gait_clock: f32,
-    /// CoM-centering contribution (CoM over the support point → low ankle torque).
-    pub com_centering: f32,
 }
 
 impl RewardBreakdown {
@@ -691,13 +858,15 @@ impl RewardBreakdown {
             + self.single_support
             + self.stand_planted
             + self.foot_slip
+            + self.force_rate
+            + self.action_rate_rate
+            + self.touchdown_vz
             + self.foot_clearance
             + self.foot_orientation
             + self.feet_yaw_mean
             + self.feet_yaw_diff
             + self.feet_distance
             + self.gait_clock
-            + self.com_centering
     }
 }
 
@@ -724,6 +893,16 @@ pub struct VelocityFlatTask {
     pub min_base_height: f32,
     /// Indices of the hip yaw/roll DOFs (for `action_rate_hipz_hipx`).
     hip_yawroll_idx: [usize; 4],
+    /// Cue distance under which the step-manoeuvre relaxation applies (m).
+    pub step_relax_dist: f32,
+    /// Widened base-height kernel while stepping (m).
+    pub step_std_base_h: f32,
+    /// Widened upright kernel while stepping (rad).
+    pub step_std_upright: f32,
+    /// `|yaw_rate|` at which the LATERAL half of `bilateral_symmetry` is fully
+    /// released (`BIPED_SYM_YAW_GATE`; 0 = off, historical behaviour). See
+    /// `symmetry_error` for why turning is otherwise taxed by that term.
+    pub sym_yaw_gate: f32,
 }
 
 impl Default for VelocityFlatTask {
@@ -785,6 +964,29 @@ impl VelocityFlatTask {
         if let Some(v) = env_f32("BIPED_W_BASE_H") {
             weights.base_height = v;
         }
+        // Target height for the base_height kernel. AGILE's 0.72 is a
+        // bent-knee stance; measured v21 sits 4-9 cm BELOW even that
+        // (0.63-0.68 m vs 0.79 natural) because crouching buys balance
+        // stability and the wide sigma=0.1 kernel makes the undershoot
+        // cheap. 0.75 is the recommended first step up; 0.78+ risks the
+        // straight-knee singularity where the leg loses vertical control
+        // authority.
+        // NOTE: BIPED_BASE_HEIGHT sets BOTH targets, so the historical
+        // single-knob behaviour is preserved exactly. BIPED_BASE_HEIGHT_STAND
+        // is applied AFTER it and overrides the standing one only -- order
+        // matters, do not reorder these two blocks.
+        if let Some(v) = env_f32("BIPED_BASE_HEIGHT") {
+            weights.base_height_target = v;
+            weights.base_height_target_stand = v;
+        }
+        // Command-conditioned standing height. The policy already prefers a
+        // taller stance than its gait (v24 measured 0.816 standing vs 0.807
+        // walking), so this codifies an existing preference rather than
+        // fighting one. See the field docs for the knee-angle geometry and why
+        // anything above ~0.837 rides the knee stop.
+        if let Some(v) = env_f32("BIPED_BASE_HEIGHT_STAND") {
+            weights.base_height_target_stand = v;
+        }
         // AGILE-alignment override: WBC has NO air-time reward — its gait
         // economy comes from torque/energy regularizers. Paying completed
         // swing DURATION (capped 0.4s ≈ our natural swing) selects for
@@ -800,6 +1002,38 @@ impl VelocityFlatTask {
         if let Some(v) = env_f32("BIPED_STD_LIN") {
             stds.lin_vel = v;
         }
+        // Width of the height kernel (BIPED_STD_BASE_H, metres). The default
+        // 0.1 is wide enough that a 4 cm undershoot still collects 85% of the
+        // reward, which is why v21 sat 4 cm below its own target and stayed
+        // there. Tightening to ~0.05 makes a crouch cost the height reward
+        // outright -- the direct way to price posture, instead of taxing knee
+        // torque and hoping the posture follows.
+        if let Some(v) = env_f32("BIPED_STD_BASE_H") {
+            stds.base_height = v;
+        }
+        // Width of the ANGULAR tracking kernel. The default 0.1 is far too
+        // narrow for the +/-0.6 command range: a policy sitting at the measured
+        // 0.06 rad/s scores exp(-(0.4-0.06)^2/0.1^2) = 1e-5 on a 0.4 command,
+        // i.e. NO gradient to climb. Measured on v24 at iter 32-42k, which
+        // never learned to turn despite the gyro, the widened yaw range and 25%
+        // arc sampling -- the arcs sample yaw in [0.2, 0.6], of which only the
+        // 0.2 edge pays anything at all (14%; 0.35 pays 0.02%).
+        //
+        // v22 DID turn (+0.38) because it happened to land inside the basin,
+        // after which a 0.4 command scores 96% and self-reinforces. That is
+        // luck, not a gradient. 0.3 makes a 0.4 command pay 28% from a standing
+        // start, so there is a slope the whole way in.
+        if let Some(v) = env_f32("BIPED_STD_ANG") {
+            stds.ang_vel = v;
+        }
+        // Action-rate penalty gain (NEGATIVE). Exposed because it is denominated
+        // in ACTION units, not radians: it charges (delta action)^2, so halving
+        // BIPED_ACTION_SCALE makes the same PHYSICAL motion cost 4x more here.
+        // Anyone running action_scale 0.25 must scale this by ~1/4 or the
+        // penalty dominates and the policy simply stops moving.
+        if let Some(v) = env_f32("BIPED_W_ACTION_RATE") {
+            weights.action_rate = v;
+        }
         Self {
             robot,
             weights,
@@ -810,6 +1044,11 @@ impl VelocityFlatTask {
             tilt_limit: 70.0_f32.to_radians(),
             min_base_height: robot.min_base_height,
             hip_yawroll_idx,
+            sym_yaw_gate: env_f32("BIPED_SYM_YAW_GATE").unwrap_or(0.0),
+            step_relax_dist: env_f32("BIPED_STEP_RELAX_DIST").unwrap_or(0.6),
+            step_std_base_h: env_f32("BIPED_STEP_STD_BASE_H").unwrap_or(0.15),
+            step_std_upright: env_f32("BIPED_STEP_STD_UPRIGHT")
+                .unwrap_or(25.0_f32.to_radians()),
         }
     }
 
@@ -877,7 +1116,8 @@ impl VelocityFlatTask {
     /// Assemble the 43-dim policy observation into `obs`.
     ///
     /// Layout: `[last_action(12), command(4), joint_pos_rel(12), joint_vel(12),
-    /// projected_gravity(3)]`. `joint_pos_rel = q − default_pos`.
+    /// projected_gravity(3), gait_clock(2), base_ang_vel(3)]`.
+    /// `joint_pos_rel = q − default_pos`.
     pub fn observe(&self, state: &RobotState, cmd: &VelocityCommand, obs: &mut [f32]) {
         debug_assert_eq!(obs.len(), OBS_DIM);
         let mut o = 0;
@@ -914,6 +1154,19 @@ impl VelocityFlatTask {
         for w in self.base_ang_vel_body(&state.base) {
             put(obs, &mut o, w);
         }
+        // Step cue LAST, so slots 0-47 keep their v22-v27 meaning. Distance is
+        // clipped: beyond ~1.5 m the exact value carries no useful information
+        // and an unclipped range would waste normalizer resolution on it.
+        // When `valid == 0` the other two are forced to zero, so "no step" is a
+        // single unambiguous pattern rather than stale numbers the policy might
+        // still act on.
+        let cue = state.step_cue;
+        let live = cue.valid > 0.5;
+        put(obs, &mut o, if live { cue.distance.clamp(-0.5, 1.5) } else { 0.0 });
+        put(obs, &mut o, if live { cue.height.clamp(-0.4, 0.4) } else { 0.0 });
+        put(obs, &mut o, if live { cue.edge_sin } else { 0.0 });
+        put(obs, &mut o, if live { cue.edge_cos } else { 0.0 });
+        put(obs, &mut o, if live { 1.0 } else { 0.0 });
         debug_assert_eq!(o, OBS_DIM);
     }
 
@@ -925,7 +1178,16 @@ impl VelocityFlatTask {
         let v = self.base_lin_vel_body(&state.base);
         let w = self.base_ang_vel_body(&state.base);
         obs[OBS_DIM..OBS_DIM + 3].copy_from_slice(&v);
-        obs[OBS_DIM + 3..CRITIC_OBS_DIM].copy_from_slice(&w);
+        obs[OBS_DIM + 3..OBS_DIM + 6].copy_from_slice(&w);
+        // Clean cue (see CRITIC_OBS_DIM): from step_cue_clean, which the env
+        // fills with the raw oracle BEFORE actor-side noise and dropout.
+        let cc = state.step_cue_clean;
+        let live = cc.valid > 0.5;
+        obs[OBS_DIM + 6] = if live { cc.distance.clamp(-0.5, 1.5) } else { 0.0 };
+        obs[OBS_DIM + 7] = if live { cc.height.clamp(-0.4, 0.4) } else { 0.0 };
+        obs[OBS_DIM + 8] = if live { cc.edge_sin } else { 0.0 };
+        obs[OBS_DIM + 9] = if live { cc.edge_cos } else { 0.0 };
+        obs[OBS_DIM + 10] = if live { 1.0 } else { 0.0 };
     }
 
     /// Compute the per-term reward for one control step.
@@ -958,15 +1220,60 @@ impl VelocityFlatTask {
         let track_ang_vel =
             self.weights.track_ang_vel * (-ang_err / self.stds.ang_vel.powi(2)).exp() * dt;
 
+        // STEP MANOEUVRE GATE. Climbing a step is flatly irrational under the
+        // flat-ground reward: the base MUST rise relative to the surface it is
+        // leaving (no choice of reference foot avoids that), and it MUST pitch
+        // forward to get the swing leg up. Measured against a 0.20 m riser,
+        // holding the normal kernels costs ~0.040/step of base_height plus
+        // ~0.072/step of upright at a 15 deg lean -- together ~42% of all
+        // positive reward, against a ~0.002 behaviour threshold. The policy
+        // would correctly learn to refuse.
+        //
+        // So while a step is cued and close, widen both kernels rather than
+        // moving their targets: the target is still where we want the robot to
+        // END UP, we are only declining to charge it for the transient.
+        //
+        // PROGRESS-GATED, and this is load-bearing. The first version relaxed
+        // on proximity alone, and the policy found the hack within 15k iters:
+        // standing inside the relax zone earns near-max posture reward in ANY
+        // pose, so it learned "cue valid -> stop". Measured on the step eval,
+        // same checkpoint, same 10 cm step: cue ON froze at x=0.16 m while cue
+        // OFF (blind) walked to 1.28 m -- the cue made behaviour WORSE, and
+        // the refusal strengthened with training while turning and gait
+        // atrophied alongside it (loitering generalises). Requiring real
+        // motion toward the edge means a loiterer faces the normal kernels and
+        // the zone pays nothing unless the manoeuvre is actually happening.
+        // Threshold 0.1 m/s matches the standing predicate's scale.
+        let toward_step =
+            v[FWD] * state.step_cue.edge_cos + v[LAT] * state.step_cue.edge_sin;
+        let stepping = state.step_cue.valid > 0.5
+            && state.step_cue.distance.abs() < self.step_relax_dist
+            && toward_step > 0.1;
+        let (std_h, std_up) = if stepping {
+            (self.step_std_base_h, self.step_std_upright)
+        } else {
+            (self.stds.base_height, self.stds.upright)
+        };
+
         // Upright: horizontal components of projected gravity → 0 when flat.
         let tilt_err = grav[FWD].powi(2) + grav[LAT].powi(2);
-        let upright = self.weights.upright * (-tilt_err / self.stds.upright.powi(2)).exp() * dt;
+        let upright = self.weights.upright * (-tilt_err / std_up.powi(2)).exp() * dt;
 
         // Base height: stand tall (exp kernel around the target) so the policy
-        // can't trivially crouch to avoid falling.
-        let h_err = (state.base.height - self.weights.base_height_target).powi(2);
-        let base_height =
-            self.weights.base_height * (-h_err / self.stds.base_height.powi(2)).exp() * dt;
+        // can't trivially crouch to avoid falling. The target is
+        // command-conditioned: standing may ask for a taller, straighter-legged
+        // stance than the gait wants, which cuts the continuous knee holding
+        // torque (measured 28 N-m at a 31 deg stand knee) without forcing the
+        // gait itself higher. Same `cmd.speed() < 0.1` gate the gait clock,
+        // stand_planted and single_support already switch on, so this adds no
+        // new discontinuity -- it rides one that is already there.
+        let h_target = if cmd.speed() < 0.1 {
+            self.weights.base_height_target_stand
+        } else {
+            self.weights.base_height_target
+        };
+        let h_err = (state.base.height - h_target).powi(2);
+        let base_height = self.weights.base_height * (-h_err / std_h.powi(2)).exp() * dt;
 
         // Hip yaw/roll deviation penalty (reuses the `pose` slot — the WBC port
         // left the full-posture reward at weight 0). The LATERAL hip DOFs (hipz
@@ -985,7 +1292,15 @@ impl VelocityFlatTask {
 
         // Bilateral symmetry: sagittal joints (hipy/knee/ankley) mirror equal,
         // lateral joints (hipz/hipx/anklex) mirror opposite. Reward exp(-error).
-        let sym_err = self.symmetry_error(&state.joint_pos);
+        // Release the LATERAL half of the symmetry term in proportion to the
+        // commanded turn: 1.0 going straight, 0.0 at |yaw_rate| >= the gate.
+        // Off (gate 0) = historical behaviour, lateral at full weight always.
+        let lateral_scale = if self.sym_yaw_gate > 0.0 {
+            (1.0 - cmd.yaw_rate.abs() / self.sym_yaw_gate).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let sym_err = self.symmetry_error(&state.joint_pos, lateral_scale);
         let bilateral_symmetry = self.weights.bilateral_symmetry * (-sym_err).exp() * dt;
 
         // Penalties (negative weights).
@@ -994,6 +1309,25 @@ impl VelocityFlatTask {
             da2 += (state.last_action[i] - state.prev_action[i]).powi(2);
         }
         let action_rate = self.weights.action_rate * da2 * dt;
+
+        // Action second difference (tremor at the source): Σ(a − 2a′ + a″)².
+        let mut dda2 = 0.0;
+        for i in 0..NUM_JOINTS {
+            let dd = state.last_action[i] - 2.0 * state.prev_action[i] + state.prev2_action[i];
+            dda2 += dd * dd;
+        }
+        let action_rate_rate = self.weights.action_rate_rate * dda2 * dt;
+
+        // Touchdown impact (kinematic slam): an airborne foot still
+        // descending faster than `touchdown_vz_ok` below the gate height.
+        let mut slam = 0.0;
+        for f in &state.feet {
+            if !f.contact && f.height < self.weights.touchdown_vz_h {
+                let ex = (-f.vz - self.weights.touchdown_vz_ok).max(0.0);
+                slam += ex * ex;
+            }
+        }
+        let touchdown_vz = self.weights.touchdown_vz * slam * dt;
 
         let mut da2_hip = 0.0;
         for &i in &self.hip_yawroll_idx {
@@ -1130,6 +1464,17 @@ impl VelocityFlatTask {
         }
         let foot_slip = self.weights.foot_slip * slip * dt;
 
+        // Ground-reaction smoothness: squared excess |ΔF| (body weights per
+        // control step) above the deadband, per foot. Slam touchdowns and the
+        // standing load-dither tremor both live here; gait weight transfer
+        // stays inside the deadband. See the `force_rate` weight doc.
+        let mut frate = 0.0;
+        for f in &state.feet {
+            let ex = (f.force_rate - self.weights.force_rate_deadband).max(0.0);
+            frate += ex * ex;
+        }
+        let force_rate = self.weights.force_rate * frate * dt;
+
         // Clearance: POSITIVE, capped reward for lifting an ACTIVE SWING foot above
         // its resting height, saturating at foot_clearance_target. Gated three ways
         // so it can't be farmed by holding one foot in the air (which is exactly how
@@ -1141,10 +1486,30 @@ impl VelocityFlatTask {
         //   (3) moving                — never at zero command (no stamping in place).
         const FOOT_REST_H: f32 = 0.035;
         const MAX_SWING_S: f32 = 0.45;
+        // REWARDING THE STEP. While a step-up is cued and close, raise the
+        // clearance target to the riser plus a margin, so "enough lift" means
+        // enough to actually clear THIS step rather than a fixed 3 cm. The
+        // reward saturates at the target (lift.min(1.0)), so raising it is
+        // exactly "you must lift higher here" and nothing else changes.
+        //
+        // This reuses the existing term ON PURPOSE. foot_clearance was dropped
+        // once because a static foot-height reward got hacked into a one-foot
+        // statue (foot held up to farm it; zero transfer, MuJoCo fell in
+        // 0.66 s). The guards added in response -- swing-only, air_time <
+        // 0.45 s so a held foot stops earning, moving-gated, capped -- are
+        // right here and apply unchanged. A fresh "reward crossing a step"
+        // term would have none of them.
+        const STEP_CLEAR_MARGIN: f32 = 0.05;
+        let clear_target = if stepping && state.step_cue.height > 0.0 {
+            (state.step_cue.height + STEP_CLEAR_MARGIN)
+                .max(self.weights.foot_clearance_target)
+        } else {
+            self.weights.foot_clearance_target
+        };
         let mut foot_h = 0.0;
         for f in &state.feet {
             if !f.contact && f.air_time < MAX_SWING_S {
-                let lift = (f.height - FOOT_REST_H).max(0.0) / self.weights.foot_clearance_target;
+                let lift = (f.height - FOOT_REST_H).max(0.0) / clear_target;
                 foot_h += lift.min(1.0);
             }
         }
@@ -1245,31 +1610,6 @@ impl VelocityFlatTask {
             0.0
         };
 
-        // CoM centering: keep the base (CoM proxy) over the support point — the
-        // centroid of whatever feet are in contact. Offset → 0 means the CoM is
-        // over the base of support, so the ankle needs ~no torque to hold balance
-        // (crucial in single-support, where an off-center CoM saturated the 15 N·m
-        // ankle). exp kernel, active whenever at least one foot is down.
-        const COM_STD: f32 = 0.12;
-        let mut sx = 0.0;
-        let mut sy = 0.0;
-        let mut nc = 0u32;
-        for f in &state.feet {
-            if f.contact {
-                sx += f.pos_xy[0];
-                sy += f.pos_xy[1];
-                nc += 1;
-            }
-        }
-        let com_centering = if nc > 0 {
-            let dx = state.base.pos_xy[0] - sx / nc as f32;
-            let dy = state.base.pos_xy[1] - sy / nc as f32;
-            let d2 = dx * dx + dy * dy;
-            self.weights.com_centering * (-d2 / (COM_STD * COM_STD)).exp() * dt
-        } else {
-            0.0
-        };
-
         RewardBreakdown {
             track_lin_vel,
             track_ang_vel,
@@ -1288,27 +1628,43 @@ impl VelocityFlatTask {
             single_support,
             stand_planted,
             foot_slip,
+            force_rate,
+            action_rate_rate,
+            touchdown_vz,
             foot_clearance,
             foot_orientation,
             feet_yaw_mean,
             feet_yaw_diff,
             feet_distance,
             gait_clock,
-            com_centering,
         }
     }
 
     /// Mirror error: pairs left/right joints via the spec's mirror permutation
     /// and accumulates the squared difference under the family's mirror sign
     /// (sagittal joints mirror equal, lateral joints mirror opposite).
-    fn symmetry_error(&self, q: &[f32; NUM_JOINTS]) -> f32 {
+    /// `lateral_scale` attenuates ONLY the mirror-opposite joints (hip_roll,
+    /// hip_yaw, ankle_roll — `mirror_sign < 0`). Those are "symmetric" when
+    /// `q_L = -q_R`, i.e. mirror images. Turning needs the opposite: both
+    /// hip_yaws rotate the SAME way, so the error is `(q + q)^2 = 4q^2` — the
+    /// worst case for that term. Measured on v26's weights, 0.2 rad of
+    /// coordinated hip yaw costs ~0.005/step against a ~0.002 behaviour
+    /// threshold, so a commanded turn is actively taxed for the one thing it
+    /// must do. The sagittal terms (hip_pitch, knee, ankle_pitch) are what keep
+    /// the gait even and are never attenuated.
+    fn symmetry_error(&self, q: &[f32; NUM_JOINTS], lateral_scale: f32) -> f32 {
         let mut err = 0.0;
         for i in 0..NUM_JOINTS {
             let jr = self.robot.mirror[i];
             if jr <= i {
                 continue; // count each L/R pair once
             }
-            err += (q[i] - self.robot.mirror_sign[i] * q[jr]).powi(2);
+            let e = (q[i] - self.robot.mirror_sign[i] * q[jr]).powi(2);
+            err += if self.robot.mirror_sign[i] < 0.0 {
+                lateral_scale * e
+            } else {
+                e
+            };
         }
         err
     }
@@ -1333,21 +1689,24 @@ mod tests {
 
     #[test]
     fn obs_dim_consistent() {
-        assert_eq!(OBS_DIM, 48);
+        // 45 through v21; + base_ang_vel(3) from v22; + step_cue(5) from v28.
+        // This is the OBSERVATION CONTRACT -- the three sim2sim harnesses and
+        // the lerobot controller all rebuild this vector by offset, so widening
+        // it means updating them too, not just this number.
+        assert_eq!(OBS_DIM, 53);
         assert_eq!(ACTION_DIM, 12);
         let task = VelocityFlatTask::new();
         let mut obs = vec![0.0; OBS_DIM];
         task.observe(&upright_state(), &VelocityCommand::default(), &mut obs);
         // Layout: last_action[0..12], command[12..16], joint_pos_rel[16..28],
         // joint_vel[28..40], projected_gravity[40..43], gait_phase(sin,cos)[43..45],
-        // base_ang_vel_body[45..48].
-        // Upright, neutral pose, zero command, phase 0, at rest → everything zero
-        // except gravity up = -1 and cos(0) = 1.
+        // base_ang_vel[45..48], step_cue(dist, h, edge_sin, edge_cos, valid)[48..53].
+        // Upright, neutral pose, zero command, phase 0 → everything zero except
+        // gravity up = -1 and cos(0) = 1.
         assert!(obs.iter().take(40).all(|&x| x == 0.0));
         assert!((obs[42] - (-1.0)).abs() < 1e-6, "up component of gravity");
         assert!(obs[43].abs() < 1e-6, "sin(phase 0) = 0");
         assert!((obs[44] - 1.0).abs() < 1e-6, "cos(phase 0) = 1");
-        assert!(obs[45..48].iter().all(|&x| x == 0.0), "gyro at rest");
     }
 
     #[test]
@@ -1413,6 +1772,8 @@ mod tests {
             yaw_rel_base: 0.0,
             pos_xy: [0.0, 0.0],
             alt_step: false,
+            vz: 0.0,
+            force_rate: 0.0,
         };
         assert_eq!(task.reward(&s, &cmd).air_time, 0.0);
         // Same swing, but now it ALTERNATED while the base actually tracks the
@@ -1425,25 +1786,73 @@ mod tests {
         let mut s2 = RobotState::default();
         s2.feet[0].planar_speed = 1.0;
         assert!(task.reward(&s2, &cmd).foot_slip < 0.0);
+        // Force-rate: off at weight 0; with a weight, a slam-sized 1.5 BW/step
+        // jump is penalized, while normal gait weight transfer (0.1 BW/step,
+        // inside the deadband) stays free.
+        let mut task_fr = task.clone();
+        task_fr.weights.force_rate = -1.0;
+        let mut s_slam = RobotState::default();
+        s_slam.feet[0].force_rate = 1.5;
+        assert_eq!(task.reward(&s_slam, &cmd).force_rate, 0.0);
+        assert!(task_fr.reward(&s_slam, &cmd).force_rate < 0.0);
+        let mut s_walk = RobotState::default();
+        s_walk.feet[0].force_rate = 0.1;
+        s_walk.feet[1].force_rate = 0.1;
+        assert_eq!(task_fr.reward(&s_walk, &cmd).force_rate, 0.0);
+        // Sustained tremor-sized dither (0.4 BW/step on both feet) is taxed.
+        let mut s_trem = RobotState::default();
+        s_trem.feet[0].force_rate = 0.4;
+        s_trem.feet[1].force_rate = 0.4;
+        assert!(task_fr.reward(&s_trem, &cmd).force_rate < 0.0);
+        // action_rate_rate: an OSCILLATING action (a, -a, a) is taxed; a
+        // smooth constant-rate ramp (a, a+d, a+2d) has zero second
+        // difference and is free — the distinction from plain action_rate.
+        let mut task_dd = task.clone();
+        task_dd.weights.action_rate_rate = -1.0;
+        let mut s_osc = RobotState::default();
+        s_osc.last_action[0] = 0.5;
+        s_osc.prev_action[0] = -0.5;
+        s_osc.prev2_action[0] = 0.5;
+        assert!(task_dd.reward(&s_osc, &cmd).action_rate_rate < 0.0);
+        let mut s_ramp = RobotState::default();
+        s_ramp.last_action[0] = 0.6;
+        s_ramp.prev_action[0] = 0.4;
+        s_ramp.prev2_action[0] = 0.2;
+        assert!(task_dd.reward(&s_ramp, &cmd).action_rate_rate.abs() < 1e-9);
+        assert_eq!(task.reward(&s_osc, &cmd).action_rate_rate, 0.0); // off at weight 0
+        // touchdown_vz: an airborne foot still dropping 1.0 m/s at 4 cm is a
+        // slam; the same descent higher up, a decelerated (0.2 m/s) landing,
+        // or a planted foot are all free.
+        let mut task_td = task.clone();
+        task_td.weights.touchdown_vz = -1.0;
+        let mut s_slam = RobotState::default();
+        s_slam.feet[0].contact = false;
+        s_slam.feet[0].height = 0.04;
+        s_slam.feet[0].vz = -1.0;
+        assert!(task_td.reward(&s_slam, &cmd).touchdown_vz < 0.0);
+        let mut s_high = RobotState::default();
+        s_high.feet[0].contact = false;
+        s_high.feet[0].height = 0.12;
+        s_high.feet[0].vz = -1.0;
+        assert_eq!(task_td.reward(&s_high, &cmd).touchdown_vz, 0.0);
+        let mut s_soft = RobotState::default();
+        s_soft.feet[0].contact = false;
+        s_soft.feet[0].height = 0.04;
+        s_soft.feet[0].vz = -0.2;
+        assert_eq!(task_td.reward(&s_soft, &cmd).touchdown_vz, 0.0);
         // A foot tilted onto its edge while in contact → flat-foot penalty.
         let mut s3 = RobotState::default();
         s3.feet[0].tilt = 1.0; // ~57° off flat
         assert!(task.reward(&s3, &cmd).foot_orientation < 0.0);
-        // The same tilt while AIRBORNE is penalized just as much (AGILE
-        // feet_roll_l2 parity: the term is ungated on contact). Leaving swing
-        // posture free is what let the policy dorsiflex through swing.
+        // The penalty is UNGATED: a tilted foot costs the same airborne as in
+        // stance. Gating it to stance let the policy fly a toes-up swing foot
+        // for free, which is exactly the heel-strike posture this term exists
+        // to remove (AGILE's roll-only feet_roll_l2 cannot see it either).
         let mut s4 = RobotState::default();
         s4.feet[0].contact = false;
         s4.feet[0].tilt = 1.0;
         s4.feet[1].contact = false;
-        assert_eq!(
-            task.reward(&s4, &cmd).foot_orientation,
-            task.reward(&s3, &cmd).foot_orientation
-        );
-        // Flat soles, airborne or not, cost nothing.
-        let mut s4b = RobotState::default();
-        s4b.feet[0].contact = false;
-        assert_eq!(task.reward(&s4b, &cmd).foot_orientation, 0.0);
+        assert!(task.reward(&s4, &cmd).foot_orientation < 0.0);
         // A foot yawed relative to the base → feet_yaw_mean penalty.
         let mut s5 = RobotState::default();
         s5.feet[0].yaw_rel_base = 0.5;
@@ -1481,7 +1890,7 @@ mod tests {
             let c = s.sample(&mut rng);
             assert!(c.vx.abs() <= 0.8 + 1e-6);
             assert!(c.vy.abs() <= 0.4 + 1e-6);
-            assert!(c.yaw_rate.abs() <= 0.2 + 1e-6);
+            assert!(c.yaw_rate.abs() <= 0.6 + 1e-6);
             if c == VelocityCommand::default() {
                 stands += 1;
             }
@@ -1493,10 +1902,306 @@ mod tests {
         );
     }
 
+    /// A cued step-up must RAISE the clearance bar, so the same foot lift that
+    /// saturated the reward on flat ground no longer does. Without this the
+    /// policy is paid the same for a 3 cm lift whether or not there is a 20 cm
+    /// riser in front of it.
+    #[test]
+    fn cued_step_up_raises_the_clearance_bar() {
+        let mut task = VelocityFlatTask::new();
+        task.weights.foot_clearance = 1.0; // off by default; enable to measure
+        task.weights.foot_clearance_target = 0.03;
+
+        // One foot mid-swing at 8 cm -- saturating on flat ground.
+        let mut st = RobotState::default();
+        st.feet[0].contact = false;
+        st.feet[0].air_time = 0.1;
+        st.feet[0].height = 0.08;
+        st.feet[1].contact = true;
+        // The adaptive bar inherits the progress gate: it only raises while
+        // actually moving toward the edge.
+        st.base.lin_vel_world = [0.4, 0.0, 0.0];
+        let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
+
+        let flat = task.reward(&st, &cmd).foot_clearance;
+        let mut stepping = st;
+        stepping.step_cue = StepCue {
+            distance: 0.3, height: 0.20, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0,
+        };
+        let on_step = task.reward(&stepping, &cmd).foot_clearance;
+        assert!(
+            on_step < flat,
+            "8 cm of lift should NOT still saturate in front of a 20 cm riser \
+             (flat {flat}, stepping {on_step})"
+        );
+
+        // And a lift that clears the riser earns it back.
+        let mut cleared = stepping;
+        cleared.feet[0].height = 0.20 + 0.05 + 0.035;
+        assert!(
+            (task.reward(&cleared, &cmd).foot_clearance - flat).abs() < 1e-6,
+            "clearing riser + margin should saturate again"
+        );
+    }
+
+    /// The step relaxation must fire ONLY when a step is cued and close, and
+    /// must not change flat-ground reward at all -- otherwise every generation
+    /// trained with the cue enabled is quietly running looser posture kernels
+    /// everywhere, which is not the intent.
+    #[test]
+    fn step_relaxation_is_gated_and_inert_when_no_step() {
+        let mut task = VelocityFlatTask::new();
+        task.weights.base_height = 2.0;
+        task.weights.upright = 4.0;
+        task.stds.base_height = 0.05;
+        task.weights.base_height_target = 0.82;
+        task.weights.base_height_target_stand = 0.82;
+        let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
+
+        // Off the target by 0.20 m -- what crossing a 0.20 m edge looks like.
+        let mut st = RobotState::default();
+        st.base.height = 0.62;
+
+        // Moving toward the edge at 0.3 m/s (body +x, edge square-on).
+        st.base.lin_vel_world = [0.3, 0.0, 0.0];
+        let no_cue = task.reward(&st, &cmd);
+        let mut cued = st;
+        cued.step_cue = StepCue { distance: 0.3, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
+        let with_cue = task.reward(&cued, &cmd);
+        assert!(
+            with_cue.base_height > no_cue.base_height,
+            "relaxation did not fire while approaching a cued step ({} vs {})",
+            with_cue.base_height, no_cue.base_height
+        );
+
+        // LOITERING in the zone (cued, close, but stationary) must get the
+        // NORMAL kernels -- this is the reward hack the first version allowed:
+        // the policy learned "cue valid -> stop" because standing in the relax
+        // zone out-paid walking (measured: cue ON froze at x=0.16 m where cue
+        // OFF walked to 1.28 m on the same checkpoint).
+        let mut loiter = cued;
+        loiter.base.lin_vel_world = [0.0, 0.0, 0.0];
+        let still = task.reward(&loiter, &cmd);
+        let mut still_no_cue = st;
+        still_no_cue.base.lin_vel_world = [0.0, 0.0, 0.0];
+        assert_eq!(
+            still.base_height,
+            task.reward(&still_no_cue, &cmd).base_height,
+            "relaxation fired for a stationary robot parked at the edge"
+        );
+
+        // Cue valid but FAR: no relaxation, so the robot is not given a licence
+        // to slouch merely because a step exists somewhere ahead.
+        let mut far = st;
+        far.step_cue = StepCue { distance: 1.4, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
+        assert_eq!(
+            task.reward(&far, &cmd).base_height, no_cue.base_height,
+            "relaxation fired for a step 1.4 m away"
+        );
+    }
+
+    /// `valid = 0` must be a single unambiguous "no information" pattern:
+    /// distance and height forced to zero, not stale values. On hardware a
+    /// failed probe hits this path, and the policy must walk normally rather
+    /// than act on whatever the last successful probe said.
+    #[test]
+    fn invalid_step_cue_zeroes_the_whole_block() {
+        let task = VelocityFlatTask::new();
+        let mut st = RobotState::default();
+        let cmd = VelocityCommand::default();
+        let mut obs = vec![0.0; OBS_DIM];
+
+        st.step_cue = StepCue { distance: 0.42, height: 0.18, edge_sin: 0.5, edge_cos: 0.87, valid: 0.0 };
+        task.observe(&st, &cmd, &mut obs);
+        assert_eq!(&obs[OBS_DIM - 5..], &[0.0; 5], "stale cue leaked through valid=0");
+
+        st.step_cue = StepCue { distance: 0.42, height: 0.18, edge_sin: 0.5, edge_cos: 0.87, valid: 1.0 };
+        task.observe(&st, &cmd, &mut obs);
+        assert_eq!(&obs[OBS_DIM - 5..], &[0.42, 0.18, 0.5, 0.87, 1.0]);
+    }
+
+    /// The cue must not disturb the slots every other consumer indexes by
+    /// position -- the sim2sim harnesses and the lerobot controller all read
+    /// 0..48 by offset.
+    #[test]
+    fn step_cue_is_appended_not_inserted() {
+        let task = VelocityFlatTask::new();
+        let mut st = RobotState::default();
+        st.joint_pos[3] = 0.3;
+        let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
+        let mut with = vec![0.0; OBS_DIM];
+        task.observe(&st, &cmd, &mut with);
+        let mut cued = vec![0.0; OBS_DIM];
+        let mut st2 = st;
+        st2.step_cue = StepCue { distance: 1.0, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
+        task.observe(&st2, &cmd, &mut cued);
+        assert_eq!(with[..OBS_DIM - 5], cued[..OBS_DIM - 5],
+                   "setting the step cue changed a pre-existing observation slot");
+    }
+
     #[test]
     fn symmetry_error_zero_for_mirrored_pose() {
         let task = VelocityFlatTask::new();
         // Neutral pose is trivially symmetric.
-        assert_eq!(task.symmetry_error(&[0.0; NUM_JOINTS]), 0.0);
+        assert_eq!(task.symmetry_error(&[0.0; NUM_JOINTS], 1.0), 0.0);
+    }
+
+    /// The lateral gate must attenuate ONLY the mirror-opposite joints
+    /// (hip_roll/hip_yaw/ankle_roll) and leave the sagittal ones alone --
+    /// otherwise gating a turn also stops enforcing an even gait.
+    #[test]
+    fn lateral_gate_spares_sagittal_symmetry() {
+        let task = VelocityFlatTask::new();
+        // Derive the indices from the SPEC rather than hardcoding a layout --
+        // VelocityFlatTask::new() honours BIPED_ROBOT, so the default here is
+        // lerobot, not the G1, and the joint order differs.
+        let lat = (0..NUM_JOINTS)
+            .find(|&i| task.robot.mirror[i] > i && task.robot.mirror_sign[i] < 0.0)
+            .expect("spec has a mirror-opposite (lateral) pair");
+        let sag = (0..NUM_JOINTS)
+            .find(|&i| task.robot.mirror[i] > i && task.robot.mirror_sign[i] > 0.0)
+            .expect("spec has a mirror-equal (sagittal) pair");
+        let mut q = [0.0; NUM_JOINTS];
+        // Coordinated motion on a LATERAL pair: what turning needs, and the
+        // worst case for a mirror-opposite term.
+        q[lat] = 0.2;
+        q[task.robot.mirror[lat]] = 0.2;
+        let full = task.symmetry_error(&q, 1.0);
+        let released = task.symmetry_error(&q, 0.0);
+        assert!(full > 0.0, "coordinated hip yaw should violate lateral mirror");
+        assert_eq!(released, 0.0, "gate should fully release the lateral term");
+
+        // Sagittal asymmetry must be charged at FULL weight whatever the gate.
+        let mut s = [0.0; NUM_JOINTS];
+        s[sag] = 0.2;
+        assert_eq!(
+            task.symmetry_error(&s, 0.0),
+            task.symmetry_error(&s, 1.0),
+            "sagittal symmetry must not depend on the lateral gate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod moving_gate_tests {
+    use super::*;
+
+    /// The `moving` gate is what keeps every stepping incentive (gait_clock,
+    /// air_time, single_support) OFF at a standing command. If it ever leaks,
+    /// the policy gets paid to march in place. Pin it directly.
+    /// The launchers set these; the struct defaults do not (stand_planted
+    /// shipped at 0 for several generations before v10 turned it on).
+    fn launcher_task() -> VelocityFlatTask {
+        let mut task = VelocityFlatTask::new();
+        task.weights.stand_planted = -1.0;
+        task.weights.gait_clock = 3.0;
+        task.weights.air_time = 1.0;
+        task.weights.single_support = 1.0;
+        task
+    }
+
+    #[test]
+    fn standing_gate_zeroes_every_stepping_term() {
+        let task = launcher_task();
+        // A state that WOULD earn every stepping term if the gate were open:
+        // one foot airborne mid-swing, the other planted, base moving forward.
+        let mut st = RobotState::default();
+        st.feet[0].contact = false;
+        st.feet[0].air_time = 0.1;
+        st.feet[0].height = 0.12;
+        st.feet[1].contact = true;
+        st.base.lin_vel_world = [0.5, 0.0, 0.0];
+        st.phase = 0.25;
+
+        let stand = task.reward(&st, &VelocityCommand::default());
+        assert_eq!(stand.gait_clock, 0.0, "gait_clock leaked at zero command");
+        assert_eq!(stand.air_time, 0.0, "air_time leaked at zero command");
+        // single_support is not gated off at stand -- it INVERTS: planted feet
+        // are rewarded, stepping is penalized. Pin the sign, not a zero.
+        assert!(
+            stand.single_support < 0.0,
+            "single_support should penalize a lifted foot at zero command: {}",
+            stand.single_support
+        );
+        let mut planted = st.clone();
+        planted.feet[0].contact = true;
+        planted.feet[0].air_time = 0.0;
+        assert!(
+            task.reward(&planted, &VelocityCommand::default()).single_support > 0.0,
+            "single_support should REWARD both feet planted at zero command"
+        );
+        // ...and stand_planted must actively CHARGE for the airborne foot.
+        assert!(stand.stand_planted < 0.0, "stand_planted did not charge: {}", stand.stand_planted);
+
+        // Same state under a moving command: the stepping terms come alive, so
+        // the assertions above are testing the GATE, not a dead code path.
+        let moving = task.reward(
+            &st,
+            &VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 },
+        );
+        assert!(moving.gait_clock != 0.0, "gait_clock never fires even when moving");
+        assert_eq!(moving.stand_planted, 0.0, "stand_planted fired while moving");
+    }
+
+    /// The standing height target must apply ONLY at a standing command, and
+    /// must default to the moving target so the split stays inert unless asked
+    /// for. A silent leak here would quietly re-target the whole gait.
+    #[test]
+    fn stand_height_target_is_command_gated() {
+        let mut task = launcher_task();
+        task.weights.base_height = 2.0;
+        task.stds.base_height = 0.05;
+        task.weights.base_height_target = 0.82;
+        task.weights.base_height_target_stand = 0.835;
+
+        // A base sitting exactly at the STANDING target: it should score better
+        // at a standing command than the same height does while moving.
+        let mut st = RobotState::default();
+        st.base.height = 0.835;
+        let standing = task.reward(&st, &VelocityCommand::default()).base_height;
+        let moving = task
+            .reward(&st, &VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 })
+            .base_height;
+        assert!(
+            standing > moving,
+            "0.835 m should score higher standing ({standing}) than moving ({moving})"
+        );
+
+        // Yaw-only is MOVING (same predicate as the gait clock), so a pure turn
+        // must use the walking target, not the standing one.
+        let turning = task
+            .reward(&st, &VelocityCommand { vx: 0.0, vy: 0.0, yaw_rate: 0.4 })
+            .base_height;
+        assert_eq!(turning, moving, "a pure yaw command must use the MOVING target");
+
+        // Default: both targets equal -> command must not change the score.
+        let mut plain = launcher_task();
+        plain.weights.base_height = 2.0;
+        assert_eq!(
+            plain.weights.base_height_target, plain.weights.base_height_target_stand,
+            "the stand target must default to the moving target"
+        );
+        let a = plain.reward(&st, &VelocityCommand::default()).base_height;
+        let b = plain
+            .reward(&st, &VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 })
+            .base_height;
+        assert_eq!(a, b, "split leaked while both targets are equal");
+    }
+
+    /// Yaw counts toward the speed magnitude, so a pure turn-in-place command
+    /// is MOVING (this was a real v11 bug: the clock froze on linear speed
+    /// only while the task's predicate included yaw).
+    #[test]
+    fn yaw_only_command_counts_as_moving() {
+        let task = launcher_task();
+        let mut st = RobotState::default();
+        st.feet[0].contact = false;
+        st.feet[0].air_time = 0.1;
+        st.feet[1].contact = true;
+        let turn = task.reward(&st, &VelocityCommand { vx: 0.0, vy: 0.0, yaw_rate: 0.4 });
+        assert_eq!(turn.stand_planted, 0.0, "a yaw command was treated as standing");
+        // And a sub-threshold command IS standing.
+        let tiny = task.reward(&st, &VelocityCommand { vx: 0.05, vy: 0.0, yaw_rate: 0.0 });
+        assert!(tiny.stand_planted < 0.0, "a 0.05 command was treated as moving");
     }
 }

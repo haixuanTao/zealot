@@ -39,6 +39,25 @@ GRID = "#2b3a5e"
 SPAN = 0.9  # half-width of the view box around the torso
 
 
+TERRAIN = d.get("terrain")
+if TERRAIN and any(h != 0.0 for h in TERRAIN["heights"]):
+    import numpy as _np
+    _n = int(round(2 * TERRAIN["half"] / TERRAIN["hs"])) + 1
+    _hx = _np.linspace(TERRAIN["cx"] - TERRAIN["half"], TERRAIN["cx"] + TERRAIN["half"], _n)
+    _hy = _np.linspace(TERRAIN["cy"] - TERRAIN["half"], TERRAIN["cy"] + TERRAIN["half"], _n)
+    _HX, _HY = _np.meshgrid(_hx, _hy)
+    _HZ = _np.array(TERRAIN["heights"]).reshape(_n, _n)
+else:
+    TERRAIN = None
+
+
+def draw_terrain():
+    # The actual ground the robot walked on (step risers included) -- without
+    # this the flat z=0 grid is drawn and a climbing robot appears to levitate.
+    ax.plot_surface(_HX, _HY, _HZ, cmap="cividis", alpha=0.55,
+                    linewidth=0, antialiased=False, rstride=1, cstride=1)
+
+
 def draw_ground(cx, cy):
     g = np.linspace(-SPAN, SPAN, 9)
     for x in g:
@@ -52,7 +71,10 @@ def update(i):
     ax.set_facecolor("#0e1320")
     pts = frames[i]
     cx, cy = torso_xy[i]
-    draw_ground(cx, cy)
+    if TERRAIN is not None:
+        draw_terrain()
+    else:
+        draw_ground(cx, cy)
     fallen = i in resets
     link_col = "#ff6b6b" if fallen else "#5ad1ff"
     # Links.

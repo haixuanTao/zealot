@@ -98,12 +98,53 @@ impl ObsHistory {
         out
     }
 
+    /// Split into per-env mutable views (disjoint slices), so a batch of
+    /// envs can push+stack CONCURRENTLY. The serial push_stacked loop
+    /// measured ~12 ms/step at 4096 envs (H=5, dim=53) — all in one thread;
+    /// the caller feeds these views to rayon instead.
+    pub fn env_views(&mut self) -> Vec<EnvHistView<'_>> {
+        let (h, dim) = (self.h, self.dim);
+        self.buf
+            .chunks_mut(h * dim)
+            .zip(self.head.iter_mut())
+            .map(|(buf, head)| EnvHistView { h, dim, buf, head })
+            .collect()
+    }
+
     /// Convenience: reset then return the stacked (replicated) observation.
     pub fn reset_stacked(&mut self, e: usize, frame: &[f32]) -> Vec<f32> {
         self.reset(e, frame);
         let mut out = vec![0.0; self.stacked_dim()];
         self.write_stacked(e, &mut out);
         out
+    }
+}
+
+/// One env's history, borrowed disjointly out of [`ObsHistory::env_views`].
+pub struct EnvHistView<'a> {
+    h: usize,
+    dim: usize,
+    /// This env's `h * dim` ring slice.
+    buf: &'a mut [f32],
+    head: &'a mut usize,
+}
+
+impl EnvHistView<'_> {
+    /// Push `*obs` (one frame) into the ring, then REPLACE it with the
+    /// freshly stacked `h * dim` window (oldest→newest) — the batch-parallel
+    /// equivalent of [`ObsHistory::push_stacked`], bit-identical output.
+    pub fn push_stacked_replace(&mut self, obs: &mut Vec<f32>) {
+        debug_assert_eq!(obs.len(), self.dim);
+        let slot = *self.head * self.dim;
+        self.buf[slot..slot + self.dim].copy_from_slice(obs);
+        *self.head = (*self.head + 1) % self.h;
+        let mut out = vec![0.0; self.h * self.dim];
+        for i in 0..self.h {
+            let s = (*self.head + i) % self.h;
+            out[i * self.dim..(i + 1) * self.dim]
+                .copy_from_slice(&self.buf[s * self.dim..(s + 1) * self.dim]);
+        }
+        *obs = out;
     }
 }
 
@@ -133,5 +174,31 @@ mod tests {
 
         // Reset mid-stream replicates again.
         assert_eq!(h.reset_stacked(0, &[5.0, 5.0]), vec![5.0; 6]);
+    }
+
+    #[test]
+    fn env_views_match_serial_push_stacked_exactly() {
+        // Same frame sequence through both paths → identical stacks & ring
+        // state, including across the ring wrap.
+        let mut serial = ObsHistory::new(3, 4, 2);
+        let mut batch = ObsHistory::new(3, 4, 2);
+        for e in 0..3 {
+            serial.reset(e, &[e as f32; 2]);
+            batch.reset(e, &[e as f32; 2]);
+        }
+        for step in 0..6 {
+            let mut frames: Vec<Vec<f32>> = (0..3)
+                .map(|e| vec![10.0 * e as f32 + step as f32; 2])
+                .collect();
+            let expected: Vec<Vec<f32>> = frames
+                .iter()
+                .enumerate()
+                .map(|(e, f)| serial.push_stacked(e, f))
+                .collect();
+            for (view, obs) in batch.env_views().iter_mut().zip(frames.iter_mut()) {
+                view.push_stacked_replace(obs);
+            }
+            assert_eq!(frames, expected, "diverged at step {step}");
+        }
     }
 }

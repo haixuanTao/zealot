@@ -298,8 +298,11 @@ fn main() {
         let (names, edges, feet) = env.skeleton();
 
         let mut frames: Vec<Vec<[f32; 3]>> = Vec::with_capacity(rollout_steps);
+        let mut frame_quats: Vec<Vec<[f32; 4]>> = Vec::with_capacity(rollout_steps);
         let mut bases: Vec<[f32; 7]> = Vec::with_capacity(rollout_steps);
         let mut joints: Vec<[f32; NUM_JOINTS]> = Vec::with_capacity(rollout_steps);
+        let dump_vel = std::env::var("BIPED_DUMP_VEL").is_ok();
+        let mut dof_vels: Vec<Vec<f32>> = Vec::new();
         let mut resets: Vec<usize> = Vec::new();
         // Ground-truth policy I/O per step, for the sim-to-sim cross-val parity
         // check: the exact 43-dim obs fed to the actor and the 12-dim mean action
@@ -321,9 +324,16 @@ fn main() {
             // the step path was switched to the same poses-only path).
             let poses = env.snapshot().await;
             frames.push(env.body_positions_for(0, &poses));
+            frame_quats.push(env.body_rotations_for(0, &poses));
             let (p, q) = env.base_pose_for(0, &poses);
             bases.push([p[0], p[1], p[2], q[0], q[1], q[2], q[3]]);
             joints.push(env.joint_angles_for(0, &poses));
+            // BIPED_DUMP_VEL=1: true generalized velocities from dof_state (a
+            // readback per step, so opt-in). The divergence probe needs these
+            // — FD velocities at 50 Hz are its noise floor.
+            if dump_vel {
+                dof_vels.push(env.true_dof_velocities(0).await);
+            }
 
             // Mean (noise-free) action for env 0.
             let mean = ac.mean(&cur[0]);
@@ -377,7 +387,10 @@ fn main() {
                 std::fs::write("/tmp/jacdump.json", out).unwrap();
                 println!("[dbgj] wrote /tmp/jacdump.json");
             }
-            if std::env::var("BIPED_DBG_CONTACTS").is_ok() && step < 30 {
+            let dbg_contacts_from: Option<usize> = std::env::var("BIPED_DBG_CONTACTS")
+                .ok()
+                .map(|v| v.parse().unwrap_or(0));
+            if dbg_contacts_from.is_some_and(|s0| step >= s0 && step < s0 + 10) {
                 let (_, cons) = env.dbg_mb_contacts().await;
                 // Aligned with the CPU probe ([cpuc]): per-foot Fz + per-point
                 // (x, normal imp, tangent imp). x = +ang_jac.y (ground-static:
@@ -459,6 +472,24 @@ fn main() {
             })
             .collect();
         let _ = write!(s, "  \"joints\": [{}],\n", joints_json.join(","));
+        if dump_vel {
+            let dofs: Vec<String> = env
+                .policy_joint_dofs()
+                .iter()
+                .map(|d| d.to_string())
+                .collect();
+            let _ = write!(s, "  \"joint_dof_idx\": [{}],\n", dofs.join(","));
+        }
+        if !dof_vels.is_empty() {
+            let dv_json: Vec<String> = dof_vels
+                .iter()
+                .map(|v| {
+                    let e: Vec<String> = v.iter().map(|a| format!("{a:.6}")).collect();
+                    format!("[{}]", e.join(","))
+                })
+                .collect();
+            let _ = write!(s, "  \"dof_vel\": [{}],\n", dv_json.join(","));
+        }
         let obs_json: Vec<String> = obss
             .iter()
             .map(|o| {
@@ -475,6 +506,33 @@ fn main() {
             })
             .collect();
         let _ = write!(s, "  \"actions\": [{}],\n", act_json.join(","));
+        // Terrain patch around the trajectory, so the offline renderer can
+        // draw the ground (the step riser is otherwise invisible and the
+        // robot appears to levitate as it climbs).
+        {
+            let n = bases.len().max(1);
+            let (mcx, mcy) = (
+                bases.iter().map(|b| b[0]).sum::<f32>() / n as f32,
+                bases.iter().map(|b| b[1]).sum::<f32>() / n as f32,
+            );
+            let (half, hs, hf) = env.terrain_patch_for(0, mcx, mcy, 6.0, 0.15);
+            let vals: Vec<String> = hf.iter().map(|h| format!("{:.3}", h)).collect();
+            let _ = write!(
+                s,
+                "  \"terrain\": {{\"cx\": {:.3}, \"cy\": {:.3}, \"half\": {:.3}, \"hs\": {:.3}, \"heights\": [{}]}},\n",
+                mcx, mcy, half, hs, vals.join(",")
+            );
+        }
+        s.push_str("  \"frame_quats\": [\n");
+        for (fi, frame) in frame_quats.iter().enumerate() {
+            let pts: Vec<String> = frame
+                .iter()
+                .map(|q| format!("[{:.5},{:.5},{:.5},{:.5}]", q[0], q[1], q[2], q[3]))
+                .collect();
+            let comma = if fi + 1 < frame_quats.len() { "," } else { "" };
+            let _ = write!(s, "    [{}]{}\n", pts.join(","), comma);
+        }
+        s.push_str("  ],\n");
         s.push_str("  \"frames\": [\n");
         for (fi, frame) in frames.iter().enumerate() {
             let pts: Vec<String> = frame

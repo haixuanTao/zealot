@@ -272,10 +272,8 @@ fn configure_env(terrain: bool, terrain_level: u32, terrain_amp_pct: u32, terrai
         ("BIPED_CONTACT_SENSE", "1"),
         ("BIPED_GAIT_SWING_RATIO", "0.5"),
         ("BIPED_CONTACT_CAP", "128"),
-        ("NEXUS_FIXED_GRID", "1"),
         // Hold the arms at the natural stand pose (joint zero = Unitree's
         // elbows-bent CAD zero — the "zombie arms").
-        ("BIPED_HELD_POSE", "natural"),
     ]
     .into_iter()
     .collect();

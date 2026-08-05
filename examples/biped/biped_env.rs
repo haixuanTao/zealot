@@ -1146,12 +1146,15 @@ impl BipedEnv {
                 air_time: if contact { prev_air } else { self.air_time[i] },
                 height: pos.z,
                 planar_speed: (lv.x * lv.x + lv.y * lv.y).sqrt(),
+                vz: lv.z,
                 tilt,
                 yaw_rel_base,
                 pos_xy: [pos.x, pos.y],
                 // CPU env (not the GPU training path) doesn't track gait
                 // alternation; alt_step stays false → no air_time reward here.
                 alt_step: false,
+                // No contact-force sensor on the CPU path → force_rate inert.
+                force_rate: 0.0,
             };
         }
         out
@@ -1191,8 +1194,15 @@ impl BipedEnv {
             joint_vel,
             last_action: self.last_action,
             prev_action: self.prev_action,
+            // CPU env keeps only two actions; a zero third point degrades
+            // action_rate_rate to (a − 2a′)² there — the term is for the GPU
+            // trainer, the CPU env never enables it.
+            prev2_action: [0.0; NUM_JOINTS],
             feet: [FootObs::default(); NUM_FEET], // overwritten by the caller
             phase: 0.0,                           // CPU env doesn't use the gait clock
+            // CPU env has no terrain, so the probe never reports a step.
+            step_cue: Default::default(),
+            step_cue_clean: Default::default(),
         }
     }
 }

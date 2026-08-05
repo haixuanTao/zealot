@@ -22,6 +22,13 @@
 //! - **Wave**: `h = A/2·cos(2πy/λ) + A/2·sin(2πx/λ)`, `A = 0.01 + 0.24·d`,
 //!   `λ = 8/3 m` (row 19 ≈ ±0.24 m peaks), patch-local coordinates.
 //!
+//! Under every family, each patch additionally carries an up-only
+//! **pyramid-slope DC bias** ([`SLOPE_GRADE_MAX`]·d grade toward a ~2 m apex
+//! plateau, zero at patch borders): the families are zero-mean noise a stride
+//! integrates away, while a sustained grade forces the policy to hold an
+//! explicit counter-lean — making constant lean/drift biases observable to
+//! the reward (and exposing every gradient direction: ±x, ±y, diagonals).
+//!
 //! The curriculum is AGILE's exactly: per env, traveled distance (chord sum
 //! between command resamples) > 4 m counts a success, < 2 m a failure
 //! (cumulative, not consecutive); 4 successes promote, 10 failures demote,
@@ -42,6 +49,52 @@ pub const STRIP_X0: f32 = PATCH;
 pub const STRIP_HALF_W: f32 = PATCH / 2.0;
 /// Thickness of the closed terrain slab below z=0.
 pub const SLAB_BOTTOM: f32 = -0.05;
+/// Max pyramid-slope grade (rise/run) at difficulty 1 (~7°, override with
+/// `BIPED_SLOPE_GRADE`). Sized by the ANKLE BUDGET, not by ambition: flat
+/// walking already runs the ankle at ~34° of dorsiflexion against a 50° hard
+/// limit, and climbing a grade of X° costs roughly another X°. At the old
+/// 0.25 (14°) the joint reached ~48° — on its endstop — so steep rows both
+/// forced limit contact and (with the limit e-stops) truncated episodes,
+/// which the distance-based curriculum then read as failure and demoted.
+/// Terrain peaked at level 14.7 and retreated while terminations rose 69%.
+/// 0.125 keeps ~9° of ankle margin at the top row.
+///
+/// UPDATE (v24 final, iter 50k): that 34° figure is stale. Measured on the
+/// finished v24 policy, flat walking peaks at only **25.8°** of dorsiflexion
+/// — 8° less than the policy that failed at 0.25, bought by the v19 ankle
+/// package and the taller/straighter stance. The budget at the top row is
+/// therefore:
+///   0.125 (7°)  -> peak ~33°, 17° margin   (very conservative now)
+///   0.268 (15°) -> peak ~41°,  9° margin   (the ORIGINAL design margin)
+///   0.35  (19°) -> peak ~45°,  5° margin   (into e-stop territory)
+/// So 15° is defensible for a policy that walks like v24's, and was NOT
+/// defensible for the one that failed. Set it per-run via BIPED_SLOPE_GRADE
+/// rather than moving this constant: a fresh policy walks nothing like a
+/// converged one, and the default must stay safe for iteration 0.
+///
+/// Failure signature to watch for, from the 0.25 attempt: terrain level
+/// climbs, peaks, then RETREATS while term_fell rises — the limit e-stops
+/// truncate episodes, the distance-based curriculum reads truncation as
+/// failure, and it demotes. If that appears, the grade is over budget.
+///
+/// The slope is a
+/// per-patch DC bias superimposed under EVERY family: zero-mean bump noise
+/// integrates out over a stride, so a policy's constant lean/drift biases are
+/// invisible to it — a sustained grade is the disturbance that makes them
+/// observable to the reward. Up-only (heights ≥ family field) so the flat
+/// z = 0 backstop cuboid and slab bottom stay valid.
+pub const SLOPE_GRADE_MAX: f32 = 0.125;
+/// Ramp run from patch edge before the apex plateau (m): apex ≤ 0.75 m, with
+/// a ~2 m flat top so the apex is standable.
+pub const SLOPE_RAMP: f32 = 3.0;
+
+/// Max single-step rise at difficulty 1 (m), for [`TerrainFamily::Step`].
+/// 0.20 m is a building stair riser and about the limit of what a 0.79 m-tall
+/// G1 can clear without a hand -- the swing foot must lift the rise PLUS the
+/// clearance margin, and this campaign's policies have managed 70-90 mm of
+/// clearance, so the top rows are deliberately beyond current capability and
+/// the curriculum will park where the policy actually tops out.
+pub const STEP_RISE_MAX: f32 = 0.20;
 
 /// Optional terrain-shape overrides (demo knobs; defaults reproduce training
 /// terrain exactly).
@@ -65,15 +118,70 @@ pub enum TerrainFamily {
     Boxes,
     Rough,
     Wave,
+    /// ONE clean edge per patch: a half-plane raised by `STEP_RISE_MAX·d`, with
+    /// the edge normal drawn uniformly in [0, 2π) per patch. The robot meets it
+    /// from whatever direction its command happens to carry it, and crossing
+    /// back down gives the step-down case for free — so a single family covers
+    /// both up and down from any approach angle.
+    ///
+    /// Deliberately NOT stairs: the other three families are zero-mean noise a
+    /// stride integrates away, and the pyramid slope is a sustained DC bias.
+    /// Neither presents a discrete obstacle that has to be cleared in one
+    /// swing, which is the skill this family is for.
+    Step,
 }
 
 impl TerrainFamily {
     /// Fixed per-env family assignment (AGILE: column families are fixed).
     pub fn of_env(env_id: usize) -> Self {
-        match env_id % 3 {
-            0 => TerrainFamily::Boxes,
-            1 => TerrainFamily::Rough,
-            _ => TerrainFamily::Wave,
+        // BIPED_TERRAIN_FAMILY forces EVERY env onto one family. For evaluation
+        // only: the renderer records env 0, whose family would otherwise be
+        // fixed at Boxes by the modulo, so there is no other way to roll out
+        // on the step strip.
+        // Both env lookups are cached in OnceLocks: of_env runs per foot per
+        // env per step inside the parallel reward block, and std::env::var
+        // takes a process-global lock + scans the environment on every call —
+        // reading it uncached measured +10 ms/step of lock contention at
+        // 4096 envs (reward pass 14 -> 24 ms).
+        static FORCED: std::sync::OnceLock<Option<TerrainFamily>> = std::sync::OnceLock::new();
+        let forced = FORCED.get_or_init(|| {
+            std::env::var("BIPED_TERRAIN_FAMILY").ok().map(|f| {
+                match f.to_ascii_lowercase().as_str() {
+                    "boxes" => TerrainFamily::Boxes,
+                    "rough" => TerrainFamily::Rough,
+                    "wave" => TerrainFamily::Wave,
+                    "step" => TerrainFamily::Step,
+                    other => panic!("unknown BIPED_TERRAIN_FAMILY '{other}'"),
+                }
+            })
+        });
+        if let Some(f) = forced {
+            return *f;
+        }
+        // BIPED_TERRAIN_STEP=0 drops the Step family from the rotation (envs
+        // cycle the three noise families instead), parking the step skill
+        // without touching the obs contract (the 53-wide cue frame stays,
+        // zeroed). NOTE: measured A/B showed the step trimesh itself does NOT
+        // cost iteration time (gpuwait identical with and without).
+        static STEP_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let step_on = *STEP_ON.get_or_init(|| {
+            std::env::var("BIPED_TERRAIN_STEP")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        });
+        if step_on {
+            match env_id % 4 {
+                0 => TerrainFamily::Boxes,
+                1 => TerrainFamily::Rough,
+                2 => TerrainFamily::Wave,
+                _ => TerrainFamily::Step,
+            }
+        } else {
+            match env_id % 3 {
+                0 => TerrainFamily::Boxes,
+                1 => TerrainFamily::Rough,
+                _ => TerrainFamily::Wave,
+            }
         }
     }
 
@@ -81,7 +189,9 @@ impl TerrainFamily {
     /// families have ≥0.4 m features.
     pub fn grid_spacing(self) -> f32 {
         match self {
-            TerrainFamily::Boxes => 0.075,
+            // A step edge sampled at 0.2 m becomes a 0.2 m ramp -- the whole
+            // point is that it is discrete, so it needs the fine grid too.
+            TerrainFamily::Boxes | TerrainFamily::Step => 0.075,
             _ => 0.2,
         }
     }
@@ -98,6 +208,16 @@ pub struct TerrainStrip {
     /// Node heights, row-major: `heights[j * (nx+1) + i]` at
     /// `(STRIP_X0 + i·hs, −STRIP_HALF_W + j·hs)`.
     heights: Vec<f32>,
+    /// For [`TerrainFamily::Step`]: each patch's edge-normal angle (world
+    /// frame), indexed by difficulty row. Lets spawn logic place the robot
+    /// BEHIND the edge facing it (the approach-mode envs). Empty for the
+    /// other families.
+    pub step_theta: Vec<f32>,
+    /// Per-patch rise (m), cached at generation. `patch_rise()` used to rescan
+    /// every node in the patch (~11k reads) and `step_cell_height` calls it on
+    /// EVERY height query -- ground-relative height runs per env per step, so
+    /// this was a large hidden CPU cost on step-family envs.
+    pub step_rise: Vec<f32>,
 }
 
 fn quantize(h: f32) -> f32 {
@@ -121,6 +241,8 @@ impl TerrainStrip {
         let amp = params.amp.max(0.0);
         let hs = family.grid_spacing();
         let nx = (PATCH * ROWS as f32 / hs).round() as usize;
+        let mut step_theta: Vec<f32> = Vec::new();
+        let mut step_rise: Vec<f32> = Vec::new();
         let ny = (2.0 * STRIP_HALF_W / hs).round() as usize;
         // Spread the seed bits — `Lcg::new` ORs bit 0, so raw adjacent seeds
         // (42 vs 43) would otherwise collide.
@@ -191,6 +313,31 @@ impl TerrainStrip {
                         }
                     }
                 }
+                TerrainFamily::Step => {
+                    // One half-plane raised by `rise`, edge through the patch
+                    // centre with a per-patch random normal. Sign of the dot
+                    // product picks which side is up, so a robot crossing one
+                    // way steps UP and the other way steps DOWN.
+                    let rise = STEP_RISE_MAX * d;
+                    let theta = rng.range(0.0, std::f32::consts::TAU);
+                    step_theta.push(theta);
+                    step_rise.push(quantize(rise));
+                    let (nx_, ny_) = (theta.cos(), theta.sin());
+                    // Patch centre in the same patch-local frame the loop uses.
+                    let cx = PATCH * 0.5;
+                    let cy = PATCH * 0.5;
+                    for i in i0..=i1.min(nx) {
+                        let lx = (i as f32 * hs) - PATCH * p as f32;
+                        for j in 0..=ny {
+                            let ly = j as f32 * hs;
+                            let side = (lx - cx) * nx_ + (ly - cy) * ny_;
+                            // Strictly binary: no interpolation across the
+                            // edge, or the grid turns the step into a ramp.
+                            let h = if side >= 0.0 { rise } else { 0.0 };
+                            heights[j * (nx + 1) + i] = quantize(h);
+                        }
+                    }
+                }
                 TerrainFamily::Wave => {
                     // A/2·cos(2πy/λ) + A/2·sin(2πx/λ), A = 0.01 + 0.24·d.
                     let a = (0.01 + 0.24 * d) * amp;
@@ -207,6 +354,38 @@ impl TerrainStrip {
                     }
                 }
             }
+
+            // Pyramid-slope DC bias under the family field (see
+            // SLOPE_GRADE_MAX): h += g·min(L∞ distance to patch border,
+            // SLOPE_RAMP), g = SLOPE_GRADE_MAX·d. Zero at every patch border,
+            // so rows and the strip edges stay continuous.
+            // The Step family carries NO slope bias: per-cell box emission would
+            // turn a smooth bias into ~2 cm lips at every cell boundary (unwanted
+            // micro-stairs), and the family's purpose is the ISOLATED discrete
+            // edge -- slope-holding is what the other three families train.
+            if matches!(family, TerrainFamily::Step) {
+                continue;
+            }
+            let gmax = std::env::var("BIPED_SLOPE_GRADE")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(SLOPE_GRADE_MAX);
+            // Scaled by `params.amp` like the family field itself, so the
+            // demo's roughness knob keeps its meaning: amp = 0 is dead flat,
+            // amp = 1 (the default, and training) is exactly this bias.
+            let g = amp * gmax * ((p as f32 + rng.range(0.0, 1.0)) / ROWS as f32);
+            for i in i0..=i1.min(nx) {
+                let lx = (i as f32 * hs) - PATCH * p as f32;
+                for j in 0..=ny {
+                    let ly = j as f32 * hs;
+                    let edge = lx
+                        .min(PATCH - lx)
+                        .min(ly.min(2.0 * STRIP_HALF_W - ly))
+                        .clamp(0.0, SLOPE_RAMP);
+                    let idx = j * (nx + 1) + i;
+                    heights[idx] = quantize(heights[idx] + g * edge);
+                }
+            }
         }
 
         // Uphill ramp along +X: smooth across the whole strip (no cliffs at
@@ -221,17 +400,200 @@ impl TerrainStrip {
             }
         }
 
-        TerrainStrip { family, hs, nx, ny, heights }
+        TerrainStrip { family, hs, nx, ny, heights, step_theta, step_rise }
     }
 
     fn node(&self, i: usize, j: usize) -> f32 {
         self.heights[j * (self.nx + 1) + i]
     }
 
+    /// Per-cell height for the box-emitted Step family: the cell is entirely
+    /// at the raised level iff its CENTRE is on the raised side of its patch's
+    /// edge line. Quantizes the edge position to the cell grid (0.075 m) but
+    /// keeps the face exactly vertical.
+    fn step_cell_height(&self, ci: usize, cj: usize) -> f32 {
+        let cx_w = STRIP_X0 + (ci as f32 + 0.5) * self.hs;
+        let cy_w = -STRIP_HALF_W + (cj as f32 + 0.5) * self.hs;
+        let p = ((cx_w - STRIP_X0) / PATCH) as usize;
+        let p = p.min(ROWS - 1);
+        let theta = self.step_theta.get(p).copied().unwrap_or(0.0);
+        // Patch-local coords of the cell centre and the patch centre.
+        let lx = cx_w - (STRIP_X0 + PATCH * p as f32);
+        let ly = cy_w + STRIP_HALF_W;
+        let side = (lx - PATCH * 0.5) * theta.cos() + (ly - PATCH * 0.5) * theta.sin();
+        if side >= 0.0 {
+            self.step_rise.get(p).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// TRUE-VERTICAL-FACE mesh for the Step family: every cell is a flat quad
+    /// at its own height (unshared vertices), with explicit wall quads where
+    /// neighbouring cells differ and skirts to the slab bottom at the borders.
+    /// The shared-vertex grid emission turns a node-to-node jump into a ramp
+    /// one cell wide (~53 deg at a 10 cm riser, ~69 deg at 20 cm) -- climbable
+    /// by toe-wedging, which is NOT the skill this family exists to train, and
+    /// softer than the MuJoCo eval scene's true 90 deg box.
+    fn mesh_boxes(&self) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let (nx, ny, hs) = (self.nx, self.ny, self.hs);
+        let mut verts: Vec<[f32; 3]> = Vec::new();
+        let mut tris: Vec<[u32; 3]> = Vec::new();
+        let mut quad = |a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]| {
+            let base = verts.len() as u32;
+            verts.extend_from_slice(&[a, b, c, d]);
+            tris.push([base, base + 1, base + 2]);
+            tris.push([base, base + 2, base + 3]);
+        };
+        let x = |i: usize| STRIP_X0 + i as f32 * hs;
+        let y = |j: usize| -STRIP_HALF_W + j as f32 * hs;
+        let ch = |i: usize, j: usize| self.step_cell_height(i, j);
+        // GREEDY RUN-MERGE. Per-cell quads made the strip 473k triangles and
+        // halved training throughput (1.6 -> 3.0 s/iter): a quarter of all
+        // envs collide against this strip every substep, and each step patch
+        // is geometrically just two flat planes and one wall. Merging
+        // constant-height RUNS along X (tops row-wise, walls column-wise)
+        // keeps the geometry bit-identical while cutting triangle count
+        // ~100x. Full 2D rectangle merge would do better still, but runs are
+        // already within sight of the ideal and stay trivially correct.
+        //
+        // Tops: for each row j, emit one quad per maximal constant-height run.
+        for j in 0..ny {
+            let mut i = 0;
+            while i < nx {
+                let h = ch(i, j);
+                let mut i2 = i + 1;
+                while i2 < nx && (ch(i2, j) - h).abs() <= 1e-6 {
+                    i2 += 1;
+                }
+                quad(
+                    [x(i), y(j), h],
+                    [x(i2), y(j), h],
+                    [x(i2), y(j + 1), h],
+                    [x(i), y(j + 1), h],
+                );
+                i = i2;
+            }
+        }
+        // Walls between +X neighbours: constant (h, hn) runs along Y.
+        for i in 0..nx.saturating_sub(1) {
+            let mut j = 0;
+            while j < ny {
+                let (h, hn) = (ch(i, j), ch(i + 1, j));
+                if (hn - h).abs() <= 1e-6 {
+                    j += 1;
+                    continue;
+                }
+                let mut j2 = j + 1;
+                while j2 < ny
+                    && (ch(i, j2) - h).abs() <= 1e-6
+                    && (ch(i + 1, j2) - hn).abs() <= 1e-6
+                {
+                    j2 += 1;
+                }
+                let (hi, lo) = (h.max(hn), h.min(hn));
+                if h > hn {
+                    quad([x(i + 1), y(j), hi], [x(i + 1), y(j2), hi],
+                         [x(i + 1), y(j2), lo], [x(i + 1), y(j), lo]);
+                } else {
+                    quad([x(i + 1), y(j2), hi], [x(i + 1), y(j), hi],
+                         [x(i + 1), y(j), lo], [x(i + 1), y(j2), lo]);
+                }
+                j = j2;
+            }
+        }
+        // Walls between +Y neighbours: constant (h, hn) runs along X.
+        for j in 0..ny.saturating_sub(1) {
+            let mut i = 0;
+            while i < nx {
+                let (h, hn) = (ch(i, j), ch(i, j + 1));
+                if (hn - h).abs() <= 1e-6 {
+                    i += 1;
+                    continue;
+                }
+                let mut i2 = i + 1;
+                while i2 < nx
+                    && (ch(i2, j) - h).abs() <= 1e-6
+                    && (ch(i2, j + 1) - hn).abs() <= 1e-6
+                {
+                    i2 += 1;
+                }
+                let (hi, lo) = (h.max(hn), h.min(hn));
+                if h > hn {
+                    quad([x(i2), y(j + 1), hi], [x(i), y(j + 1), hi],
+                         [x(i), y(j + 1), lo], [x(i2), y(j + 1), lo]);
+                } else {
+                    quad([x(i), y(j + 1), hi], [x(i2), y(j + 1), hi],
+                         [x(i2), y(j + 1), lo], [x(i), y(j + 1), lo]);
+                }
+                i = i2;
+            }
+        }
+        // Border skirts down to the slab bottom, then the slab underside.
+        let mut run_border = |along_x: bool, fixed_first: bool| {
+            let count = if along_x { nx } else { ny };
+            let mut a = 0;
+            while a < count {
+                let hv = if along_x {
+                    ch(a, if fixed_first { 0 } else { ny - 1 })
+                } else {
+                    ch(if fixed_first { 0 } else { nx - 1 }, a)
+                };
+                let mut a2 = a + 1;
+                while a2 < count {
+                    let hn = if along_x {
+                        ch(a2, if fixed_first { 0 } else { ny - 1 })
+                    } else {
+                        ch(if fixed_first { 0 } else { nx - 1 }, a2)
+                    };
+                    if (hn - hv).abs() > 1e-6 {
+                        break;
+                    }
+                    a2 += 1;
+                }
+                match (along_x, fixed_first) {
+                    (true, true) => quad([x(a), y(0), hv], [x(a), y(0), SLAB_BOTTOM],
+                                         [x(a2), y(0), SLAB_BOTTOM], [x(a2), y(0), hv]),
+                    (true, false) => quad([x(a2), y(ny), hv], [x(a2), y(ny), SLAB_BOTTOM],
+                                          [x(a), y(ny), SLAB_BOTTOM], [x(a), y(ny), hv]),
+                    (false, true) => quad([x(0), y(a2), hv], [x(0), y(a2), SLAB_BOTTOM],
+                                          [x(0), y(a), SLAB_BOTTOM], [x(0), y(a), hv]),
+                    (false, false) => quad([x(nx), y(a), hv], [x(nx), y(a), SLAB_BOTTOM],
+                                           [x(nx), y(a2), SLAB_BOTTOM], [x(nx), y(a2), hv]),
+                }
+                a = a2;
+            }
+        };
+        run_border(true, true);
+        run_border(true, false);
+        run_border(false, true);
+        run_border(false, false);
+        quad(
+            [x(0), y(0), SLAB_BOTTOM],
+            [x(0), y(ny), SLAB_BOTTOM],
+            [x(nx), y(ny), SLAB_BOTTOM],
+            [x(nx), y(0), SLAB_BOTTOM],
+        );
+        (verts, tris)
+    }
+
     /// Exact piecewise-linear surface height at world `(x, y)` — matches the
     /// emitted mesh's triangulation (each cell split along the (i,j)→(i+1,j+1)
     /// diagonal). Returns 0.0 (the flat backstop top) outside the strip.
     pub fn height(&self, x: f32, y: f32) -> f32 {
+        if matches!(self.family, TerrainFamily::Step) {
+            // Must match mesh_boxes(): constant within each cell.
+            let lx = x - STRIP_X0;
+            let ly = y + STRIP_HALF_W;
+            if lx < 0.0 || ly < 0.0 {
+                return 0.0;
+            }
+            let (ci, cj) = ((lx / self.hs) as usize, (ly / self.hs) as usize);
+            if ci >= self.nx || cj >= self.ny {
+                return 0.0;
+            }
+            return self.step_cell_height(ci, cj);
+        }
         let lx = x - STRIP_X0;
         let ly = y + STRIP_HALF_W;
         if lx < 0.0 || ly < 0.0 {
@@ -274,6 +636,9 @@ impl TerrainStrip {
     /// bottom at [`SLAB_BOTTOM`]) — watertight so parry's ORIENTED
     /// pseudo-normals exist (nexus requires them for trimesh contacts).
     pub fn mesh(&self) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        if matches!(self.family, TerrainFamily::Step) {
+            return self.mesh_boxes();
+        }
         let (nx, ny) = (self.nx, self.ny);
         let stride = nx + 1;
         let n_grid = stride * (ny + 1);
@@ -376,7 +741,21 @@ pub const MOVE_DOWN_DISTANCE: f32 = 2.0;
 
 impl TerrainCurriculum {
     /// Initial level ~ U{0, 1} (AGILE's `max_init_terrain_level = 1`).
+    /// BIPED_TERRAIN_LEVEL pins the starting difficulty row (evaluation: a
+    /// controlled riser height instead of the U{0,1} draw).
     pub fn init(rng: &mut Lcg) -> Self {
+        if let Some(l) = std::env::var("BIPED_TERRAIN_LEVEL")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            let mut c = Self::init_inner(rng);
+            c.level = l.min(ROWS as u32 - 1);
+            return c;
+        }
+        Self::init_inner(rng)
+    }
+
+    fn init_inner(rng: &mut Lcg) -> Self {
         let level = if rng.range(0.0, 1.0) < 0.5 { 0 } else { 1 };
         TerrainCurriculum { level, successes: 0, failures: 0 }
     }
@@ -435,40 +814,165 @@ mod tests {
         (lo, hi)
     }
 
+    /// Slope apex bound for a row: g_max · ramp (+q for quantization).
+    fn apex(row: u32) -> f32 {
+        SLOPE_GRADE_MAX * ((row as f32 + 1.0) / ROWS as f32) * SLOPE_RAMP
+    }
+
     #[test]
     fn boxes_amplitude_pins() {
         let s = strip(TerrainFamily::Boxes);
-        // Row 0: d < 0.05 → g < 2 mm (quantized: 0 or ±5 mm edge cases).
+        // Row 0: d < 0.05 → g < 2 mm cells (+ slope apex ≤ 37.5 mm).
         let (lo, hi) = row_extremes(&s, 0);
-        assert!(hi <= 0.006 && lo >= -0.006, "row0 boxes {lo}..{hi}");
-        // Row 19: d ∈ [0.95, 1) → g ≈ 0.038..0.04; heights within ±g.
+        assert!(hi <= 0.006 + apex(0) && lo >= -0.006, "row0 boxes {lo}..{hi}");
+        // Row 19: cells within ±0.04, plus slope apex ≤ 0.75.
         let (lo, hi) = row_extremes(&s, 19);
-        assert!(hi <= 0.0405 && lo >= -0.0405, "row19 boxes {lo}..{hi}");
-        assert!(hi > 0.02 && lo < -0.02, "row19 boxes should be rough: {lo}..{hi}");
+        assert!(hi <= 0.0405 + apex(19) && lo >= -0.0405, "row19 boxes {lo}..{hi}");
+        // Cell jitter must survive on the apex plateau (slope is constant
+        // there, so any spread is the checker field): ±1 m around center.
+        let (cx, _) = TerrainStrip::patch_center(19);
+        let (mut plo, mut phi) = (f32::MAX, f32::MIN);
+        let mut rng = Lcg::new(11);
+        for _ in 0..2000 {
+            let h = s.height(cx + rng.range(-1.0, 1.0), rng.range(-1.0, 1.0));
+            plo = plo.min(h);
+            phi = phi.max(h);
+        }
+        assert!(phi - plo > 0.03, "row19 boxes plateau should stay rough: {plo}..{phi}");
     }
 
     #[test]
     fn rough_amplitude_pins() {
         let s = strip(TerrainFamily::Rough);
-        // One-sided: heights ≥ 0 everywhere (interpolation preserves bounds).
+        // One-sided family + up-only slope: heights ≥ 0 everywhere.
         let (lo0, hi0) = row_extremes(&s, 0);
-        assert!(lo0 >= -1e-6 && hi0 <= 0.2 * 0.05 + VERTICAL_SCALE, "row0 rough {lo0}..{hi0}");
+        assert!(lo0 >= -1e-6 && hi0 <= 0.2 * 0.05 + apex(0) + VERTICAL_SCALE, "row0 rough {lo0}..{hi0}");
         let (lo19, hi19) = row_extremes(&s, 19);
-        assert!(lo19 >= -1e-6, "rough is one-sided: {lo19}");
-        assert!(hi19 <= 0.2 + VERTICAL_SCALE, "row19 rough max {hi19}");
+        assert!(lo19 >= -1e-6, "rough+slope is one-sided: {lo19}");
+        assert!(hi19 <= 0.2 + apex(19) + VERTICAL_SCALE, "row19 rough max {hi19}");
         assert!(hi19 > 0.09, "row19 rough should reach near 0.2·d: {hi19}");
     }
 
     #[test]
     fn wave_amplitude_pins() {
         let s = strip(TerrainFamily::Wave);
-        // Row 19: A ≈ 0.238..0.25 → extremes near ±A.
+        // Row 19: family ±A ≈ ±0.25, plus slope apex ≤ 0.75 on the high side.
         let (lo, hi) = row_extremes(&s, 19);
-        assert!(hi <= 0.25 + VERTICAL_SCALE && lo >= -(0.25 + VERTICAL_SCALE), "row19 wave {lo}..{hi}");
-        assert!(hi > 0.17 && lo < -0.17, "row19 wave peaks: {lo}..{hi}");
-        // Row 0: A ≈ 0.01..0.022.
+        assert!(hi <= 0.25 + apex(19) + VERTICAL_SCALE && lo >= -(0.25 + VERTICAL_SCALE), "row19 wave {lo}..{hi}");
+        // Wave troughs survive near patch borders where the slope ramps to 0.
+        assert!(hi > 0.17 && lo < -0.08, "row19 wave peaks: {lo}..{hi}");
+        // Row 0: A ≈ 0.01..0.022 (+ slope apex ≤ 37.5 mm).
         let (lo, hi) = row_extremes(&s, 0);
-        assert!(hi <= 0.025 && lo >= -0.025, "row0 wave {lo}..{hi}");
+        assert!(hi <= 0.025 + apex(0) && lo >= -0.025, "row0 wave {lo}..{hi}");
+    }
+
+    /// Dump the step strip's REAL collision mesh to JSON for out-of-band
+    /// inspection (`cargo test dump_step_mesh -- --ignored --nocapture`).
+    /// Exists because the video renderer draws a RESAMPLED height grid, which
+    /// interpolates -- a vertical wall renders as a ramp, so footage cannot
+    /// validate the geometry. Only the triangles can.
+    #[test]
+    #[ignore]
+    fn dump_step_mesh() {
+        let s = strip(TerrainFamily::Step);
+        let (verts, tris) = s.mesh();
+        let mut out = String::from("{\"verts\":[");
+        for (i, v) in verts.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            out.push_str(&format!("[{:.4},{:.4},{:.4}]", v[0], v[1], v[2]));
+        }
+        out.push_str("],\"tris\":[");
+        for (i, t) in tris.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            out.push_str(&format!("[{},{},{}]", t[0], t[1], t[2]));
+        }
+        out.push_str("]}");
+        std::fs::write("/tmp/step_mesh.json", out).unwrap();
+        println!("wrote /tmp/step_mesh.json: {} verts {} tris", verts.len(), tris.len());
+    }
+
+    /// The step face must be TRULY VERTICAL in the emitted mesh -- the
+    /// shared-vertex grid emission turned it into a one-cell ramp (~53 deg at
+    /// 10 cm), which is climbable by toe-wedging and softer than the MuJoCo
+    /// eval scene's 90 deg box. Pin that the mesh contains genuinely vertical
+    /// triangles carrying at least the top row's full rise.
+    #[test]
+    fn step_face_is_vertical_in_the_mesh() {
+        let s = strip(TerrainFamily::Step);
+        let (verts, tris) = s.mesh();
+        let mut best_drop: f32 = 0.0;
+        for t in &tris {
+            let (a, b, c) = (verts[t[0] as usize], verts[t[1] as usize], verts[t[2] as usize]);
+            let xs = [a[0], b[0], c[0]];
+            let ys = [a[1], b[1], c[1]];
+            let zs = [a[2], b[2], c[2]];
+            let flat_x = (xs[0] - xs[1]).abs() < 1e-6 && (xs[1] - xs[2]).abs() < 1e-6;
+            let flat_y = (ys[0] - ys[1]).abs() < 1e-6 && (ys[1] - ys[2]).abs() < 1e-6;
+            if flat_x || flat_y {
+                let zmin = zs.iter().cloned().fold(f32::INFINITY, f32::min);
+                let zmax = zs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                // Interior walls only (skirts reach SLAB_BOTTOM; exclude them).
+                if zmin >= 0.0 {
+                    best_drop = best_drop.max(zmax - zmin);
+                }
+            }
+        }
+        assert!(
+            best_drop > 0.5 * STEP_RISE_MAX,
+            "no vertical face carrying a real rise found (best {best_drop} m)"
+        );
+    }
+
+    /// The step family only teaches stepping if the edge is DISCRETE. If the
+    /// mesh grid interpolates across it the patch becomes a ramp, which the
+    /// existing families already cover and which needs no foot lift at all.
+    /// Pin that some pair of adjacent nodes jumps the full rise.
+    #[test]
+    fn step_edge_is_a_real_discontinuity() {
+        let s = strip(TerrainFamily::Step);
+        // Top row: rise is STEP_RISE_MAX * d, d ~= 1.
+        let level = ROWS - 1;
+        let (cx, cy) = TerrainStrip::patch_center(level as u32);
+        let hs = TerrainFamily::Step.grid_spacing();
+        // Sweep a line through the patch centre and find the largest
+        // node-to-node jump; with a binary half-plane it must be ~the rise.
+        let mut biggest: f32 = 0.0;
+        let n = (PATCH / hs) as i32 / 2;
+        for k in -n..n {
+            let a = s.height(cx + k as f32 * hs, cy);
+            let b = s.height(cx + (k + 1) as f32 * hs, cy);
+            biggest = biggest.max((b - a).abs());
+            let a2 = s.height(cx, cy + k as f32 * hs);
+            let b2 = s.height(cx, cy + (k + 1) as f32 * hs);
+            biggest = biggest.max((b2 - a2).abs());
+        }
+        // The edge normal is random, so at least one of the two sweeps must
+        // cross it. Allow quantization slack but require a real jump.
+        assert!(
+            biggest > 0.5 * STEP_RISE_MAX,
+            "step edge got smoothed into a ramp: biggest adjacent jump {biggest} m, \
+             expected ~{} m",
+            STEP_RISE_MAX
+        );
+    }
+
+    #[test]
+    fn slope_bias_pins() {
+        // The DC slope is present under EVERY family: the row-19 patch center
+        // sits near the apex (g·ramp ∈ [0.71, 0.75) minus family lows ≥ −0.25),
+        // while row 0 stays near-flat. Borders stay ~0 (continuity).
+        for f in [TerrainFamily::Boxes, TerrainFamily::Rough, TerrainFamily::Wave] {
+            let s = strip(f);
+            let (cx, cy) = TerrainStrip::patch_center(19);
+            let h = s.height(cx, cy);
+            assert!(h > 0.2, "{f:?} row19 apex should carry the slope: {h}");
+            let (cx0, cy0) = TerrainStrip::patch_center(0);
+            let h0 = s.height(cx0, cy0);
+            assert!(h0.abs() <= 0.08, "{f:?} row0 should stay near-flat: {h0}");
+            // Patch border (x = start of row 19's patch, mid-y): slope term 0.
+            let hb = s.height(STRIP_X0 + PATCH * 19.0, cy);
+            assert!(hb.abs() <= 0.26, "{f:?} border should have no slope: {hb}");
+        }
     }
 
     #[test]
@@ -540,15 +1044,26 @@ mod tests {
         let (lo, hi) = row_extremes(&flat, 19);
         assert!(lo.abs() < 1e-6 && hi.abs() < 1e-6, "amp=0 flat: {lo}..{hi}");
 
-        // amp = 2 → wave row-19 extremes ≈ 2× the default bounds.
+        // amp = 2 → row-19 extremes ≈ 2× the amp = 1 extremes. Relative on
+        // purpose: the terrain content evolves (e.g. the pyramid DC bias now
+        // superimposed under every family — also amp-scaled), and this test
+        // pins the KNOB's meaning, not the field's absolute shape.
+        let base = TerrainStrip::generate_with(
+            TerrainFamily::Wave,
+            42,
+            TerrainParams { amp: 1.0, slope: 0.0 },
+        );
+        let (blo, bhi) = row_extremes(&base, 19);
         let big = TerrainStrip::generate_with(
             TerrainFamily::Wave,
             42,
             TerrainParams { amp: 2.0, slope: 0.0 },
         );
         let (lo, hi) = row_extremes(&big, 19);
-        assert!(hi > 0.34 && lo < -0.34, "amp=2 row19 wave peaks: {lo}..{hi}");
-        assert!(hi <= 0.51 && lo >= -0.51, "amp=2 row19 wave bounds: {lo}..{hi}");
+        assert!(
+            (hi / bhi - 2.0).abs() < 0.15 && (lo / blo - 2.0).abs() < 0.15,
+            "amp=2 should double the amp=1 extremes: {blo}..{bhi} -> {lo}..{hi}"
+        );
 
         // slope: mean height in a patch rises by ~tan(θ)·Δx per patch; with
         // amp=0 the surface IS the ramp.

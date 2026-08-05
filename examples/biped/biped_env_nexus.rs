@@ -545,6 +545,25 @@ pub struct LinkIndices {
     /// is `θ = 2·atan2(rel.z, rel.w)` where
     /// `rel = rest_quat⁻¹ · q_parent⁻¹ · q_child`.
     pub actuated_rest_quat: [Rotation; NUM_JOINTS],
+
+    /// PD-held non-action joints (G1 waist + arms), in MJCF insertion order —
+    /// the upper-body staging targets for the AMASS arm-motion disturbance
+    /// (BIPED_ARM_MOTION). Empty when the model has none or BIPED_LOCK_HELD
+    /// welded them (no motor to stage).
+    pub held: Vec<HeldJoint>,
+}
+
+/// One PD-held (non-action) joint: enough to restage its motor target.
+#[derive(Clone, Debug)]
+pub struct HeldJoint {
+    pub link: u32,
+    pub name: String,
+    /// The build-time hold target (`held_home` or 0) the joint returns to
+    /// when no clip is playing.
+    pub home: f32,
+    /// MJCF joint range — clip poses are clamped into it (retargeted mocap
+    /// can exceed the robot's mechanical range).
+    pub range: (f32, f32),
 }
 
 /// Build one env's rapier scene + sim params with the given DR sample.
@@ -872,6 +891,10 @@ fn build_env_scene(
     let joint_limits_on = env_var("BIPED_JOINT_LIMITS")
         .map(|v| v != "0")
         .unwrap_or(true);
+    // Held (non-action) joints collected as they're built, for the AMASS
+    // upper-body playback (BIPED_ARM_MOTION). Skipped under BIPED_LOCK_HELD
+    // (welded joints carry no motor to restage).
+    let mut held_joints: Vec<HeldJoint> = Vec::new();
     for (i, b) in mjcf.iter().enumerate() {
         let (Some(parent), Some(jname)) = (b.parent, b.joint.as_ref()) else {
             continue;
@@ -896,11 +919,32 @@ fn build_env_scene(
             .find(|(frag, ..)| jname.contains(frag))
             .map(|&(_, kp, kd, effort)| (kp, kd, effort, (-pi, pi), 0.0))
             .unwrap_or((50.0 * pj, 1.0 * pj, 20.0 * pj, (-pi, pi), 0.0));
+        // Per-family ankle gain override (BIPED_ANKLE_KP / BIPED_ANKLE_KD),
+        // applied before DR. AGILE's ankles are kp 20 / kd 0.2 (roll 0.1) —
+        // with the foot planted the body's ~12 kg·m² reflected inertia makes
+        // that a damping ratio of 0.003-0.006, i.e. effectively UNDAMPED, and
+        // measured stand tremor peaks at 9-10 rad/s there while every other
+        // joint sits near 0.08. unitree_rl_gym's deploy pair (40 / 2.0) gives
+        // ~0.046 planted and stays ~critically damped in swing. Unset = the
+        // spec value (AGILE parity preserved by default).
+        let (ankle_kp_ovr, ankle_kd_ovr) = (
+            std::env::var("BIPED_ANKLE_KP").ok().and_then(|s| s.parse::<f32>().ok()),
+            std::env::var("BIPED_ANKLE_KD").ok().and_then(|s| s.parse::<f32>().ok()),
+        );
         let (kp, kd, effort, pos_limit, spec_damping) = spec
             .map(|s| {
+                let is_ankle = s.name.contains("ankle");
+                let base_kp = match ankle_kp_ovr {
+                    Some(v) if is_ankle => v,
+                    _ => s.kp,
+                };
+                let base_kd = match ankle_kd_ovr {
+                    Some(v) if is_ankle => v,
+                    _ => s.kd,
+                };
                 (
-                    s.kp * dr.pd_scale * pj,
-                    s.kd * dr.pd_scale * dr.kd_scale * pj,
+                    base_kp * dr.pd_scale * pj,
+                    base_kd * dr.pd_scale * dr.kd_scale * pj,
                     s.effort_limit * pj,
                     s.pos_limit,
                     s.damping,
@@ -965,31 +1009,39 @@ fn build_env_scene(
         let kd_scale: f32 = env_or_override("BIPED_KD_SCALE")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
-        // Held (non-action) joints hold target 0 by default — Unitree's
-        // joint-zero convention, which for the arms is the elbows-bent-90°
-        // CAD zero. BIPED_HELD_POSE=natural holds the upper body at the
-        // model's "stand" keyframe instead (arms at the sides, elbows
-        // relaxed) — cosmetic for demos; the MuJoCo sim2sim harness holds
-        // the same natural pose and the policy is indifferent. Policy
-        // joints' targets are overwritten every control step either way.
-        let hold_target = if env_or_override("BIPED_HELD_POSE").as_deref() == Some("natural") {
-            const NATURAL: &[(&str, f32)] = &[
-                ("left_shoulder_pitch_joint", 0.2),
-                ("left_shoulder_roll_joint", 0.2),
-                ("left_elbow_joint", 1.28),
-                ("right_shoulder_pitch_joint", 0.2),
-                ("right_shoulder_roll_joint", -0.2),
-                ("right_elbow_joint", 1.28),
-            ];
-            NATURAL
+        // Held joints hold at the spec's `held_home` target, falling back to 0
+        // (the model's rest pose). For the G1 this puts the arms ALONG THE BODY
+        // rather than out in front: the MJCF bakes a 73.2 deg elbow bend into
+        // the body hierarchy, so q = 0 is a bent arm, and elbow = 1.28 cancels
+        // it. Every sim2sim harness and the LeRobot controller already command
+        // 1.28; training held 0, so it ran a different upper-body geometry than
+        // every evaluator and the real robot.
+        // BIPED_HELD_HOME=0 restores the pre-fix behaviour (every held joint at
+        // the model rest pose = arms OUT IN FRONT). Required to evaluate v19-v27
+        // checkpoints, which were TRAINED that way -- without it, rebuilding the
+        // render binary silently re-poses those policies and their numbers stop
+        // matching every measurement taken before this change.
+        let held_home_on = std::env::var("BIPED_HELD_HOME")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let hold_target = if held_home_on {
+            robot
+                .held_home
                 .iter()
-                .find(|(n, _)| jname.as_str() == *n)
-                .map_or(0.0, |&(_, a)| a)
+                .find(|(frag, _)| jname.contains(frag))
+                .map(|&(_, t)| t)
+                .unwrap_or(0.0)
         } else {
             0.0
         };
         if !lock_held {
-            joint.set_motor_position(JointAxis::AngZ, hold_target, kp * kp_scale, kd * kd_scale);
+            joint.set_motor_position(
+                JointAxis::AngZ,
+                hold_target,
+                kp * kp_scale,
+                kd * kd_scale,
+            );
             joint.set_motor_max_force(JointAxis::AngZ, effort);
         }
         // Enforce the free axis's position limits — OFF by default (set
@@ -1005,6 +1057,14 @@ fn build_env_scene(
         if joint_limits_on {
             let (lo, hi) = b.joint_range.unwrap_or(pos_limit);
             joint.set_limits(JointAxis::AngZ, [lo, hi]);
+        }
+        if spec.is_none() && !lock_held {
+            held_joints.push(HeldJoint {
+                link: next_mb_link,
+                name: jname.clone(),
+                home: hold_target,
+                range: b.joint_range.unwrap_or(pos_limit),
+            });
         }
         let jh = multibody.insert(handles[parent], handles[i], joint, true);
         if let (Some(jh), Some(&q0)) = (jh, init_pose.get(jname.as_str())) {
@@ -1211,6 +1271,7 @@ fn build_env_scene(
         mjcf_to_link,
         actuated_parent_links,
         actuated_rest_quat,
+        held: held_joints,
     };
 
     let _ = torso_handle;
@@ -1259,10 +1320,10 @@ struct DbgStance {
 /// command, step counter, action history, air-time, sole-normals) lives in
 /// parallel vectors keyed by env index. Reset uses pre-built single-env spawn
 /// templates and `state.reset_env_from(env_i, template)`.
-/// BIPED_TERRAIN=1 state: the three family strips + per-env curriculum
+/// BIPED_TERRAIN=1 state: the four family strips + per-env curriculum
 /// (WBC-AGILE's terrain_levels_vel_curriculum — see zealot_env::terrain).
 struct TerrainSetup {
-    strips: [TerrainStrip; 3],
+    strips: [TerrainStrip; 4],
     /// Per-env curriculum state (level + success/failure counters).
     curriculum: Vec<TerrainCurriculum>,
     /// Dedicated RNG stream (levels, spawn jitter) — the env's command/DR
@@ -1276,8 +1337,101 @@ struct TerrainSetup {
 
 impl TerrainSetup {
     fn strip_for(&self, env: usize) -> &TerrainStrip {
-        &self.strips[env % 3]
+        // Route through of_env() so BIPED_TERRAIN_FAMILY affects the STRIP,
+        // not just the family label. Indexing by env % 4 directly meant the
+        // forced-family eval walked the wrong terrain: env 0 got the Boxes
+        // strip while every log said "step" -- the negative cell heights in a
+        // dumped patch (impossible for the 0-or-rise step field) were the
+        // tell, and the "riser climb" in the first step videos was actually
+        // the Boxes family's pyramid slope.
+        &self.strips[Self::family_index(env)]
     }
+
+    fn family_index(env: usize) -> usize {
+        match TerrainFamily::of_env(env) {
+            TerrainFamily::Boxes => 0,
+            TerrainFamily::Rough => 1,
+            TerrainFamily::Wave => 2,
+            TerrainFamily::Step => 3,
+        }
+    }
+
+    /// Oracle for the FOOT-CONTACT PROBE the real robot will run: walk a ray
+    /// forward along the heading and report the first discrete height change.
+    ///
+    /// This deliberately models what a probe can actually measure -- distance
+    /// to an edge and the height beyond it -- not what the simulator knows. It
+    /// detects an edge in ANY family, not just Step, so the policy cannot use
+    /// "cue present" as a proxy for "this is the step family".
+    ///
+    /// `EDGE_MIN` is the smallest height change worth reporting: below it the
+    /// feature is terrain roughness the gait already absorbs, and a probe
+    /// would not reliably resolve it either.
+    fn probe(&self, env: usize, x: f32, y: f32, yaw: f32) -> zealot_env::tasks::velocity_flat::StepCue {
+        use zealot_env::tasks::velocity_flat::StepCue;
+        const EDGE_MIN: f32 = 0.04;
+        const RANGE: f32 = 1.5;
+        const DS: f32 = 0.05;
+        let strip = self.strip_for(env);
+        let (cx, sy) = (yaw.cos(), yaw.sin());
+        let h0 = strip.height(x, y);
+        let mut prev = h0;
+        let mut d = DS;
+        while d <= RANGE {
+            let (px, py) = (x + cx * d, y + sy * d);
+            let h = strip.height(px, py);
+            if (h - prev).abs() > EDGE_MIN {
+                // Edge ORIENTATION from the height gradient at the crossing.
+                // The gradient points across the edge (up-slope), which is
+                // exactly the edge normal; a camera's edge extraction recovers
+                // the same direction from the depth discontinuity.
+                let e = 0.10;
+                let gx = strip.height(px + e, py) - strip.height(px - e, py);
+                let gy = strip.height(px, py + e) - strip.height(px, py - e);
+                let n = (gx * gx + gy * gy).sqrt();
+                // Degenerate gradient (edge exactly on the sample grid) -> fall
+                // back to "square-on", which is what a detector would also
+                // report when it cannot resolve the orientation.
+                let (nx, ny) = if n > 1e-6 { (gx / n, gy / n) } else { (cx, sy) };
+                // Rotate the world-frame normal into the body frame.
+                let ec = nx * cx + ny * sy;
+                let es = -nx * sy + ny * cx;
+                return StepCue {
+                    distance: d,
+                    height: h - h0,
+                    edge_sin: es,
+                    edge_cos: ec,
+                    valid: 1.0,
+                };
+            }
+            prev = h;
+            d += DS;
+        }
+        StepCue::default()
+    }
+}
+
+/// Gait cycle seconds at the slowest walking command (0.1 m/s).
+const GAIT_PERIOD_SLOW: f32 = 0.8;
+/// Gait cycle seconds at the full 0.5 m/s command.
+const GAIT_PERIOD_FAST: f32 = 0.55;
+/// Floor on the cycle time when the cap is raised past 0.5 m/s: the
+/// slow->fast interpolation is linear and would extrapolate to 0.36 s at
+/// 0.8 m/s, which is a sprint cadence this robot has never walked at.
+/// 0.40 s at 0.8 m/s is a ~0.16 m step, which is in family with the
+/// 0.14 m step the 0.5 m/s command already uses.
+const GAIT_PERIOD_MIN: f32 = 0.40;
+
+/// AMASS/SONIC upper-body playback config (see the `arm_motion` field).
+struct ArmMotionCfg {
+    clips: Vec<zealot_env::motion::MotionClip>,
+    /// P(a standing command plays a clip) — BIPED_ARM_MOTION_P, default 0.7:
+    /// most stands get moving arms, but quiet stands stay in the curriculum.
+    p: f32,
+    /// Amplitude blend home→clip — BIPED_ARM_MOTION_SCALE, default 1.0.
+    /// <1 attenuates the retargeted motion toward `held_home` (curriculum
+    /// knob if full-amplitude dance clips topple everything early on).
+    scale: f32,
 }
 
 pub struct BipedNexusBatchEnv {
@@ -1296,6 +1450,8 @@ pub struct BipedNexusBatchEnv {
     resample_at: Vec<u32>,
     last_action: Vec<[f32; NUM_JOINTS]>,
     prev_action: Vec<[f32; NUM_JOINTS]>,
+    /// Action before prev — third point for action_rate_rate's second difference.
+    prev2_action: Vec<[f32; NUM_JOINTS]>,
     /// Actuator delay (BIPED_MOTOR_DELAY=min,max): the PD position target is
     /// delayed by a per-env lag of k physics SUBSTEPS (WBC-AGILE's
     /// DelayedPDActuator semantics — k ~ uniform int [min,max] inclusive,
@@ -1341,6 +1497,11 @@ pub struct BipedNexusBatchEnv {
     /// the control tick. Seeded to "planted" (half body weight) on reset so
     /// the spawn pose reads as standing before the first step's readback.
     sensed_force: Vec<[f32; NUM_FEET]>,
+    /// Previous control step's `sensed_force` (same units), for the
+    /// `force_rate` ground-reaction-smoothness reward. `has_prev_force` gates
+    /// the first post-reset step so the seeded value never fabricates a ΔF.
+    prev_sensed_force: Vec<[f32; NUM_FEET]>,
+    has_prev_force: Vec<bool>,
     /// Index of the foot that most recently touched down, per env (-1 = none yet,
     /// reset on episode reset). Drives `FootObs.alt_step`: a touchdown only counts
     /// as a step if it's the OTHER foot than this, enforcing L→R→L→R alternation.
@@ -1349,8 +1510,49 @@ pub struct BipedNexusBatchEnv {
     /// each step (wraps at 1), reset to 0 on episode reset. Fed to the policy as
     /// (sin,cos) and used by the periodic gait reward to prescribe swing/stance.
     gait_phase: Vec<f32>,
-    /// Seconds per full gait cycle (both feet step once). BIPED_GAIT_PERIOD.
-    gait_period: f32,
+    /// Speed at which the gait clock reaches its fastest cadence
+    /// (`BIPED_GAIT_SPEED_CAP`, default 0.5 = historical). Raise alongside
+    /// BIPED_VX or higher commands all share one cadence.
+    gait_speed_cap: f32,
+    /// Trainer-installed dropout override for the actor's step cue (annealed
+    /// exploration schedule). None = the BIPED_STEP_CUE_DROPOUT env default.
+    step_cue_dropout_override: Option<f32>,
+    /// AMASS/SONIC upper-body playback (BIPED_ARM_MOTION=<clip dir>): while
+    /// the command is "stand", the held waist+arm joints replay a random clip
+    /// window as an unobserved moving-mass disturbance, and the legs must
+    /// balance under it. None = off (bit-identical staging to before).
+    arm_motion: Option<ArmMotionCfg>,
+    /// Dedicated RNG stream (clip choice / start offset / activation roll) so
+    /// enabling playback leaves the command/DR stream untouched.
+    arm_rng: Vec<Lcg>,
+    /// Per-env clip index / playback position (s) / active flag.
+    arm_clip: Vec<u32>,
+    arm_time: Vec<f32>,
+    arm_active: Vec<bool>,
+    /// Crossfade progress ∈ [0,1] from `arm_from` toward the current
+    /// destination (clip pose or home), ramped over ~0.5 s. Reset to 0 on
+    /// EVERY destination switch — activation, deactivation, AND a
+    /// stand→stand resample that draws a fresh clip window — so the held
+    /// PD targets never see a step input between unrelated poses.
+    arm_blend: Vec<f32>,
+    /// Crossfade source: the held targets staged at the moment of the last
+    /// destination switch (`env * held.len() + j`).
+    arm_from: Vec<f32>,
+    /// Scratch: one sampled pose (idx.held.len() radians).
+    arm_scratch: Vec<f32>,
+    /// Last staged held-joint targets (`env * held.len() + j`) — mirrored into
+    /// the motor-delay state's held-link slots so the GPU delay kernel swaps
+    /// prev==current (identity) for held links instead of a zero from the
+    /// buffer default.
+    arm_staged: Vec<f32>,
+    /// Consecutive control steps each joint has spent inside its position-limit
+    /// band, per env (`env * NUM_JOINTS + joint`). Atomic so the parallel
+    /// per-env step closure can update its own entries. Drives the
+    /// endstop-DWELL termination: touching a limit is normal in every gait
+    /// (54-66% of frames), but LEANING on one is the standing pathology
+    /// (median dwell 19 steps standing vs 9 walking).
+    limit_dwell: Vec<std::sync::atomic::AtomicU16>,
+
     /// Global control-step counter (for push-perturbation scheduling).
     global_step: u64,
     /// Debug-only per-foot stance-phase tracker (env 0). Tracks, while a foot is
@@ -1466,7 +1668,7 @@ pub struct BipedNexusBatchEnv {
 }
 
 /// Number of logged reward components (see [`REWARD_COMP_NAMES`]).
-pub const NUM_REWARD_COMPS: usize = 29;
+pub const NUM_REWARD_COMPS: usize = 31;
 
 /// Names of the per-component reward terms, in `rlog_comps` / `RewardLog::comps`
 /// order. The first 20 mirror `RewardBreakdown`'s live terms; the last four are
@@ -1499,9 +1701,11 @@ pub const REWARD_COMP_NAMES: [&str; NUM_REWARD_COMPS] = [
     "termination",
     "power",         // Σ|τ·q̇| mechanical-power (energy / cost-of-transport) penalty
     "gait_clock",    // dense periodic swing/stance-matching reward
-    "com_centering", // CoM-over-support-foot (low-ankle-torque single-support)
     "stand_planted", // per-airborne-foot penalty at standing command (balance, don't step)
     "feet_yaw_diff", // WBC feet_yaw_diff_l2: L/R foot yaw splay penalty
+    "force_rate",    // ground-reaction smoothness: |ΔF| above deadband, squared (slam + tremor)
+    "action_rate_rate", // action 2nd difference — tremor at the source (engine-agnostic)
+    "touchdown_vz",  // kinematic slam: descent speed near ground, above allowance
 ];
 
 /// One window of accumulated reward/termination stats (see `take_reward_log`).
@@ -1574,11 +1778,91 @@ impl BipedNexusBatchEnv {
         {
             task.weights.feet_distance = w;
         }
-        if let Some(w) = env_var("BIPED_COM_CENTERING_W")
+        // Foot-clearance weight. DEFAULT 0 -- this reward was dropped once for
+        // being farmed into a one-foot statue (foot held up to collect it; zero
+        // transfer, MuJoCo fell in 0.66 s). The guards that make it safe now
+        // live in the reward (swing-only, air_time < 0.45 s so a held foot
+        // stops earning, moving-gated, capped at the target), and the target
+        // scales with a cued step riser -- but enable it deliberately, and
+        // watch for the statue signature: one foot held, air_time saturating,
+        // clearance high, travel low.
+        if let Some(w) = std::env::var("BIPED_W_FOOT_CLEARANCE")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
         {
-            task.weights.com_centering = w;
+            task.weights.foot_clearance = w;
+        }
+        // Target for that reward (m). Overridden upward automatically while a
+        // step is cued; this is the flat-ground value.
+        if let Some(t) = std::env::var("BIPED_FOOT_CLEARANCE_TARGET")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.foot_clearance_target = t;
+        }
+        if let Some(w) = std::env::var("BIPED_W_FOOT_ORIENTATION")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.foot_orientation = w;
+        }
+        if let Some(w) = std::env::var("BIPED_W_STAND_PLANTED")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.stand_planted = w;
+        }
+        // Ground-reaction-smoothness (force-rate) penalty: pass the weight
+        // NEGATIVE (it's a penalty). Deadband in body weights per control
+        // step. Requires BIPED_CONTACT_SENSE=1 — without the sensor the ΔF
+        // input is identically 0 and the term is silently inert.
+        if let Some(w) = std::env::var("BIPED_W_FORCE_RATE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.force_rate = w;
+        }
+        if let Some(d) = std::env::var("BIPED_FORCE_RATE_DB")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.force_rate_deadband = d;
+        }
+        // Action-side slam/tremor pair (the engine-agnostic replacement for
+        // the retired sensor-side force_rate): both weights NEGATIVE.
+        if let Some(w) = std::env::var("BIPED_W_ACTION_RATE_RATE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.action_rate_rate = w;
+        }
+        if let Some(w) = std::env::var("BIPED_W_TOUCHDOWN_VZ")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.touchdown_vz = w;
+        }
+        if let Some(v) = std::env::var("BIPED_TOUCHDOWN_VZ_OK")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.touchdown_vz_ok = v;
+        }
+        if let Some(v) = std::env::var("BIPED_TOUCHDOWN_VZ_H")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.touchdown_vz_h = v;
+        }
+        // Soft joint-limit penalty weight. At the spec default (-0.5) a fully
+        // saturated ankle costs ~0.0009/step per joint — 3-4x below the
+        // ~0.002/step where a term changes behaviour, which is why the policy
+        // parks on the endstop and lets the constraint carry ~97% of the load.
+        if let Some(w) = std::env::var("BIPED_W_DOF_LIMITS")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.dof_pos_limits = w;
         }
         // Balance-don't-step at stand: per-airborne-foot penalty while the
         // command is standing (NEGATIVE, e.g. -1.0; 0 = off). Pair with a
@@ -1619,7 +1903,7 @@ impl BipedNexusBatchEnv {
             template_dr[0].friction = f;
         }
 
-        // BIPED_TERRAIN=1: generate the three family strips once and wrap each
+        // BIPED_TERRAIN=1: generate the four family strips once and wrap each
         // in ONE SharedShape (cloned across that family's envs so nexus dedupes
         // the mesh buffers to 3 uploads). ORIENTED pseudo-normals are required
         // by the nexus trimesh contact path; the strips are closed slabs.
@@ -1643,6 +1927,7 @@ impl BipedNexusBatchEnv {
                 TerrainStrip::generate_with(TerrainFamily::Boxes, seed, params),
                 TerrainStrip::generate_with(TerrainFamily::Rough, seed, params),
                 TerrainStrip::generate_with(TerrainFamily::Wave, seed, params),
+                TerrainStrip::generate_with(TerrainFamily::Step, seed, params),
             ];
             let mk_shape = |verts: Vec<[f32; 3]>, tris: Vec<[u32; 3]>| -> SharedShape {
                 let pts: Vec<_> = verts
@@ -1665,11 +1950,16 @@ impl BipedNexusBatchEnv {
                 .collect();
             let (sv, st) = TerrainStrip::flat_stub_mesh();
             let stub = mk_shape(sv, st);
+            let step_in_rotation = std::env::var("BIPED_TERRAIN_STEP")
+                .map(|v| v != "0")
+                .unwrap_or(true);
             println!(
-                "terrain curriculum ENABLED: 3 family strips ({} rows x {} m patches), built in {:.1}s",
+                "terrain curriculum ENABLED: {} family strips ({} rows x {} m patches), built in {:.1}s{}",
+                if step_in_rotation { 4 } else { 3 },
                 zealot_env::terrain::ROWS,
                 zealot_env::terrain::PATCH,
-                t0.elapsed().as_secs_f64()
+                t0.elapsed().as_secs_f64(),
+                if step_in_rotation { "" } else { " [Step parked: BIPED_TERRAIN_STEP=0]" }
             );
             Some((strips, shapes, stub))
         } else {
@@ -1683,7 +1973,7 @@ impl BipedNexusBatchEnv {
         let mut env_scenes: Vec<EnvScene> = Vec::with_capacity(num_envs);
         for e in 0..num_envs {
             let dr = template_dr[e % num_templates];
-            let tshape = terrain_build.as_ref().map(|(_, shapes, _)| &shapes[e % 3]);
+            let tshape = terrain_build.as_ref().map(|(_, shapes, _)| &shapes[TerrainSetup::family_index(e)]);
             let (scene, ix) = build_env_scene(&mjcf, &robot, &dr, task.sim_dt, tshape);
             if idx_out.is_none() {
                 idx_out = Some(ix);
@@ -1941,6 +2231,7 @@ impl BipedNexusBatchEnv {
         let resample_at = vec![0u32; num_envs];
         let last_action = vec![[0.0f32; NUM_JOINTS]; num_envs];
         let prev_action = vec![[0.0f32; NUM_JOINTS]; num_envs];
+        let prev2_action = vec![[0.0f32; NUM_JOINTS]; num_envs];
         // BIPED_MOTOR_DELAY=min,max (or just max → min=0), in physics
         // substeps. `0,0` is a valid ENABLED config (constant zero delay —
         // used by the staging-equivalence check); unset/unparseable = off.
@@ -1971,11 +2262,10 @@ impl BipedNexusBatchEnv {
         let air_time = vec![[0.0f32; NUM_FEET]; num_envs];
         let last_td_foot = vec![-1i8; num_envs];
         let gait_phase = vec![0.0f32; num_envs];
-        let gait_period = env_var("BIPED_GAIT_PERIOD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.7);
-        let reset_vel = env_var("BIPED_RESET_VEL").is_ok_and(|v| v == "1");
+        let limit_dwell: Vec<std::sync::atomic::AtomicU16> = (0..num_envs * NUM_JOINTS)
+            .map(|_| std::sync::atomic::AtomicU16::new(0))
+            .collect();
+        let reset_vel = std::env::var("BIPED_RESET_VEL").is_ok_and(|v| v == "1");
         if reset_vel {
             println!("reset-velocity randomization ENABLED (AGILE reset_base/joints: lin ±0.25, ang ±0.5, joints ±1.0)");
         }
@@ -2014,6 +2304,47 @@ impl BipedNexusBatchEnv {
         } else {
             vec![0; num_envs]
         };
+        // AMASS/SONIC upper-body playback (BIPED_ARM_MOTION=<dir of SONIC
+        // csv clips>). Loaded against the model's held joints BY NAME, so a
+        // clip column set that doesn't cover them fails here, not silently.
+        let arm_motion = std::env::var("BIPED_ARM_MOTION").ok().map(|dir| {
+            assert!(
+                !idx.held.is_empty(),
+                "BIPED_ARM_MOTION needs PD-held joints (unset BIPED_LOCK_HELD, use a 29dof model)"
+            );
+            let fps: f32 = std::env::var("BIPED_ARM_MOTION_FPS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30.0);
+            let names: Vec<String> = idx.held.iter().map(|h| h.name.clone()).collect();
+            let clips = zealot_env::motion::MotionClip::load_dir(
+                std::path::Path::new(&dir),
+                &names,
+                fps,
+            )
+            .expect("BIPED_ARM_MOTION");
+            let p: f32 = std::env::var("BIPED_ARM_MOTION_P")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.7);
+            let scale: f32 = std::env::var("BIPED_ARM_MOTION_SCALE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0);
+            let total_s: f32 = clips.iter().map(|c| c.duration()).sum();
+            println!(
+                "arm-motion playback ENABLED: {} clips ({:.0} s total) driving {} held joints, p={p}, scale={scale}, fps={fps}",
+                clips.len(),
+                total_s,
+                idx.held.len()
+            );
+            ArmMotionCfg { clips, p, scale }
+        });
+        let arm_rng: Vec<Lcg> = (0..num_envs)
+            .map(|e| Lcg::new(seed ^ ((e as u64).wrapping_mul(2654435761)) ^ 0xA53A))
+            .collect();
+        let n_held = idx.held.len();
+        let held_homes: Vec<f32> = idx.held.iter().map(|h| h.home).collect();
         let sampler = CommandSampler::default();
         let sampler_default = CommandSampler::default();
 
@@ -2025,11 +2356,33 @@ impl BipedNexusBatchEnv {
             n: num_envs,
             rng,
             sampler,
+            arm_motion,
+            arm_rng,
+            arm_clip: vec![0; num_envs],
+            arm_time: vec![0.0; num_envs],
+            arm_active: vec![false; num_envs],
+            // Blend starts settled-at-home (1.0, staged == home): the spawn
+            // pose holds home, so there is nothing to fade from.
+            arm_blend: vec![1.0; num_envs],
+            arm_from: held_homes
+                .iter()
+                .copied()
+                .cycle()
+                .take(n_held * num_envs)
+                .collect(),
+            arm_scratch: vec![0.0; n_held],
+            arm_staged: held_homes
+                .iter()
+                .copied()
+                .cycle()
+                .take(n_held * num_envs)
+                .collect(),
             cmd,
             step_count,
             resample_at,
             last_action,
             prev_action,
+            prev2_action,
             motor_delay,
             delay_k,
             delay_rng,
@@ -2076,9 +2429,16 @@ impl BipedNexusBatchEnv {
             contact_force_n,
             sensor_inv_dt,
             sensed_force: vec![[0.5 * robot.total_mass * 9.81; NUM_FEET]; num_envs],
+            prev_sensed_force: vec![[0.5 * robot.total_mass * 9.81; NUM_FEET]; num_envs],
+            has_prev_force: vec![false; num_envs],
             last_td_foot,
             gait_phase,
-            gait_period,
+            gait_speed_cap: std::env::var("BIPED_GAIT_SPEED_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.5),
+            step_cue_dropout_override: None,
+            limit_dwell,
             global_step: 0,
             dbg_stance: Vec::new(),
             push_vel,
@@ -2124,6 +2484,7 @@ impl BipedNexusBatchEnv {
             env.resample_at[e] = env
                 .sampler
                 .resample_steps(&mut env.rng[e], env.task.control_dt());
+            env.arm_resample(e);
         }
         // BIPED_TERRAIN: teleport every env onto its initial-level patch (the
         // as-built state stands on flat ground at the origin). Uses the same
@@ -2132,7 +2493,7 @@ impl BipedNexusBatchEnv {
         if env.terrain.is_some() {
             for e in 0..num_envs {
                 let t = e % env.templates.len().max(1);
-                let off = env.terrain_spawn_offset(e);
+                let off = env.terrain_spawn_offset(e, t);
                 env.state.reset_env_from_snapshot_offset(
                     &env.gpu,
                     e as u32,
@@ -2150,12 +2511,50 @@ impl BipedNexusBatchEnv {
     /// BIPED_TERRAIN: pick env `e`'s spawn offset — its current level's patch
     /// center plus AGILE's ±2.5 m jitter, lifted to clear the local terrain —
     /// and reset its travel bookkeeping to the new spawn.
-    fn terrain_spawn_offset(&mut self, e: usize) -> Vec3 {
+    fn terrain_spawn_offset(&mut self, e: usize, template: usize) -> Vec3 {
+        // Step-family APPROACH MODE: with probability BIPED_STEP_APPROACH_P
+        // (default 0.5), spawn the robot so its heading POINTS AT the edge from
+        // a short standoff, instead of AGILE's uniform +/-2.5 m jitter (which,
+        // with the edge through the patch centre, spawns the robot ON the edge
+        // line with a random heading -- clean approach->cross->continue
+        // sequences are rare accidents, and the curriculum can promote through
+        // episodes that walked ALONG the edge).
+        //
+        // The reset API has no yaw control, so instead of turning the robot we
+        // pick the spawn point: place it standoff metres BEHIND the patch
+        // centre along its own baked heading (template_dr[t].spawn_yaw), so
+        // walking forward crosses the edge. The heading is uniform across
+        // templates and the edge normal uniform per patch, so approach angles
+        // stay fully diverse -- head-on, oblique, up-side, down-side all occur.
+        let approach_p: f32 = std::env::var("BIPED_STEP_APPROACH_P")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.5);
+        let yaw_t = self
+            .template_dr
+            .get(template)
+            .map(|d| d.spawn_yaw)
+            .unwrap_or(0.0);
         let ter = self.terrain.as_mut().expect("terrain on");
         let level = ter.curriculum[e].level;
         let (cx, cy) = TerrainStrip::patch_center(level);
         let rng = &mut ter.rng[e];
-        let (sx, sy) = (cx + rng.range(-2.5, 2.5), cy + rng.range(-2.5, 2.5));
+        let is_step = matches!(
+            TerrainFamily::of_env(e),
+            TerrainFamily::Step
+        );
+        let (sx, sy) = if is_step && rng.range(0.0, 1.0) < approach_p {
+            let standoff = rng.range(1.0, 2.5);
+            // Lateral jitter perpendicular to the heading, so the crossing
+            // point sweeps along the edge rather than always hitting centre.
+            let lat = rng.range(-1.5, 1.5);
+            (
+                cx - yaw_t.cos() * standoff - yaw_t.sin() * lat,
+                cy - yaw_t.sin() * standoff + yaw_t.cos() * lat,
+            )
+        } else {
+            (cx + rng.range(-2.5, 2.5), cy + rng.range(-2.5, 2.5))
+        };
         // Clearance over a foot-sized neighborhood + a small epsilon: spawn
         // height is relative to flat ground (the template pose), so the offset
         // z lifts the whole robot by the local surface height.
@@ -2168,6 +2567,32 @@ impl BipedNexusBatchEnv {
     #[allow(dead_code)]
     pub fn num_envs(&self) -> usize {
         self.n
+    }
+
+    /// Sample the terrain height field around `(cx, cy)` on a regular grid,
+    /// for the offline renderer to draw the ground the robot actually walked
+    /// on. Returns (half_extent, spacing, row-major heights). Zeros if terrain
+    /// is off.
+    pub fn terrain_patch_for(&self, e: usize, cx: f32, cy: f32, half: f32, hs: f32) -> (f32, f32, Vec<f32>) {
+        let n = (2.0 * half / hs).round() as usize + 1;
+        let mut out = vec![0.0f32; n * n];
+        if let Some(t) = self.terrain.as_ref() {
+            let strip = t.strip_for(e);
+            for j in 0..n {
+                for i in 0..n {
+                    let x = cx - half + i as f32 * hs;
+                    let y = cy - half + j as f32 * hs;
+                    out[j * n + i] = strip.height(x, y);
+                }
+            }
+        }
+        (half, hs, out)
+    }
+
+    /// Install the annealed actor-cue dropout for this iteration (see the
+    /// rollout's cue block). The critic's clean copy is unaffected.
+    pub fn set_step_cue_dropout(&mut self, p: f32) {
+        self.step_cue_dropout_override = Some(p.clamp(0.0, 1.0));
     }
 
     /// The shared GPU backend driving the physics. Exposed so a vortx GPU policy
@@ -2258,6 +2683,30 @@ impl BipedNexusBatchEnv {
     /// its feet after each shove, which is what makes the learned equilibrium
     /// ROBUST and engine-agnostic (sim-to-real) rather than a brittle
     /// nexus-specific reflex. Read-modify-write the generalized-velocity section of
+    /// DOF index of each policy joint within an env's `dof_state` slice, in
+    /// canonical `JOINT_NAMES` order (root DOFs occupy 0..6).
+    pub fn policy_joint_dofs(&self) -> [u32; NUM_JOINTS] {
+        self.idx.joint_dof_offset
+    }
+
+    /// TRUE generalized velocities for one env, straight from `dof_state`
+    /// (no finite differencing): `[root_lin(3), root_ang(3), joints…]` in the
+    /// multibody's DOF order, world frame for the root. Used by the
+    /// cross-engine divergence probe, where FD velocity error at the 50 Hz
+    /// control rate is the dominant noise floor.
+    pub async fn true_dof_velocities(&mut self, env: usize) -> Vec<f32> {
+        let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
+        let n = self.n;
+        let total = self.state.multibodies_mut().dof_state().buffer().len();
+        let mut buf = vec![0.0f32; total];
+        self.gpu
+            .slow_read_buffer(self.state.multibodies_mut().dof_state().buffer(), &mut buf)
+            .await
+            .expect("dof_state readback");
+        // Batch-interleaved: dof `d` of env `e` at `d·n + e`.
+        (0..dpb).map(|d| buf[d * n + env]).collect()
+    }
+
     /// `dof_state` (env-major, `dofs_per_batch` DOFs per env; root linear = 0..3,
     /// root angular = 3..6, world frame — rapier free-joint DOF order).
     async fn apply_random_pushes(&mut self) {
@@ -2488,8 +2937,12 @@ impl BipedNexusBatchEnv {
                 joint_vel,
                 last_action: self.last_action[env],
                 prev_action: self.prev_action[env],
+                prev2_action: self.prev2_action[env],
                 feet: [FootObs::default(); NUM_FEET],
                 phase: 0.0, // overwritten with self.gait_phase[env] by the caller
+                // Filled by the caller (needs the terrain + this env's pose).
+                step_cue: Default::default(),
+            step_cue_clean: Default::default(),
             },
             joint_pos,
         )
@@ -2534,13 +2987,13 @@ impl BipedNexusBatchEnv {
             let link = self.idx.foot_links[i] as usize;
             let foot_pose = &poses[env_base + link];
             let pos = foot_pose.translation;
-            let planar_speed = if has_prev {
+            let (planar_speed, vz) = if has_prev {
                 let prev_pos = self.prev_body_poses[env_base + link].translation;
                 let dx = (pos.x - prev_pos.x) / dt;
                 let dy = (pos.y - prev_pos.y) / dt;
-                (dx * dx + dy * dy).sqrt()
+                ((dx * dx + dy * dy).sqrt(), (pos.z - prev_pos.z) / dt)
             } else {
-                0.0
+                (0.0, 0.0)
             };
             let world_normal = foot_pose.rotation * sole_local[i];
             let tilt = world_normal.z.abs().clamp(0.0, 1.0).acos();
@@ -2570,6 +3023,14 @@ impl BipedNexusBatchEnv {
             // last one to touch down (or the first step ever, last_td_foot == -1).
             let alt_step = first_contact && self.last_td_foot[env] != i as i8;
             new_air[i] = if contact { 0.0 } else { prev_air + dt };
+            // ΔF in body weights per control step (force_rate reward). Zero
+            // without the sensor (forces frozen at seed) or pre-first-read.
+            let force_rate = if self.contact_sense && self.has_prev_force[env] {
+                (self.sensed_force[env][i] - self.prev_sensed_force[env][i]).abs()
+                    / (self.robot.total_mass * 9.81)
+            } else {
+                0.0
+            };
             out[i] = FootObs {
                 contact,
                 first_contact,
@@ -2580,6 +3041,8 @@ impl BipedNexusBatchEnv {
                 yaw_rel_base,
                 pos_xy: [pos.x, pos.y],
                 alt_step,
+                vz,
+                force_rate,
             };
         }
         (out, new_air)
@@ -2686,8 +3149,108 @@ impl BipedNexusBatchEnv {
         }
     }
 
+    /// Roll the upper-body playback state for env `e` against its CURRENT
+    /// command. Called wherever the command (re)samples: playback only runs
+    /// while standing (`speed() < 0.1` — the same gate as the gait clock and
+    /// stand height), so a walk command always blends the arms back home.
+    fn arm_resample(&mut self, e: usize) {
+        let Some(am) = self.arm_motion.as_ref() else { return };
+        let (n_clips, p) = (am.clips.len(), am.p);
+        let n_held = self.idx.held.len();
+        let standing = self.cmd[e].speed() < 0.1;
+        if standing && self.arm_rng[e].chance(p) {
+            let c = ((self.arm_rng[e].unit() * n_clips as f32) as usize).min(n_clips - 1);
+            // Random start with runway: uniformly inside the clip minus the
+            // longest plausible stand dwell (a finished clip freezes on its
+            // last frame — legal, just less motion than intended).
+            let dur = self.arm_motion.as_ref().unwrap().clips[c].duration();
+            let t0 = self.arm_rng[e].range(0.0, (dur - 8.0).max(0.0));
+            self.arm_clip[e] = c as u32;
+            self.arm_time[e] = t0;
+            self.arm_active[e] = true;
+            // New destination (fresh clip window — even stand→stand):
+            // crossfade from wherever the arms are RIGHT NOW, never jump.
+            self.arm_from[e * n_held..(e + 1) * n_held]
+                .copy_from_slice(&self.arm_staged[e * n_held..(e + 1) * n_held]);
+            self.arm_blend[e] = 0.0;
+        } else if self.arm_active[e] {
+            // Deactivating: crossfade back home from the current pose. (An
+            // already-home env stays settled — no pointless re-blend.)
+            self.arm_active[e] = false;
+            self.arm_from[e * n_held..(e + 1) * n_held]
+                .copy_from_slice(&self.arm_staged[e * n_held..(e + 1) * n_held]);
+            self.arm_blend[e] = 0.0;
+        }
+    }
+
+    /// Kill playback INSTANTLY (no blend-out): episode resets respawn the
+    /// held joints at the home pose, so a lingering blend would drag the
+    /// fresh episode's arms through a stale clip pose.
+    fn arm_reset(&mut self, e: usize) {
+        if self.arm_motion.is_none() {
+            return;
+        }
+        let n_held = self.idx.held.len();
+        self.arm_active[e] = false;
+        self.arm_blend[e] = 1.0; // settled at home, nothing to fade from
+        for (j, h) in self.idx.held.iter().enumerate() {
+            self.arm_staged[e * n_held + j] = h.home;
+        }
+    }
+
+    /// Advance every env's playback one control step and restage the held
+    /// joints' PD targets in the `links_static` mirror (uploaded by the same
+    /// `flush_links_static` that carries the leg targets). No-op when
+    /// BIPED_ARM_MOTION is unset — staging stays bit-identical to before.
+    fn stage_arm_motion(&mut self) {
+        let dt = self.task.control_dt();
+        let Some(am) = &self.arm_motion else { return };
+        let n_held = self.idx.held.len();
+        let mbs = self.state.multibodies_mut();
+        for e in 0..self.n {
+            // Crossfade `arm_from` → destination over ~0.5 s (smoothstep, so
+            // the fade starts and ends with zero velocity). The destination
+            // is the LIVE clip pose (already moving during the fade) or home;
+            // `arm_from` was snapshotted at the last destination switch, so
+            // every transition — activation, deactivation, stand→stand clip
+            // swap — leaves from wherever the arms currently are.
+            let b = (self.arm_blend[e] + dt / 0.5).min(1.0);
+            self.arm_blend[e] = b;
+            let s = b * b * (3.0 - 2.0 * b);
+            if self.arm_active[e] {
+                self.arm_time[e] += dt;
+                let clip = &am.clips[self.arm_clip[e] as usize];
+                clip.sample(self.arm_time[e], &mut self.arm_scratch);
+            }
+            for (j, h) in self.idx.held.iter().enumerate() {
+                // Destination: amplitude-scaled clip pose (or home), clamped
+                // into the joint's mechanical range (retargeted mocap can
+                // exceed it).
+                let dest = if self.arm_active[e] {
+                    (h.home + am.scale * (self.arm_scratch[j] - h.home))
+                        .clamp(h.range.0, h.range.1)
+                } else {
+                    h.home
+                };
+                let q = if s >= 1.0 {
+                    dest
+                } else {
+                    let from = self.arm_from[e * n_held + j];
+                    from + s * (dest - from)
+                };
+                mbs.stage_motor_position(e as u32, h.link, JointAxis::AngZ, q);
+                self.arm_staged[e * n_held + j] = q;
+            }
+        }
+    }
+
     pub async fn step(&mut self, actions: &[[f32; NUM_JOINTS]]) -> Vec<StepOut> {
         assert_eq!(actions.len(), self.n);
+
+        // (0) Upper-body playback: restage the held-joint targets FIRST, so
+        // both staging branches below flush them together with the leg
+        // targets in the one links_static upload.
+        self.stage_arm_motion();
 
         // (1) Stage every env's motor targets host-side in the mirror, then
         // push the whole `links_static` buffer in ONE write_buffer call.
@@ -2753,6 +3316,17 @@ impl BipedNexusBatchEnv {
                 for j in 0..NUM_JOINTS {
                     let link = self.idx.actuated[j].0 as usize;
                     self.delay_state_buf[base + 2 + link] = self.delay_prev_targets[e][j];
+                }
+                // Held links: mirror the just-staged playback target into the
+                // prev slot (prev == current → the delay swap is an identity
+                // for the upper body; the buffer default of 0.0 would dip the
+                // elbows toward q=0 for the first k substeps of every step).
+                if self.arm_motion.is_some() {
+                    let n_held = self.idx.held.len();
+                    for (j, h) in self.idx.held.iter().enumerate() {
+                        self.delay_state_buf[base + 2 + h.link as usize] =
+                            self.arm_staged[e * n_held + j];
+                    }
                 }
             }
             let buf = std::mem::take(&mut self.delay_state_buf);
@@ -2899,8 +3473,18 @@ impl BipedNexusBatchEnv {
             let _ = mbs_per_batch; // 1 robot per batch on this stack
             for e in 0..self.n {
                 let base = e * MAX_CONTACT_SENSORS as usize;
+                // Roll the force history for the force_rate reward. On the
+                // first read after a reset, prev := new (ΔF = 0) so the
+                // half-body-weight seed never fabricates a force spike.
+                if self.has_prev_force[e] {
+                    self.prev_sensed_force[e] = self.sensed_force[e];
+                }
                 for i in 0..NUM_FEET {
                     self.sensed_force[e][i] = imp[base + i] * self.sensor_inv_dt;
+                }
+                if !self.has_prev_force[e] {
+                    self.prev_sensed_force[e] = self.sensed_force[e];
+                    self.has_prev_force[e] = true;
                 }
             }
         }
@@ -2927,6 +3511,7 @@ impl BipedNexusBatchEnv {
                     + self
                         .sampler
                         .resample_steps(&mut self.rng[e], self.task.control_dt());
+                self.arm_resample(e);
             }
         }
         self.timings.serial_pre_ns += t.elapsed().as_nanos() as u64;
@@ -2987,6 +3572,70 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(0.0);
+        // Leg-interpenetration termination distance (BIPED_SELF_COLL_TERM,
+        // 0 disables). 0.05 m between link centers ≈ colliders overlapping.
+        let sc_term = std::env::var("BIPED_SELF_COLL_TERM")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.05);
+        // Joint-velocity fault (BIPED_DOF_VEL_TERM, multiplier on each
+        // joint's hardware vel_limit; 0 disables). Real actuators fault past
+        // rated speed — flail-speed swings end the episode like an e-stop.
+        let vel_term: f32 = std::env::var("BIPED_DOF_VEL_TERM")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        // Mechanical-power fault (BIPED_POWER_TERM, watts of Σ|τ·q̇| in one
+        // control step; 0 disables). Calibration: walking ≈ 350 W, the
+        // stand-tremor pathology ≈ 2000 W — sustained dither burns past the
+        // threshold while honest locomotion never approaches it.
+        let power_term: f32 = std::env::var("BIPED_POWER_TERM")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(3000.0);
+        // DC torque-speed envelope fault (BIPED_ENVELOPE_TERM, speed-axis
+        // scale; 0 disables — and it DEFAULTS OFF: with 50 Hz finite-diff
+        // joint velocities, contact aliasing throws single joints past rated
+        // speed for one sample and even healthy gaits "violate" on 92% of
+        // steps (measured). The correct form of this idea is kernel-level DC
+        // torque-speed saturation in the actuator model, not a termination.
+        let env_term: f32 = std::env::var("BIPED_ENVELOPE_TERM")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        // Endstop-SLAM fault (BIPED_LIMIT_SLAM_VEL, rad/s; 0 disables). Resting
+        // against a position limit is a static load the structure carries, but
+        // ARRIVING at one carries ½Iω² into the gearbox — measured entries hit
+        // 9-10 rad/s ≈ 0.9 J, like dropping the foot 15 cm through the ankle
+        // drive. Terminating on contact would fire within 0.15 s of every
+        // episode (the ankle is inside the band >50% of the time) and bury the
+        // gradient; gating on approach SPEED targets only the damaging case.
+        // 2.0 rad/s ≈ 43 mJ, the energy of a 7 mm drop.
+        // Endstop-DWELL fault (BIPED_LIMIT_DWELL_STEPS, consecutive control
+        // steps inside the band; 0 disables). The free-support exploit is
+        // STATIC — the constraint carries ~97% of the ankle load while the
+        // motor idles — so a velocity gate can't catch it: the policy can
+        // drift onto the stop slowly and lean forever. Terminating on CONTACT
+        // is not an option either (54-66% of frames touch, in every gait).
+        // Dwell separates them: standing leans ~19 steps at a stretch,
+        // walking brushes ~9.
+        let dwell_max: u16 = std::env::var("BIPED_LIMIT_DWELL_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let slam_vel: f32 = std::env::var("BIPED_LIMIT_SLAM_VEL")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        const SLAM_BAND: f32 = 0.05; // rad from the hard limit
+        // Per-joint instantaneous power fault (BIPED_JOINT_POWER_TERM, watts;
+        // 0 disables). Spikes are the failure mode averages cannot see, and
+        // hardware limits are per actuator: healthy v17-style gait peaks at
+        // ~700 W in the worst joint, the stand-tremor spikes to 20 kW.
+        let joint_power_term: f32 = std::env::var("BIPED_JOINT_POWER_TERM")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1500.0);
         let sc_dt = self.task.control_dt();
         // Torque (effort) penalty: we're PD position-controlled and had NO cost
         // on joint torque, so the policy reward-hacks strained high-torque poses
@@ -3025,6 +3674,25 @@ impl BipedNexusBatchEnv {
         let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(5e-5);
         let w_ankle_torques = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1e-4);
         let w_ankle_roll_torques = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(1e-3);
+        // Knee-specific torque extra (BIPED_W_KNEE_TORQUES, per-step weight on
+// tau^2; 0 = off). Unlike the generic ramped leg term this is
+// FULL-STRENGTH from iter 0, like the ankle extras: the knee holds the
+// crouch, and a sustained 105 N.m (75% of the 139 limit measured at
+// cmd 0.4) is a thermal problem long before it is an electrical one.
+// Extension is free for the knee - the load passes through the joint -
+// so this term prices the crouch itself.
+        // SIZING TRAP (v22): this was first set to 1.5e-3, copied from the ankle
+// extra -- but the penalty is tau^2 and the knee runs at ~4.5x the ankle's
+// torque, so the same weight costs ~20x more. At 1.5e-3 a 105 N.m walking
+// peak charges 0.33/step, MORE than the entire positive reward (~0.26): the
+// policy's only survivable answer was to stop using the knee at all
+// (measured: -4 deg through the whole swing, a locked compass gait). Size
+// this by the COST it should impose, not by another joint's weight. 7e-5
+// puts a walking peak at ~0.016/step, comparable to the ankle extra.
+let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
         // Mechanical-power (energy) penalty weight. Penalizes Σ|τᵢ·q̇ᵢ| — the rate
         // of mechanical work, the principled cost-of-transport proxy. Unlike Στ²
         // (effort, penalized even when static), this only charges for work done in
@@ -3043,6 +3711,28 @@ impl BipedNexusBatchEnv {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
         let cpb_idx = self.idx.colliders_per_batch as usize;
+        // Step-cue knobs, read once per step rather than per env.
+        // BIPED_STEP_CUE=0 disables the cue entirely (obs slots stay zero), so
+        // a run can be done with the wider observation but no step information
+        // -- the control for "did the cue actually help".
+        let step_cue_on = std::env::var("BIPED_STEP_CUE").as_deref() != Ok("0");
+        // Detector-shaped error. A depth-based edge detector is decent when it
+        // fires and occasionally does not fire at all; training on a clean
+        // oracle would teach the policy to trust it, and the first dropout on
+        // hardware becomes a fall rather than a refusal.
+        // Base dropout from the env (deploy-level, default 0.10) unless the
+        // trainer has installed an annealed override (exploration schedule:
+        // hide the cue from the ACTOR early so it practices crossings blind,
+        // then hand the cue back as skill accrues; the critic sees the clean
+        // cue throughout, so the gradient credits crossings either way).
+        let step_cue_dropout: f32 = self.step_cue_dropout_override.unwrap_or_else(|| {
+            std::env::var("BIPED_STEP_CUE_DROPOUT")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.10)
+        });
+        let step_cue_dn: f32 = std::env::var("BIPED_STEP_CUE_DIST_NOISE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0.03);
+        let step_cue_hn: f32 = std::env::var("BIPED_STEP_CUE_H_NOISE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0.02);
         let computed: Vec<PerEnv> = (0..self.n)
             .into_par_iter()
             .with_min_len(64)
@@ -3051,6 +3741,37 @@ impl BipedNexusBatchEnv {
                 let (mut state, new_joint_pos) = self.read_state_from_poses(e, &poses);
                 state.feet = feet;
                 state.phase = self.gait_phase[e];
+                // Step cue from the foot-probe oracle, with PROBE-shaped error.
+                // A real probe is accurate when it succeeds (the foot touched
+                // the edge) but fails outright now and then -- foot slips off,
+                // sweep misses, operator probes the wrong spot. So: small
+                // Gaussian-ish noise on both numbers, plus a dropout that
+                // clears the cue entirely. Training on a perfect oracle would
+                // teach the policy to trust it, and the first bad probe on
+                // hardware becomes a fall instead of a refusal.
+                if let Some(t) = self.terrain.as_ref() {
+                    if step_cue_on {
+                        let yaw = {
+                            let q = state.base.orientation;
+                            // q = [x, y, z, w]
+                            (2.0 * (q[3] * q[2] + q[0] * q[1]))
+                                .atan2(1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2]))
+                        };
+                        let mut cue =
+                            t.probe(e, state.base.pos_xy[0], state.base.pos_xy[1], yaw);
+                        state.step_cue_clean = cue; // critic-only, un-noised
+                        if cue.valid > 0.5 {
+                            let r = &mut self.rng[e].clone();
+                            if r.range(0.0, 1.0) < step_cue_dropout {
+                                cue = Default::default();
+                            } else {
+                                cue.distance += r.range(-step_cue_dn, step_cue_dn);
+                                cue.height += r.range(-step_cue_hn, step_cue_hn);
+                            }
+                        }
+                        state.step_cue = cue;
+                    }
+                }
                 let env_base = e * cpb_idx;
                 let illegal = self.idx.illegal_ground_links.iter().any(|&l| {
                     let p = poses[env_base + l as usize].translation;
@@ -3061,8 +3782,98 @@ impl BipedNexusBatchEnv {
                         .map_or(0.0, |ter| ter.strip_for(e).height(p.x, p.y));
                     p.z - gh < illegal_z
                 });
-                let fell =
-                    illegal || self.task.fell_over(&state.base) || !state.base.height.is_finite();
+                // E-stop termination: legs truly interpenetrating (any L/R pair
+                // inside `sc_term`). Neither engine has leg-leg collision, so on
+                // hardware this state is an operator emergency stop — train the
+                // same contract. The soft `sc_weight` ring (below) keeps this
+                // rare after the first few hundred iters.
+                let crossed = sc_term > 0.0
+                    && self.idx.self_collision_pairs.iter().any(|&(a, b)| {
+                        let pa = poses[env_base + a as usize].translation;
+                        let pb = poses[env_base + b as usize].translation;
+                        (pa - pb).length_squared() < sc_term * sc_term
+                    });
+                let vel_fault = vel_term > 0.0
+                    && (0..NUM_JOINTS).any(|i| {
+                        state.joint_vel[i].abs()
+                            > self.task.robot.joints[i].vel_limit * vel_term
+                    });
+                // Leaning on an endstop: inside the band for `dwell_max`
+                // consecutive control steps (own-env entries only, so the
+                // relaxed atomics never race).
+                let dwell_fault = if dwell_max > 0 {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut hit = false;
+                    for i in 0..NUM_JOINTS {
+                        let (lo, hi) = self.task.robot.joints[i].pos_limit;
+                        let q = state.joint_pos[i];
+                        let c = &self.limit_dwell[e * NUM_JOINTS + i];
+                        if q < lo + SLAM_BAND || q > hi - SLAM_BAND {
+                            if c.fetch_add(1, Relaxed) + 1 >= dwell_max {
+                                hit = true;
+                            }
+                        } else {
+                            c.store(0, Relaxed);
+                        }
+                    }
+                    hit
+                } else {
+                    false
+                };
+                // Slamming a joint endstop: inside the band AND still moving
+                // into it above the energy threshold.
+                let slam_fault = slam_vel > 0.0
+                    && (0..NUM_JOINTS).any(|i| {
+                        let (lo, hi) = self.task.robot.joints[i].pos_limit;
+                        let (q, v) = (state.joint_pos[i], state.joint_vel[i]);
+                        (q < lo + SLAM_BAND && v < -slam_vel)
+                            || (q > hi - SLAM_BAND && v > slam_vel)
+                    });
+                let (power_fault, envelope_fault) = if power_term > 0.0
+                    || env_term > 0.0
+                    || joint_power_term > 0.0
+                {
+                    let q_target = self.task.joint_targets(&actions[e]);
+                    let mut p = 0.0f32;
+                    let mut pj_max = 0.0f32;
+                    let mut env_viol = false;
+                    for i in 0..NUM_JOINTS {
+                        let j = &self.task.robot.joints[i];
+                        let tau = (j.kp * (q_target[i] - state.joint_pos[i])
+                            - j.kd * state.joint_vel[i])
+                            .clamp(-j.effort_limit, j.effort_limit);
+                        let pj = (tau * state.joint_vel[i]).abs();
+                        p += pj;
+                        pj_max = pj_max.max(pj);
+                        if env_term > 0.0 {
+                            let avail = j.effort_limit
+                                * (1.0 - state.joint_vel[i].abs() / (env_term * j.vel_limit))
+                                    .max(0.0);
+                            // only torque WITH the motion direction is motor
+                            // work — braking torque comes for free in a DC
+                            // motor and must not trip the envelope.
+                            if tau * state.joint_vel[i] > 0.0 && tau.abs() > avail {
+                                env_viol = true;
+                            }
+                        }
+                    }
+                    (
+                        (power_term > 0.0 && p > power_term)
+                            || (joint_power_term > 0.0 && pj_max > joint_power_term),
+                        env_viol,
+                    )
+                } else {
+                    (false, false)
+                };
+                let fell = illegal
+                    || crossed
+                    || vel_fault
+                    || slam_fault
+                    || dwell_fault
+                    || power_fault
+                    || envelope_fault
+                    || self.task.fell_over(&state.base)
+                    || !state.base.height.is_finite();
                 let rb = self.task.reward(&state, &self.cmd[e]);
                 let mut reward = rb.total();
                 let mut comps = [0.0f32; NUM_REWARD_COMPS];
@@ -3087,10 +3898,16 @@ impl BipedNexusBatchEnv {
                 comps[18] = rb.feet_yaw_mean;
                 comps[19] = rb.feet_distance;
                 comps[25] = rb.gait_clock;
-                comps[26] = rb.com_centering;
-                comps[27] = rb.stand_planted;
-                comps[28] = rb.feet_yaw_diff;
+                comps[26] = rb.stand_planted;
+                comps[27] = rb.feet_yaw_diff;
+                comps[28] = rb.force_rate;
+                comps[29] = rb.action_rate_rate;
+                comps[30] = rb.touchdown_vz;
                 if fell {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    for i in 0..NUM_JOINTS {
+                        self.limit_dwell[e * NUM_JOINTS + i].store(0, Relaxed);
+                    }
                     comps[23] = self.task.weights.termination;
                     reward += self.task.weights.termination;
                 }
@@ -3118,10 +3935,11 @@ impl BipedNexusBatchEnv {
                 // while the leg term ramps with the curriculum (`torque_w`). WBC
                 // lerobot base weights: -5e-4 legs, -1.5e-3 ankle pitch, -6.5e-3
                 // ankle roll (coupled, weakest).
-                if torque_w > 0.0 || ankle_torque_w > 0.0 || power_w > 0.0 {
+                if torque_w > 0.0 || ankle_torque_w > 0.0 || power_w > 0.0 || w_knee_torques > 0.0 {
                     let q_target = self.task.joint_targets(&actions[e]);
                     let mut leg_pen = 0.0f32;
                     let mut ankle_pen = 0.0f32;
+                    let mut knee_pen = 0.0f32; // unramped, full-strength like the ankle extras
                     let mut power = 0.0f32; // Σ|τ·q̇| mechanical power (energy rate)
                     for i in 0..NUM_JOINTS {
                         let j = &self.task.robot.joints[i];
@@ -3142,12 +3960,18 @@ impl BipedNexusBatchEnv {
                             }
                             ankle_pen += w * t2;
                         }
+                        if j.name.contains("knee") {
+                            knee_pen += w_knee_torques * t2;
+                        }
                     }
-                    comps[20] = -(torque_w * leg_pen) * sc_dt;
+                    comps[20] = -(torque_w * leg_pen + knee_pen) * sc_dt;
                     comps[21] = -(ankle_torque_w * ankle_pen) * sc_dt;
                     comps[24] = -(power_w * power) * sc_dt;
-                    reward -=
-                        (torque_w * leg_pen + ankle_torque_w * ankle_pen + power_w * power) * sc_dt;
+                    reward -= (torque_w * leg_pen
+                        + knee_pen
+                        + ankle_torque_w * ankle_pen
+                        + power_w * power)
+                        * sc_dt;
                 }
                 let mut obs = vec![0.0; OBS_DIM];
                 self.task.observe(&state, &self.cmd[e], &mut obs);
@@ -3205,20 +4029,55 @@ impl BipedNexusBatchEnv {
                 for v in &mut c.obs[3 * NUM_JOINTS + 4..3 * NUM_JOINTS + 7] {
                     *v += rng.range(-0.05, 0.05) * obs_noise;
                 }
+                // base_ang_vel / gyro [45..48]: ±0.2 rad/s. This block predates
+                // the gyro (added with the 48-dim frame in v22) and stopped at
+                // projected_gravity, so every gyro-era policy trained on a
+                // PERFECT IMU while every other channel was noised -- the one
+                // proprioceptive input with no sim-to-real margin. Measured on
+                // v24: 0.01 rad/s of gyro noise moves the action by 0.016,
+                // ~0.8 N-m of knee torque ripple at action_scale 0.25.
+                // 0.2 completes Isaac Lab's UniformNoise set the amplitudes
+                // above are taken from (joint_pos 0.01 / joint_vel 1.5 /
+                // ang_vel 0.2 / gravity 0.05).
+                if OBS_DIM >= 48 {
+                    for v in &mut c.obs[45..48] {
+                        *v += rng.range(-0.2, 0.2) * obs_noise;
+                    }
+                }
             }
-            // Obs history: push the final (noised) frame, emit the stacked
-            // window. Must run after the noise block — the history records
-            // exactly what the policy saw (WBC-AGILE ordering).
-            if let Some(hist) = &mut self.obs_hist {
-                c.obs = hist.push_stacked(e, &c.obs);
-            }
+            // (obs history is stacked in one parallel pass after this loop —
+            // it must see the final NOISED frame, and per-env ring buffers
+            // are disjoint, so batching after the serial mutations is
+            // bit-identical to pushing here. Serial it cost ~12 ms/step.)
             self.air_time[e] = c.new_air;
             if c.td_foot >= 0 {
                 self.last_td_foot[e] = c.td_foot;
             }
-            // Advance the gait clock (wraps at 1).
-            self.gait_phase[e] =
-                (self.gait_phase[e] + self.task.control_dt() / self.gait_period).fract();
+            // Gait clock: fully derived from the command, matching the
+            // deploy contract. Standing command (< 0.1 m/s) freezes the phase
+            // (the obs clock stops asking for swings the gated reward no
+            // longer pays); a move command advances it with a cadence that
+            // scales with commanded speed — 0.8 s/cycle at 0.1 m/s down to
+            // 0.55 s at the full 0.5 m/s (stride rate carries part of the
+            // speed, as in biological gait). Deterministic from command
+            // history: any deploy stack reproduces it without an estimator.
+            // Same magnitude the task's standing predicate uses (INCLUDING
+            // yaw rate) — a turn-in-place command must tick the clock, or the
+            // gait reward scores against a frozen phase.
+            let cmd_speed = self.cmd[e].speed();
+            if cmd_speed >= 0.1 {
+                // The cap must track the command range: with BIPED_VX raised to
+                // 0.8 but the cap left at 0.5, every command from 0.5 to 0.8
+                // gets an IDENTICAL cadence, so the policy can only go 60%
+                // faster by lengthening its stride. Raise both together.
+                // NOTE: this mapping is part of the observation contract -- the
+                // sim2sim harnesses and the LeRobot controller hardcode it too.
+                let t = ((cmd_speed.min(self.gait_speed_cap)) - 0.1) / 0.4;
+                let period = (GAIT_PERIOD_SLOW + (GAIT_PERIOD_FAST - GAIT_PERIOD_SLOW) * t)
+                    .max(GAIT_PERIOD_MIN);
+                self.gait_phase[e] =
+                    (self.gait_phase[e] + self.task.control_dt() / period).fract();
+            }
             self.prev_joint_pos[e] = c.new_joint_pos;
             self.has_prev_joint_pos[e] = true;
             // Snapshot poses for this env into prev_body_poses for the next
@@ -3227,6 +4086,7 @@ impl BipedNexusBatchEnv {
             self.prev_body_poses[env_base..env_base + cpb]
                 .copy_from_slice(&poses[env_base..env_base + cpb]);
             self.has_prev_pose[e] = true;
+            self.prev2_action[e] = self.prev_action[e];
             self.prev_action[e] = self.last_action[e];
             self.last_action[e] = actions[e];
             let timeout = self.step_count[e] >= self.task.max_steps();
@@ -3265,6 +4125,17 @@ impl BipedNexusBatchEnv {
                 done: c.fell || timeout,
                 fell: c.fell,
             });
+        }
+        // Obs history, batched: push each env's final (noised) frame and
+        // replace it with the stacked window — in PARALLEL over the disjoint
+        // per-env ring buffers (the serial in-loop version cost ~12 ms/step
+        // at 4096 envs). Runs before any caller-side resets, exactly where
+        // the serial pushes sat, so semantics are bit-identical.
+        if let Some(hist) = &mut self.obs_hist {
+            hist.env_views()
+                .into_par_iter()
+                .zip(outs.par_iter_mut())
+                .for_each(|(mut view, o)| view.push_stacked_replace(&mut o.obs));
         }
         self.timings.serial_commit_ns += t.elapsed().as_nanos() as u64;
         self.timings.steps += 1;
@@ -3330,7 +4201,7 @@ impl BipedNexusBatchEnv {
         if self.terrain.is_some() {
             // Teleport to the env's current difficulty patch (level was
             // already updated by the curriculum when the episode ended).
-            let off = self.terrain_spawn_offset(env);
+            let off = self.terrain_spawn_offset(env, t);
             self.state.reset_env_from_snapshot_offset(
                 &self.gpu,
                 env as u32,
@@ -3376,17 +4247,22 @@ impl BipedNexusBatchEnv {
 
         // Reset host state.
         self.cmd[env] = eval_cmd_override().unwrap_or_else(|| self.sampler.sample(&mut self.rng[env]));
+        self.arm_reset(env); // respawn holds home — kill playback instantly
+        self.arm_resample(env); // then re-roll against the fresh command
         self.step_count[env] = 0;
         self.resample_at[env] = self
             .sampler
             .resample_steps(&mut self.rng[env], self.task.control_dt());
         self.last_action[env] = [0.0; NUM_JOINTS];
         self.prev_action[env] = [0.0; NUM_JOINTS];
+        self.prev2_action[env] = [0.0; NUM_JOINTS];
         self.air_time[env] = [0.0; NUM_FEET];
         // Force-sensed contact: seed the new episode as planted (half body
         // weight per foot) — the spawn pose stands on both soles, and the
         // real sensed value arrives with the first step's readback.
         self.sensed_force[env] = [0.5 * self.robot.total_mass * 9.81; NUM_FEET];
+        self.prev_sensed_force[env] = self.sensed_force[env];
+        self.has_prev_force[env] = false; // no ΔF across the reset teleport
         self.last_td_foot[env] = -1;
         self.gait_phase[env] = 0.0;
         // Actuator delay: resample the lag for the new episode (from the
@@ -3510,17 +4386,52 @@ impl BipedNexusBatchEnv {
     /// per-env DR sample the env was originally seeded with.
     pub async fn reset_env_to_default_template(&mut self, e: usize) -> (Vec<f32>, Vec<f32>) {
         assert!(!self.template_snapshots.is_empty());
-        self.state
-            .reset_env_from_snapshot(&self.gpu, e as u32, &self.template_snapshots[0]);
+        // TERRAIN-AWARE. The snapshot is the as-built pose at the ORIGIN, and
+        // the terrain strip starts 8 m away at x = STRIP_X0, so a plain
+        // snapshot reset silently undoes the on-terrain teleport that `new()`
+        // performed -- the rollout then walks on flat ground while every log
+        // line still says "terrain ENABLED". That produced an eval where the
+        // step-cue A/B returned byte-identical numbers for cue on and cue off
+        // because the robot never met a step at all.
+        if self.terrain.is_some() {
+            let off = self.terrain_spawn_offset(e, 0);
+            self.state
+                .reset_env_from_snapshot_offset(&self.gpu, e as u32, &self.template_snapshots[0], off);
+        } else {
+            self.state
+                .reset_env_from_snapshot(&self.gpu, e as u32, &self.template_snapshots[0]);
+        }
         self.foot_sole_local[e] = self.idx.foot_sole_local;
         self.cmd[e] = VelocityCommand::default();
+        self.arm_reset(e); // eval reset: deterministic home arms, no playback
+        // BIPED_EVAL_ARM_CLIP=<idx>: pin clip <idx> from t=0 for THIS eval
+        // rollout (deterministic — no RNG), so renders/evals can show the
+        // upper-body playback that the training-side arm_reset suppresses.
+        if let Some(am) = &self.arm_motion {
+            if let Some(c) = std::env::var("BIPED_EVAL_ARM_CLIP")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                let n_held = self.idx.held.len();
+                self.arm_clip[e] = c % am.clips.len() as u32;
+                self.arm_time[e] = 0.0;
+                self.arm_active[e] = true;
+                // Fade in from home (arm_reset above just staged it).
+                self.arm_from[e * n_held..(e + 1) * n_held]
+                    .copy_from_slice(&self.arm_staged[e * n_held..(e + 1) * n_held]);
+                self.arm_blend[e] = 0.0;
+            }
+        }
         self.step_count[e] = 0;
         // Pin the resample so the command stays where the caller pins it.
         self.resample_at[e] = u32::MAX;
         self.last_action[e] = [0.0; NUM_JOINTS];
         self.prev_action[e] = [0.0; NUM_JOINTS];
+        self.prev2_action[e] = [0.0; NUM_JOINTS];
         self.air_time[e] = [0.0; NUM_FEET];
         self.sensed_force[e] = [0.5 * self.robot.total_mass * 9.81; NUM_FEET];
+        self.prev_sensed_force[e] = self.sensed_force[e];
+        self.has_prev_force[e] = false; // no ΔF across the reset teleport
         self.last_td_foot[e] = -1;
         self.gait_phase[e] = 0.0;
         // Deterministic render path: pin the delay to `min` (no RNG draw).
@@ -3561,6 +4472,20 @@ impl BipedNexusBatchEnv {
     /// order (matches `BipedEnv::body_positions` so the python renderer reads
     /// both the same way). Reads from `body_poses` — correct at all times,
     /// including step 0 (before any FK has run).
+    /// Per-link world rotations (x, y, z, w), same ordering as
+    /// [`Self::body_positions_for`]. Needed by the native replay renderer to
+    /// place link MESHES -- positions alone can only place spheres.
+    pub fn body_rotations_for(&self, e: usize, poses: &[NexusPose]) -> Vec<[f32; 4]> {
+        let cpb = self.idx.colliders_per_batch as usize;
+        let base = e * cpb;
+        (0..self.idx.mjcf_to_link.len())
+            .map(|i| {
+                let r = poses[base + i].rotation;
+                [r.x, r.y, r.z, r.w]
+            })
+            .collect()
+    }
+
     pub fn body_positions_for(&self, e: usize, poses: &[NexusPose]) -> Vec<[f32; 3]> {
         let cpb = self.idx.colliders_per_batch as usize;
         let base = e * cpb;

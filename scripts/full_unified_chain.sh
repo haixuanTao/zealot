@@ -7,7 +7,7 @@ export PATH=$HOME/.cargo/bin:$PATH
 TOOL=$HOME/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin
 LIBDEV=$HOME/nvvm-wheel/extracted/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc
 PTXAS=$HOME/cuda-13.3-tile/bin/ptxas
-BACKEND_DIR=$HOME/cuda-oxide-upstreaming            # NVlabs main + local/unified-bridge
+BACKEND_DIR=$HOME/cuda-oxide-upstreaming            # stock NVlabs main (>= 6247276)
 BACKEND=$BACKEND_DIR/target/release/librustc_codegen_cuda.so
 export CUDA_OXIDE_PTX_DIR=$HOME/nexus_ptx_unified
 export CUDA_OXIDE_DEVICE_ARCH=sm_120

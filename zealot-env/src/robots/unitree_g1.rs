@@ -148,6 +148,7 @@ pub const fn unitree_g1() -> RobotSpec {
             ("right_hip_yaw_link", "left_hip_yaw_link"),
         ],
         held_joints: &[],
+        held_home: &[],
     }
 }
 
@@ -222,6 +223,18 @@ pub const fn unitree_g1_29dof() -> RobotSpec {
         ("elbow", 40.0, 1.0, 25.0),
         ("wrist", 40.0, 1.0, 25.0), // wrist_roll (pitch/yaw are welded)
     ];
+    // Arms ALONG THE BODY, matching the sim2sim harnesses and the LeRobot
+    // deploy controller. The MJCF bakes a 73.2 deg elbow bend into the body
+    // hierarchy, so holding at q = 0 is NOT a straight arm -- it is the
+    // forearms out in front. elbow = 1.28 cancels that bend (1.1 deg residual,
+    // hand 0.179 m below the shoulder instead of 0.116 m in front of it).
+    // Left/right shoulder_roll are mirrored, so match the sided names.
+    spec.held_home = &[
+        ("left_shoulder_roll", 0.2),
+        ("right_shoulder_roll", -0.2),
+        ("shoulder_pitch", 0.2),
+        ("elbow", 1.28),
+    ];
     spec
 }
 
@@ -249,12 +262,38 @@ pub const fn unitree_g1_29dof_agile() -> RobotSpec {
         ("elbow", 60.0, 1.0, 25.0),
         ("wrist", 4.0, 0.2, 25.0), // wrist_roll (pitch/yaw are welded)
     ];
+    // Arms ALONG THE BODY (deploy pose). NOTE the inheritance trap this table
+    // fell into once already: it was first attached to unitree_g1_29dof(),
+    // which NOTHING uses -- every launcher runs g1_29dof_agile, which builds
+    // from unitree_g1_agile() and inherits nothing from the non-agile 29dof.
+    // The pinned test below asserts THIS spec carries it, so the fix cannot
+    // silently detach again.
+    spec.held_home = &[
+        ("left_shoulder_roll", 0.2),
+        ("right_shoulder_roll", -0.2),
+        ("shoulder_pitch", 0.2),
+        ("elbow", 1.28),
+    ];
     spec
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deploy arm pose must live on the spec every launcher actually uses.
+    /// It was first attached to unitree_g1_29dof(), which NOTHING trains --
+    /// g1_29dof_agile builds from unitree_g1_agile and inherited nothing, so
+    /// training silently kept the forearms out in front while the commit
+    /// claimed otherwise. Caught by the user noticing raised arms in a video.
+    #[test]
+    fn trained_spec_holds_arms_along_the_body() {
+        let r = unitree_g1_29dof_agile();
+        assert!(
+            r.held_home.iter().any(|(f, t)| *f == "elbow" && (*t - 1.28).abs() < 1e-6),
+            "g1_29dof_agile lost its held_home elbow target"
+        );
+    }
 
     #[test]
     fn gains_match_unitree_rl_gym() {

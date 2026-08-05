@@ -752,6 +752,16 @@ fn main() {
         // under stream capture) — run its epochs eagerly.
         let profiling = std::env::var_os("KHAL_CUDA_PROFILE").is_some();
         let no_graph = std::env::var("BIPED_UPD_GRAPH").is_ok_and(|v| v == "0");
+        #[cfg(not(feature = "cuda_backend"))]
+        let _ = (profiling, no_graph);
+        #[cfg(not(feature = "cuda_backend"))]
+        for _ in 0..epochs {
+            let mut cur = EncCursor::new(&bk);
+            run_minibatches!(cur);
+            cur.flush();
+            bk.synchronize().unwrap();
+        }
+        #[cfg(feature = "cuda_backend")]
         if let Some(cuda) = bk
             .as_cuda()
             .filter(|_| !profiling && !no_graph && ct.is_none())
