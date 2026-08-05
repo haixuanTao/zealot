@@ -20,25 +20,21 @@ physics engine.
 **Every layer — physics, model, training loop, deployment — is Rust,
 compiled to whatever GPU is available.**
 
-- **The simulator is Rust on any GPU.** The nexus solver is compute shaders
-  written via [Rust-GPU](https://rust-gpu.github.io/); the same source runs
-  through WebGPU in a browser and through CUDA or Metal natively. That is why
-  the demo above can be the *actual training environment*, not an animation.
-- **The learning half too.** `zealot-rl` is the rsl_rl tier rewritten in
-  Rust — model, autodiff, PPO, GAE, Adam — on the same portable GPU layer
-  ([vortx](https://github.com/dimforge/vortx) /
+- **The learning half is Rust too.** `zealot-rl` is the rsl_rl tier
+  rewritten in Rust — model, autodiff, PPO, GAE, Adam — on the same portable
+  GPU layer ([vortx](https://github.com/dimforge/vortx) /
   [khal](https://github.com/dimforge/khal)) the physics uses. CPU reference
   implementations verify every GPU kernel to float epsilon.
 - **One source, three compilers.** Rust-GPU → SPIR-V,
   [cuda-oxide](https://github.com/NVlabs/cuda-oxide) → PTX, naga → MSL — no
-  second implementation to keep in sync. The native-CUDA path (with cuTile
-  tf32 GEMMs) runs 2.4–4.3× faster than WebGPU while staying bit-exact.
+  second implementation to keep in sync; CUDA and WebGPU builds are
+  bit-exact against each other, and the hot PPO GEMMs use cuTile tf32
+  tensor cores.
 - **The control loop never leaves the GPU.** Observation assembly, policy
   GEMMs, PD-target scatter, and physics substeps are one chained GPU
   workload, in training and in the browser alike.
-- **Policies must survive a different solver.** The same checkpoint runs
-  sim2sim on rapier.js, MuJoCo (wasm and native), Genesis, and Isaac — and on
-  the physical G1 via `deploy/`.
+
+The long-form version: [docs/explanation.md](docs/explanation.md).
 
 ## What's different about the physics
 
@@ -94,8 +90,3 @@ Three steps — full walkthrough in
 | **Reference** | hosted rustdoc: [`zealot_env`](https://haixuantao.github.io/zealot/doc/zealot_env/) · [`zealot_rl`](https://haixuantao.github.io/zealot/doc/zealot_rl/) |
 | **Explanation** | [docs/explanation.md](docs/explanation.md) — how it's built and why |
 
-## Benchmarks
-
-Historical methodology and numbers live in
-[docs/benchmarks.md](docs/benchmarks.md); a clean cross-engine benchmark on
-the current stack is planned before quoting headline figures here.
