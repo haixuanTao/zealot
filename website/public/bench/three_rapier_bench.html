@@ -816,7 +816,7 @@
         const rot = r.bodies[0].rotation();
         const ground = terrain ? terrain.height(t.x, t.y) : 0;
         const upz = 1 - 2 * (rot.x * rot.x + rot.y * rot.y);
-        if (t.z - ground < FALL_Z || upz < TILT || r.epT >= 20 / DT) {
+        if (t.z - ground < FALL_Z || upz < TILT) { // fall only — no episode timeout in a demo
           if (t.z - ground < FALL_Z || upz < TILT) falls += 1;
           resetRobot(r);
           r.lastXY = null;

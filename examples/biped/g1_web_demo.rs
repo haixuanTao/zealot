@@ -1580,10 +1580,12 @@ pub async fn run(cfg: DemoCfg) {
             let up_z = 1.0 - 2.0 * (brot[0] * brot[0] + brot[1] * brot[1]);
             if fall_cooldown[e] > 0 {
                 fall_cooldown[e] -= 1;
-            } else if base[2] - ground < FALL_Z || up_z < TILT_COS || ep_steps[e] >= 1000 {
-                if base[2] - ground < FALL_Z || up_z < TILT_COS {
-                    falls += 1;
-                }
+            } else if base[2] - ground < FALL_Z || up_z < TILT_COS {
+                // Reset ONLY on a fall. There used to be a 20 s episode
+                // timeout here (training's episode budget), but in a demo a
+                // healthy robot teleporting mid-stride reads as a glitch —
+                // an episode that never ends is the correct behaviour.
+                falls += 1;
                 fallen.push(e);
             }
         }

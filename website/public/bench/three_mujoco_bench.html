@@ -775,7 +775,7 @@
         r.lastXY = [qpos[0], qpos[1]];
         const groundZ = TERRAIN ? terrain.height(qpos[0], qpos[1]) : 0;
         const upz = 1 - 2 * (qpos[4] * qpos[4] + qpos[5] * qpos[5]);
-        if (qpos[2] - groundZ < FALL_Z || upz < TILT_COS || r.epT >= 20 / DT) {
+        if (qpos[2] - groundZ < FALL_Z || upz < TILT_COS) { // fall only — no episode timeout in a demo
           const why = qpos[2] - groundZ < FALL_Z ? 'below-ground-z' : upz < TILT_COS ? 'tilt' : 'timeout';
           console.log(`[bench] reset robot ${r.idx}: ${why} after ${(r.epT * DT).toFixed(1)}s ` +
             `(pelvis ${qpos[2].toFixed(2)} ground ${groundZ.toFixed(2)} upz ${upz.toFixed(2)} ` +
