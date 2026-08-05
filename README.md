@@ -41,13 +41,13 @@ The long-form version: [docs/explanation.md](docs/explanation.md).
 Derived from the solver source (full analysis with file pointers:
 [docs/explanation.md](docs/explanation.md)):
 
-| | **zealot (nexus)** | MuJoCo | Isaac Lab (PhysX 5) | MJX | Genesis |
+| | **zealot (nexus)** | MuJoCo | Isaac (PhysX 5) | MJX | Genesis |
 | --- | --- | --- | --- | --- | --- |
-| Articulated dynamics | generalized coords: CRBA + dense LU, on GPU | generalized coords: CRB + sparse LᵀDL (the reference) | reduced-coord articulations, Featherstone-style | MuJoCo's model via XLA | generalized coords, MuJoCo-style, in Taichi-JIT kernels |
-| Constraint solver | Soft-TGS (rapier lineage) | convex smooth contact optimization | TGS | MuJoCo-like, with restrictions | MuJoCo-like convex (Newton/CG), plus coupled MPM/FEM/SPH multiphysics |
-| GPU-batched envs | any GPU: WebGPU / Metal / CUDA, one source | no (CPU) | CUDA | GPU/TPU via XLA | CUDA |
-| Runs in the browser | yes — the GPU sim itself, via WebGPU ([live demo](https://haixuantao.github.io/zealot/)) | yes — official wasm build, on CPU (the demo's MuJoCo tab) | no | no | no |
-| Rendering | wgpu rasterizer (the browser demo) + a built-in ray tracer in the viewer (headless rollout videos) | fast OpenGL rasterizer; Madrona batch renderer in the ecosystem | Omniverse RTX — photorealistic path tracing, tiled batch cameras | via MuJoCo / Madrona | own rasterizer + the Nyx photorealistic ray tracer |
+| Articulated dynamics | CRBA + dense LU, on GPU | CRB + sparse LᵀDL (the reference) | Featherstone articulations | MuJoCo's model, via XLA | MuJoCo-style, Taichi kernels |
+| Constraint solver | Soft-TGS (rapier lineage) | convex optimization | TGS | MuJoCo-like, restricted | convex + MPM/FEM/SPH multiphysics |
+| GPU-batched envs | ✓ any GPU — WebGPU / Metal / CUDA | — (CPU) | ✓ CUDA | ✓ GPU/TPU | ✓ CUDA |
+| Runs in the browser | ✓ the GPU sim itself ([live demo](https://haixuantao.github.io/zealot/)) | ✓ wasm build, CPU | — | — | — |
+| Ray tracing | ✓ built into the viewer | — | ✓ Omniverse RTX | — | ✓ Nyx |
 
 The load-bearing realism claim: at Unitree's real ankle gains a G1 cannot
 passively stand (MuJoCo reproduces this) — stability at 5 ms comes from the
