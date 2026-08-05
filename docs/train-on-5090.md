@@ -1,5 +1,12 @@
 # Training the biped on an RTX 5090 (native CUDA)
 
+> **Maintenance note (2026-08-05):** the current entry points are
+> `scripts/train.sh` (production config is the code default — no env-var
+> litany) and `scripts/build_cubins.sh` (cubin rebuild incl. auto-built
+> codegen backend). Sections below that reference `build_nexus_cubin.sh`,
+> `nexus-cuda`, or per-variable run commands predate them and are kept for
+> the toolchain/provisioning details only.
+
 How to stand up a fresh Blackwell box (RTX 5090 `sm_120`, or the 5060 vast box)
 and run the GPU-resident PPO biped trainer end-to-end on the **native-CUDA**
 backend — physics *and* the PPO update on the GPU, no PhysX / no Isaac.
