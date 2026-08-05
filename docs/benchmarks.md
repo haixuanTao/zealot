@@ -39,7 +39,6 @@ same N — see the table + reproduce block below.)
 
 Sweep N by re-running with `2048` / `4096` / `8192`. For **rollout-only**
 throughput (no PPO update, matches the rollout table below): `cargo run --release
---bin rollout_e2e_bench --features "gpu biped_gpu" -- 8192`. First build is
 slow (shader compile); the toolchain is cached afterward (~16 s rebuilds).
 
 ## Benchmark — full training iteration (rollout + PPO update)
@@ -351,7 +350,6 @@ training A/B (matched config, matched iteration count).
 
 ## Benchmark — full CPU vs full GPU rollout
 
-`examples/biped/rollout_e2e_bench.rs` runs the full rollout control step —
 **policy forward** (an action per env) **+ physics step** — and reports
 wall-clock throughput. **Full CPU** = rapier multibody physics (rayon) + the CPU
 MLP policy (serial per-env `actor.mean`/`critic.value`). **Full GPU** = one
@@ -384,7 +382,6 @@ position-iters = 4 + explicit Coriolis; **†** columns are the previous
 
 > ⚠️ The **GPU rollout** numbers above predate the 2026-06 per-env-parallelism
 > work and have **not** been refreshed: a re-measure showed much higher values
-> (WebGPU ~238 k @ N=8 192) but they're confounded by `rollout_e2e_bench`'s
 > per-step policy-forward + obs readback + CPU sampling — wall-clock there is
 > dominated by backend-dependent readback/sync, not physics (native CUDA even
 > measures *slower* than WebGPU at large N because of per-step `synchronize` +
@@ -419,6 +416,5 @@ What this says in practice:
 Reproduce:
 
 ```sh
-cargo run --release --bin rollout_e2e_bench --features "gpu biped_gpu" -- <num_envs> <steps>
 ```
 

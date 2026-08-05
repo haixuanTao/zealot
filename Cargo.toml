@@ -138,12 +138,6 @@ name = "iter_e2e_bench"
 path = "src/bin/iter_e2e_bench.rs"
 required-features = ["gpu", "biped_gpu"]
 
-# Rollout-only CPU-vs-GPU benchmark (scripts/perf_bench2.sh leg D).
-[[bin]]
-name = "rollout_e2e_bench"
-path = "src/bin/rollout_e2e_bench.rs"
-required-features = ["gpu", "biped_gpu"]
-
 [[bin]]
 name = "biped_train_gpu"
 path = "src/bin/biped_train_gpu.rs"
@@ -210,9 +204,4 @@ required-features = ["g1_web"]
 name = "g1_terrain_web"
 path = "examples/biped/g1_terrain_web.rs"
 required-features = ["g1_terrain_web"]
-
-[[bin]]
-name = "passive_stand"
-path = "src/bin/passive_stand.rs"
-required-features = ["gpu", "biped_gpu"]
 

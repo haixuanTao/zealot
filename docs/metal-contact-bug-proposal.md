@@ -154,7 +154,7 @@ Most likely outcome: the M⁻¹ columns differ → audit the multibody LU/mass-m
 
 ### Step 4 — verify
 ```
-BIPED_SPAWN_DR=0 cargo run --release --bin passive_stand --features "gpu biped_gpu" -- 256 300
+BIPED_SPAWN_DR=0 cargo run --release 
 ```
 Success = `torso` holds ~0.70, `fell_frac → 0` on WebGpu (matching CUDA). Then run a short `biped_train_gpu` on WebGpu and confirm it no longer collapses for lack of a floor.
 
