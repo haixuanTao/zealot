@@ -96,7 +96,7 @@ pub struct CutileGemm;
 #[allow(clippy::too_many_arguments)]
 impl CutileGemm {
     pub async fn init(_bk: &GpuBackend) -> Option<&'static CutileGemm> {
-        if std::env::var("BIPED_CUTILE_GEMM").is_ok_and(|v| v == "1") {
+        if std::env::var("BIPED_CUTILE_GEMM").map_or(true, |v| v != "0") {
             eprintln!(
                 "[cutile] BIPED_CUTILE_GEMM=1 but zealot was built without --features cutile; \
                  using the vortx GEMM path"
@@ -366,7 +366,7 @@ mod real {
         /// Runs a numeric self-test (vs a CPU reference, through the real
         /// khal-buffer interop path) before returning. Leaked: see module docs.
         pub async fn init(bk: &GpuBackend) -> Option<&'static CutileGemm> {
-            if !std::env::var("BIPED_CUTILE_GEMM").is_ok_and(|v| v == "1") {
+            if std::env::var("BIPED_CUTILE_GEMM").is_ok_and(|v| v == "0") {
                 return None;
             }
             let Some(cuda) = bk.as_cuda() else {

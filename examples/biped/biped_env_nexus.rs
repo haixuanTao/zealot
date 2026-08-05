@@ -935,8 +935,10 @@ fn build_env_scene(
         // ~0.046 planted and stays ~critically damped in swing. Unset = the
         // spec value (AGILE parity preserved by default).
         let (ankle_kp_ovr, ankle_kd_ovr) = (
-            std::env::var("BIPED_ANKLE_KP").ok().and_then(|s| s.parse::<f32>().ok()),
-            std::env::var("BIPED_ANKLE_KD").ok().and_then(|s| s.parse::<f32>().ok()),
+            std::env::var("BIPED_ANKLE_KP").ok().and_then(|s| s.parse::<f32>().ok())
+                .or(robot.name.starts_with("unitree_g1").then_some(40.0)),
+            std::env::var("BIPED_ANKLE_KD").ok().and_then(|s| s.parse::<f32>().ok())
+                .or(robot.name.starts_with("unitree_g1").then_some(2.0)),
         );
         let (kp, kd, effort, pos_limit, spec_damping) = spec
             .map(|s| {
@@ -1165,8 +1167,8 @@ fn build_env_scene(
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(SOLVER_ITERS);
     sp.contact_natural_frequency =
-        env_f32("BIPED_CONTACT_NF").unwrap_or(dr.contact_natural_frequency);
-    sp.contact_damping_ratio = env_f32("BIPED_CONTACT_DR").unwrap_or(dr.contact_damping_ratio);
+        env_f32("BIPED_CONTACT_NF").unwrap_or(240.0);
+    sp.contact_damping_ratio = env_f32("BIPED_CONTACT_DR").unwrap_or(1.0);
     // Penetration-recovery knobs (A/B vs the Rapier game defaults 1mm/10m/s).
     // MuJoCo has NO velocity-level depenetration (critically-damped soft constraint
     // only); Isaac clamps max_depenetration_velocity to ~1 m/s in RL configs. The
@@ -1182,7 +1184,7 @@ fn build_env_scene(
     sp.normalized_prediction_distance =
         env_f32("BIPED_PREDICTION").unwrap_or(sp.normalized_prediction_distance);
     sp.normalized_max_corrective_velocity =
-        env_f32("BIPED_MAX_CORR_VEL").unwrap_or(sp.normalized_max_corrective_velocity);
+        env_f32("BIPED_MAX_CORR_VEL").unwrap_or(0.2);
 
     // Build the index table from the canonical joint ordering.
     let mut actuated: Vec<(u32, String)> = Vec::with_capacity(NUM_JOINTS);
@@ -1756,6 +1758,7 @@ impl BipedNexusBatchEnv {
             .get()
             .copied()
             .or_else(|| env_var("BIPED_DECIMATION").ok().and_then(|s| s.parse().ok()))
+            .or(Some(4))
         {
             task.decimation = d;
             task.sim_dt = 0.02 / d as f32;
@@ -1765,12 +1768,10 @@ impl BipedNexusBatchEnv {
         // PERIOD is BIPED_GAIT_PERIOD (read below — larger = slower,
         // lower-frequency weight transfer). These two shape how hard the
         // policy locks to that clock and the swing/stance split:
-        if let Some(w) = env_var("BIPED_GAIT_CLOCK_W")
+        task.weights.gait_clock = env_var("BIPED_GAIT_CLOCK_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-        {
-            task.weights.gait_clock = w;
-        }
+            .unwrap_or(3.0);
         if let Some(sr) = env_var("BIPED_GAIT_SWING_RATIO")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
@@ -1781,12 +1782,10 @@ impl BipedNexusBatchEnv {
         // (slow gait clocks) are only cheap for the fragile ankles if the
         // CoM rides over the stance foot — raise this together with
         // BIPED_GAIT_PERIOD.
-        if let Some(w) = env_var("BIPED_W_FEET_DISTANCE")
+        task.weights.feet_distance = std::env::var("BIPED_W_FEET_DISTANCE")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-        {
-            task.weights.feet_distance = w;
-        }
+            .unwrap_or(-1.0);
         // Foot-clearance weight. DEFAULT 0 -- this reward was dropped once for
         // being farmed into a one-foot statue (foot held up to collect it; zero
         // transfer, MuJoCo fell in 0.66 s). The guards that make it safe now
@@ -1795,12 +1794,10 @@ impl BipedNexusBatchEnv {
         // scales with a cued step riser -- but enable it deliberately, and
         // watch for the statue signature: one foot held, air_time saturating,
         // clearance high, travel low.
-        if let Some(w) = std::env::var("BIPED_W_FOOT_CLEARANCE")
+        task.weights.foot_clearance = std::env::var("BIPED_W_FOOT_CLEARANCE")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-        {
-            task.weights.foot_clearance = w;
-        }
+            .unwrap_or(0.5);
         // Target for that reward (m). Overridden upward automatically while a
         // step is cued; this is the flat-ground value.
         if let Some(t) = std::env::var("BIPED_FOOT_CLEARANCE_TARGET")
@@ -1809,18 +1806,14 @@ impl BipedNexusBatchEnv {
         {
             task.weights.foot_clearance_target = t;
         }
-        if let Some(w) = std::env::var("BIPED_W_FOOT_ORIENTATION")
+        task.weights.foot_orientation = std::env::var("BIPED_W_FOOT_ORIENTATION")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-        {
-            task.weights.foot_orientation = w;
-        }
-        if let Some(w) = std::env::var("BIPED_W_STAND_PLANTED")
+            .unwrap_or(-0.5);
+        task.weights.stand_planted = std::env::var("BIPED_W_STAND_PLANTED")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-        {
-            task.weights.stand_planted = w;
-        }
+            .unwrap_or(-1.0);
         // Ground-reaction-smoothness (force-rate) penalty: pass the weight
         // NEGATIVE (it's a penalty). Deadband in body weights per control
         // step. Requires BIPED_CONTACT_SENSE=1 — without the sensor the ΔF
@@ -1839,18 +1832,14 @@ impl BipedNexusBatchEnv {
         }
         // Action-side slam/tremor pair (the engine-agnostic replacement for
         // the retired sensor-side force_rate): both weights NEGATIVE.
-        if let Some(w) = std::env::var("BIPED_W_ACTION_RATE_RATE")
+        task.weights.action_rate_rate = std::env::var("BIPED_W_ACTION_RATE_RATE")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-        {
-            task.weights.action_rate_rate = w;
-        }
-        if let Some(w) = std::env::var("BIPED_W_TOUCHDOWN_VZ")
+            .unwrap_or(-0.1);
+        task.weights.touchdown_vz = std::env::var("BIPED_W_TOUCHDOWN_VZ")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-        {
-            task.weights.touchdown_vz = w;
-        }
+            .unwrap_or(-1.0);
         if let Some(v) = std::env::var("BIPED_TOUCHDOWN_VZ_OK")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
@@ -1867,12 +1856,10 @@ impl BipedNexusBatchEnv {
         // saturated ankle costs ~0.0009/step per joint — 3-4x below the
         // ~0.002/step where a term changes behaviour, which is why the policy
         // parks on the endstop and lets the constraint carry ~97% of the load.
-        if let Some(w) = std::env::var("BIPED_W_DOF_LIMITS")
+        task.weights.dof_pos_limits = std::env::var("BIPED_W_DOF_LIMITS")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-        {
-            task.weights.dof_pos_limits = w;
-        }
+            .unwrap_or(-5.0);
         // Balance-don't-step at stand: per-airborne-foot penalty while the
         // command is standing (NEGATIVE, e.g. -1.0; 0 = off). Pair with a
         // raised BIPED_STAND_PROB so the policy actually trains the quiet
@@ -1890,7 +1877,7 @@ impl BipedNexusBatchEnv {
         // points per collider pair before the solvers (training-grade
         // approximation; flat-ground contacts unaffected). Biggest terrain
         // perf lever — the mb contact-constraint kernels scale with points.
-        if env_var("BIPED_CONTACT_REDUCE").as_deref() == Ok("1") {
+        if env_var("BIPED_CONTACT_REDUCE").as_deref() != Ok("0") {
             pipeline.contact_reduction = true;
             println!("contact reduction ENABLED (per-pair manifolds merged to ≤4 points)");
         }
@@ -1916,7 +1903,7 @@ impl BipedNexusBatchEnv {
         // in ONE SharedShape (cloned across that family's envs so nexus dedupes
         // the mesh buffers to 3 uploads). ORIENTED pseudo-normals are required
         // by the nexus trimesh contact path; the strips are closed slabs.
-        let terrain_on = env_var("BIPED_TERRAIN").as_deref() == Ok("1");
+        let terrain_on = env_var("BIPED_TERRAIN").as_deref() != Ok("0");
         let terrain_build = if terrain_on {
             let t0 = Instant::now();
             // BIPED_TERRAIN_AMP (amplitude multiplier, default 1) and
@@ -2022,10 +2009,11 @@ impl BipedNexusBatchEnv {
         // (per batch). Required before BIPED_GRAPH capture on terrain — the
         // lazy in-step resize can't run once a CUDA graph is captured, and
         // overflowing pairs are silently dropped (feet sink into the mesh).
-        if let Some(cap) = env_var("BIPED_CONTACT_CAP")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
         {
+            let cap = env_var("BIPED_CONTACT_CAP")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(128);
             state.reserve_contacts(&gpu, cap);
             println!("contact buffers pre-sized to {cap}/batch");
         }
@@ -2037,7 +2025,7 @@ impl BipedNexusBatchEnv {
         // foot-height proxy (which can't tell a planted foot from one hovering
         // just under the threshold). Threshold BIPED_CONTACT_FORCE_N (default
         // 1.0 N = AGILE's feet_slip contact_threshold).
-        let contact_sense = env_var("BIPED_CONTACT_SENSE").is_ok_and(|v| v == "1");
+        let contact_sense = env_var("BIPED_CONTACT_SENSE").map_or(true, |v| v != "0");
         let contact_force_n = env_var("BIPED_CONTACT_FORCE_N")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
@@ -2112,7 +2100,7 @@ impl BipedNexusBatchEnv {
             .set_implicit_coriolis(implicit_coriolis);
         // Decomposed refresh probe: implicit mode's per-substep dynamics +
         // constraint rebuild cadence with the explicit (coriolis-free) kernels.
-        let refresh_mode = env_or_override("NEXUS_SUBSTEP_REFRESH").unwrap_or_default();
+        let refresh_mode = env_or_override("NEXUS_SUBSTEP_REFRESH").unwrap_or_else(|| "1".into());
         state
             .multibodies_mut()
             .set_substep_refresh(refresh_mode == "1");
@@ -2244,16 +2232,17 @@ impl BipedNexusBatchEnv {
         // BIPED_MOTOR_DELAY=min,max (or just max → min=0), in physics
         // substeps. `0,0` is a valid ENABLED config (constant zero delay —
         // used by the staging-equivalence check); unset/unparseable = off.
-        let motor_delay: Option<(u32, u32)> = env_var("BIPED_MOTOR_DELAY").ok().and_then(
-            |s| {
+        let motor_delay: Option<(u32, u32)> = env_var("BIPED_MOTOR_DELAY")
+            .ok()
+            .and_then(|s| {
                 let p: Vec<u32> = s.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
                 match p.as_slice() {
                     [max] => Some((0, *max)),
                     [min, max] => Some((*min, *max)),
                     _ => None,
                 }
-            },
-        );
+            })
+            .or(Some((0, 4)));
         if let Some((min, max)) = motor_delay {
             assert!(
                 min <= max && max <= task.decimation,
@@ -2274,14 +2263,14 @@ impl BipedNexusBatchEnv {
         let limit_dwell: Vec<std::sync::atomic::AtomicU16> = (0..num_envs * NUM_JOINTS)
             .map(|_| std::sync::atomic::AtomicU16::new(0))
             .collect();
-        let reset_vel = std::env::var("BIPED_RESET_VEL").is_ok_and(|v| v == "1");
+        let reset_vel = std::env::var("BIPED_RESET_VEL").map_or(true, |v| v != "0");
         if reset_vel {
             println!("reset-velocity randomization ENABLED (AGILE reset_base/joints: lin ±0.25, ang ±0.5, joints ±1.0)");
         }
         let push_vel = env_var("BIPED_PUSH_VEL")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(0.5);
         let push_interval = env_var("BIPED_PUSH_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -2289,7 +2278,7 @@ impl BipedNexusBatchEnv {
         let push_angvel = env_var("BIPED_PUSH_ANGVEL")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(0.25);
         let prev_joint_pos = vec![[0.0f32; NUM_JOINTS]; num_envs];
         let has_prev_joint_pos = vec![false; num_envs];
         // One pose entry per collider per env (matches `body_poses` layout).
@@ -2445,7 +2434,7 @@ impl BipedNexusBatchEnv {
             gait_speed_cap: std::env::var("BIPED_GAIT_SPEED_CAP")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0.5),
+                .unwrap_or(0.8),
             step_cue_dropout_override: None,
             limit_dwell,
             global_step: 0,
@@ -3576,11 +3565,11 @@ impl BipedNexusBatchEnv {
         let sc_margin = env_var("BIPED_SELF_COLL_DIST")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(0.12);
+            .unwrap_or(0.08);
         let sc_weight = env_var("BIPED_SELF_COLL_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(5.0);
         // Leg-interpenetration termination distance (BIPED_SELF_COLL_TERM,
         // 0 disables). 0.05 m between link centers ≈ colliders overlapping.
         let sc_term = std::env::var("BIPED_SELF_COLL_TERM")
@@ -3631,11 +3620,11 @@ impl BipedNexusBatchEnv {
         let dwell_max: u16 = std::env::var("BIPED_LIMIT_DWELL_STEPS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(40);
         let slam_vel: f32 = std::env::var("BIPED_LIMIT_SLAM_VEL")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(2.0);
         const SLAM_BAND: f32 = 0.05; // rad from the hard limit
         // Per-joint instantaneous power fault (BIPED_JOINT_POWER_TERM, watts;
         // 0 disables). Spikes are the failure mode averages cannot see, and
@@ -3671,7 +3660,7 @@ impl BipedNexusBatchEnv {
         let ankle_torque_w = env_var("BIPED_ANKLE_TORQUE_W")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(1.0);
+            .unwrap_or(4.0);
         // AGILE-named torque regularizers, WBC-AGILE **G1** config verbatim
         // (`torques` -5e-5 on every controlled joint, `ankle_torques` an extra
         // -1e-4 on ankle joints, `ankle_roll_torques` an extra -1e-3 on
@@ -3680,9 +3669,9 @@ impl BipedNexusBatchEnv {
         // matched the lerobot-only name "anklex", which never fires on the
         // G1's `ankle_roll` joints.
         let env_f32 = |k: &str| env_or_override(k).and_then(|s| s.parse::<f32>().ok());
-        let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(5e-5);
-        let w_ankle_torques = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1e-4);
-        let w_ankle_roll_torques = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(1e-3);
+        let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(5e-4);
+        let w_ankle_torques = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1.5e-3);
+        let w_ankle_roll_torques = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(0.0);
         // Knee-specific torque extra (BIPED_W_KNEE_TORQUES, per-step weight on
 // tau^2; 0 = off). Unlike the generic ramped leg term this is
 // FULL-STRENGTH from iter 0, like the ankle extras: the knee holds the
@@ -3701,7 +3690,7 @@ impl BipedNexusBatchEnv {
 let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(7e-5);
         // Mechanical-power (energy) penalty weight. Penalizes Σ|τᵢ·q̇ᵢ| — the rate
         // of mechanical work, the principled cost-of-transport proxy. Unlike Στ²
         // (effort, penalized even when static), this only charges for work done in
@@ -3718,7 +3707,7 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
             .ok()
             .or_else(|| env_var("BIPED_POWER_W").ok())
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(1e-4);
         // Chest angular-velocity penalty (BIPED_CHEST_ANGVEL_W, 0 = off).
         // Every other stability term reads the PELVIS (link 0); on the 29-DOF
         // body the chest above the waist joints is invisible to the reward, so
@@ -4992,7 +4981,7 @@ fn sample_dr(rng: &mut Lcg) -> DrParams {
     // AGILE leaves effort alone), kd ×U(0.8,2.0) per env (theirs is per joint),
     // link mass ×U(0.95,1.05) + pelvis payload +U(−1,5) kg, tilt ±10°, no z
     // jitter. Not modeled: CoM offsets, armature ×U(0,2), continuous wrenches.
-    if env_var("BIPED_AGILE_DR").is_ok_and(|v| v == "1") {
+    if env_var("BIPED_AGILE_DR").map_or(true, |v| v != "0") {
         let pd_scale = 1.0;
         let kd_scale = rng.range(0.8, 2.0);
         let friction = rng.range(0.2, 1.25);

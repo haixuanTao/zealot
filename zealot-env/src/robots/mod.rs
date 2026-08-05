@@ -186,10 +186,11 @@ impl RobotSpec {
             .or_else(|| std::env::var("BIPED_ROBOT").ok())
             .unwrap_or_default();
         let mut spec = match name.as_str() {
-            "" | "lerobot" => lerobot_bipedal::lerobot(),
+            // Default = the current production platform (was "lerobot").
+            "" | "g1_29dof_agile" => unitree_g1::unitree_g1_29dof_agile(),
+            "lerobot" => lerobot_bipedal::lerobot(),
             "g1" | "unitree_g1" => unitree_g1::unitree_g1(),
             "g1_agile" => unitree_g1::unitree_g1_agile(),
-            "g1_29dof_agile" => unitree_g1::unitree_g1_29dof_agile(),
             "g1_29dof" | "g1_29" | "g1full" => unitree_g1::unitree_g1_29dof(),
             "h2plus" | "h2_plus" | "unitree_h2_plus" => unitree_h2_plus::unitree_h2_plus(),
             other => {

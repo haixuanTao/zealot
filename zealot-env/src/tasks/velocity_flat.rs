@@ -320,7 +320,7 @@ impl Default for CommandSampler {
             // unreachable max command the curriculum forces the policy into a
             // regime where tracking reward is uniformly tiny → it gives up.
             // Override per-axis with BIPED_VX / BIPED_VY / BIPED_YAW ("lo,hi").
-            lin_vel_x: range_env("BIPED_VX", (-0.5, 0.5)),
+            lin_vel_x: range_env("BIPED_VX", (-0.8, 0.8)),
             lin_vel_y: range_env("BIPED_VY", (-0.3, 0.3)),
             // Yaw was ±0.2 through v21 — 5× narrower than WBC-AGILE T1's ±1.0,
             // and too narrow to learn from: at |yaw| ≤ 0.2 the exp tracking
@@ -381,7 +381,7 @@ impl CommandSampler {
         let slow_prob: f32 = std::env::var("BIPED_SLOW_PROB")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.25);
+            .unwrap_or(0.5);
         // Arc bias (BIPED_ARC_PROB, default 0.25): with the yaw range widened
         // to +/-0.6, independent uniform draws still put almost no mass on
         // CURVED walking -- measured only ~5% of moving commands were strong
@@ -984,9 +984,8 @@ impl VelocityFlatTask {
         // walking), so this codifies an existing preference rather than
         // fighting one. See the field docs for the knee-angle geometry and why
         // anything above ~0.837 rides the knee stop.
-        if let Some(v) = env_f32("BIPED_BASE_HEIGHT_STAND") {
-            weights.base_height_target_stand = v;
-        }
+        weights.base_height_target_stand =
+            env_f32("BIPED_BASE_HEIGHT_STAND").unwrap_or(weights.base_height_target + 0.01);
         // AGILE-alignment override: WBC has NO air-time reward — its gait
         // economy comes from torque/energy regularizers. Paying completed
         // swing DURATION (capped 0.4s ≈ our natural swing) selects for
@@ -1008,9 +1007,7 @@ impl VelocityFlatTask {
         // there. Tightening to ~0.05 makes a crouch cost the height reward
         // outright -- the direct way to price posture, instead of taxing knee
         // torque and hoping the posture follows.
-        if let Some(v) = env_f32("BIPED_STD_BASE_H") {
-            stds.base_height = v;
-        }
+        stds.base_height = env_f32("BIPED_STD_BASE_H").unwrap_or(0.05);
         // Width of the ANGULAR tracking kernel. The default 0.1 is far too
         // narrow for the +/-0.6 command range: a policy sitting at the measured
         // 0.06 rad/s scores exp(-(0.4-0.06)^2/0.1^2) = 1e-5 on a 0.4 command,
@@ -1023,9 +1020,7 @@ impl VelocityFlatTask {
         // after which a 0.4 command scores 96% and self-reinforces. That is
         // luck, not a gradient. 0.3 makes a 0.4 command pay 28% from a standing
         // start, so there is a slope the whole way in.
-        if let Some(v) = env_f32("BIPED_STD_ANG") {
-            stds.ang_vel = v;
-        }
+        stds.ang_vel = env_f32("BIPED_STD_ANG").unwrap_or(0.3);
         // Action-rate penalty gain (NEGATIVE). Exposed because it is denominated
         // in ACTION units, not radians: it charges (delta action)^2, so halving
         // BIPED_ACTION_SCALE makes the same PHYSICAL motion cost 4x more here.

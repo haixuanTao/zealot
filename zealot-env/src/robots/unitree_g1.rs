@@ -256,6 +256,7 @@ pub const fn unitree_g1_29dof() -> RobotSpec {
 pub const fn unitree_g1_29dof_agile() -> RobotSpec {
     let mut spec = unitree_g1_agile();
     spec.name = "unitree_g1_29dof_agile";
+    spec.base_height = 0.82; // 29-DOF walking-height target (BIPED_BASE_HEIGHT-era production value)
     spec.mjcf_rel_path = "assets/robots/unitree_g1_29dof.xml";
     spec.urdf_rel_path = "Documents/work/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf";
     spec.total_mass = 33.34;

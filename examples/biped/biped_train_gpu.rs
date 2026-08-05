@@ -71,7 +71,7 @@ const DESIRED_KL: f32 = 0.01;
 // the epoch loop (caps per-iter KL), which stops KL persistently sitting high —
 // so the controller no longer pegs the floor and 1e-4 is safe (gives braking room
 // without the crouch regression).
-const LR_MIN: f32 = 1e-4;
+const LR_MIN: f32 = 1e-5;
 const LR_MAX: f32 = 1e-2;
 
 fn mk(b: &GpuBackend, m: &DMatrix<f32>, u: BufferUsages) -> Tensor<f32> {
@@ -102,7 +102,7 @@ static OBS_H: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&h| h > 1)
-        .unwrap_or(1)
+        .unwrap_or(5)
 });
 fn jmirror(v: &[f32]) -> Vec<f32> {
     (0..NUM_JOINTS).map(|i| JSIGN[i] * v[JMIRROR[i]]).collect()
@@ -644,7 +644,7 @@ fn main() {
         // sample → symmetric policy. To keep the minibatch SIZE `mb` (and the
         // pre-sized GPU buffers) unchanged, we double the minibatch COUNT instead
         // (n_mb below), so a doubled batch just runs 2× minibatches at the same mb.
-        let mirror_aug = std::env::var("BIPED_MIRROR_AUG").is_ok();
+        let mirror_aug = std::env::var("BIPED_MIRROR_AUG").map_or(true, |v| v != "0");
         if mirror_aug {
             println!("mirror augmentation ENABLED (symmetric policy)");
         }
@@ -749,7 +749,7 @@ fn main() {
         let grad_clip: f32 = std::env::var("BIPED_GRAD_CLIP")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(1.0);
         if grad_clip > 0.0 {
             println!("grad-norm clip ENABLED: global max_grad_norm = {grad_clip} (rsl_rl parity)");
         }
@@ -779,7 +779,7 @@ fn main() {
             gc_lens.push(ad_);
             gc_slots += 1;
         }
-        let norm_freeze = std::env::var("BIPED_NORM_FREEZE").is_ok_and(|v| v == "1");
+        let norm_freeze = std::env::var("BIPED_NORM_FREEZE").map_or(true, |v| v != "0");
         if norm_freeze {
             println!("obs-normalizer FREEZE enabled: per-iteration stats snapshot (exact PPO ratios)");
         }

@@ -14,7 +14,7 @@ set -eo pipefail
 TOOL=$HOME/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin
 LIBDEV=$HOME/nvvm-wheel/extracted/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc
 PTXAS=$HOME/cuda-13.3-tile/bin/ptxas
-BACKEND="${CUDA_OXIDE_BACKEND:?set CUDA_OXIDE_BACKEND to librustc_codegen_cuda.so (build from NVlabs/cuda-oxide at khal-std's pinned rev)}"
+BACKEND="${CUDA_OXIDE_BACKEND:?set CUDA_OXIDE_BACKEND to librustc_codegen_cuda.so (build from NVlabs/cuda-oxide at the rev pinned in khal-std)}"
 export CUDA_OXIDE_PTX_DIR="${PTX_OUT:-$HOME/nexus_ptx}"
 mkdir -p "$CUDA_OXIDE_PTX_DIR"
 export PATH=$HOME/.cargo/bin:$PATH

@@ -369,7 +369,7 @@ impl TerrainStrip {
             let gmax = std::env::var("BIPED_SLOPE_GRADE")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(SLOPE_GRADE_MAX);
+                .unwrap_or(0.268);
             // Scaled by `params.amp` like the family field itself, so the
             // demo's roughness knob keeps its meaning: amp = 0 is dead flat,
             // amp = 1 (the default, and training) is exactly this bias.
