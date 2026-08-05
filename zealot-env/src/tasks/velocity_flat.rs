@@ -140,6 +140,12 @@ pub struct FootObs {
     /// the air never touches down (no reward), and double-tapping the same foot
     /// (hopping) earns nothing on the repeat. Forces a real alternating gait.
     pub alt_step: bool,
+    /// Foot vertical velocity, m/s (world +Z; negative = descending). Env
+    /// finite-diff, 0 on the first step after reset. Drives the
+    /// `touchdown_vz` slam penalty — the KINEMATIC impact term (a slam is a
+    /// foot still descending fast near the ground; kinematics transfer
+    /// across engines far better than contact-sensor forces do).
+    pub vz: f32,
     /// One-step change in this foot's sensed normal contact force, in BODY
     /// WEIGHTS per control step (|F_t − F_{t−1}| / (m·g), ≥ 0). Filled by the
     /// env from the contact-force sensor (BIPED_CONTACT_SENSE); 0 when force
@@ -164,6 +170,7 @@ impl Default for FootObs {
             yaw_rel_base: 0.0,
             pos_xy: [0.0, 0.0],
             alt_step: false,
+            vz: 0.0,
             force_rate: 0.0,
         }
     }
@@ -211,6 +218,12 @@ pub struct RobotState {
     pub last_action: [f32; NUM_JOINTS],
     /// Action before that (for the action-rate-of-rate term).
     pub prev_action: [f32; NUM_JOINTS],
+    /// Action before THAT — third point for the true second difference
+    /// (`action_rate_rate` = Σ(a − 2a' + a″)²), the action-side tremor
+    /// penalty: dither is action oscillation, so it's priced at the source
+    /// with no contact sensor in the loop (the sensor-side force_rate term
+    /// bred a straight-leg, transfer-breaking gait).
+    pub prev2_action: [f32; NUM_JOINTS],
     /// Per-foot contact state (left, right).
     pub feet: [FootObs; NUM_FEET],
     /// Gait-clock phase ∈ [0,1), advanced by the env each control step. Drives
@@ -235,6 +248,7 @@ impl Default for RobotState {
             joint_vel: [0.0; NUM_JOINTS],
             last_action: [0.0; NUM_JOINTS],
             prev_action: [0.0; NUM_JOINTS],
+            prev2_action: [0.0; NUM_JOINTS],
             feet: [FootObs::default(); NUM_FEET],
             phase: 0.0,
             step_cue: StepCue::default(),
@@ -487,6 +501,22 @@ pub struct RewardWeights {
     pub stand_planted: f32,
     /// Foot-slip penalty (horizontal foot speed while in contact).
     pub foot_slip: f32,
+    /// Action second-difference penalty (NEGATIVE): Σ(a − 2a′ + a″)². The
+    /// ACTION-side tremor term — high-frequency dither is literally an
+    /// oscillating action, so this prices it at the policy's output with no
+    /// engine-specific signal in the loop. Complements (does not stack with)
+    /// `action_rate`, which only prices speed of change, not oscillation:
+    /// a smooth fast ramp scores high action_rate but ~0 here. 0 = off.
+    pub action_rate_rate: f32,
+    /// Touchdown-impact penalty (NEGATIVE): per airborne foot below
+    /// `touchdown_vz_h` (m), squared excess descent speed beyond
+    /// `touchdown_vz_ok` (m/s). Kinematic slam term: a soft landing decel-
+    /// erates BEFORE the ground, a slam is still fast at 5 cm. 0 = off.
+    pub touchdown_vz: f32,
+    /// Allowed descent speed at the gate height (m/s, default 0.3).
+    pub touchdown_vz_ok: f32,
+    /// Gate height above local ground (m, default 0.06).
+    pub touchdown_vz_h: f32,
     /// Ground-reaction smoothness penalty (NEGATIVE): per foot, the one-step
     /// sensed-force change above `force_rate_deadband` (both in body weights
     /// per control step), squared. Prices the two behaviours v26 shipped with:
@@ -607,6 +637,10 @@ impl Default for RewardWeights {
             single_support: 0.5, // REPURPOSED → double-support SETTLE bonus (both feet
             // planted while moving). Modest, so it shapes a
             // "swing → settle → swing" cycle without farmable waddle.
+            action_rate_rate: 0.0, // off — enable with BIPED_W_ACTION_RATE_RATE
+            touchdown_vz: 0.0,     // off — enable with BIPED_W_TOUCHDOWN_VZ
+            touchdown_vz_ok: 0.3,
+            touchdown_vz_h: 0.06,
             force_rate: 0.0, // off by default — enable with BIPED_W_FORCE_RATE
             force_rate_deadband: 0.15,
             foot_slip: -1.0, // dialed back from -3.0: -3.0 suppressed motion
@@ -668,6 +702,10 @@ impl RewardWeights {
             flight: -20.0, // AGILE `jumping`
             single_support: 0.0,
             stand_planted: 0.0,
+            action_rate_rate: 0.0, // WBC has action_rate_rate; weight unknown, keep off
+            touchdown_vz: 0.0,
+            touchdown_vz_ok: 0.3,
+            touchdown_vz_h: 0.06,
             force_rate: 0.0, // no WBC equivalent (their contact_forces cap is absolute, not rate)
             force_rate_deadband: 0.15,
             foot_slip: -0.05, // AGILE feet_slip
@@ -775,6 +813,10 @@ pub struct RewardBreakdown {
     pub foot_slip: f32,
     /// Ground-reaction-smoothness (force-rate) penalty contribution.
     pub force_rate: f32,
+    /// Action second-difference (tremor-at-source) penalty contribution.
+    pub action_rate_rate: f32,
+    /// Kinematic touchdown-impact (descent-speed) penalty contribution.
+    pub touchdown_vz: f32,
     /// Foot-clearance penalty contribution.
     pub foot_clearance: f32,
     /// Flat-foot (sole-tilt) penalty contribution.
@@ -812,6 +854,8 @@ impl RewardBreakdown {
             + self.stand_planted
             + self.foot_slip
             + self.force_rate
+            + self.action_rate_rate
+            + self.touchdown_vz
             + self.foot_clearance
             + self.foot_orientation
             + self.feet_yaw_mean
@@ -1261,6 +1305,25 @@ impl VelocityFlatTask {
         }
         let action_rate = self.weights.action_rate * da2 * dt;
 
+        // Action second difference (tremor at the source): Σ(a − 2a′ + a″)².
+        let mut dda2 = 0.0;
+        for i in 0..NUM_JOINTS {
+            let dd = state.last_action[i] - 2.0 * state.prev_action[i] + state.prev2_action[i];
+            dda2 += dd * dd;
+        }
+        let action_rate_rate = self.weights.action_rate_rate * dda2 * dt;
+
+        // Touchdown impact (kinematic slam): an airborne foot still
+        // descending faster than `touchdown_vz_ok` below the gate height.
+        let mut slam = 0.0;
+        for f in &state.feet {
+            if !f.contact && f.height < self.weights.touchdown_vz_h {
+                let ex = (-f.vz - self.weights.touchdown_vz_ok).max(0.0);
+                slam += ex * ex;
+            }
+        }
+        let touchdown_vz = self.weights.touchdown_vz * slam * dt;
+
         let mut da2_hip = 0.0;
         for &i in &self.hip_yawroll_idx {
             da2_hip += (state.last_action[i] - state.prev_action[i]).powi(2);
@@ -1561,6 +1624,8 @@ impl VelocityFlatTask {
             stand_planted,
             foot_slip,
             force_rate,
+            action_rate_rate,
+            touchdown_vz,
             foot_clearance,
             foot_orientation,
             feet_yaw_mean,
@@ -1702,6 +1767,7 @@ mod tests {
             yaw_rel_base: 0.0,
             pos_xy: [0.0, 0.0],
             alt_step: false,
+            vz: 0.0,
             force_rate: 0.0,
         };
         assert_eq!(task.reward(&s, &cmd).air_time, 0.0);
@@ -1733,6 +1799,42 @@ mod tests {
         s_trem.feet[0].force_rate = 0.4;
         s_trem.feet[1].force_rate = 0.4;
         assert!(task_fr.reward(&s_trem, &cmd).force_rate < 0.0);
+        // action_rate_rate: an OSCILLATING action (a, -a, a) is taxed; a
+        // smooth constant-rate ramp (a, a+d, a+2d) has zero second
+        // difference and is free — the distinction from plain action_rate.
+        let mut task_dd = task.clone();
+        task_dd.weights.action_rate_rate = -1.0;
+        let mut s_osc = RobotState::default();
+        s_osc.last_action[0] = 0.5;
+        s_osc.prev_action[0] = -0.5;
+        s_osc.prev2_action[0] = 0.5;
+        assert!(task_dd.reward(&s_osc, &cmd).action_rate_rate < 0.0);
+        let mut s_ramp = RobotState::default();
+        s_ramp.last_action[0] = 0.6;
+        s_ramp.prev_action[0] = 0.4;
+        s_ramp.prev2_action[0] = 0.2;
+        assert!(task_dd.reward(&s_ramp, &cmd).action_rate_rate.abs() < 1e-9);
+        assert_eq!(task.reward(&s_osc, &cmd).action_rate_rate, 0.0); // off at weight 0
+        // touchdown_vz: an airborne foot still dropping 1.0 m/s at 4 cm is a
+        // slam; the same descent higher up, a decelerated (0.2 m/s) landing,
+        // or a planted foot are all free.
+        let mut task_td = task.clone();
+        task_td.weights.touchdown_vz = -1.0;
+        let mut s_slam = RobotState::default();
+        s_slam.feet[0].contact = false;
+        s_slam.feet[0].height = 0.04;
+        s_slam.feet[0].vz = -1.0;
+        assert!(task_td.reward(&s_slam, &cmd).touchdown_vz < 0.0);
+        let mut s_high = RobotState::default();
+        s_high.feet[0].contact = false;
+        s_high.feet[0].height = 0.12;
+        s_high.feet[0].vz = -1.0;
+        assert_eq!(task_td.reward(&s_high, &cmd).touchdown_vz, 0.0);
+        let mut s_soft = RobotState::default();
+        s_soft.feet[0].contact = false;
+        s_soft.feet[0].height = 0.04;
+        s_soft.feet[0].vz = -0.2;
+        assert_eq!(task_td.reward(&s_soft, &cmd).touchdown_vz, 0.0);
         // A foot tilted onto its edge while in contact → flat-foot penalty.
         let mut s3 = RobotState::default();
         s3.feet[0].tilt = 1.0; // ~57° off flat

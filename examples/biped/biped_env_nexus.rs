@@ -1310,6 +1310,8 @@ pub struct BipedNexusBatchEnv {
     resample_at: Vec<u32>,
     last_action: Vec<[f32; NUM_JOINTS]>,
     prev_action: Vec<[f32; NUM_JOINTS]>,
+    /// Action before prev — third point for action_rate_rate's second difference.
+    prev2_action: Vec<[f32; NUM_JOINTS]>,
     /// Actuator delay (BIPED_MOTOR_DELAY=min,max): the PD position target is
     /// delayed by a per-env lag of k physics SUBSTEPS (WBC-AGILE's
     /// DelayedPDActuator semantics — k ~ uniform int [min,max] inclusive,
@@ -1526,7 +1528,7 @@ pub struct BipedNexusBatchEnv {
 }
 
 /// Number of logged reward components (see [`REWARD_COMP_NAMES`]).
-pub const NUM_REWARD_COMPS: usize = 29;
+pub const NUM_REWARD_COMPS: usize = 31;
 
 /// Names of the per-component reward terms, in `rlog_comps` / `RewardLog::comps`
 /// order. The first 20 mirror `RewardBreakdown`'s live terms; the last four are
@@ -1562,6 +1564,8 @@ pub const REWARD_COMP_NAMES: [&str; NUM_REWARD_COMPS] = [
     "stand_planted", // per-airborne-foot penalty at standing command (balance, don't step)
     "feet_yaw_diff", // WBC feet_yaw_diff_l2: L/R foot yaw splay penalty
     "force_rate",    // ground-reaction smoothness: |ΔF| above deadband, squared (slam + tremor)
+    "action_rate_rate", // action 2nd difference — tremor at the source (engine-agnostic)
+    "touchdown_vz",  // kinematic slam: descent speed near ground, above allowance
 ];
 
 /// One window of accumulated reward/termination stats (see `take_reward_log`).
@@ -1682,6 +1686,26 @@ impl BipedNexusBatchEnv {
             .and_then(|s| s.parse::<f32>().ok())
         {
             task.weights.force_rate_deadband = d;
+        }
+        // Action-side slam/tremor pair (the engine-agnostic replacement for
+        // the retired sensor-side force_rate): both weights NEGATIVE.
+        if let Some(w) = std::env::var("BIPED_W_ACTION_RATE_RATE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.action_rate_rate = w;
+        }
+        if let Some(w) = std::env::var("BIPED_W_TOUCHDOWN_VZ")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.touchdown_vz = w;
+        }
+        if let Some(v) = std::env::var("BIPED_TOUCHDOWN_VZ_OK")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.touchdown_vz_ok = v;
         }
         // Soft joint-limit penalty weight. At the spec default (-0.5) a fully
         // saturated ankle costs ~0.0009/step per joint — 3-4x below the
@@ -2047,6 +2071,7 @@ impl BipedNexusBatchEnv {
         let resample_at = vec![0u32; num_envs];
         let last_action = vec![[0.0f32; NUM_JOINTS]; num_envs];
         let prev_action = vec![[0.0f32; NUM_JOINTS]; num_envs];
+        let prev2_action = vec![[0.0f32; NUM_JOINTS]; num_envs];
         // BIPED_MOTOR_DELAY=min,max (or just max → min=0), in physics
         // substeps. `0,0` is a valid ENABLED config (constant zero delay —
         // used by the staging-equivalence check); unset/unparseable = off.
@@ -2197,6 +2222,7 @@ impl BipedNexusBatchEnv {
             resample_at,
             last_action,
             prev_action,
+            prev2_action,
             motor_delay,
             delay_k,
             delay_rng,
@@ -2736,6 +2762,7 @@ impl BipedNexusBatchEnv {
                 joint_vel,
                 last_action: self.last_action[env],
                 prev_action: self.prev_action[env],
+                prev2_action: self.prev2_action[env],
                 feet: [FootObs::default(); NUM_FEET],
                 phase: 0.0, // overwritten with self.gait_phase[env] by the caller
                 // Filled by the caller (needs the terrain + this env's pose).
@@ -2785,13 +2812,13 @@ impl BipedNexusBatchEnv {
             let link = self.idx.foot_links[i] as usize;
             let foot_pose = &poses[env_base + link];
             let pos = foot_pose.translation;
-            let planar_speed = if has_prev {
+            let (planar_speed, vz) = if has_prev {
                 let prev_pos = self.prev_body_poses[env_base + link].translation;
                 let dx = (pos.x - prev_pos.x) / dt;
                 let dy = (pos.y - prev_pos.y) / dt;
-                (dx * dx + dy * dy).sqrt()
+                ((dx * dx + dy * dy).sqrt(), (pos.z - prev_pos.z) / dt)
             } else {
-                0.0
+                (0.0, 0.0)
             };
             let world_normal = foot_pose.rotation * sole_local[i];
             let tilt = world_normal.z.abs().clamp(0.0, 1.0).acos();
@@ -2839,6 +2866,7 @@ impl BipedNexusBatchEnv {
                 yaw_rel_base,
                 pos_xy: [pos.x, pos.y],
                 alt_step,
+                vz,
                 force_rate,
             };
         }
@@ -3698,6 +3726,8 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
                 comps[26] = rb.stand_planted;
                 comps[27] = rb.feet_yaw_diff;
                 comps[28] = rb.force_rate;
+                comps[29] = rb.action_rate_rate;
+                comps[30] = rb.touchdown_vz;
                 if fell {
                     use std::sync::atomic::Ordering::Relaxed;
                     for i in 0..NUM_JOINTS {
@@ -3881,6 +3911,7 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
             self.prev_body_poses[env_base..env_base + cpb]
                 .copy_from_slice(&poses[env_base..env_base + cpb]);
             self.has_prev_pose[e] = true;
+            self.prev2_action[e] = self.prev_action[e];
             self.prev_action[e] = self.last_action[e];
             self.last_action[e] = actions[e];
             let timeout = self.step_count[e] >= self.task.max_steps();
@@ -4049,6 +4080,7 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
             .resample_steps(&mut self.rng[env], self.task.control_dt());
         self.last_action[env] = [0.0; NUM_JOINTS];
         self.prev_action[env] = [0.0; NUM_JOINTS];
+        self.prev2_action[env] = [0.0; NUM_JOINTS];
         self.air_time[env] = [0.0; NUM_FEET];
         // Force-sensed contact: seed the new episode as planted (half body
         // weight per foot) — the spawn pose stands on both soles, and the
@@ -4220,6 +4252,7 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         self.resample_at[e] = u32::MAX;
         self.last_action[e] = [0.0; NUM_JOINTS];
         self.prev_action[e] = [0.0; NUM_JOINTS];
+        self.prev2_action[e] = [0.0; NUM_JOINTS];
         self.air_time[e] = [0.0; NUM_FEET];
         self.sensed_force[e] = [0.5 * self.robot.total_mass * 9.81; NUM_FEET];
         self.prev_sensed_force[e] = self.sensed_force[e];
