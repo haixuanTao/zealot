@@ -3,10 +3,7 @@
 A full whole-body-control training stack for humanoid robots — environment,
 PPO trainer, and deployment — written entirely in Rust, on top of
 [nexus](https://github.com/dimforge/nexus), dimforge's cross-platform GPU
-physics engine. The engine core is portable WebGPU; training performance work
-targets the native-CUDA (cuda-oxide) fast path.
-
-## Live demo — [haixuantao.github.io/zealot](https://haixuantao.github.io/zealot/)
+physics engine.
 
 [![The web demo: Unitree G1s walking the training terrain in the browser](docs/img/web-demo.png)](https://haixuantao.github.io/zealot/)
 
@@ -44,6 +41,67 @@ behind the `g1_terrain_web` / `g1_web` examples; the site lives in
 [`website/`](website/) (Vite + React, deployed to GitHub Pages —
 see `website/README.md`).
 
+## Why it's built this way
+
+**Every layer — physics, model, training loop, deployment — is Rust,
+compiled to whatever GPU is available.**
+
+- **The simulator is Rust on any GPU.** The nexus solver is compute shaders
+  written via [Rust-GPU](https://rust-gpu.github.io/); the same source runs
+  through WebGPU in a browser and through CUDA or Metal natively. That is why
+  the demo above can be the *actual training environment*, not an animation.
+- **The learning half too.** `zealot-rl` is the rsl_rl tier rewritten in
+  Rust — model, autodiff, PPO, GAE, Adam — on the same portable GPU layer
+  ([vortx](https://github.com/dimforge/vortx) /
+  [khal](https://github.com/dimforge/khal)) the physics uses. CPU reference
+  implementations verify every GPU kernel to float epsilon.
+- **One source, three compilers.** Rust-GPU → SPIR-V,
+  [cuda-oxide](https://github.com/NVlabs/cuda-oxide) → PTX, naga → MSL — no
+  second implementation to keep in sync. The native-CUDA path (with cuTile
+  tf32 GEMMs) runs 2.4–4.3× faster than WebGPU while staying bit-exact.
+- **The control loop never leaves the GPU.** Observation assembly, policy
+  GEMMs, PD-target scatter, and physics substeps are one chained GPU
+  workload, in training and in the browser alike.
+- **Policies must survive a different solver.** The same checkpoint runs
+  sim2sim on rapier.js, MuJoCo (wasm and native), Genesis, and Isaac — and on
+  the physical G1 via `deploy/`.
+
+The long-form version: [docs/explanation.md](docs/explanation.md).
+
+## Getting started
+
+Three steps — full walkthrough in
+[docs/getting-started.md](docs/getting-started.md):
+
+1. **Watch it walk** — the [live demo](https://haixuantao.github.io/zealot/)
+   is the training env in your browser. Tap the ground, switch engines, load
+   any published checkpoint.
+2. **Train the humanoid** (needs
+   [`cargo-gpu`](https://github.com/Rust-GPU/cargo-gpu); see
+   [development.md](docs/development.md)):
+
+   ```sh
+   # RTX-class GPU: ~71 k env-steps/s at N=4096 on a 5090
+   BIPED_ROBOT=g1_29dof_agile BIPED_CUTILE_GEMM=1 BIPED_TERRAIN=1 \
+     cargo run --release --example biped_train_gpu \
+     --features "gpu biped_gpu cutile" -- 50000 4096 my_policy.safetensors
+   ```
+
+3. **Watch *your* policy walk** — upload the checkpoint to Hugging Face and
+   open `https://haixuantao.github.io/zealot/?ckpt=your-name/your-repo`.
+
+## Documentation
+
+[Diátaxis](https://diataxis.fr) set, hub at
+[**haixuantao.github.io/zealot/doc**](https://haixuantao.github.io/zealot/doc/):
+
+| | |
+| --- | --- |
+| **Getting started** | [docs/getting-started.md](docs/getting-started.md) — demo → training → your checkpoint |
+| **How-to guides** | [building & development](docs/development.md) · [reproducing the benchmarks](docs/benchmarks.md) · [the demo site](website/README.md) |
+| **Reference** | hosted rustdoc: [`zealot_env`](https://haixuantao.github.io/zealot/doc/zealot_env/) · [`zealot_rl`](https://haixuantao.github.io/zealot/doc/zealot_rl/) |
+| **Explanation** | [docs/explanation.md](docs/explanation.md) — how it's built and why |
+
 ## Workspace layout
 
 | Crate | Role | Analogy |
@@ -55,61 +113,10 @@ see `website/README.md`).
 
 nexus itself provides the GPU physics + parallel environments (the Isaac Sim tier).
 
-## The stack in one paragraph
-
-Scenes ship as MJCF assets in `assets/robots/` (generated from Unitree's
-official models, parsed by the in-repo subset loader), selected at runtime
-with `BIPED_ROBOT=lerobot|g1|g1_29dof_agile|h2plus`. The MDP — observations,
-rewards, terminations — is Rust code in `zealot-env`, not a config file. The
-working core is the biped stack in `examples/biped/`: batched nexus GPU envs
-(`biped_env_nexus.rs`) and the GPU-resident PPO trainer (`biped_train_gpu.rs`),
-with the hot PPO GEMMs on cuTile tf32 tensor cores (`BIPED_CUTILE_GEMM=1`).
-`zealot-rl` carries the CPU reference implementations every GPU kernel is
-verified against.
-
-## Train
-
-```sh
-# native CUDA + cuTile (RTX 5090): ~71 k env-steps/s at N=4096 (12-DOF; full
-# training iteration = rollout + PPO update)
-BIPED_ROBOT=g1_29dof_agile BIPED_CUTILE_GEMM=1 BIPED_TERRAIN=1 \
-  cargo run --release --example biped_train_gpu --features "gpu biped_gpu cutile" -- 50000 4096 out.safetensors
-```
-
-Checkpoints publish to
-[huggingface.co/haixuantao/zealot-g1-locomotion](https://huggingface.co/haixuantao/zealot-g1-locomotion)
-and are directly loadable in the live demo. Sim2sim harnesses (MuJoCo,
-Genesis, Isaac) live in `scripts/` and `examples/biped/`.
-
-## Documentation
-
-Organized as a [Diátaxis](https://diataxis.fr) set, hub at
-[**haixuantao.github.io/zealot/doc**](https://haixuantao.github.io/zealot/doc/):
-
-- **[Getting started](docs/getting-started.md)** — the [live demo](https://haixuantao.github.io/zealot/)
-  is step one (nothing to install), then humanoid training, then your
-  checkpoint back in the demo.
-- **How-to guides** — [building & development](docs/development.md),
-  [reproducing the benchmarks](docs/benchmarks.md), [the demo site](website/README.md).
-- **Reference** — hosted rustdoc for
-  [`zealot_env`](https://haixuantao.github.io/zealot/doc/zealot_env/) and
-  [`zealot_rl`](https://haixuantao.github.io/zealot/doc/zealot_rl/), rebuilt on
-  every site deploy.
-- **[Explanation](docs/explanation.md)** — how the stack is built and why:
-  100% Rust on any GPU, one source / three compilers, the GPU-resident loop,
-  sim2sim as a trust discipline.
-
 ## Benchmarks
 
-Full methodology, tables, and repro commands: [docs/benchmarks.md](docs/benchmarks.md).
-The short version (same RTX 5090, sequential same-hour runs, Unitree G1):
-full training iterations at 61 k / 71 k / 82 k env-steps/s for
-N = 2048/4096/8192 — ≈0.85× Isaac Lab/PhysX 5 at 2048 envs, with the gap
-opening at large N (the megakernel lever in the notes) — and the WebGPU
-build currently ~4× behind native CUDA at scale (open vortx-GEMM
-regression).
-
-## Building & development
-
-Toolchain setup (cargo-gpu, the native-CUDA cubin chain) and the repo's
-hook/test conventions: [docs/development.md](docs/development.md).
+Full methodology and tables: [docs/benchmarks.md](docs/benchmarks.md). The
+short version (same RTX 5090, sequential same-hour runs, Unitree G1): full
+training iterations at 61 k / 71 k / 82 k env-steps/s for N = 2048/4096/8192 —
+≈0.85× Isaac Lab/PhysX 5 at 2048 envs, the gap opening at large N — with the
+WebGPU build currently ~4× behind native CUDA at scale.
