@@ -1,5 +1,12 @@
 # zealot
 
+<p align="center">
+  <a href="https://haixuantao.github.io/zealot/"><b>Live demo</b></a> ·
+  <a href="https://haixuantao.github.io/zealot/doc/"><b>Docs</b></a> ·
+  <a href="docs/getting-started.md"><b>Getting started</b></a> ·
+  <a href="docs/benchmarks.md"><b>Benchmarks</b></a>
+</p>
+
 A full whole-body-control training stack for humanoid robots — environment,
 PPO trainer, and deployment — written entirely in Rust, on top of
 [nexus](https://github.com/dimforge/nexus), dimforge's cross-platform GPU
