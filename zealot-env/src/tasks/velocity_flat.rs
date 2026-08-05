@@ -515,7 +515,12 @@ pub struct RewardWeights {
     pub touchdown_vz: f32,
     /// Allowed descent speed at the gate height (m/s, default 0.3).
     pub touchdown_vz_ok: f32,
-    /// Gate height above local ground (m, default 0.06).
+    /// Gate height above local ground (m, default 0.10). NOTE this compares
+    /// against `FootObs.height`, which is the foot link ORIGIN — ~0.035 m
+    /// above the sole even when planted (FOOT_REST_H). The first default
+    /// (0.06) left a ~2 cm trigger window that contact sensing pre-empted:
+    /// the term logged exactly 0 for 100 iters of newborn flailing. 0.10 =
+    /// sole ~6.5 cm up, a real approach window.
     pub touchdown_vz_h: f32,
     /// Ground-reaction smoothness penalty (NEGATIVE): per foot, the one-step
     /// sensed-force change above `force_rate_deadband` (both in body weights
@@ -640,7 +645,7 @@ impl Default for RewardWeights {
             action_rate_rate: 0.0, // off — enable with BIPED_W_ACTION_RATE_RATE
             touchdown_vz: 0.0,     // off — enable with BIPED_W_TOUCHDOWN_VZ
             touchdown_vz_ok: 0.3,
-            touchdown_vz_h: 0.06,
+            touchdown_vz_h: 0.10,
             force_rate: 0.0, // off by default — enable with BIPED_W_FORCE_RATE
             force_rate_deadband: 0.15,
             foot_slip: -1.0, // dialed back from -3.0: -3.0 suppressed motion
@@ -705,7 +710,7 @@ impl RewardWeights {
             action_rate_rate: 0.0, // WBC has action_rate_rate; weight unknown, keep off
             touchdown_vz: 0.0,
             touchdown_vz_ok: 0.3,
-            touchdown_vz_h: 0.06,
+            touchdown_vz_h: 0.10,
             force_rate: 0.0, // no WBC equivalent (their contact_forces cap is absolute, not rate)
             force_rate_deadband: 0.15,
             foot_slip: -0.05, // AGILE feet_slip

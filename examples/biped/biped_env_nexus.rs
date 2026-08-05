@@ -1707,6 +1707,12 @@ impl BipedNexusBatchEnv {
         {
             task.weights.touchdown_vz_ok = v;
         }
+        if let Some(v) = std::env::var("BIPED_TOUCHDOWN_VZ_H")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            task.weights.touchdown_vz_h = v;
+        }
         // Soft joint-limit penalty weight. At the spec default (-0.5) a fully
         // saturated ankle costs ~0.0009/step per joint — 3-4x below the
         // ~0.002/step where a term changes behaviour, which is why the policy
