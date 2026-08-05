@@ -17,11 +17,21 @@
     @media (max-width: 700px) {
       #hud { font-size: 9.5px; padding: 6px 8px; right: 10px; white-space: pre-wrap; word-break: break-word; }
     }
+    /* Boot indicator: the wasm download + compile takes seconds (tens on a
+       phone) and the HUD that used to show it is now hidden by default — an
+       explicit centered spinner keeps "loading" from looking like "broken". */
+    #boot { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 14px;
+            align-items: center; justify-content: center; color: #9fd8dc;
+            font: 14px system-ui; background: #0d2b2e; z-index: 5; text-align: center; }
+    #boot .spin { width: 30px; height: 30px; border: 3px solid #1c4a4f;
+            border-top-color: #35c1cd; border-radius: 50%; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
     canvas { display: block; }
   </style>
 </head>
 <body>
   <button id="hudToggle" aria-label="Toggle diagnostics" onclick="document.getElementById('hud').classList.toggle('open')">ⓘ</button>
+  <div id="boot"><div class="spin"></div><div>loading MuJoCo (~10 MB WebAssembly)…</div></div>
   <div id="hud">loading MuJoCo wasm…</div>
   <script type="module">
     // The reference engine, in the browser: Google DeepMind's official
@@ -42,8 +52,8 @@
     import loadMujoco from './mujoco/mujoco.js';
 
     const hud = document.getElementById('hud');
-    window.addEventListener('error', (e) => { hud.textContent = 'ERROR ' + e.message; console.log('[bench] ERROR ' + e.message); });
-    window.addEventListener('unhandledrejection', (e) => { hud.textContent = 'ERROR ' + e.reason; console.log('[bench] ERROR ' + e.reason); });
+    window.addEventListener('error', (e) => { const b = document.getElementById('boot'); if (b) b.textContent = 'failed to load: ' + e.message; hud.textContent = 'ERROR ' + e.message; console.log('[bench] ERROR ' + e.message); });
+    window.addEventListener('unhandledrejection', (e) => { const b = document.getElementById('boot'); if (b) b.textContent = 'failed to load: ' + e.reason; hud.textContent = 'ERROR ' + e.reason; console.log('[bench] ERROR ' + e.reason); });
 
     const params = new URLSearchParams(location.search);
     const mujoco = await loadMujoco();
@@ -750,7 +760,15 @@
     let simTime = 0;
     let t0 = performance.now();
     let frames = 0, steps = 0, physMs = 0, winT0 = performance.now();
+    let bootGone = false;
+    function dropBoot() {
+      if (!bootGone) {
+        bootGone = true;
+        document.getElementById('boot')?.remove();
+      }
+    }
     function frame() {
+      dropBoot();
       const wall = (performance.now() - t0) / 1000;
       let stepsThisFrame = 0;
       while (simTime < wall && stepsThisFrame < 4) {

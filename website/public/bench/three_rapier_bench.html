@@ -17,11 +17,21 @@
     @media (max-width: 700px) {
       #hud { font-size: 9.5px; padding: 6px 8px; right: 10px; white-space: pre-wrap; word-break: break-word; }
     }
+    /* Boot indicator: the wasm download + compile takes seconds (tens on a
+       phone) and the HUD that used to show it is now hidden by default — an
+       explicit centered spinner keeps "loading" from looking like "broken". */
+    #boot { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 14px;
+            align-items: center; justify-content: center; color: #9fd8dc;
+            font: 14px system-ui; background: #0d2b2e; z-index: 5; text-align: center; }
+    #boot .spin { width: 30px; height: 30px; border: 3px solid #1c4a4f;
+            border-top-color: #35c1cd; border-radius: 50%; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
     canvas { display: block; }
   </style>
 </head>
 <body>
   <button id="hudToggle" aria-label="Toggle diagnostics" onclick="document.getElementById('hud').classList.toggle('open')">ⓘ</button>
+  <div id="boot"><div class="spin"></div><div>loading rapier.js + the policy…</div></div>
   <div id="hud">loading…</div>
   <script type="module">
     // The typical three.js physics stack — three.js WebGL + rapier.js (CPU
@@ -39,7 +49,7 @@
     import RAPIER from 'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/+esm';
 
     const hud = document.getElementById('hud');
-    window.addEventListener('error', (e) => { hud.textContent = 'ERROR ' + e.message; console.log('[bench] ERROR ' + e.message); });
+    window.addEventListener('error', (e) => { const b = document.getElementById('boot'); if (b) b.textContent = 'failed to load: ' + e.message; hud.textContent = 'ERROR ' + e.message; console.log('[bench] ERROR ' + e.message); });
     await RAPIER.init();
 
     // ---- Model + visual meshes (same sources the zealot demo embeds).
@@ -816,7 +826,15 @@
     const results = [];
     let sweepIdx = 0, sweepWin = 0;
 
+    let bootGone = false;
+    function dropBoot() {
+      if (!bootGone) {
+        bootGone = true;
+        document.getElementById('boot')?.remove();
+      }
+    }
     function frame() {
+      dropBoot();
       const wall = (performance.now() - t0) / 1000;
       let stepsThisFrame = 0;
       while (simTime < wall && stepsThisFrame < 4) {
