@@ -3840,12 +3840,10 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
                     }
                 }
             }
-            // Obs history: push the final (noised) frame, emit the stacked
-            // window. Must run after the noise block — the history records
-            // exactly what the policy saw (WBC-AGILE ordering).
-            if let Some(hist) = &mut self.obs_hist {
-                c.obs = hist.push_stacked(e, &c.obs);
-            }
+            // (obs history is stacked in one parallel pass after this loop —
+            // it must see the final NOISED frame, and per-env ring buffers
+            // are disjoint, so batching after the serial mutations is
+            // bit-identical to pushing here. Serial it cost ~12 ms/step.)
             self.air_time[e] = c.new_air;
             if c.td_foot >= 0 {
                 self.last_td_foot[e] = c.td_foot;
@@ -3921,6 +3919,17 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
                 done: c.fell || timeout,
                 fell: c.fell,
             });
+        }
+        // Obs history, batched: push each env's final (noised) frame and
+        // replace it with the stacked window — in PARALLEL over the disjoint
+        // per-env ring buffers (the serial in-loop version cost ~12 ms/step
+        // at 4096 envs). Runs before any caller-side resets, exactly where
+        // the serial pushes sat, so semantics are bit-identical.
+        if let Some(hist) = &mut self.obs_hist {
+            hist.env_views()
+                .into_par_iter()
+                .zip(outs.par_iter_mut())
+                .for_each(|(mut view, o)| view.push_stacked_replace(&mut o.obs));
         }
         self.timings.serial_commit_ns += t.elapsed().as_nanos() as u64;
         self.timings.steps += 1;
