@@ -1,5 +1,5 @@
 //! Train briefly on **nexus GPU physics**, then record a deterministic rollout
-//! of env 0 to JSON for rendering with `examples/biped/render_biped.py` (or the
+//! of env 0 to JSON for rendering with `scripts/render_biped.py` (or the
 //! MuJoCo mesh renderer). Same output format as `biped_render.rs` — same python
 //! script reads both.
 //!
@@ -7,13 +7,13 @@
 //!   `cargo run --release --example biped_render_nexus --features biped_gpu -- \
 //!         [train_iters] [rollout_steps] [out.json]`
 //! then:
-//!   `python3 examples/biped/render_biped.py /tmp/biped_rollout_nexus.json /tmp/biped_nexus.mp4`
+//!   `python3 scripts/render_biped.py /tmp/biped_rollout_nexus.json /tmp/biped_nexus.mp4`
 
-#[path = "biped_env_nexus.rs"]
+#[path = "../biped/biped_env_nexus.rs"]
 mod biped_env_nexus;
-#[path = "cutile_gemm.rs"]
+#[path = "../biped/cutile_gemm.rs"]
 mod cutile_gemm;
-#[path = "gpu_policy.rs"]
+#[path = "../biped/gpu_policy.rs"]
 mod gpu_policy;
 
 use biped_env_nexus::{BipedNexusBatchEnv, StepOut, default_mjcf_path};
@@ -546,7 +546,7 @@ fn main() {
         std::fs::write(&out, &s).expect("write json");
 
         println!(
-            "wrote {} frames + skeleton → {out}\nrender: python3 examples/biped/render_biped.py {out} /tmp/biped_nexus.mp4",
+            "wrote {} frames + skeleton → {out}\nrender: python3 scripts/render_biped.py {out} /tmp/biped_nexus.mp4",
             frames.len()
         );
     });

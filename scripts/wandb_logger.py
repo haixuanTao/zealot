@@ -7,9 +7,9 @@ backfills any rows already in the file, then follows the file live (like
 `tail -f`). Finishes the run after the trainer stops writing.
 
 Usage:
-  python3 examples/biped/wandb_logger.py <logfile> <run_name> [project]
+  python3 scripts/wandb_logger.py <logfile> <run_name> [project]
 e.g.
-  python3 examples/biped/wandb_logger.py /tmp/train_v7.log v7 zealot-biped
+  python3 scripts/wandb_logger.py /tmp/train_v7.log v7 zealot-biped
 """
 import sys
 import time

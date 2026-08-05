@@ -12,7 +12,9 @@
 //! Honors the full BIPED_* env-var stack (TERRAIN, ROBOT, MOTOR_DELAY, DR,
 //! RESET_VEL, PUSH_*, …), so it probes exactly the training configuration.
 
+#[path = "../biped/biped_env.rs"]
 mod biped_env;
+#[path = "../biped/biped_env_nexus.rs"]
 mod biped_env_nexus;
 
 use biped_env_nexus::{BipedNexusBatchEnv, default_mjcf_path};

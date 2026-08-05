@@ -36,7 +36,7 @@
 //! Native run:  `cargo run --release --example lerobot_biped_web --features lerobot_biped_web`
 //! Smoke check: `cargo run --release --example lerobot_biped_web --features lerobot_biped_web -- --headless-check`
 
-#[path = "biped_env_nexus.rs"]
+#[path = "../../src/biped/biped_env_nexus.rs"]
 mod biped_env_nexus;
 
 use biped_env_nexus::{BipedNexusBatchEnv, parse_mjcf};

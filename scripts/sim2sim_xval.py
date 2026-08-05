@@ -16,7 +16,7 @@ Three phases, gated:
 Phases 1 & 2 must PASS before phase 3 is trusted.
 
 Usage:
-    python3 examples/biped/sim2sim_xval.py [rollout.json] [policy.safetensors]
+    python3 scripts/sim2sim_xval.py [rollout.json] [policy.safetensors]
 
 defaults: /tmp/biped_xval.json  /tmp/biped_policy_v7.safetensors
 """

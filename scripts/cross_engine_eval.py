@@ -9,7 +9,7 @@ targets without the robot falling and the base trajectory matches, the policy is
 sim-agnostic. If MuJoCo falls or wildly diverges, the policy is exploiting
 rapier-specific contact behaviour.
 
-Run: python3 examples/biped/cross_engine_eval.py
+Run: python3 scripts/cross_engine_eval.py
 """
 import json
 import math
@@ -202,7 +202,7 @@ def main():
         json.dump(out, f)
     print()
     print("Saved MuJoCo-replayed trajectory → /tmp/biped_rollout_mujoco.json")
-    print("Render with: python3 examples/biped/render_biped_mujoco.py /tmp/biped_rollout_mujoco.json /tmp/biped_mesh_mujoco.mp4 90")
+    print("Render with: python3 scripts/render_biped_mujoco.py /tmp/biped_rollout_mujoco.json /tmp/biped_mesh_mujoco.mp4 90")
 
 
 if __name__ == "__main__":

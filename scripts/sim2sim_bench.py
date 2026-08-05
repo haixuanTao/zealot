@@ -34,11 +34,11 @@ COMMANDS = [("stand", "0,0,0"), ("slow02", "0.2,0,0"),
 
 # (engine, harness script, python env var, default python, extra env)
 FOREIGN = [
-    ("mujoco", "examples/biped/sim2sim_g1_mujoco.py", "BENCH_PY",
+    ("mujoco", "scripts/sim2sim_g1_mujoco.py", "BENCH_PY",
      "~/rt_build/bench-venv/bin/python", {"MUJOCO_GL": "egl"}),
-    ("genesis", "examples/biped/sim2sim_g1_genesis.py", "GENESIS_PY",
+    ("genesis", "scripts/sim2sim_g1_genesis.py", "GENESIS_PY",
      "~/rt_build/nyx-venv/bin/python", {}),
-    ("isaacsim-physx", "examples/biped/sim2sim_g1_isaac.py", "ISAAC_PY",
+    ("isaacsim-physx", "scripts/sim2sim_g1_isaac.py", "ISAAC_PY",
      "~/rt_build/isaac-venv/bin/python",
      {"ACCEPT_EULA": "Y", "OMNI_KIT_ACCEPT_EULA": "YES", "PRIVACY_CONSENT": "Y"}),
 ]

@@ -23,7 +23,7 @@
 //! multibody contacts under naga's MSL backend (the robot falls no matter
 //! what) — judge physics in Chrome (Tint) or on CUDA, not on Metal.
 
-#[path = "biped_env_nexus.rs"]
+#[path = "../../src/biped/biped_env_nexus.rs"]
 mod biped_env_nexus;
 
 /// Which flavour of the demo to run.

@@ -6,8 +6,8 @@ Outputs a JSON pose dump in the same schema as the Rust example so the existing
 `render_foot_tip.py` can replay it side-by-side with the rapier result.
 
 Run:
-    python3 examples/biped/foot_tip_stability_newton.py
-    python3 examples/biped/render_foot_tip.py /tmp/foot_tip_poses_newton.json /tmp/foot_tip_newton.mp4
+    python3 scripts/foot_tip_stability_newton.py
+    python3 scripts/render_foot_tip.py /tmp/foot_tip_poses_newton.json /tmp/foot_tip_newton.mp4
 
 Newton's MuJoCo solver uses MuJoCo's soft-contact formulation, so the prediction
 is: the knife_edge_94mm artefact rapier shows will tip flat correctly here.
@@ -190,7 +190,7 @@ def main():
     with open(path, "w") as f:
         json.dump(out, f)
     print(f"\nwrote pose trajectories → {path}")
-    print("render with: python3 examples/biped/render_foot_tip.py "
+    print("render with: python3 scripts/render_foot_tip.py "
           f"{path} /tmp/foot_tip_newton.mp4")
 
 

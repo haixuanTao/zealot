@@ -9,7 +9,7 @@ follows sim2sim's examples/lerobot_legs/isaac_zealot.py.
 
 Usage (needs the Isaac venv):
   OMNI_KIT_ACCEPT_EULA=YES ~/rt_build/isaac-venv/bin/python \
-      examples/biped/sim2sim_g1_isaac.py [policy.safetensors] [out.mp4] [seconds]
+      scripts/sim2sim_g1_isaac.py [policy.safetensors] [out.mp4] [seconds]
 Env: BIPED_CMD="vx,vy,yaw" (default 0.4,0,0)
 """
 from __future__ import annotations

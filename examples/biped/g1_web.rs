@@ -7,9 +7,9 @@
 //! Smoke check: `... --example g1_web --features g1_web -- --headless-check`
 //! Wasm build:  `website/scripts/build-demos.sh g1_web`
 
-#[path = "cutile_gemm.rs"]
+#[path = "../../src/biped/cutile_gemm.rs"]
 mod cutile_gemm;
-#[path = "gpu_policy.rs"]
+#[path = "../../src/biped/gpu_policy.rs"]
 mod gpu_policy;
 #[path = "g1_web_demo.rs"]
 mod g1_web_demo;

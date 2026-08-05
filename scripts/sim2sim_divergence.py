@@ -10,7 +10,7 @@ targets, NO policy feedback. Any divergence is then pure dynamics (actuator mode
 
 Reuses the faithful MuJoCo model + constants from sim2sim_xval.
 
-  python3 examples/biped/sim2sim_divergence.py <rollout.json> [out_prefix]
+  python3 scripts/sim2sim_divergence.py <rollout.json> [out_prefix]
 """
 import os, sys, json
 os.environ.setdefault("MUJOCO_GL", "egl")

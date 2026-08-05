@@ -11,7 +11,7 @@ collision geoms (functionally identical motion, just blockier looking).
 Headless GL via EGL (the box has a GPU); falls back to osmesa.
 
 Usage:
-  python3 examples/biped/render_sim2sim_mujoco.py [rollout.json] [policy.safetensors] [out.mp4] [steps]
+  python3 scripts/render_sim2sim_mujoco.py [rollout.json] [policy.safetensors] [out.mp4] [steps]
 defaults: /tmp/biped_xval.json  /tmp/biped_policy_v7.safetensors  /tmp/biped_sim2sim_mujoco.mp4  500
 """
 import os

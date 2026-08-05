@@ -7,7 +7,7 @@ here but collapses in nexus, nexus's multibody/contact solver is the bug.
 Matches zealot's config: per-joint kp/kd/armature (WBC-AGILE values), default
 pose all-zero, 200 Hz physics / 50 Hz control (decimation 4), 10deg spawn pitch.
 
-Run: python3 examples/biped/mujoco_passive_stand.py [seconds]
+Run: python3 scripts/mujoco_passive_stand.py [seconds]
 """
 import os
 import sys

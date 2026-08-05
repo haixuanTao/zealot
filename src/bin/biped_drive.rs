@@ -5,7 +5,7 @@
 //! commanded-vs-achieved summary, and a top-down ASCII map of the path. Also
 //! writes a CSV (t,x,y,z,yaw) for plotting and a rollout JSON in the
 //! `render_biped.py` format, so the run can be rendered to video:
-//!   `python3 examples/biped/render_biped.py /tmp/biped_drive.json /tmp/biped_drive.mp4`
+//!   `python3 scripts/render_biped.py /tmp/biped_drive.json /tmp/biped_drive.mp4`
 //!
 //! Run:
 //!   `cargo run --release --example biped_drive --features biped_gpu -- \
@@ -15,7 +15,7 @@
 //! turn in place:
 //!   `cargo run --release --example biped_drive --features biped_gpu -- 0 0 0.5`
 
-#[path = "biped_env_nexus.rs"]
+#[path = "../biped/biped_env_nexus.rs"]
 mod biped_env_nexus;
 
 use biped_env_nexus::{BipedNexusBatchEnv, default_mjcf_path};
@@ -287,7 +287,7 @@ fn main() {
         s.push_str("  ]\n}\n");
         std::fs::write(&json_path, s).expect("write rollout json");
         println!(
-            "rollout json → {json_path}\nrender: python3 examples/biped/render_biped.py {json_path} /tmp/biped_drive.mp4"
+            "rollout json → {json_path}\nrender: python3 scripts/render_biped.py {json_path} /tmp/biped_drive.mp4"
         );
     });
 }

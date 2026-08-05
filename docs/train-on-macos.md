@@ -116,7 +116,7 @@ nohup cargo run --release --bin biped_train_gpu \
 ```bash
 cargo run --release --bin biped_render_nexus \
     --features "gpu biped_gpu" -- 0 500 /tmp/rollout.json walking_policy.safetensors
-MUJOCO_GL=cgl python3 examples/biped/render_biped_mujoco.py \
+MUJOCO_GL=cgl python3 scripts/render_biped_mujoco.py \
     /tmp/rollout.json /tmp/walk.mp4
 ```
 

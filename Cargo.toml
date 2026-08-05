@@ -135,23 +135,23 @@ anyhow = "1"
 # generator (scripts/perf_bench.sh -> bench/perf/).
 [[bin]]
 name = "iter_e2e_bench"
-path = "examples/biped/iter_e2e_bench.rs"
+path = "src/bin/iter_e2e_bench.rs"
 required-features = ["gpu", "biped_gpu"]
 
 # Rollout-only CPU-vs-GPU benchmark (scripts/perf_bench2.sh leg D).
 [[bin]]
 name = "rollout_e2e_bench"
-path = "examples/biped/rollout_e2e_bench.rs"
+path = "src/bin/rollout_e2e_bench.rs"
 required-features = ["gpu", "biped_gpu"]
 
 [[bin]]
 name = "biped_train_gpu"
-path = "examples/biped/biped_train_gpu.rs"
+path = "src/bin/biped_train_gpu.rs"
 required-features = ["gpu", "biped_gpu"]
 
 [[bin]]
 name = "zero_action_probe"
-path = "examples/biped/zero_action_probe.rs"
+path = "src/bin/zero_action_probe.rs"
 required-features = ["gpu", "biped_gpu"]
 
 # Train briefly on nexus then record a deterministic env-0 rollout to JSON.
@@ -161,7 +161,7 @@ required-features = ["gpu", "biped_gpu"]
 # Render with `python3 examples/biped/render_biped.py <out.json> <out.mp4>`.
 [[bin]]
 name = "biped_render_nexus"
-path = "examples/biped/biped_render_nexus.rs"
+path = "src/bin/biped_render_nexus.rs"
 required-features = ["biped_gpu", "gpu"]
 
 # Drive a trained policy with a constant velocity command and report where the
@@ -171,7 +171,7 @@ required-features = ["biped_gpu", "gpu"]
 # robot goes (per-second pose, commanded-vs-achieved summary, ASCII path map).
 [[bin]]
 name = "biped_drive"
-path = "examples/biped/biped_drive.rs"
+path = "src/bin/biped_drive.rs"
 required-features = ["biped_gpu"]
 
 # Numerical parity: GPU PPO output-grad kernels (vortx) vs scalar-CPU reference.
@@ -213,6 +213,6 @@ required-features = ["g1_terrain_web"]
 
 [[bin]]
 name = "passive_stand"
-path = "examples/biped/passive_stand.rs"
+path = "src/bin/passive_stand.rs"
 required-features = ["gpu", "biped_gpu"]
 

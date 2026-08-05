@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Genesis sim2sim harness for the zealot G1 policy — third-engine transfer
-check mirroring examples/biped/sim2sim_g1_mujoco.py: same 45-dim obs frames
+check mirroring scripts/sim2sim_g1_mujoco.py: same 45-dim obs frames
 (trainer conventions, stacked 5-deep, checkpoint Welford normalization), same
 explicit torque PD at 200 Hz with decimation 4, same fall/timeout episode
 logic and direction-aware metrics.

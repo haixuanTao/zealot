@@ -2,7 +2,7 @@
 """Bake the self-contained, mesh-free G1 MJCF for the browser MuJoCo demo.
 
 Source of truth: mujoco_playground's `scene_mjx_feetonly_flat_terrain.xml`
-(the exact model `examples/biped/sim2sim_g1_mujoco.py` validates against).
+(the exact model `scripts/sim2sim_g1_mujoco.py` validates against).
 The browser page renders with zealot's own baked visual meshes
 (`g1_visuals_29dof.bin`), so every `<mesh>` asset and every mesh geom is
 stripped — what remains is the physics: primitive feet-only collision,
