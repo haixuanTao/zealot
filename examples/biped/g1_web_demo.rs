@@ -67,7 +67,7 @@ use web_time::Instant;
 const MJCF_XML: &str = include_str!("../../assets/robots/unitree_g1_29dof.xml");
 
 /// Baked G1 visual meshes in the converted link frames (see
-/// `tools/bake_g1_visuals.py`): per kept body, decimated menagerie meshes.
+/// `scripts/bake_g1_visuals.py`): per kept body, decimated menagerie meshes.
 const VISUALS_BIN: &[u8] = include_bytes!("assets/g1_visuals_29dof.bin");
 
 /// The v26 walking checkpoint (iter 42290): ActorCritic weights + Welford

@@ -81,7 +81,7 @@ pub struct RobotSpec {
     /// The foot's "forward" direction in the foot link's LOCAL frame (used by
     /// the foot-yaw-vs-base observation). +X for models whose foot frame is
     /// upright; the Unitree G1's foot frame is axis-normalized so its forward
-    /// is +Z (see `tools/convert_unitree_biped.py`).
+    /// is +Z (see `scripts/convert_unitree_biped.py`).
     pub foot_forward_local: [f32; 3],
     /// Foot-link-origin height (m, world) below which the foot counts as in
     /// ground contact. Robot-specific because the sole-to-link-origin offset
@@ -100,7 +100,7 @@ pub struct RobotSpec {
     pub min_base_height: f32,
     /// Total robot mass, kg (≈ sum of model link masses).
     pub total_mass: f32,
-    /// MJCF path (zealot dialect — see `tools/convert_unitree_biped.py`),
+    /// MJCF path (zealot dialect — see `scripts/convert_unitree_biped.py`),
     /// relative to `$HOME`.
     pub mjcf_rel_path: &'static str,
     /// Source URDF path, relative to `$HOME` (kept for the URDF-based smoke

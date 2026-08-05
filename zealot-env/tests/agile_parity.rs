@@ -2,7 +2,7 @@
 //!
 //! The reference table is GENERATED from AGILE's own source
 //! (`G1_29DOF_DELAYED_DC_MOTOR` + the Velocity-G1-History task cfg) by
-//! `tools/pull_agile_actuators.py` — re-run it after updating the WBC-AGILE
+//! `scripts/pull_agile_actuators.py` — re-run it after updating the WBC-AGILE
 //! checkout, then re-run these tests. Two guarantees:
 //!
 //! 1. `unitree_g1_agile()` matches AGILE exactly on every parameter zealot

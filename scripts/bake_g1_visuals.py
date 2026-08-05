@@ -3,7 +3,7 @@
 frames for the website demo (`examples/biped/g1_web.rs`).
 
 Source: mujoco_menagerie/unitree_g1/g1.xml (same g1_description lineage as the
-unitree_rl_gym model tools/convert_unitree_biped.py converted). Every visual
+unitree_rl_gym model scripts/convert_unitree_biped.py converted). Every visual
 mesh geom is mapped to its nearest KEPT ancestor body (the 13 bodies of
 assets/robots/unitree_g1_12dof.xml — upper body fuses into the pelvis at
 qpos = 0), transformed into that body's frame, then rotated into zealot's
@@ -19,7 +19,7 @@ Output (little-endian, examples/biped/assets/g1_visuals.bin):
     f32*4 rgba, u32 n_verts, u32 n_tris,
     f32*3*n_verts positions, u32*3*n_tris indices.
 
-Run: python3 tools/bake_g1_visuals.py [decimate_ratio=0.15]
+Run: python3 scripts/bake_g1_visuals.py [decimate_ratio=0.15]
 """
 
 import struct

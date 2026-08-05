@@ -14,7 +14,7 @@ Output format = bake_g1_visuals.py's (u32 count; per entry: u8 name_len,
 name, f32*4 rgba, u32 nv, u32 nf, f32 verts, u32 tris), written to
 website/static/bench/g1_visuals_mj29.bin.
 
-Run: python3 tools/bake_g1_visuals_mj.py [decimate_ratio=0.15]
+Run: python3 scripts/bake_g1_visuals_mj.py [decimate_ratio=0.15]
 """
 
 import struct
