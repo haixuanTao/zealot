@@ -1,6 +1,6 @@
 # Getting started
 
-Zero to "my own policy walks in a browser", in four steps.
+Zero to "my own policy walks in a browser", in three steps.
 
 ## 1. Watch it walk (nothing to install)
 
@@ -25,22 +25,12 @@ Things to try:
 The WebGPU tab needs Chrome; Safari/Firefox/iOS open on the CPU engines
 automatically.
 
-## 2. Run the code (pendulum first)
-
-The gentle on-ramp is the inverted pendulum —
-[`examples/pendulum/README.md`](../examples/pendulum/README.md) walks from a
-physics smoke test to PPO swing-up:
-
-```sh
-cargo run --release --example pendulum_ppo --features pendulum
-```
+## 2. Train the humanoid
 
 Prerequisites (one-time): Rust, plus the
 [`cargo-gpu`](https://github.com/Rust-GPU/cargo-gpu) toolchain for the
-Rust-GPU shader builds — see
-[development.md](development.md) for the exact versions and gotchas.
-
-## 3. Train the humanoid
+Rust-GPU shader builds — see [development.md](development.md) for the exact
+versions and gotchas. Then:
 
 ```sh
 # RTX-class GPU; ~71 k env-steps/s at N=4096 on a 5090
@@ -53,7 +43,7 @@ The checkpoint is a plain safetensors file: actor-critic weights plus the
 observation-normalizer state. Sim2sim harnesses for MuJoCo / Genesis / Isaac
 live in `scripts/` and `examples/biped/`.
 
-## 4. Watch *your* policy walk
+## 3. Watch *your* policy walk
 
 Upload the checkpoint to any Hugging Face model repo and paste the repo
 handle into the demo's Policy box — or hand someone a link:

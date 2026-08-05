@@ -46,7 +46,7 @@ cat > "$DIST/doc/index.html" <<'HTML'
 <h2>Getting started</h2>
 <p class="sub">Learning-oriented — from the live demo to your own walking policy.</p>
 <ul>
-  <li><a href="https://github.com/haixuanTao/zealot/blob/master/docs/getting-started.md">Getting started</a> — watch it walk (the <a href="../">live demo</a> is step one, nothing to install), run the pendulum, train the humanoid, load your checkpoint back into the demo</li>
+  <li><a href="https://github.com/haixuanTao/zealot/blob/master/docs/getting-started.md">Getting started</a> — watch it walk (the <a href="../">live demo</a> is step one, nothing to install), train the humanoid, load your checkpoint back into the demo</li>
 </ul>
 
 <h2>How-to guides</h2>

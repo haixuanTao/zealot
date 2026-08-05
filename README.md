@@ -65,8 +65,7 @@ working core is the biped stack in `examples/biped/`: batched nexus GPU envs
 (`biped_env_nexus.rs`) and the GPU-resident PPO trainer (`biped_train_gpu.rs`),
 with the hot PPO GEMMs on cuTile tf32 tensor cores (`BIPED_CUTILE_GEMM=1`).
 `zealot-rl` carries the CPU reference implementations every GPU kernel is
-verified against, and `examples/pendulum/` is the gentle introduction
-([guide](examples/pendulum/README.md)).
+verified against.
 
 ## Train
 
