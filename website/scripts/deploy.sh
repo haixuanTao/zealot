@@ -28,9 +28,30 @@ ZEALOT_DIR="$(dirname "$WEBSITE_DIR")"
 rm -rf "$DIST/doc"
 cp -R "$ZEALOT_DIR/target/doc" "$DIST/doc"
 cat > "$DIST/doc/index.html" <<'HTML'
-<!DOCTYPE html><meta charset="utf-8">
-<meta http-equiv="refresh" content="0; url=zealot_env/index.html">
-<a href="zealot_env/index.html">zealot API docs</a>
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zealot — docs</title>
+<style>
+  body { font: 16px/1.6 system-ui, sans-serif; color: #1c2b2d; max-width: 44rem;
+         margin: 3rem auto; padding: 0 1.2rem; }
+  h1 { font-size: 1.5rem; } h2 { font-size: 1.05rem; margin-top: 1.8rem; }
+  a { color: #14747c; } li { margin: 0.3rem 0; }
+</style></head><body>
+<h1>zealot — documentation</h1>
+<p>A whole-body-control training stack for humanoid robots, in Rust.
+<a href="../">Live demo</a> · <a href="https://github.com/haixuanTao/zealot">GitHub</a></p>
+<h2>API reference (rustdoc)</h2>
+<ul>
+  <li><a href="zealot_env/index.html"><code>zealot_env</code></a> — the environment/MDP layer: observations, rewards, terminations, terrain, robot specs</li>
+  <li><a href="zealot_rl/index.html"><code>zealot_rl</code></a> — CPU reference policy network, autodiff, and PPO (what the GPU kernels are verified against)</li>
+</ul>
+<h2>Guides</h2>
+<ul>
+  <li><a href="https://github.com/haixuanTao/zealot/blob/master/docs/development.md">Building &amp; development</a> — toolchain setup (cargo-gpu, the native-CUDA cubin chain), git hooks, running the checks</li>
+  <li><a href="https://github.com/haixuanTao/zealot/blob/master/docs/benchmarks.md">Benchmarks</a> — full methodology, tables, and repro commands</li>
+  <li><a href="https://github.com/haixuanTao/zealot/blob/master/website/README.md">The demo site</a> — build/deploy flow and demo URL knobs</li>
+</ul>
+</body></html>
 HTML
 
 TMP=$(mktemp -d)
