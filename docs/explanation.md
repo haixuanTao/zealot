@@ -1,0 +1,62 @@
+# Explanation — how zealot is built, and why
+
+The short version: **every layer of the robot-learning stack — physics,
+model, training loop, deployment — is Rust compiled to whatever GPU is
+available.** The rest of this page unpacks what that buys.
+
+## 100% Rust simulator, on any GPU
+
+Physics is [nexus](https://github.com/dimforge/nexus), dimforge's GPU
+multiphysics engine: the whole solver is compute shaders written in Rust via
+[Rust-GPU](https://rust-gpu.github.io/). The same source runs through WebGPU
+in a browser and through CUDA or Metal natively — no Python, no CUDA C, no
+per-backend rewrite. That is why the [live demo](https://haixuantao.github.io/zealot/)
+can be the *actual training environment* rather than a canned animation.
+
+## The learning half is Rust too
+
+`zealot-rl` is the rsl_rl tier rewritten in Rust: model definition, autodiff,
+PPO, GAE, Adam — not a Python front-end over a C++ core. It runs on
+[vortx](https://github.com/dimforge/vortx) and
+[khal](https://github.com/dimforge/khal), the same portable GPU layer nexus is
+built on, so the learning half is no more platform-bound than the physics
+half. The CPU implementations in `zealot-rl` are the *reference*: every GPU
+kernel is verified against them to float epsilon.
+
+## One source, three compilers
+
+The kernels are written once and compiled three ways — Rust-GPU → SPIR-V for
+WebGPU/Vulkan, [cuda-oxide](https://github.com/NVlabs/cuda-oxide) → PTX for
+native CUDA, and naga → MSL for Metal — with no second implementation to keep
+in sync. On an RTX 5090 the native-CUDA path runs 2.4–4.3× faster than WebGPU
+while staying bit-exact against it. The hot PPO GEMMs additionally use
+cuTile tf32 tensor cores.
+
+## Three layers people conflate
+
+1. **Asset / scene description** — bodies, joints, collision, mass. Ships as
+   MJCF in `assets/robots/`, generated from Unitree's official models and
+   parsed by an in-repo subset loader. `BIPED_ROBOT=` selects at runtime.
+2. **Engine model** — nexus consumes rapier types; the asset path is always
+   `MJCF → rapier → GPU`.
+3. **The MDP** — observations, rewards, terminations, resets. This is *code*
+   in `zealot-env`, not a config file: reward terms with their gating logic
+   are the actual research surface, and they version with the code.
+
+## The GPU-resident control loop
+
+In both training and the browser demo, a control step never crosses to the
+CPU: observation assembly, the policy GEMMs, and PD-target scatter are GPU
+kernels (`zealot-obs-shaders`, `zealot-gpu-obs`) chained with the physics
+substeps. The CPU's only steady-state job is deciding how many steps to run
+and reading back poses for rendering — pipelined, never fenced.
+
+## A policy is only trustworthy if it survives a different solver
+
+The same checkpoint runs sim2sim on rapier.js and on the official MuJoCo
+WebAssembly build — the reference engine — walking bit-identical terrain (the
+demo's JS terrain generator is a bit-faithful port of the Rust one, verified
+to 2e-10). Where the engines agree, believe the policy; where they diverge,
+you have found either an engine artifact being exploited or a genuine
+robustness gap. The same discipline extends natively to Genesis and Isaac
+harnesses, and to the real G1 via the deployment stack in `deploy/`.

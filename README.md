@@ -82,12 +82,23 @@ Checkpoints publish to
 and are directly loadable in the live demo. Sim2sim harnesses (MuJoCo,
 Genesis, Isaac) live in `scripts/` and `examples/biped/`.
 
-## API docs
+## Documentation
 
-Rustdoc for the library crates is hosted with the demo site:
-[**haixuantao.github.io/zealot/doc**](https://haixuantao.github.io/zealot/doc/)
-(`zealot_env` — the env/MDP layer — and `zealot_rl`, the CPU reference
-PPO/network implementations). Rebuilt on every site deploy.
+Organized as a [Diátaxis](https://diataxis.fr) set, hub at
+[**haixuantao.github.io/zealot/doc**](https://haixuantao.github.io/zealot/doc/):
+
+- **[Getting started](docs/getting-started.md)** — the [live demo](https://haixuantao.github.io/zealot/)
+  is step one (nothing to install), then pendulum → humanoid training → your
+  checkpoint back in the demo.
+- **How-to guides** — [building & development](docs/development.md),
+  [reproducing the benchmarks](docs/benchmarks.md), [the demo site](website/README.md).
+- **Reference** — hosted rustdoc for
+  [`zealot_env`](https://haixuantao.github.io/zealot/doc/zealot_env/) and
+  [`zealot_rl`](https://haixuantao.github.io/zealot/doc/zealot_rl/), rebuilt on
+  every site deploy.
+- **[Explanation](docs/explanation.md)** — how the stack is built and why:
+  100% Rust on any GPU, one source / three compilers, the GPU-resident loop,
+  sim2sim as a trust discipline.
 
 ## Benchmarks
 
