@@ -135,7 +135,7 @@ pub const fn unitree_h2_plus() -> RobotSpec {
         spawn_z: 1.039,       // converter FK: straight-leg sole-on-ground
         min_base_height: 0.58,
         total_mass: 77.24,
-        mjcf_rel_path: "Documents/work/zealot/assets/robots/unitree_h2_plus_12dof.xml",
+        mjcf_rel_path: "assets/robots/unitree_h2_plus_12dof.xml",
         urdf_rel_path: "Documents/work/unitree_ros/robots/h2_plus/H2_Plus.urdf",
         mirror: [6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5],
         mirror_sign: [1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0],

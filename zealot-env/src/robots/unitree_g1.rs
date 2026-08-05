@@ -131,7 +131,7 @@ pub const fn unitree_g1() -> RobotSpec {
         spawn_z: 0.792,       // converter FK: straight-leg sole-on-ground
         min_base_height: 0.45,
         total_mass: 32.11,
-        mjcf_rel_path: "Documents/work/zealot/assets/robots/unitree_g1_12dof.xml",
+        mjcf_rel_path: "assets/robots/unitree_g1_12dof.xml",
         urdf_rel_path: "Documents/work/unitree_ros/robots/g1_description/g1_12dof.urdf",
         // Canonical order is left leg [0..6), right leg [6..12): mirror swaps
         // the halves; pitch/knee mirror equal, roll/yaw mirror opposite.
@@ -210,7 +210,7 @@ pub const fn unitree_g1_agile() -> RobotSpec {
 pub const fn unitree_g1_29dof() -> RobotSpec {
     let mut spec = unitree_g1();
     spec.name = "unitree_g1_29dof";
-    spec.mjcf_rel_path = "Documents/work/zealot/assets/robots/unitree_g1_29dof.xml";
+    spec.mjcf_rel_path = "assets/robots/unitree_g1_29dof.xml";
     spec.urdf_rel_path = "Documents/work/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf";
     spec.total_mass = 33.34;
     // A fallen robot contacts the ground with its (collider-less) upper body —
@@ -248,7 +248,7 @@ pub const fn unitree_g1_29dof() -> RobotSpec {
 pub const fn unitree_g1_29dof_agile() -> RobotSpec {
     let mut spec = unitree_g1_agile();
     spec.name = "unitree_g1_29dof_agile";
-    spec.mjcf_rel_path = "Documents/work/zealot/assets/robots/unitree_g1_29dof.xml";
+    spec.mjcf_rel_path = "assets/robots/unitree_g1_29dof.xml";
     spec.urdf_rel_path = "Documents/work/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf";
     spec.total_mass = 33.34;
     spec.illegal_ground_fragments = &["hip", "knee", "torso", "waist", "shoulder", "elbow", "wrist"];

@@ -217,8 +217,27 @@ impl RobotSpec {
         std::array::from_fn(|i| self.joints[i].action_scale)
     }
 
-    /// Absolute path to the zealot-dialect MJCF, resolved against `$HOME`.
+    /// Absolute path to the zealot-dialect MJCF.
+    ///
+    /// Resolution order:
+    /// 1. relative to the WORKSPACE ROOT (baked in at compile time) — this is
+    ///    what makes a fresh clone train without any setup: the converted
+    ///    MJCFs are committed under `assets/robots/`, nothing is downloaded;
+    /// 2. relative to the current directory (binaries moved off the build
+    ///    machine, run from the repo root);
+    /// 3. joined onto `$HOME` — the legacy hardcoded-layout form, and how the
+    ///    out-of-repo LeRobot asset is still found.
+    /// `BIPED_MJCF` (handled by the caller) overrides all of this.
     pub fn mjcf_path(&self) -> std::path::PathBuf {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        for base in [workspace, std::path::Path::new(".")] {
+            let p = base.join(self.mjcf_rel_path);
+            if p.exists() {
+                return p;
+            }
+        }
         Self::home().join(self.mjcf_rel_path)
     }
 
@@ -235,6 +254,23 @@ impl RobotSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The in-repo robots must resolve to their committed MJCFs on a FRESH
+    /// CLONE — no `$HOME` layout assumptions, no downloads, no `BIPED_MJCF`.
+    /// (The LeRobot spec is excluded: its asset lives in a separate private
+    /// repo and is still resolved through the `$HOME` fallback.)
+    #[test]
+    fn committed_assets_resolve() {
+        for spec in [
+            unitree_g1::unitree_g1(),
+            unitree_g1::unitree_g1_29dof(),
+            unitree_g1::unitree_g1_29dof_agile(),
+            unitree_h2_plus::unitree_h2_plus(),
+        ] {
+            let p = spec.mjcf_path();
+            assert!(p.exists(), "{}: MJCF not found at {}", spec.name, p.display());
+        }
+    }
 
     fn check_invariants(r: &RobotSpec) {
         // Unique joint names.
