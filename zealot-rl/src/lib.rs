@@ -1,9 +1,14 @@
 //! Learning tier: policy network, autodiff, and the PPO training loop.
 //!
-//! The learning stack is intentionally undecided (see project notes):
-//! - **burn** (wgpu backend) — batteries-included autodiff + optimizers, or
-//! - **vortx** + hand-rolled MLP backprop — a single dimforge/WebGPU stack
-//!   shared with nexus (zero readback, browser-capable; better dora story).
+//! These are the **CPU reference implementations**. The production trainer
+//! runs the same math as GPU kernels on vortx (the dimforge tensor stack
+//! nexus shares), and every GPU kernel is verified against this crate to
+//! float epsilon — see `examples/` (`ppo_grad_check`, `elu_check`,
+//! `policy_forward_bench`) in the
+//! [zealot repo](https://github.com/haixuanTao/zealot). Start at the crate
+//! front page of
+//! [`zealot_env`](https://haixuantao.github.io/zealot/doc/zealot_env/) for
+//! the getting-started walkthrough.
 //!
 //! Modules:
 //! - `net`  — MLP (ELU, multi-layer), hand-written backprop, Adam, grad clip.

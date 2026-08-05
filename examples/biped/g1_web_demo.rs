@@ -1127,7 +1127,20 @@ pub async fn run(cfg: DemoCfg) {
     // steers heading + the lateral channel toward the target, which is
     // exactly what a higher-level navigator does on hardware.
     let mut nav_target: Option<Vec3> = None; // render-space ground point
-    let mut nav_marker = scene.add_cylinder(0.22, 0.02);
+    // Marker z: the terrain is quantized box cells, so a disc placed at the
+    // CENTER's height buries itself in (or floats over) neighboring cells —
+    // sample the footprint and sit on the highest cell under it.
+    let marker_ground = |strips: &[TerrainStrip], terrain: bool, off: Vec3, x: f32, y: f32| -> f32 {
+        if !terrain || strips.is_empty() {
+            return 0.0;
+        }
+        let mut h = f32::MIN;
+        for (dx, dy) in [(0.0, 0.0), (0.14, 0.0), (-0.14, 0.0), (0.0, 0.14), (0.0, -0.14)] {
+            h = h.max(strips[0].height(x + dx - off.x, y + dy - off.y));
+        }
+        h
+    };
+    let mut nav_marker = scene.add_cylinder(0.16, 0.02);
     nav_marker.set_color(Color::new(0.21, 0.76, 0.80, 1.0));
     nav_marker.set_visible(false);
     let mut cursor_px = (0.0f64, 0.0f64);
@@ -1214,7 +1227,9 @@ pub async fn run(cfg: DemoCfg) {
                                     };
                                     t = (h - o.z) / d.z;
                                 }
-                                let hit = o + d * t;
+                                let mut hit = o + d * t;
+                                let off0 = offset_of(0);
+                                hit.z = marker_ground(&strips, terrain, off0, hit.x, hit.y);
                                 wander = false;
                                 nav_target = Some(hit);
                                 nav_marker.set_pose(Pose3::from_parts(
@@ -1254,11 +1269,7 @@ pub async fn run(cfg: DemoCfg) {
             // Keep the stroll on the strip (it is ~PATCH wide; lane center
             // is the robot's spawn y).
             let ty = (base[1] + off0.y + dist * ang.sin()).clamp(off0.y - 3.0, off0.y + 3.0);
-            let tz = if terrain {
-                strips[0].height(tx - off0.x, ty - off0.y)
-            } else {
-                0.0
-            };
+            let tz = marker_ground(&strips, terrain, off0, tx, ty);
             let hit = Vec3::new(tx, ty, tz);
             nav_target = Some(hit);
             nav_marker.set_pose(Pose3::from_parts(
