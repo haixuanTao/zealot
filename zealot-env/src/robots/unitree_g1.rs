@@ -198,10 +198,15 @@ pub const fn unitree_g1_agile() -> RobotSpec {
 /// full 35 does not.
 ///
 /// Leg gains/limits are identical to [`unitree_g1`] (the rev 1.0 leg ranges
-/// match the 12-DOF model's). `held_joints` gains hold the upper body at the
-/// rest pose: waist like a hip (kp 100), arms kp 40 / kd 1 — holding gains,
-/// not deployment sysid. Efforts are the model's actuator limits (waist yaw
-/// 88 / waist roll+pitch 50 / arm joints 25 N·m).
+/// match the 12-DOF model's). `held_joints` gains are the DEPLOYMENT table
+/// (same as [`unitree_g1_29dof_agile`]'s upper body): waist kp 300 / kd 5,
+/// shoulder_pitch 90/2, shoulder_roll 60/1, shoulder_yaw 20/0.4, elbow 60/1,
+/// wrist_roll 4/0.2. The old kp 100 / kd 2 waist "holding gains" put the
+/// chest's natural frequency (~1.5–2 Hz at ζ≈0.1) right at step cadence —
+/// the gait drove the chest at resonance, AND trained a different upper-body
+/// plant than the MuJoCo harness / LeRobot controller deploy at. Efforts are
+/// the model's actuator limits (waist yaw 88 / waist roll+pitch 50 / arm
+/// joints 25 N·m).
 pub const fn unitree_g1_29dof() -> RobotSpec {
     let mut spec = unitree_g1();
     spec.name = "unitree_g1_29dof";
@@ -211,12 +216,15 @@ pub const fn unitree_g1_29dof() -> RobotSpec {
     // A fallen robot contacts the ground with its (collider-less) upper body —
     // count torso/waist/arm links as illegal ground contact alongside hips/knees.
     spec.illegal_ground_fragments = &["hip", "knee", "torso", "waist", "shoulder", "elbow", "wrist"];
+    // Fragment match order: most specific first (first match wins).
     spec.held_joints = &[
-        ("waist_yaw", 100.0, 2.0, 88.0),
-        ("waist", 100.0, 2.0, 50.0), // waist_roll / waist_pitch
-        ("shoulder", 40.0, 1.0, 25.0),
-        ("elbow", 40.0, 1.0, 25.0),
-        ("wrist", 40.0, 1.0, 25.0), // wrist_roll (pitch/yaw are welded)
+        ("waist_yaw", 300.0, 5.0, 88.0),
+        ("waist", 300.0, 5.0, 50.0), // waist_roll / waist_pitch
+        ("shoulder_pitch", 90.0, 2.0, 25.0),
+        ("shoulder_roll", 60.0, 1.0, 25.0),
+        ("shoulder", 20.0, 0.4, 25.0), // shoulder_yaw
+        ("elbow", 60.0, 1.0, 25.0),
+        ("wrist", 4.0, 0.2, 25.0), // wrist_roll (pitch/yaw are welded)
     ];
     spec
 }

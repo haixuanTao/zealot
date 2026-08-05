@@ -463,6 +463,13 @@ pub struct LinkIndices {
     pub colliders_per_batch: u32,
     /// Multibody link index of the torso (always 0 — the root).
     pub torso_link: u32,
+    /// Multibody link index of the CHEST — the `torso_link` body above the
+    /// waist chain on full-body models. Every "stability" reward term reads the
+    /// pelvis (link 0); the chest rides above three PD-held waist joints and is
+    /// otherwise invisible to the reward. Falls back to 0 (pelvis) on models
+    /// without a `torso_link` body (legs-only), where the chest term would
+    /// duplicate `body_ang_vel` anyway.
+    pub chest_link: u32,
     /// Multibody link indices of the two feet (assembly order).
     pub foot_links: [u32; NUM_FEET],
     /// Links that must NEVER touch the ground (thigh / shin / hip) — only the
@@ -994,6 +1001,7 @@ fn build_env_scene(
         // robot bodies + ground (+ terrain trimesh when BIPED_TERRAIN=1)
         colliders_per_batch: (mjcf.len() + 1 + terrain_shape.is_some() as usize) as u32,
         torso_link: 0,
+        chest_link: link_of_name("torso_link").unwrap_or(0),
         foot_links,
         illegal_ground_links,
         self_collision_pairs,
@@ -1258,7 +1266,7 @@ pub struct BipedNexusBatchEnv {
 }
 
 /// Number of logged reward components (see [`REWARD_COMP_NAMES`]).
-pub const NUM_REWARD_COMPS: usize = 29;
+pub const NUM_REWARD_COMPS: usize = 30;
 
 /// Names of the per-component reward terms, in `rlog_comps` / `RewardLog::comps`
 /// order. The first 20 mirror `RewardBreakdown`'s live terms; the last four are
@@ -1294,6 +1302,7 @@ pub const REWARD_COMP_NAMES: [&str; NUM_REWARD_COMPS] = [
     "com_centering", // CoM-over-support-foot (low-ankle-torque single-support)
     "stand_planted", // per-airborne-foot penalty at standing command (balance, don't step)
     "feet_yaw_diff", // WBC feet_yaw_diff_l2: L/R foot yaw splay penalty
+    "chest_ang_vel", // chest-link roll/pitch rate penalty (BIPED_CHEST_ANGVEL_W)
 ];
 
 /// One window of accumulated reward/termination stats (see `take_reward_log`).
@@ -3100,6 +3109,19 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(4e-3);
+        // Chest angular-velocity penalty (BIPED_CHEST_ANGVEL_W, 0 = off).
+        // Every other stability term reads the PELVIS (link 0); on the 29-DOF
+        // body the chest above the waist joints is invisible to the reward, so
+        // the policy never learns pelvis trajectories that don't shake what's
+        // above them. Penalizes the chest link's roll/pitch rate ω²_xy
+        // (finite-diff, same approximation as the base ang-vel obs) — yaw is
+        // excluded so turning with the commanded heading isn't taxed. The
+        // Isaac-Lab humanoid analogue is `ang_vel_xy_l2` on the torso link.
+        let chest_w: f32 = std::env::var("BIPED_CHEST_ANGVEL_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let chest_link = self.idx.chest_link as usize;
         let cpb_idx = self.idx.colliders_per_batch as usize;
         let computed: Vec<PerEnv> = (0..self.n)
             .into_par_iter()
@@ -3204,6 +3226,19 @@ impl BipedNexusBatchEnv {
                     comps[24] = -(power_w * power) * sc_dt;
                     reward -=
                         (torque_w * leg_pen + ankle_torque_w * ankle_pen + power_w * power) * sc_dt;
+                }
+                // Chest roll/pitch rate penalty (see `chest_w` above). Same
+                // finite-diff ω approximation as `read_state_from_poses`.
+                if chest_w > 0.0 && self.has_prev_pose[e] {
+                    let cur = &poses[env_base + chest_link];
+                    let prev = &self.prev_body_poses[env_base + chest_link];
+                    let dq = cur.rotation * prev.rotation.conjugate();
+                    let s = if dq.w >= 0.0 { 1.0 } else { -1.0 };
+                    let wx = 2.0 * s * dq.x / sc_dt;
+                    let wy = 2.0 * s * dq.y / sc_dt;
+                    let pen = chest_w * (wx * wx + wy * wy) * sc_dt;
+                    comps[29] = -pen;
+                    reward -= pen;
                 }
                 let mut obs = vec![0.0; OBS_DIM];
                 self.task.observe(&state, &self.cmd[e], &mut obs);
