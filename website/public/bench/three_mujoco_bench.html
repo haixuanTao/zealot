@@ -539,6 +539,10 @@
     const sun = new THREE.DirectionalLight(0xffffff, 1.4);
     sun.position.set(-2, 3, 5);
     scene.add(sun);
+    // Terrain visual, kept for the tap-to-walk raycast (assigned during the
+    // scene build below — declared here so the assignment isn't a
+    // temporal-dead-zone error).
+    let terrainMesh = null;
     const ground = new THREE.Mesh(
       new THREE.BoxGeometry(200, 200, 0.1),
       new THREE.MeshStandardMaterial({ color: 0x24565a, roughness: 0.95 }));
@@ -626,7 +630,6 @@
     // ---- Tap-to-walk: raycast the tap to a ground point and steer the
     // velocity command toward it (P-controller on heading + distance — the
     // policy still only ever sees a velocity command).
-    let terrainMesh = null;
     let navTarget = null;
     const navMarker = (() => {
       const g = new THREE.RingGeometry(0.16, 0.24, 32);
