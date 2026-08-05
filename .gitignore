@@ -16,3 +16,4 @@ overnight/*.log
 overnight/STATUS
 /naga-fixed/
 *.safetensors
+checkpoints/

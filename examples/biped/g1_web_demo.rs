@@ -233,6 +233,160 @@ mod drive {
     }
 }
 
+/// Live VR upper-body input (`?vr=<ws-url>`): a WebSocket client for the
+/// retarget bridge (`examples/vr_teleop/retarget_bridge.py`), which publishes
+/// `{"arm_targets": {joint_name: radians}, "stick": [lx,ly,rx,ry],
+/// "fresh": bool}` at ~50 Hz. The sim loop maps `arm_targets` onto the env's
+/// PD-held joints (`set_live_arm_targets`) and the left stick onto the
+/// velocity command. Stale/no data (headset asleep, bridge down) reads as
+/// None and the arms fade back home.
+#[cfg(target_arch = "wasm32")]
+mod vr {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    #[derive(Default)]
+    struct State {
+        targets: HashMap<String, f32>,
+        stick: [f32; 4],
+        fresh: bool,
+        last_msg_ms: f64,
+        enabled: bool,
+    }
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::new(State::default());
+    }
+
+    fn now_ms() -> f64 {
+        js_sys::Date::now()
+    }
+
+    /// `?vr=` value (percent-encoded ws URL), if present.
+    pub fn url_param() -> Option<String> {
+        let search = web_sys::window()?.location().search().ok()?;
+        for kv in search.trim_start_matches('?').split('&') {
+            if let Some(v) = kv.strip_prefix("vr=") {
+                let dec = js_sys::decode_uri_component(v)
+                    .ok()
+                    .map(|s| String::from(s))
+                    .unwrap_or_else(|| v.to_string());
+                if !dec.is_empty() {
+                    return Some(dec);
+                }
+            }
+        }
+        None
+    }
+
+    /// Connect to the bridge; messages update the shared state, the sim loop
+    /// polls it. Reconnects are the user's F5 — this is a demo, not a daemon.
+    pub fn install(url: &str) {
+        let Ok(ws) = web_sys::WebSocket::new(url) else {
+            web_sys::console::warn_1(&format!("VR: bad ws url {url}").into());
+            return;
+        };
+        STATE.with(|s| s.borrow_mut().enabled = true);
+        let onmessage = Closure::<dyn FnMut(_)>::new(move |ev: web_sys::MessageEvent| {
+            let Some(txt) = ev.data().as_string() else { return };
+            let Ok(v) = js_sys::JSON::parse(&txt) else { return };
+            let get = |k: &str| js_sys::Reflect::get(&v, &k.into()).ok();
+            STATE.with(|s| {
+                let mut st = s.borrow_mut();
+                if let Some(t) = get("arm_targets") {
+                    if let Some(obj) = t.dyn_ref::<js_sys::Object>() {
+                        st.targets.clear();
+                        for entry in js_sys::Object::entries(obj).iter() {
+                            let pair: js_sys::Array = entry.into();
+                            if let (Some(k), Some(val)) =
+                                (pair.get(0).as_string(), pair.get(1).as_f64())
+                            {
+                                st.targets.insert(k, val as f32);
+                            }
+                        }
+                    }
+                }
+                if let Some(sv) = get("stick") {
+                    let arr: js_sys::Array = sv.into();
+                    for i in 0..4 {
+                        st.stick[i] = arr.get(i as u32).as_f64().unwrap_or(0.0) as f32;
+                    }
+                }
+                st.fresh = get("fresh").map(|f| f.is_truthy()).unwrap_or(false);
+                st.last_msg_ms = now_ms();
+            });
+        });
+        ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        onmessage.forget();
+        let url_owned = url.to_string();
+        let onopen = Closure::<dyn FnMut()>::new(move || {
+            web_sys::console::log_1(&format!("VR: connected to {url_owned}").into());
+        });
+        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+        onopen.forget();
+    }
+
+    pub fn enabled() -> bool {
+        STATE.with(|s| s.borrow().enabled)
+    }
+
+    /// Held-joint targets in the given (env staging) order; None when the
+    /// stream is absent, stale, or body tracking isn't fresh. Joints the
+    /// bridge doesn't know keep their staged home (the bridge only speaks
+    /// arms; the waist rides at home).
+    pub fn arm_targets(names: &[String], homes: &[f32]) -> Option<Vec<f32>> {
+        STATE.with(|s| {
+            let st = s.borrow();
+            let live = st.enabled && st.fresh && (now_ms() - st.last_msg_ms) < 1000.0;
+            if !live || st.targets.is_empty() {
+                return None;
+            }
+            Some(
+                names
+                    .iter()
+                    .zip(homes)
+                    .map(|(n, h)| st.targets.get(n).copied().unwrap_or(*h))
+                    .collect(),
+            )
+        })
+    }
+
+    /// Left stick → velocity command (fwd/back + steer), deadzoned. None
+    /// when centred or stale — the caller latches stand on the transition.
+    pub fn stick_command() -> Option<[f32; 3]> {
+        STATE.with(|s| {
+            let st = s.borrow();
+            if !st.enabled || (now_ms() - st.last_msg_ms) > 1000.0 {
+                return None;
+            }
+            let dead = |v: f32| if v.abs() < 0.15 { 0.0 } else { v };
+            let (lx, ly) = (dead(st.stick[0]), dead(st.stick[1]));
+            if lx == 0.0 && ly == 0.0 {
+                return None;
+            }
+            Some([(ly * 0.6).clamp(-0.4, 0.6), 0.0, (-lx * 0.8).clamp(-1.0, 1.0)])
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod vr {
+    pub fn url_param() -> Option<String> {
+        None
+    }
+    pub fn install(_url: &str) {}
+    pub fn enabled() -> bool {
+        false
+    }
+    pub fn arm_targets(_names: &[String], _homes: &[f32]) -> Option<Vec<f32>> {
+        None
+    }
+    pub fn stick_command() -> Option<[f32; 3]> {
+        None
+    }
+}
+
 /// Env knobs the demo needs regardless of target. `std::env::set_var` PANICS
 /// on wasm32-unknown-unknown, so these go through programmatic overrides. Must
 /// run BEFORE the env is constructed. Decimation 8 → 2.5 ms sim dt — the
@@ -1118,6 +1272,16 @@ pub async fn run(cfg: DemoCfg) {
 
 
     drive::install();
+
+    // Live VR upper-body (`?vr=<ws-url>`): connect to the retarget bridge
+    // (examples/vr_teleop/retarget_bridge.py) and mirror the operator's arms
+    // on the PD-held joints while the policy keeps balancing.
+    if let Some(u) = vr::url_param() {
+        vr::install(&u);
+    }
+    let held_names = env.held_joint_names();
+    let held_homes = env.held_joint_homes();
+    let mut vr_stick_live = false;
     // Start the latched command at what the demo is already running, so the
     // first tap bumps up from the visible value instead of from zero.
     drive::sync(cmd_ui);
@@ -1259,6 +1423,37 @@ pub async fn run(cfg: DemoCfg) {
             nav_target = None;
             nav_marker.set_visible(false);
             nav_cmd = drive_now.unwrap_or(cmd_ui);
+        }
+
+        // Live VR: restage the held joints from the retargeted arm stream
+        // (fading home whenever it goes stale), and let the headset's left
+        // stick drive the velocity command like the keyboard does.
+        if vr::enabled() {
+            match vr::arm_targets(&held_names, &held_homes) {
+                Some(t) => env.set_live_arm_targets(&t),
+                None => env.clear_live_arm_targets(),
+            }
+            // This demo's control step is GPU-resident and never calls
+            // env.step() — stage + upload the held targets explicitly.
+            env.stage_and_flush_arm_targets();
+            let vr_cmd = vr::stick_command();
+            if vr_cmd.is_some() || vr_stick_live {
+                let c = vr_cmd.unwrap_or([0.0; 3]);
+                vr_stick_live = vr_cmd.is_some();
+                wander = false;
+                nav_target = None;
+                nav_marker.set_visible(false);
+                if cmds.iter().any(|p| *p != c) {
+                    cmd_ui = c;
+                    drive::sync(c);
+                    last_drive_cmd = drive::command();
+                    for e in 0..n_robots {
+                        cmds[e] = c;
+                        env.pin_command_for(e, c[0], c[1], c[2]);
+                        gobs.set_cmd(&backend, e, c).expect("cmd");
+                    }
+                }
+            }
         }
 
         // Wander: pick a stroll point 2–3.5 m out at a random bearing once

@@ -178,10 +178,50 @@ write_index_html() {
       display: none;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .vr-btn {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 5;
+      background: rgba(13, 43, 46, 0.8);
+      color: #35c1cd;
+      border: 1px solid #1c4a4f;
+      border-radius: 6px;
+      padding: 5px 10px;
+      font: 12px system-ui, sans-serif;
+      cursor: pointer;
+    }
+    .vr-btn:hover { background: #1c4a4f; }
+    .vr-btn.on { color: #7ee787; border-color: #7ee787; }
   </style>
 </head>
 <body>
   <div class="loading" id="loading">Loading WebAssembly (GPU physics)...</div>
+  <button class="vr-btn" id="vrBtn" title="Mirror your upper body from a VR headset via the retarget bridge (examples/vr_teleop)">🥽 VR</button>
+  <script>
+    // VR settings: prompt for the retarget-bridge WebSocket URL and reload
+    // with ?vr=<url> — the wasm connects at startup and drives the held
+    // arm joints from the stream (examples/vr_teleop/retarget_bridge.py).
+    (() => {
+      const q = new URLSearchParams(location.search);
+      const btn = document.getElementById('vrBtn');
+      const current = q.get('vr');
+      if (current) {
+        btn.classList.add('on');
+        btn.textContent = '🥽 VR ✓';
+      }
+      btn.addEventListener('click', () => {
+        const url = prompt(
+          'Retarget bridge WebSocket URL (empty to disconnect):',
+          current || 'ws://localhost:8765',
+        );
+        if (url === null) return;
+        if (url.trim() === '') q.delete('vr');
+        else q.set('vr', url.trim());
+        location.search = q.toString();
+      });
+    })();
+  </script>
   <script>
     // Mirror the first WebGPU/shader error into the tab TITLE. On Safari and
     // Firefox the devtools console can't be reached from automation, but the

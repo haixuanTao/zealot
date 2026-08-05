@@ -1543,6 +1543,13 @@ pub struct BipedNexusBatchEnv {
     /// stand→stand resample that draws a fresh clip window — so the held
     /// PD targets never see a step input between unrelated poses.
     arm_blend: Vec<f32>,
+    /// Externally-driven held-joint targets (VR teleop / web demo): when
+    /// `Some`, they replace clip-or-home as the staging destination for
+    /// EVERY env until cleared. Length = `idx.held.len()`, staging order.
+    live_arm: Option<Vec<f32>>,
+    /// Staging steps left after a live clear, so the fade back home
+    /// completes even with no clips configured.
+    live_fadeout: u32,
     /// Crossfade source: the held targets staged at the moment of the last
     /// destination switch (`env * held.len() + j`).
     arm_from: Vec<f32>,
@@ -2373,6 +2380,8 @@ impl BipedNexusBatchEnv {
             // Blend starts settled-at-home (1.0, staged == home): the spawn
             // pose holds home, so there is nothing to fade from.
             arm_blend: vec![1.0; num_envs],
+            live_arm: None,
+            live_fadeout: 0,
             arm_from: held_homes
                 .iter()
                 .copied()
@@ -3196,47 +3205,63 @@ impl BipedNexusBatchEnv {
     /// held joints at the home pose, so a lingering blend would drag the
     /// fresh episode's arms through a stale clip pose.
     fn arm_reset(&mut self, e: usize) {
-        if self.arm_motion.is_none() {
+        if self.arm_motion.is_none() && self.live_arm.is_none() {
             return;
         }
         let n_held = self.idx.held.len();
         self.arm_active[e] = false;
-        self.arm_blend[e] = 1.0; // settled at home, nothing to fade from
+        // Settled at home (nothing to fade from) — unless live targets are
+        // installed, in which case fade home → live instead of jumping.
+        self.arm_blend[e] = if self.live_arm.is_some() { 0.0 } else { 1.0 };
         for (j, h) in self.idx.held.iter().enumerate() {
             self.arm_staged[e * n_held + j] = h.home;
+            self.arm_from[e * n_held + j] = h.home;
         }
     }
 
     /// Advance every env's playback one control step and restage the held
     /// joints' PD targets in the `links_static` mirror (uploaded by the same
     /// `flush_links_static` that carries the leg targets). No-op when
-    /// BIPED_ARM_MOTION is unset — staging stays bit-identical to before.
+    /// BIPED_ARM_MOTION is unset and no live targets are installed —
+    /// staging stays bit-identical to before.
     fn stage_arm_motion(&mut self) {
         let dt = self.task.control_dt();
-        let Some(am) = &self.arm_motion else { return };
+        if self.arm_motion.is_none() && self.live_arm.is_none() && self.live_fadeout == 0 {
+            return;
+        }
+        if self.live_arm.is_none() && self.live_fadeout > 0 {
+            self.live_fadeout -= 1;
+        }
+        let clip_scale = self.arm_motion.as_ref().map(|am| am.scale).unwrap_or(1.0);
         let n_held = self.idx.held.len();
         let mbs = self.state.multibodies_mut();
         for e in 0..self.n {
             // Crossfade `arm_from` → destination over ~0.5 s (smoothstep, so
             // the fade starts and ends with zero velocity). The destination
-            // is the LIVE clip pose (already moving during the fade) or home;
-            // `arm_from` was snapshotted at the last destination switch, so
-            // every transition — activation, deactivation, stand→stand clip
-            // swap — leaves from wherever the arms currently are.
+            // is the LIVE external target, the clip pose (already moving
+            // during the fade), or home; `arm_from` was snapshotted at the
+            // last destination switch, so every transition — activation,
+            // deactivation, stand→stand clip swap, live install/clear —
+            // leaves from wherever the arms currently are.
             let b = (self.arm_blend[e] + dt / 0.5).min(1.0);
             self.arm_blend[e] = b;
             let s = b * b * (3.0 - 2.0 * b);
             if self.arm_active[e] {
                 self.arm_time[e] += dt;
-                let clip = &am.clips[self.arm_clip[e] as usize];
-                clip.sample(self.arm_time[e], &mut self.arm_scratch);
+                if let Some(am) = &self.arm_motion {
+                    let clip = &am.clips[self.arm_clip[e] as usize];
+                    clip.sample(self.arm_time[e], &mut self.arm_scratch);
+                }
             }
+            let live = self.live_arm.as_deref();
             for (j, h) in self.idx.held.iter().enumerate() {
-                // Destination: amplitude-scaled clip pose (or home), clamped
-                // into the joint's mechanical range (retargeted mocap can
-                // exceed it).
-                let dest = if self.arm_active[e] {
-                    (h.home + am.scale * (self.arm_scratch[j] - h.home))
+                // Destination: live external target, or amplitude-scaled clip
+                // pose (or home) — always clamped into the joint's mechanical
+                // range (retargeted mocap/VR can exceed it).
+                let dest = if let Some(lv) = live {
+                    lv[j].clamp(h.range.0, h.range.1)
+                } else if self.arm_active[e] {
+                    (h.home + clip_scale * (self.arm_scratch[j] - h.home))
                         .clamp(h.range.0, h.range.1)
                 } else {
                     h.home
@@ -3251,6 +3276,69 @@ impl BipedNexusBatchEnv {
                 self.arm_staged[e * n_held + j] = q;
             }
         }
+    }
+
+    /// Names of the PD-held (non-action) joints in staging order — the key
+    /// for mapping external (VR) targets onto `set_live_arm_targets`.
+    pub fn held_joint_names(&self) -> Vec<String> {
+        self.idx.held.iter().map(|h| h.name.clone()).collect()
+    }
+
+    /// Hold-pose targets of the held joints, same order as
+    /// `held_joint_names()` — the fallback for joints an external source
+    /// doesn't provide.
+    pub fn held_joint_homes(&self) -> Vec<f32> {
+        self.idx.held.iter().map(|h| h.home).collect()
+    }
+
+    /// Install externally-driven held-joint targets (VR teleop): they
+    /// override clip/home as the staging destination for EVERY env until
+    /// cleared, crossfading from the current pose on install (same ~0.5 s
+    /// smoothstep as clip transitions). Length must match
+    /// `held_joint_names()`; subsequent calls update in place (no re-fade).
+    pub fn set_live_arm_targets(&mut self, targets: &[f32]) {
+        let n_held = self.idx.held.len();
+        assert_eq!(targets.len(), n_held, "expected one target per held joint");
+        if self.live_arm.is_none() {
+            for e in 0..self.n {
+                self.arm_from[e * n_held..(e + 1) * n_held]
+                    .copy_from_slice(&self.arm_staged[e * n_held..(e + 1) * n_held]);
+                self.arm_blend[e] = 0.0;
+            }
+        }
+        self.live_arm = Some(targets.to_vec());
+    }
+
+    /// For GPU-resident callers (the web demo's single-submit control step
+    /// bypasses `step()`, so `stage_arm_motion` never runs there): stage the
+    /// live/clip held-joint targets and upload the links buffer now. The
+    /// mirror's ACTUATED entries may be stale — harmless, the GPU scatter
+    /// rewrites them from the policy output within the same control step,
+    /// before any physics substep runs.
+    pub fn stage_and_flush_arm_targets(&mut self) {
+        if self.arm_motion.is_none() && self.live_arm.is_none() && self.live_fadeout == 0 {
+            return;
+        }
+        self.stage_arm_motion();
+        self.state
+            .multibodies_mut()
+            .flush_links_static(&self.gpu)
+            .expect("flush arm targets");
+    }
+
+    /// Remove live targets, crossfading the held joints back to clip/home.
+    pub fn clear_live_arm_targets(&mut self) {
+        if self.live_arm.is_none() {
+            return;
+        }
+        let n_held = self.idx.held.len();
+        for e in 0..self.n {
+            self.arm_from[e * n_held..(e + 1) * n_held]
+                .copy_from_slice(&self.arm_staged[e * n_held..(e + 1) * n_held]);
+            self.arm_blend[e] = 0.0;
+        }
+        self.live_arm = None;
+        self.live_fadeout = 30; // ~0.6 s of staging to finish the fade home
     }
 
     pub async fn step(&mut self, actions: &[[f32; NUM_JOINTS]]) -> Vec<StepOut> {

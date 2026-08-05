@@ -7,7 +7,7 @@ onto the PD-held arms in real time; the whole thing renders in a browser tab —
 no native viewer, works on a headless host.
 
 ```
-PICO headset ──XRoboToolkit──▶ G1 Orin (orin/pose_pub.py, ZMQ :5556)
+PICO headset ──XRoboToolkit──▶ G1 Orin (headset_server/pose_pub.py, ZMQ :5556)
                                    │ smpl joints + wrist quats + sticks + triggers
                                    ▼
                 Mac/laptop: g1_vr_stand.py
@@ -30,7 +30,7 @@ pip install mujoco zmq websockets safetensors   # python 3.10+
 
 Robot side (one-time; survives reboots once in `~unitree`):
 ```bash
-scp orin/pose_pub.py unitree@<robot-ip>:~/
+scp headset_server/pose_pub.py unitree@<robot-ip>:~/
 # XRoboToolkit PC service must be installed (GR00T-WholeBodyControl install_pico.sh)
 ```
 
@@ -63,7 +63,7 @@ Extras in this directory:
 - `fake_publisher.py` — synthetic pose source; test everything with zero hardware
 - `g1_mirror.py --test` — offline retarget sanity renders (needs the GR00T
   `g1_gear_wbc` model in `g1_model/`, scp'able from the robot)
-- `orin/start_pico.sh` — swaps the publisher for GR00T's real `--manager`
+- `headset_server/start_sonic_manager.sh` — swaps the publisher for GR00T's real `--manager`
   streamer (button-driven SONIC pipeline); both bind :5556, one at a time
 
 ## Notes & failure modes
@@ -78,3 +78,13 @@ Extras in this directory:
   relaunch pose_pub, force-quit + reopen the headset app, Reconnect.
 - Wrist-twist axis conventions are set by `TWIST_AXIS_COL` / `TWIST_SIGN` in
   `g1_mirror.py` — flip there if your pronation mirrors.
+
+## Driving the zealot WEBSITE demo (nexus, in-browser)
+
+The main site demo (`website/public/demos/g1_web`) has a **🥽 VR** button:
+run `retarget_bridge.py` anywhere reachable, click the button, enter its
+WebSocket URL (`ws://localhost:8765`), and the fleet mirrors your upper body
+on nexus GPU physics while walking — same stream, zero extra installs.
+`retarget_bridge.py` is the shared util: headset ZMQ in, named G1 joint
+targets + stick + triggers out over WebSocket, for the website demo, the
+MuJoCo scripts here, or anything else.
