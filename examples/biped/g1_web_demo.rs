@@ -1138,8 +1138,24 @@ pub async fn run(cfg: DemoCfg) {
     // any user input (tap, key, gamepad, slider, preset) takes over.
     let mut wander = true;
     let mut wander_seeded = false;
-    // Cheap LCG; statistical quality is irrelevant for picking stroll points.
-    let mut wander_rng: u32 = 0x9E37_79B9;
+    // Cheap LCG; statistical quality is irrelevant for picking stroll
+    // points — but the SEED must differ per page load, or every visitor
+    // watches the identical walk (wasm is deterministic; a constant here
+    // meant exactly that).
+    let mut wander_rng: u32 = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            (js_sys::Date::now().to_bits() ^ js_sys::Math::random().to_bits()) as u32
+                ^ 0x9E37_79B9
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0x9E37_79B9)
+        }
+    };
     let mut wander_rand = move || {
         wander_rng = wander_rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         (wander_rng >> 8) as f32 / (1u32 << 24) as f32
@@ -1216,7 +1232,9 @@ pub async fn run(cfg: DemoCfg) {
 
         // Wander: pick a stroll point 2–3.5 m out at a random bearing once
         // the spawn has settled, and again at every arrival below.
-        if wander && !wander_seeded && sim_time > 1.5 {
+        // Draw the first stroll point almost immediately — the marker gives
+        // the opening seconds intent even while the spawn drop settles.
+        if wander && !wander_seeded && sim_time > 0.2 {
             wander_seeded = true;
             let off0 = offset_of(0);
             let (base, _) = env.base_pose_for(0, &pose_stream.poses);
