@@ -1229,6 +1229,12 @@ pub async fn run(cfg: DemoCfg) {
                                 }
                                 let mut hit = o + d * t;
                                 let off0 = offset_of(0);
+                                // Keep targets ON the strip: taps past its
+                                // edge clamp to the nearest on-terrain point
+                                // (the strip is the demo's world).
+                                if terrain {
+                                    hit.y = hit.y.clamp(off0.y - 3.6, off0.y + 3.6);
+                                }
                                 hit.z = marker_ground(&strips, terrain, off0, hit.x, hit.y);
                                 wander = false;
                                 nav_target = Some(hit);

@@ -71,12 +71,3 @@ Three steps — full walkthrough in
 3. **Watch *your* policy walk** — upload the checkpoint to Hugging Face and
    open `https://haixuantao.github.io/zealot/?ckpt=your-name/your-repo`.
 
-## Documentation
-
-API reference (rustdoc):
-[**`zealot_env`**](https://haixuantao.github.io/zealot/doc/zealot_env/) ·
-[**`zealot_rl`**](https://haixuantao.github.io/zealot/doc/zealot_rl/).
-Guides live in [`docs/`](docs/): [getting started](docs/getting-started.md) ·
-[development](docs/development.md) · [benchmarks](docs/benchmarks.md) ·
-[explanation](docs/explanation.md).
-

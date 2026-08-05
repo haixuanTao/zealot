@@ -664,9 +664,14 @@
       const hits = navRay.intersectObjects(terrainMesh ? [terrainMesh] : [ground]);
       if (!hits.length) return;
       const h = hits[0].point;
+      // Clamp taps onto the strip; the flat apron past its edge is walkable
+      // but off the demo's world.
+      const tx = h.x;
+      const ty = TERRAIN ? Math.max(-3.6, Math.min(3.6, h.y)) : h.y;
+      const tz = TERRAIN && terrain ? terrain.groundAt(tx, ty) : h.z;
       wander = false;
-      navTarget = { x: h.x, y: h.y };
-      navMarker.position.set(h.x, h.y, h.z + 0.03);
+      navTarget = { x: tx, y: ty };
+      navMarker.position.set(tx, ty, tz + 0.03);
       navMarker.visible = true;
     }
     function cancelNav() {
