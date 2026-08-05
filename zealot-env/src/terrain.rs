@@ -121,24 +121,37 @@ impl TerrainFamily {
         // only: the renderer records env 0, whose family would otherwise be
         // fixed at Boxes by the modulo, so there is no other way to roll out
         // on the step strip.
-        if let Ok(f) = std::env::var("BIPED_TERRAIN_FAMILY") {
-            return match f.to_ascii_lowercase().as_str() {
-                "boxes" => TerrainFamily::Boxes,
-                "rough" => TerrainFamily::Rough,
-                "wave" => TerrainFamily::Wave,
-                "step" => TerrainFamily::Step,
-                other => panic!("unknown BIPED_TERRAIN_FAMILY '{other}'"),
-            };
+        // Both env lookups are cached in OnceLocks: of_env runs per foot per
+        // env per step inside the parallel reward block, and std::env::var
+        // takes a process-global lock + scans the environment on every call —
+        // reading it uncached measured +10 ms/step of lock contention at
+        // 4096 envs (reward pass 14 -> 24 ms).
+        static FORCED: std::sync::OnceLock<Option<TerrainFamily>> = std::sync::OnceLock::new();
+        let forced = FORCED.get_or_init(|| {
+            std::env::var("BIPED_TERRAIN_FAMILY").ok().map(|f| {
+                match f.to_ascii_lowercase().as_str() {
+                    "boxes" => TerrainFamily::Boxes,
+                    "rough" => TerrainFamily::Rough,
+                    "wave" => TerrainFamily::Wave,
+                    "step" => TerrainFamily::Step,
+                    other => panic!("unknown BIPED_TERRAIN_FAMILY '{other}'"),
+                }
+            })
+        });
+        if let Some(f) = forced {
+            return *f;
         }
-        // BIPED_TERRAIN_STEP=0 drops the Step family from the rotation
-        // (envs cycle the three noise families instead). The Step strip's
-        // box-cell TRIMESH is what moved training from ~1.6 to ~2.4-3.0
-        // s/iter (gpuwait 62.5 ms/control step vs the heightfield-era cost):
-        // parking the step skill buys the iteration rate back without
-        // touching the obs contract (the 53-wide cue frame stays, zeroed).
-        let step_on = std::env::var("BIPED_TERRAIN_STEP")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        // BIPED_TERRAIN_STEP=0 drops the Step family from the rotation (envs
+        // cycle the three noise families instead), parking the step skill
+        // without touching the obs contract (the 53-wide cue frame stays,
+        // zeroed). NOTE: measured A/B showed the step trimesh itself does NOT
+        // cost iteration time (gpuwait identical with and without).
+        static STEP_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let step_on = *STEP_ON.get_or_init(|| {
+            std::env::var("BIPED_TERRAIN_STEP")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        });
         if step_on {
             match env_id % 4 {
                 0 => TerrainFamily::Boxes,
