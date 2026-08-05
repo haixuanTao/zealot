@@ -82,6 +82,13 @@ Checkpoints publish to
 and are directly loadable in the live demo. Sim2sim harnesses (MuJoCo,
 Genesis, Isaac) live in `scripts/` and `examples/biped/`.
 
+## API docs
+
+Rustdoc for the library crates is hosted with the demo site:
+[**haixuantao.github.io/zealot/doc**](https://haixuantao.github.io/zealot/doc/)
+(`zealot_env` — the env/MDP layer — and `zealot_rl`, the CPU reference
+PPO/network implementations). Rebuilt on every site deploy.
+
 ## Benchmarks
 
 Full methodology, tables, and repro commands: [docs/benchmarks.md](docs/benchmarks.md).

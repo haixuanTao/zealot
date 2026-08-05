@@ -19,6 +19,20 @@ REMOTE=${DEPLOY_REMOTE:-origin}
 # .nojekyll keeps Pages from eating files that start with an underscore.
 touch "$DIST/.nojekyll"
 
+# API docs ride along under /doc/: rustdoc for the library crates, with a
+# tiny index redirect (there is no root crate to land on). Rebuilt on every
+# deploy — it's ~1 s warm and keeps the hosted docs from silently going
+# stale relative to the code the site claims to demonstrate.
+ZEALOT_DIR="$(dirname "$WEBSITE_DIR")"
+(cd "$ZEALOT_DIR" && cargo doc --no-deps -p zealot-env -p zealot-rl >/dev/null)
+rm -rf "$DIST/doc"
+cp -R "$ZEALOT_DIR/target/doc" "$DIST/doc"
+cat > "$DIST/doc/index.html" <<'HTML'
+<!DOCTYPE html><meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url=zealot_env/index.html">
+<a href="zealot_env/index.html">zealot API docs</a>
+HTML
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
