@@ -4,7 +4,8 @@
   <a href="https://haixuantao.github.io/zealot/"><b>Live demo</b></a> ·
   <a href="https://haixuantao.github.io/zealot/doc/"><b>Docs</b></a> ·
   <a href="docs/getting-started.md"><b>Getting started</b></a> ·
-  <a href="docs/benchmarks.md"><b>Benchmarks</b></a>
+  <a href="docs/benchmarks.md"><b>Benchmarks</b></a> ·
+  <a href="https://huggingface.co/haixuantao/zealot-g1-locomotion"><b>Policies</b></a>
 </p>
 
 A full whole-body-control training stack for humanoid robots — environment,
