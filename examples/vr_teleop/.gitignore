@@ -1,0 +1,7 @@
+playground_g1/
+menagerie_g1/
+checkpoints/
+g1_model/
+test_renders/
+__pycache__/
+*.pyc

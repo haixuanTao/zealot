@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PICO SMPL Stream Viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #101318; color: #dde3ea; font: 14px/1.4 -apple-system, sans-serif; overflow: hidden; }
+  #hud { position: fixed; top: 12px; left: 14px; background: rgba(16,19,24,.8); border: 1px solid #2a3340; border-radius: 8px; padding: 10px 14px; min-width: 220px; }
+  #hud b { color: #7fb4ff; }
+  #status { font-weight: 600; }
+  .ok { color: #5fd68b; } .bad { color: #ff7a76; } .wait { color: #ffc857; }
+  #hint { position: fixed; bottom: 10px; left: 14px; color: #5b6575; font-size: 12px; }
+  canvas { display: block; cursor: grab; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div>status: <span id="status" class="bad">connecting…</span></div>
+  <div>stream: <span id="rate">–</span> Hz &nbsp; frame: <span id="fidx">–</span></div>
+  <div>protocol: v<span id="ver">–</span></div>
+  <div>fields: <span id="fields" style="font-size:11px">–</span></div>
+  <div>wrists (rad): <span id="wrists" style="font-size:11px">–</span></div>
+</div>
+<div id="hint">drag to orbit &middot; scroll to zoom &middot; expects smpl_joints [24&times;3] on the 'pose' topic</div>
+<canvas id="c"></canvas>
+<script>
+// SMPL 24-joint hierarchy (parent of joint i), from vr3pt_pose_visualizer.py
+const PARENTS = [-1,0,0,0,1,2,3,4,5,6,7,8,9,9,9,12,13,14,16,17,18,19,20,21];
+const NAMES = ["pelvis","l_hip","r_hip","spine1","l_knee","r_knee","spine2","l_ankle","r_ankle",
+  "spine3","l_foot","r_foot","neck","l_collar","r_collar","head","l_shoulder","r_shoulder",
+  "l_elbow","r_elbow","l_wrist","r_wrist","l_hand","r_hand"];
+const LEFT = new Set([1,4,7,10,13,16,18,20,22]);
+const RIGHT = new Set([2,5,8,11,14,17,19,21,23]);
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let W, H;
+function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+addEventListener("resize", resize); resize();
+
+let yaw = 0.6, pitch = 0.25, zoom = 280;
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("mousedown", e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+addEventListener("mouseup", () => dragging = false);
+addEventListener("mousemove", e => {
+  if (!dragging) return;
+  yaw += (e.clientX - lastX) * 0.01; pitch += (e.clientY - lastY) * 0.01;
+  pitch = Math.max(-1.4, Math.min(1.4, pitch));
+  lastX = e.clientX; lastY = e.clientY;
+});
+canvas.addEventListener("wheel", e => { zoom *= Math.exp(-e.deltaY * 0.001); e.preventDefault(); }, { passive: false });
+
+let joints = null;   // [24][3]
+function project(p, cx, cy) {
+  // stream is z-up: rotate about z (yaw) then tilt (pitch); screen y is up
+  const [x, y, z] = p;
+  const x1 = x * Math.cos(yaw) - y * Math.sin(yaw);
+  const y1 = x * Math.sin(yaw) + y * Math.cos(yaw);
+  const y2 = y1 * Math.cos(pitch) - z * Math.sin(pitch);
+  const z2 = y1 * Math.sin(pitch) + z * Math.cos(pitch);
+  return [cx + x1 * zoom, cy - z2 * zoom, y2];
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  const cx = W / 2, cy = H * 0.55;
+  // ground grid (z=0 plane through pelvis-projected origin)
+  ctx.strokeStyle = "#1d232c"; ctx.lineWidth = 1;
+  for (let i = -5; i <= 5; i++) {
+    let a = project([i * 0.2, -1, 0], cx, cy), b = project([i * 0.2, 1, 0], cx, cy);
+    ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+    a = project([-1, i * 0.2, 0], cx, cy); b = project([1, i * 0.2, 0], cx, cy);
+    ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+  }
+  if (!joints) return;
+  // center on pelvis xy; anchor lowest joint to the grid plane
+  const px = joints[0][0], py = joints[0][1];
+  const zmin = Math.min(...joints.map(j => j[2]));
+  const pts = joints.map(j => project([j[0] - px, j[1] - py, j[2] - zmin], cx, cy));
+  for (let i = 1; i < 24; i++) {
+    const p = pts[i], q = pts[PARENTS[i]];
+    ctx.strokeStyle = LEFT.has(i) ? "#5fd68b" : RIGHT.has(i) ? "#7fb4ff" : "#dde3ea";
+    ctx.lineWidth = 3; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(q[0], q[1]); ctx.lineTo(p[0], p[1]); ctx.stroke();
+  }
+  for (let i = 0; i < 24; i++) {
+    ctx.fillStyle = i === 15 ? "#ffc857" : "#aab6c5";
+    ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], i === 15 ? 7 : 4, 0, 7); ctx.fill();
+  }
+}
+(function loop() { draw(); requestAnimationFrame(loop); })();
+
+const statusEl = document.getElementById("status");
+function connect() {
+  const ws = new WebSocket(`ws://${location.hostname}:8765`);
+  ws.onopen = () => { statusEl.textContent = "bridge connected"; statusEl.className = "wait"; };
+  ws.onclose = () => { statusEl.textContent = "bridge offline — retrying"; statusEl.className = "bad"; setTimeout(connect, 1500); };
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.waiting) { statusEl.textContent = "bridge up, no pose data yet"; statusEl.className = "wait"; return; }
+    statusEl.textContent = "streaming"; statusEl.className = "ok";
+    document.getElementById("rate").textContent = m.rx_hz ?? "–";
+    document.getElementById("fidx").textContent = m.frame_index ?? "–";
+    document.getElementById("ver").textContent = m.version ?? "–";
+    document.getElementById("fields").textContent = (m.fields || []).join(", ");
+    if (m.joint_pos) {
+      const w = m.joint_pos.slice(23, 29).map(v => v.toFixed(2));
+      document.getElementById("wrists").textContent = `L[${w.slice(0,3)}] R[${w.slice(3)}]`;
+    }
+    if (m.smpl_joints) joints = m.smpl_joints;
+  };
+}
+connect();
+</script>
+</body>
+</html>

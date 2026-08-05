@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>G1 Upper-Body Mirror</title>
+<style>
+  body { margin: 0; background: #101318; color: #dde3ea; font: 14px -apple-system, sans-serif; overflow: hidden; }
+  #hud { position: fixed; top: 12px; left: 14px; background: rgba(16,19,24,.85); border: 1px solid #2a3340; border-radius: 8px; padding: 10px 14px; z-index: 2; }
+  .ok { color: #5fd68b; } .bad { color: #ff7a76; } .wait { color: #ffc857; }
+  .push { background: #1d232c; color: #dde3ea; border: 1px solid #2a3340; border-radius: 5px; padding: 3px 8px; margin-right: 4px; cursor: pointer; font-size: 12px; }
+  .push:hover { background: #2a3340; }
+  #hint { position: fixed; bottom: 10px; left: 14px; color: #5b6575; font-size: 12px; z-index: 2; }
+</style>
+<script type="importmap">
+  { "imports": { "three": "./three.module.js", "three/addons/controls/OrbitControls.js": "./OrbitControls.js" } }
+</script>
+</head>
+<body>
+<div id="hud">
+  <div>status: <span id="status" class="bad">loading model…</span></div>
+  <div>pose stream: <span id="rate">–</span> Hz</div>
+  <div style="margin-top:6px">
+    <button class="push" data-p="0.5,0">push fwd</button>
+    <button class="push" data-p="-0.5,0">back</button>
+    <button class="push" data-p="0,0.5">left</button>
+    <button class="push" data-p="0,-0.5">right</button>
+    <button class="push" data-p="-2.5,0" style="border-color:#ff7a76">💥 shove</button>
+    <button class="push" id="resetBtn" style="border-color:#5fd68b">↺ reset</button>
+  </div>
+</div>
+<div id="hint">drag to orbit · scroll to zoom · legs = v28 policy balancing (physics), arms = your VR upper body · push buttons or arrow keys shove the robot</div>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+THREE.Object3D.DEFAULT_UP = new THREE.Vector3(0, 0, 1);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x101318);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.05, 50);
+camera.position.set(2.0, 1.4, 1.3);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0.75);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const key = new THREE.DirectionalLight(0xffffff, 1.6);
+key.position.set(2, 2, 4);
+scene.add(key);
+const fill = new THREE.DirectionalLight(0x99bbff, 0.5);
+fill.position.set(-3, -2, 2);
+scene.add(fill);
+
+const grid = new THREE.GridHelper(6, 30, 0x2a3340, 0x1d232c);
+grid.rotation.x = Math.PI / 2;
+scene.add(grid);
+
+const statusEl = document.getElementById("status");
+const bodies = [];  // index = mujoco body id -> THREE.Group
+
+function b64ToArr(b64, T) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new T(bytes.buffer);
+}
+
+const mat = new THREE.MeshStandardMaterial({ color: 0xd8dde4, metalness: 0.35, roughness: 0.45 });
+const matDark = new THREE.MeshStandardMaterial({ color: 0x30343c, metalness: 0.4, roughness: 0.5 });
+
+fetch("/manifest.json").then(r => r.json()).then(man => {
+  const geoms = man.meshes.map(m => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(b64ToArr(m.verts, Float32Array), 3));
+    g.setIndex(new THREE.BufferAttribute(b64ToArr(m.faces, Uint32Array), 1));
+    g.computeVertexNormals();
+    return g;
+  });
+  for (let i = 0; i < man.nbody; i++) bodies.push(new THREE.Group());
+  for (const g of man.geoms) {
+    let mesh;
+    if (g.type === "box" || g.type === "sphere") {
+      const geo = g.type === "box"
+        ? new THREE.BoxGeometry(2 * g.size[0], 2 * g.size[1], 2 * g.size[2])
+        : new THREE.SphereGeometry(g.size[0], 32, 24);
+      const m = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(g.rgba[0], g.rgba[1], g.rgba[2]), metalness: 0.05, roughness: 0.7 });
+      mesh = new THREE.Mesh(geo, m);
+    } else {
+      mesh = new THREE.Mesh(geoms[g.mesh], g.mesh % 7 === 0 ? matDark : mat);
+    }
+    mesh.position.set(...g.pos);
+    mesh.quaternion.set(g.quat[1], g.quat[2], g.quat[3], g.quat[0]); // wxyz -> xyzw
+    bodies[g.body].add(mesh);
+  }
+  bodies.forEach(b => scene.add(b));
+  statusEl.textContent = "model loaded, connecting…";
+  statusEl.className = "wait";
+  connect();
+});
+
+let wsLive = null;
+function sendPush(vx, vy) {
+  if (wsLive && wsLive.readyState === 1) wsLive.send(JSON.stringify({ push: [vx, vy] }));
+}
+document.querySelectorAll(".push").forEach(b => {
+  if (b.id === "resetBtn") { b.addEventListener("click", () => { if (wsLive?.readyState === 1) wsLive.send(JSON.stringify({ reset: true })); }); return; }
+  b.addEventListener("click", () => { const [x, y] = b.dataset.p.split(",").map(Number); sendPush(x, y); });
+});
+addEventListener("keydown", e => { if (e.key === "r") { if (wsLive?.readyState === 1) wsLive.send(JSON.stringify({ reset: true })); } });
+addEventListener("keydown", e => {
+  const map = { ArrowUp: [0.5, 0], ArrowDown: [-0.5, 0], ArrowLeft: [0, 0.5], ArrowRight: [0, -0.5] };
+  if (map[e.key]) { sendPush(...map[e.key]); e.preventDefault(); }
+});
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.hostname}:8766`);
+  wsLive = ws;
+  ws.onclose = () => { statusEl.textContent = "stream offline — retrying"; statusEl.className = "bad"; setTimeout(connect, 1500); };
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    statusEl.textContent = m.rx_hz > 1 ? "mirroring" : "no pose data (standing)";
+    statusEl.className = m.rx_hz > 1 ? "ok" : "wait";
+    document.getElementById("rate").textContent = m.rx_hz;
+    for (let i = 0; i < bodies.length; i++) {
+      bodies[i].position.set(...m.xpos[i]);
+      bodies[i].quaternion.set(m.xquat[i][1], m.xquat[i][2], m.xquat[i][3], m.xquat[i][0]);
+    }
+  };
+}
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+(function loop() { controls.update(); renderer.render(scene, camera); requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>
