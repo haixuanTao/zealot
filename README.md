@@ -41,7 +41,6 @@ Derived from the solver source (full analysis with file pointers:
 | --- | --- | --- | --- | --- | --- |
 | Articulated dynamics | generalized coords: CRBA + dense LU, on GPU | generalized coords: CRB + sparse LᵀDL (the reference) | reduced-coord articulations, Featherstone-style | MuJoCo's model via XLA | own solvers (Taichi) |
 | Constraint solver | Soft-TGS (rapier lineage) | convex smooth contact optimization | TGS | MuJoCo-like, with restrictions | own |
-| Actuation in the shipped env | real Unitree PD gains + torque limits, actuator delay, official model params | config-dependent | config-dependent | config-dependent | config-dependent |
 | GPU-batched envs | any GPU: WebGPU / Metal / CUDA, one source | no (CPU; official wasm runs in-browser) | CUDA | GPU/TPU via XLA | CUDA |
 | G1 throughput, same RTX 5090¹ | 61 k / 71 k / 82 k | — | 72 k / 115 k / 180 k | 77 k / 89 k / 98 k | 342 k / 622 k / 963 k² |
 | Cross-checked here | is the trainer | browser + native harness | harness | — | harness |
