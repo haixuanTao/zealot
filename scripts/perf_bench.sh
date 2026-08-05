@@ -1,6 +1,6 @@
 #!/bin/bash
-# Recompute the zealot perf tables (iter_e2e_bench) on the current stack:
-# unified NVlabs cuda-oxide toolchain, solver-fix branch, and the production
+# Recompute the zealot perf tables (iter_e2e_bench) on the current stack
+# (cubins from scripts/build_cubins.sh), with the production
 # physics config (d4 + 4 substeps + NEXUS_SUBSTEP_REFRESH). WebGPU + native
 # CUDA(+cuTile) legs, N = 2048/4096/8192.
 #
@@ -10,13 +10,11 @@ LABEL=${1:?label}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/bench/perf/$LABEL"
 mkdir -p "$OUT"
-TOOL=$HOME/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin
-LIBDEV=$HOME/rt_build/bench-venv/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc
-PTXAS=$HOME/miniconda3/bin/ptxas
-BACKEND_DIR=$HOME/rt_build/cuda-oxide-upstreaming
-BACKEND=$BACKEND_DIR/target/release/librustc_codegen_cuda.so
-PTX_DIR=$HOME/rt_build/nexus_ptx_unified
-export CUDA_TOOLKIT_PATH=$HOME/miniconda3/targets/x86_64-linux
+PTX_DIR=$HOME/nexus_ptx
+export CUDA_TOOLKIT_PATH=$HOME/cuda-13-shim
+
+# Cubins are built separately: scripts/build_cubins.sh (host-interception + O3).
+[ -s "$PTX_DIR/nexus_rbd_shaders3d.cubin" ] || { echo "FATAL: run scripts/build_cubins.sh first"; exit 1; }
 
 idle_check() {
   local n; n=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l)
@@ -24,35 +22,6 @@ idle_check() {
 }
 
 echo "=== GPU idle check (before) ==="; idle_check
-
-echo "=== STAGE 1: cuda-oxide backend (unified bridge) ==="
-(cd $BACKEND_DIR/crates/rustc-codegen-cuda && CARGO_TARGET_DIR=$BACKEND_DIR/target RUSTFLAGS="-L $HOME/rt_build/linkshim" cargo build --release) 2>&1 | tail -1
-[ -s "$BACKEND" ] || { echo "FATAL: backend missing"; exit 1; }
-
-echo "=== STAGE 2: cubins (host-target interception) ==="
-mkdir -p $PTX_DIR
-gen () { # ws pkg features name srcdir tgt
-  cd "$1"; rm -f $PTX_DIR/$4.ll
-  find "$5" -name "*.rs" -exec touch {} +
-  CUDA_OXIDE_DEVICE_ARCH=sm_120 CUDA_OXIDE_PTX_DIR=$PTX_DIR CARGO_TARGET_DIR="$6" CARGO_INCREMENTAL=0 \
-  RUSTFLAGS="-Z codegen-backend=$BACKEND -Zalways-encode-mir -Zmir-enable-passes=-JumpThreading" \
-    cargo +nightly-2026-04-03 build -p "$2" --release --no-default-features --features "$3" 2>&1 | tail -1
-  [ -s $PTX_DIR/$4.ll ] || { echo "FATAL: $4.ll missing"; exit 1; }
-  grep -q ") #0 {" $PTX_DIR/$4.ll || { echo "FATAL: $4.ll lacks convergent attrs"; exit 1; }
-  echo "$4.ll ok: $(grep -c "^define" $PTX_DIR/$4.ll) defines"
-}
-gen $HOME/rt_build/nexus nexus_rbd_shaders3d "cuda-oxide dim3 unsafe_remove_boundchecks" nexus_rbd_shaders3d $HOME/rt_build/nexus/src_rbd_shaders $HOME/rt_build/nexus/target
-gen $HOME/rt_build/vortx-unified vortx-shaders "cuda-oxide" vortx_shaders $HOME/rt_build/vortx-unified/vortx-shaders/src $HOME/rt_build/vortx-unified/target-unified
-
-echo "=== STAGE 3: O3 lowering ==="
-for name in nexus_rbd_shaders3d vortx_shaders; do
-  $TOOL/llvm-as $PTX_DIR/$name.ll -o /tmp/pb.bc
-  $TOOL/llvm-link /tmp/pb.bc $LIBDEV -o /tmp/pb_linked.bc
-  $TOOL/opt -passes="internalize,globaldce,default<O3>" /tmp/pb_linked.bc -o /tmp/pb_pruned.bc
-  $TOOL/llc -mcpu=sm_120 -O3 -fp-contract=fast /tmp/pb_pruned.bc -o /tmp/pb.ptx
-  $PTXAS -arch=sm_120 -O3 /tmp/pb.ptx -o $PTX_DIR/$name.cubin
-  echo "$name.cubin built"
-done
 
 echo "=== STAGE 4: bench binaries ==="
 cd "$ROOT"

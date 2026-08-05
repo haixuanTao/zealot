@@ -11,8 +11,8 @@ LABEL=${1:?label}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/bench/perf/$LABEL"
 mkdir -p "$OUT"
-PTX_DIR=$HOME/rt_build/nexus_ptx_unified
-export CUDA_TOOLKIT_PATH=$HOME/miniconda3/targets/x86_64-linux
+PTX_DIR=$HOME/nexus_ptx
+export CUDA_TOOLKIT_PATH=$HOME/cuda-13-shim
 export PATH=$HOME/cuda-13.3-tile/bin:$HOME/.cargo/bin:$PATH
 
 idle_check() {
@@ -79,12 +79,12 @@ PYEOF
 done
 
 echo "=== F: nexus bench_batch_sweep3 (boxes + chain, WebGPU) ===" | tee -a "$OUT/raw2.log"
-cd $HOME/rt_build/nexus
-CARGO_TARGET_DIR=$HOME/rt_build/nexus/target cargo build --release -p nexus_examples_3d --example bench_batch_sweep3 2>&1 | tail -1
+cd $HOME/Documents/work/nexus
+CARGO_TARGET_DIR=$HOME/Documents/work/nexus/target cargo build --release -p nexus_examples_3d --example bench_batch_sweep3 2>&1 | tail -1
 for cfg in "boxes 3" "chain 6"; do
   set -- $cfg
   echo "--- nexus sweep $1 size=$2 (NEXUS_BENCH_ONLY_MAX @1024) ---" | tee -a "$OUT/raw2.log"
-  NEXUS_BENCH_ONLY_MAX=1 $HOME/rt_build/nexus/target/release/examples/bench_batch_sweep3 $1 $2 1024 2>&1 | tee -a "$OUT/raw2.log" | tail -4
+  NEXUS_BENCH_ONLY_MAX=1 $HOME/Documents/work/nexus/target/release/examples/bench_batch_sweep3 $1 $2 1024 2>&1 | tee -a "$OUT/raw2.log" | tail -4
 done
 
 echo "=== GPU idle (after) ==="; idle_check

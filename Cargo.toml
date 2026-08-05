@@ -127,6 +127,19 @@ async-std = { version = "1", features = ["attributes"] }
 anyhow = "1"
 
 # Fully GPU-resident trainer: GPU policy forward + GPU PPO update (vortx).
+# Full-iteration end-to-end benchmark (rollout + PPO update), the perf-table
+# generator (scripts/perf_bench.sh -> bench/perf/).
+[[example]]
+name = "iter_e2e_bench"
+path = "examples/biped/iter_e2e_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+# Rollout-only CPU-vs-GPU benchmark (scripts/perf_bench2.sh leg D).
+[[example]]
+name = "rollout_e2e_bench"
+path = "examples/biped/rollout_e2e_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
 [[example]]
 name = "biped_train_gpu"
 path = "examples/biped/biped_train_gpu.rs"
