@@ -68,6 +68,11 @@ Three steps — full walkthrough in
      --features "gpu biped_gpu cutile" -- 50000 4096 my_policy.safetensors
    ```
 
+   Primary training support is **native CUDA** (the cuda-oxide fast path,
+   as above); the same trainer also runs on the default **WebGPU** backend —
+   which is how it reaches **Metal** and **Vulkan** — from the same source,
+   just slower.
+
 3. **Watch *your* policy walk** — upload the checkpoint to Hugging Face and
    open `https://haixuantao.github.io/zealot/?ckpt=your-name/your-repo`.
 
