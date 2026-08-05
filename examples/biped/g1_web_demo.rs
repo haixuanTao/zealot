@@ -1133,6 +1133,17 @@ pub async fn run(cfg: DemoCfg) {
     let mut cursor_px = (0.0f64, 0.0f64);
     let mut press_px: Option<(f64, f64)> = None;
     let mut last_drive_cmd = drive::command();
+    // Wander mode: the demo opens with a random target so the robot is
+    // visibly going SOMEWHERE, and each arrival draws the next one — until
+    // any user input (tap, key, gamepad, slider, preset) takes over.
+    let mut wander = true;
+    let mut wander_seeded = false;
+    // Cheap LCG; statistical quality is irrelevant for picking stroll points.
+    let mut wander_rng: u32 = 0x9E37_79B9;
+    let mut wander_rand = move || {
+        wander_rng = wander_rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (wander_rng >> 8) as f32 / (1u32 << 24) as f32
+    };
 
     // One blocking snapshot to prime the pipeline; every frame after this one
     // reads back without waiting.
@@ -1179,6 +1190,7 @@ pub async fn run(cfg: DemoCfg) {
                                     t = (h - o.z) / d.z;
                                 }
                                 let hit = o + d * t;
+                                wander = false;
                                 nav_target = Some(hit);
                                 nav_marker.set_pose(Pose3::from_parts(
                                     hit + Vec3::new(0.0, 0.0, 0.03),
@@ -1197,8 +1209,35 @@ pub async fn run(cfg: DemoCfg) {
         let drive_now = drive::command();
         if drive_now != last_drive_cmd {
             last_drive_cmd = drive_now;
+            wander = false;
             nav_target = None;
             nav_marker.set_visible(false);
+        }
+
+        // Wander: pick a stroll point 2–3.5 m out at a random bearing once
+        // the spawn has settled, and again at every arrival below.
+        if wander && !wander_seeded && sim_time > 1.5 {
+            wander_seeded = true;
+            let off0 = offset_of(0);
+            let (base, _) = env.base_pose_for(0, &pose_stream.poses);
+            let ang = wander_rand() * core::f32::consts::TAU;
+            let dist = 2.0 + 1.5 * wander_rand();
+            let tx = base[0] + off0.x + dist * ang.cos();
+            // Keep the stroll on the strip (it is ~PATCH wide; lane center
+            // is the robot's spawn y).
+            let ty = (base[1] + off0.y + dist * ang.sin()).clamp(off0.y - 3.0, off0.y + 3.0);
+            let tz = if terrain {
+                strips[0].height(tx - off0.x, ty - off0.y)
+            } else {
+                0.0
+            };
+            let hit = Vec3::new(tx, ty, tz);
+            nav_target = Some(hit);
+            nav_marker.set_pose(Pose3::from_parts(
+                hit + Vec3::new(0.0, 0.0, 0.03),
+                Rot3::from_rotation_x(core::f32::consts::FRAC_PI_2),
+            ));
+            nav_marker.set_visible(true);
         }
 
         // Autopilot: steer robot 0's velocity command at the target. Heading
@@ -1213,8 +1252,13 @@ pub async fn run(cfg: DemoCfg) {
             let (dx, dy) = (tgt.x - bx, tgt.y - by);
             let dist = dx.hypot(dy);
             let c: [f32; 3] = if dist < 0.3 {
-                nav_target = None;
-                nav_marker.set_visible(false);
+                if wander {
+                    // Arrived at a stroll point: draw the next one.
+                    wander_seeded = false;
+                } else {
+                    nav_target = None;
+                    nav_marker.set_visible(false);
+                }
                 [0.0, 0.0, 0.0]
             } else {
                 let q = Rot3::from_xyzw(brot[0], brot[1], brot[2], brot[3]);
@@ -1682,6 +1726,7 @@ pub async fn run(cfg: DemoCfg) {
         }
         if let Some(c) = choice {
             // Buttons and sliders take over from the autopilot.
+            wander = false;
             nav_target = None;
             nav_marker.set_visible(false);
             last_drive_cmd = drive::command();
