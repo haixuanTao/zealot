@@ -45,7 +45,7 @@ Derived from the solver source (full analysis with file pointers:
 | --- | --- | --- | --- | --- | --- |
 | Articulated dynamics | CRBA + dense LU, on GPU | CRB + sparse LᵀDL (the reference) | Featherstone articulations | MuJoCo's model, via XLA | MuJoCo-style, Taichi kernels |
 | Constraint solver | Soft-TGS (rapier lineage) | convex optimization | TGS | MuJoCo-like, restricted | convex + MPM/FEM/SPH multiphysics |
-| GPU-batched envs | ✓ any GPU — WebGPU / Metal / CUDA | — (CPU) | ✓ CUDA | ✓ GPU/TPU | ✓ CUDA |
+| GPU-batched training | ✓ CUDA (primary) · WebGPU → Metal / Vulkan | — (CPU) | ✓ CUDA | ✓ GPU/TPU | ✓ CUDA |
 | Runs in the browser | ✓ the GPU sim itself ([live demo](https://haixuantao.github.io/zealot/)) | ✓ wasm build, CPU ([demo tab](https://haixuantao.github.io/zealot/?tab=mujoco)) | — | — | — |
 | Ray tracing | ✓ built into the viewer | — | ✓ Omniverse RTX | — | ✓ Nyx |
 
@@ -67,11 +67,6 @@ Three steps — full walkthrough in
      cargo run --release --example biped_train_gpu \
      --features "gpu biped_gpu cutile" -- 50000 4096 my_policy.safetensors
    ```
-
-   Primary training support is **native CUDA** (the cuda-oxide fast path,
-   as above); the same trainer also runs on the default **WebGPU** backend —
-   which is how it reaches **Metal** and **Vulkan** — from the same source,
-   just slower.
 
 3. **Watch *your* policy walk** — upload the checkpoint to Hugging Face and
    open `https://haixuantao.github.io/zealot/?ckpt=your-name/your-repo`.
