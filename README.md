@@ -13,7 +13,7 @@ PPO trainer, and deployment — written entirely in Rust, on top of
 [nexus](https://github.com/dimforge/nexus), dimforge's cross-platform GPU
 physics engine.
 
-[![A Unitree G1 walking the training terrain, live in the browser](docs/img/web-demo.gif)](https://haixuantao.github.io/zealot/)
+[![Tap the ground and the G1 walks there — live in the browser](docs/img/web-demo.gif)](https://haixuantao.github.io/zealot/)
 
 ## Why it's built this way
 
