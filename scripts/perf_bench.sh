@@ -41,7 +41,7 @@ gen () { # ws pkg features name srcdir tgt
   grep -q ") #0 {" $PTX_DIR/$4.ll || { echo "FATAL: $4.ll lacks convergent attrs"; exit 1; }
   echo "$4.ll ok: $(grep -c "^define" $PTX_DIR/$4.ll) defines"
 }
-gen $HOME/rt_build/nexus-unified nexus_rbd_shaders3d "cuda-oxide dim3 unsafe_remove_boundchecks" nexus_rbd_shaders3d $HOME/rt_build/nexus-unified/src_rbd_shaders $HOME/rt_build/nexus-unified/target
+gen $HOME/rt_build/nexus nexus_rbd_shaders3d "cuda-oxide dim3 unsafe_remove_boundchecks" nexus_rbd_shaders3d $HOME/rt_build/nexus/src_rbd_shaders $HOME/rt_build/nexus/target
 gen $HOME/rt_build/vortx-unified vortx-shaders "cuda-oxide" vortx_shaders $HOME/rt_build/vortx-unified/vortx-shaders/src $HOME/rt_build/vortx-unified/target-unified
 
 echo "=== STAGE 3: O3 lowering ==="

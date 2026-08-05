@@ -80,7 +80,7 @@ cuda-async = { path = "../cutile-rs/cuda-async", optional = true }
 vortx = { version = "0.3", optional = true }
 zealot-gpu-obs = { path = "zealot-gpu-obs", optional = true }
 khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
-nexus3d = { path = "../nexus-unified/crates/nexus3d", features = ["rbd"], optional = true }
+nexus3d = { path = "../nexus/crates/nexus3d", features = ["rbd"], optional = true }
 rapier3d = { version = "0.34", optional = true }
 rapier3d-urdf = { version = "0.34", features = ["stl"], optional = true }
 roxmltree = { version = "0.20", optional = true }

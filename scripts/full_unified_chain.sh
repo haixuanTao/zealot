@@ -26,7 +26,7 @@ gen () { # $1 ws, $2 pkg, $3 features, $4 name, $5 srcdir, $6 target-dir
   echo "$4.ll ok: $(grep -c "^define" $CUDA_OXIDE_PTX_DIR/$4.ll) defines"
 }
 echo "=== STAGE 2: regen .ll (unified host-target interception) ==="
-gen ~/Documents/work/nexus-unified nexus_rbd_shaders3d "cuda-oxide dim3 unsafe_remove_boundchecks" nexus_rbd_shaders3d ~/Documents/work/nexus-unified/src_rbd_shaders ~/Documents/work/nexus-unified/target
+gen ~/Documents/work/nexus nexus_rbd_shaders3d "cuda-oxide dim3 unsafe_remove_boundchecks" nexus_rbd_shaders3d ~/Documents/work/nexus/src_rbd_shaders ~/Documents/work/nexus/target
 gen ~/Documents/work/vortx-unified vortx-shaders "cuda-oxide" vortx_shaders ~/Documents/work/vortx-unified/vortx-shaders/src ~/Documents/work/vortx-unified/target-unified
 
 echo "=== STAGE 3: full-O3 lowering ==="

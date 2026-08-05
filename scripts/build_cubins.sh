@@ -1,5 +1,5 @@
 #!/bin/bash
-# Rebuild the sm_120 cubins for the production stack (nexus-unified +
+# Rebuild the sm_120 cubins for the production stack (nexus +
 # vortx-unified + khal-unified) into ~/nexus_ptx.
 #
 # Toolchain (see docs/train-on-5090.md):
@@ -36,6 +36,6 @@ build_one () { # $1 workspace dir, $2 package, $3 features, $4 ll name
   ls -la $CUDA_OXIDE_PTX_DIR/$4.cubin
 }
 
-build_one "$HOME/Documents/work/nexus-unified" nexus_rbd_shaders3d "cuda-oxide dim3 unsafe_remove_boundchecks" nexus_rbd_shaders3d
+build_one "$HOME/Documents/work/nexus" nexus_rbd_shaders3d "cuda-oxide dim3 unsafe_remove_boundchecks" nexus_rbd_shaders3d
 build_one "$HOME/Documents/work/vortx-unified" vortx-shaders "cuda-oxide" vortx_shaders
 echo DONE
