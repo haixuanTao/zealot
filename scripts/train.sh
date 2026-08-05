@@ -25,6 +25,6 @@ ITERS="${1:-50000}"
 ENVS="${2:-4096}"
 CKPT="${3:-$HOME/overnight/biped_$(date +%Y%m%d_%H%M).safetensors}"
 echo "[launch] $(date) branch=$(git rev-parse --abbrev-ref HEAD) head=$(git rev-parse --short HEAD)"
-cargo run --release --example biped_train_gpu --features "gpu biped_gpu cutile" \
+cargo run --release --bin biped_train_gpu --features "gpu biped_gpu cutile" \
     -- "$ITERS" "$ENVS" "$CKPT"
 echo "[done] exit=$? $(date)"

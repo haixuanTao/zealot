@@ -93,7 +93,7 @@ cd ../zealot
 export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D=$HOME/nexus_ptx/nexus_rbd_shaders3d.cubin
 export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS=$HOME/nexus_ptx/vortx_shaders.cubin
 touch ../nexus-cuda/crates/nexus_rbd3d/build.rs   # force re-embed of the fresh cubin
-BIPED_CUDA=1 cargo build --release --example iter_e2e_bench --features "gpu biped_gpu cuda_backend"
+BIPED_CUDA=1 cargo build --release --bin iter_e2e_bench --features "gpu biped_gpu cuda_backend"
 ```
 
 If you change a shader, re-run step 1 (or 2) then step 3. Plain host changes only
@@ -110,7 +110,7 @@ export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D=$HOME/nexus_ptx/nexus_rbd_shad
 export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS=$HOME/nexus_ptx/vortx_shaders.cubin
 
 # main number (capture path = the headline column)
-BIPED_CAPTURE=1 BIPED_CUDA=1 ./target/release/examples/iter_e2e_bench 8192 32 5 16
+BIPED_CAPTURE=1 BIPED_CUDA=1 ./target/release/iter_e2e_bench 8192 32 5 16
 # sweep N: 512 1024 2048 4096 8192
 ```
 

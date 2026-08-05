@@ -42,7 +42,7 @@ export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS="$PTX/vortx_shaders.cubin"
 
 # Native CUDA is auto-selected on sm_120 — no flag needed.
 # iters  num_envs  checkpoint
-cargo run --release --example biped_train_gpu \
+cargo run --release --bin biped_train_gpu \
     --features "gpu biped_gpu cuda_backend" -- 2000 4096 "$HOME/biped_convex.safetensors"
 ```
 
@@ -200,7 +200,7 @@ cd "$WORK/zealot"
 export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D="$PTX/nexus_rbd_shaders3d.cubin"
 export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS="$PTX/vortx_shaders.cubin"
 
-cargo run --release --example biped_train_gpu \
+cargo run --release --bin biped_train_gpu \
     --features "gpu biped_gpu cuda_backend" -- <iters> <num_envs> <checkpoint>
 ```
 
@@ -236,7 +236,7 @@ Always launch under `tmux` so training survives disconnects:
 
 ```bash
 tmux new -s train
-cargo run --release --example biped_train_gpu \
+cargo run --release --bin biped_train_gpu \
     --features "gpu biped_gpu cuda_backend" -- 2000 4096 "$HOME/biped_convex.safetensors"
 # detach: Ctrl-b d   |   reattach: tmux attach -t train
 ```

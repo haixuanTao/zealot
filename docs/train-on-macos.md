@@ -12,7 +12,7 @@ patched naga; everything below assumes it (and the repo already wires it in).
 cd ~/Documents/work/zealot
 # WebGPU/Metal is the auto-selected backend on a Mac — no flag needed.
 #                                       iters  num_envs  checkpoint
-cargo run --release --example biped_train_gpu \
+cargo run --release --bin biped_train_gpu \
     --features "gpu biped_gpu" --       2000   1024      walking_policy.safetensors
 ```
 
@@ -94,7 +94,7 @@ launching upward within a few steps.
 
 ```bash
 # Long runs: use nohup — session-managed background jobs may get reaped.
-nohup cargo run --release --example biped_train_gpu \
+nohup cargo run --release --bin biped_train_gpu \
     --features "gpu biped_gpu" -- 2000 1024 walking_policy.safetensors \
     > walk_train.log 2>&1 &
 ```
@@ -114,7 +114,7 @@ nohup cargo run --release --example biped_train_gpu \
 ## 6. Render a rollout video
 
 ```bash
-cargo run --release --example biped_render_nexus \
+cargo run --release --bin biped_render_nexus \
     --features "gpu biped_gpu" -- 0 500 /tmp/rollout.json walking_policy.safetensors
 MUJOCO_GL=cgl python3 examples/biped/render_biped_mujoco.py \
     /tmp/rollout.json /tmp/walk.mp4

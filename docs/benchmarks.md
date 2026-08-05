@@ -22,7 +22,7 @@ cargo install cargo-gpu --version 0.10.0-alpha.1 --force    # plain `cargo insta
 
 ```sh
 export PATH=$HOME/.cargo/bin:$PATH
-cargo run --release --example iter_e2e_bench --features "gpu biped_gpu" -- 8192 32 5 16
+cargo run --release --bin iter_e2e_bench --features "gpu biped_gpu" -- 8192 32 5 16
 ```
 
 Expected output on a 5090 (numbers are `num_envs·T / iteration_time` =
@@ -39,7 +39,7 @@ same N — see the table + reproduce block below.)
 
 Sweep N by re-running with `2048` / `4096` / `8192`. For **rollout-only**
 throughput (no PPO update, matches the rollout table below): `cargo run --release
---example rollout_e2e_bench --features "gpu biped_gpu" -- 8192`. First build is
+--bin rollout_e2e_bench --features "gpu biped_gpu" -- 8192`. First build is
 slow (shader compile); the toolchain is cached afterward (~16 s rebuilds).
 
 ## Benchmark — full training iteration (rollout + PPO update)
@@ -240,10 +240,10 @@ Reproduce:
 
 ```sh
 # WebGPU
-cargo run --release --example iter_e2e_bench --features "gpu biped_gpu" -- <num_envs> 32 5 16
+cargo run --release --bin iter_e2e_bench --features "gpu biped_gpu" -- <num_envs> 32 5 16
 # native CUDA + cuTile tf32 (the current native-CUDA column; needs the cuda-oxide
 # toolchain + embedded cubins; fixed-grid is the CUDA default)
-BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 cargo run --release --example iter_e2e_bench \
+BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 cargo run --release --bin iter_e2e_bench \
     --features "gpu biped_gpu cuda_backend cutile" -- <num_envs> 32 5 16
 # BIPED_CAPTURE=1 (rollout CUDA-graph capture) and the update's default graph path
 # are currently pathological on this driver (replay 4–7× slower than eager, see the
@@ -308,7 +308,7 @@ its repo):
 BIPED_ROBOT=g1_29dof_agile BIPED_SOLVER_ITERS=8 BIPED_MOTOR_DELAY=0,4 BIPED_OBS_HISTORY=5 \
     BIPED_TERRAIN=1 BIPED_CONTACT_REDUCE=1 BIPED_CONTACT_CAP=128 \
     BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 \
-    cargo run --release --example iter_e2e_bench \
+    cargo run --release --bin iter_e2e_bench \
     --features "gpu biped_gpu cuda_backend cutile" -- <num_envs> 32 5 16
 ```
 
@@ -330,7 +330,7 @@ WBC-AGILE's T1 velocity policy (actor `[obs,256,256,128,12]`, critic
 ```sh
 # The fast path: native CUDA + cuTile tf32 GEMMs. Build WITH the `cutile` feature —
 # without it BIPED_CUTILE_GEMM silently no-ops and the update falls back ~20× slower.
-BIPED_ROBOT=g1 BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 cargo run --release --example biped_train_gpu \
+BIPED_ROBOT=g1 BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 cargo run --release --bin biped_train_gpu \
     --features "gpu biped_gpu cuda_backend cutile" -- <iters> <num_envs> <ckpt.safetensors>
 ```
 
@@ -419,6 +419,6 @@ What this says in practice:
 Reproduce:
 
 ```sh
-cargo run --release --example rollout_e2e_bench --features "gpu biped_gpu" -- <num_envs> <steps>
+cargo run --release --bin rollout_e2e_bench --features "gpu biped_gpu" -- <num_envs> <steps>
 ```
 

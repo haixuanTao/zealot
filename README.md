@@ -64,7 +64,7 @@ Three steps — full walkthrough in
    ```sh
    # RTX-class GPU: ~71 k env-steps/s at N=4096 on a 5090
    BIPED_ROBOT=g1_29dof_agile BIPED_CUTILE_GEMM=1 BIPED_TERRAIN=1 \
-     cargo run --release --example biped_train_gpu \
+     cargo run --release --bin biped_train_gpu \
      --features "gpu biped_gpu cutile" -- 50000 4096 my_policy.safetensors
    ```
 

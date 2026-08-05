@@ -65,5 +65,5 @@ export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D=$CUDA_OXIDE_PTX_DIR/nexus_rbd_
 export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS=$CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin
 export CUDA_TOOLKIT_PATH=$HOME/cuda-13-shim
 cargo clean -p nexus_rbd_shaders3d -p vortx-shaders 2>/dev/null || true
-cargo build --release --example biped_train_gpu --features "gpu biped_gpu cutile" 2>&1 | tail -1
+cargo build --release --bin biped_train_gpu --features "gpu biped_gpu cutile" 2>&1 | tail -1
 echo CHAIN_DONE

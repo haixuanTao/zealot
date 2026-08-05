@@ -21,16 +21,16 @@ idle_check() {
 }
 echo "=== GPU idle (before) ==="; idle_check
 
-CUDA_BIN=$ROOT/target-cuda/release/examples
-WG_BIN=$ROOT/target/release/examples
+CUDA_BIN=$ROOT/target-cuda/release
+WG_BIN=$ROOT/target/release
 
 echo "=== build: trainer + rollout bench ==="
 cd "$ROOT"
 CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D=$PTX_DIR/nexus_rbd_shaders3d.cubin \
 CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS=$PTX_DIR/vortx_shaders.cubin \
 CARGO_TARGET_DIR=$ROOT/target-cuda \
-cargo build --release --example biped_train_gpu --example iter_e2e_bench --features "gpu biped_gpu cuda_backend cutile" 2>&1 | tail -1
-cargo build --release --example rollout_e2e_bench --features "gpu biped_gpu" 2>&1 | tail -1
+cargo build --release --bin biped_train_gpu --bin iter_e2e_bench --features "gpu biped_gpu cuda_backend cutile" 2>&1 | tail -1
+cargo build --release --bin rollout_e2e_bench --features "gpu biped_gpu" 2>&1 | tail -1
 
 iter_rows () { # tag env...
   local tag=$1; shift

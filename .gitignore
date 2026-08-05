@@ -17,3 +17,4 @@ overnight/STATUS
 /naga-fixed/
 *.safetensors
 .venv/
+bench/sim2sim/
