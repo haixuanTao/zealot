@@ -39,19 +39,18 @@ Derived from the solver source (full analysis with file pointers:
 
 | | **zealot (nexus)** | MuJoCo | Isaac Lab (PhysX 5) | MJX | Genesis |
 | --- | --- | --- | --- | --- | --- |
-| Articulated dynamics | generalized coords: CRBA + dense LU, rebuilt **every 5 ms substep**, on GPU | generalized coords: CRB + sparse LᵀDL (the reference) | reduced-coord articulations, Featherstone-style | MuJoCo's model via XLA | own solvers (Taichi) |
-| Constraint solver | Soft-TGS (rapier's algorithm): colored Gauss–Seidel, soft contacts 240 Hz/ζ=1, speculative contacts, box friction¹ | convex smooth contact optimization | TGS | MuJoCo-like, with restrictions | own |
-| Actuation in the shipped env | real Unitree PD gains + torque limits, per-substep PD in-kernel, actuator delay, armature / damping / friction-loss from official models | config-dependent | config-dependent | config-dependent | config-dependent |
-| Runs on | WebGPU (browser!) + Metal + CUDA, one Rust source | CPU | CUDA | GPU/TPU via XLA | CUDA |
-| G1 throughput, same RTX 5090² | 61 k / 71 k / 82 k | — (CPU) | 72 k / 115 k / 180 k | 77 k / 89 k / 98 k | 342 k / 622 k / 963 k³ |
+| Articulated dynamics | generalized coords: CRBA + dense LU, on GPU | generalized coords: CRB + sparse LᵀDL (the reference) | reduced-coord articulations, Featherstone-style | MuJoCo's model via XLA | own solvers (Taichi) |
+| Constraint solver | Soft-TGS (rapier lineage) | convex smooth contact optimization | TGS | MuJoCo-like, with restrictions | own |
+| Actuation in the shipped env | real Unitree PD gains + torque limits, actuator delay, official model params | config-dependent | config-dependent | config-dependent | config-dependent |
+| GPU-batched envs | any GPU: WebGPU / Metal / CUDA, one source | no (CPU; official wasm runs in-browser) | CUDA | GPU/TPU via XLA | CUDA |
+| G1 throughput, same RTX 5090¹ | 61 k / 71 k / 82 k | — | 72 k / 115 k / 180 k | 77 k / 89 k / 98 k | 342 k / 622 k / 963 k² |
 | Cross-checked here | is the trainer | browser + native harness | harness | — | harness |
 
-¹ per-tangent ±μ·N clamp; the circular cone is noted in-source as future work.
-² env-steps/s at N = 2048/4096/8192, sequential same-hour runs
+¹ env-steps/s at N = 2048/4096/8192, sequential same-hour runs
   ([methodology](docs/benchmarks.md)); zealot & Genesis 12-DOF, Isaac & MJX
   full-body — read the notes before quoting.
-³ not iteration-equivalent: Genesis integrates 2×10 ms strides per control
-  step vs zealot's 4×5 ms substeps, each with 8 TGS iterations.
+² not iteration-equivalent: Genesis integrates 2×10 ms strides per control
+  step vs zealot's 4×5 ms substeps.
 
 The load-bearing realism claim: at Unitree's real ankle gains a G1 cannot
 passively stand (MuJoCo reproduces this) — stability at 5 ms comes from the
