@@ -1138,6 +1138,15 @@ pub async fn run(cfg: DemoCfg) {
     // any user input (tap, key, gamepad, slider, preset) takes over.
     let mut wander = true;
     let mut wander_seeded = false;
+    // The autopilot's command is slew-limited: a stand-to-full step input
+    // visibly staggers the robot, so each component ramps toward the target
+    // command instead (≈1.3 m/s² linear, ≈2.6 rad/s² yaw at ~26 fps).
+    let mut nav_cmd: [f32; 3] = [0.0; 3];
+    let slew = |cur: &mut [f32; 3], want: [f32; 3]| {
+        for (i, limit) in [0.05f32, 0.05, 0.10].into_iter().enumerate() {
+            cur[i] += (want[i] - cur[i]).clamp(-limit, limit);
+        }
+    };
     // Cheap LCG; statistical quality is irrelevant for picking stroll
     // points — but the SEED must differ per page load, or every visitor
     // watches the identical walk (wasm is deterministic; a constant here
@@ -1228,6 +1237,7 @@ pub async fn run(cfg: DemoCfg) {
             wander = false;
             nav_target = None;
             nav_marker.set_visible(false);
+            nav_cmd = drive_now.unwrap_or(cmd_ui);
         }
 
         // Wander: pick a stroll point 2–3.5 m out at a random bearing once
@@ -1296,6 +1306,8 @@ pub async fn run(cfg: DemoCfg) {
                     (1.5 * err).clamp(-1.0, 1.0),
                 ]
             };
+            slew(&mut nav_cmd, c);
+            let c = nav_cmd;
             cmd_ui = c;
             drive::sync(c);
             last_drive_cmd = drive::command();
