@@ -49,13 +49,6 @@ Derived from the solver source (full analysis with file pointers:
 | Runs in the browser | ✓ the GPU sim itself ([live demo](https://haixuantao.github.io/zealot/)) | ✓ wasm build, CPU | — | — | — |
 | Ray tracing | ✓ built into the viewer | — | ✓ Omniverse RTX | — | ✓ Nyx |
 
-The load-bearing realism claim: at Unitree's real ankle gains a G1 cannot
-passively stand (MuJoCo reproduces this) — stability at 5 ms comes from the
-per-substep refresh and soft-contact structure, not from inflating gains.
-And the engines above aren't rivals here so much as referees: the same
-checkpoint is stepped through them as sim2sim validation — see
-[the sim2sim discipline](docs/explanation.md#a-policy-is-only-trustworthy-if-it-survives-a-different-solver).
-
 ## Getting started
 
 Three steps — full walkthrough in
