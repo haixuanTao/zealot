@@ -42,14 +42,7 @@ Derived from the solver source (full analysis with file pointers:
 | Articulated dynamics | generalized coords: CRBA + dense LU, on GPU | generalized coords: CRB + sparse LᵀDL (the reference) | reduced-coord articulations, Featherstone-style | MuJoCo's model via XLA | own solvers (Taichi) |
 | Constraint solver | Soft-TGS (rapier lineage) | convex smooth contact optimization | TGS | MuJoCo-like, with restrictions | own |
 | GPU-batched envs | any GPU: WebGPU / Metal / CUDA, one source | no (CPU; official wasm runs in-browser) | CUDA | GPU/TPU via XLA | CUDA |
-| G1 throughput, same RTX 5090¹ | 61 k / 71 k / 82 k | — | 72 k / 115 k / 180 k | 77 k / 89 k / 98 k | 342 k / 622 k / 963 k² |
 | Cross-checked here | is the trainer | browser + native harness | harness | — | harness |
-
-¹ env-steps/s at N = 2048/4096/8192, sequential same-hour runs
-  ([methodology](docs/benchmarks.md)); zealot & Genesis 12-DOF, Isaac & MJX
-  full-body — read the notes before quoting.
-² not iteration-equivalent: Genesis integrates 2×10 ms strides per control
-  step vs zealot's 4×5 ms substeps.
 
 The load-bearing realism claim: at Unitree's real ankle gains a G1 cannot
 passively stand (MuJoCo reproduces this) — stability at 5 ms comes from the
@@ -91,8 +84,6 @@ Three steps — full walkthrough in
 
 ## Benchmarks
 
-Full methodology and tables: [docs/benchmarks.md](docs/benchmarks.md). The
-short version (same RTX 5090, sequential same-hour runs, Unitree G1): full
-training iterations at 61 k / 71 k / 82 k env-steps/s for N = 2048/4096/8192 —
-≈0.85× Isaac Lab/PhysX 5 at 2048 envs, the gap opening at large N — with the
-WebGPU build currently ~4× behind native CUDA at scale.
+Historical methodology and numbers live in
+[docs/benchmarks.md](docs/benchmarks.md); a clean cross-engine benchmark on
+the current stack is planned before quoting headline figures here.
