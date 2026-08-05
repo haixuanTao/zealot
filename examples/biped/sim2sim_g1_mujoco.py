@@ -162,6 +162,21 @@ def main():
     for i, n in enumerate(POLICY_JOINTS):
         pol_kp[i], pol_kd[i], pol_eff[i] = leg_gains(n)
         pol_rng[i] = model.joint(n).range
+    # Align the policy joints' PASSIVE dynamics with the trained spec. The
+    # playground MJCF bakes actuator-level damping into the joints (hip/knee
+    # damping 2.0 ≈ AGILE's kd — their pipeline uses kp-only position
+    # actuators) plus frictionloss 0.1 and per-CAD armature. zealot trains
+    # with passive damping 0.001 / frictionloss 0 / armature 0.02 and applies
+    # kd in the PD — leaving the model values in place DOUBLE-damps every
+    # joint, which spares quasi-static balance but mistimes the swing leg
+    # (measured: the walking policy face-planted at 0.8 s every attempt;
+    # the standing-era policy was unaffected).
+    for i, n in enumerate(POLICY_JOINTS):
+        da = model.joint(n).dofadr[0]
+        model.dof_damping[da] = 0.001
+        model.dof_frictionloss[da] = 0.0
+        model.dof_armature[da] = 0.02
+
     held = []  # (qposadr, dofadr, kp, kd, eff, q_home)
     home_qpos = model.key_qpos[key_home]
     for j in range(model.njnt):

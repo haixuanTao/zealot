@@ -56,7 +56,7 @@ const EPOCHS: usize = 5;
 const MINIBATCHES: usize = 4;
 const LR: f32 = 1e-3;
 const CLIP: f32 = 0.2;
-const ENTROPY: f32 = 0.01; // WBC lerobot entropy_coef (was 0.005)
+const ENTROPY: f32 = 0.005; // WBC-AGILE G1 entropy_coef (verified in their runner cfg)
 const VALUE_COEF: f32 = 1.0; // WBC-AGILE / rsl_rl value_coef
 const GAMMA: f32 = 0.99;
 const LAM: f32 = 0.95;
@@ -545,10 +545,12 @@ impl GpuMlp {
 }
 
 fn main() {
+    // Default budget = WBC-AGILE's max_iterations (50k). Our earlier runs were
+    // judged at 10k against results AGILE gets with 5× the budget.
     let iters: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(200);
+        .unwrap_or(50_000);
     let n: usize = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
@@ -1114,24 +1116,33 @@ fn main() {
                 gstep += n_mb as u64;
                 let bc1 = 1.0 - 0.9f32.powi(gstep.min(1 << 30) as i32);
                 let bc2 = 1.0 - 0.999f32.powi(gstep.min(1 << 30) as i32);
-                let adp = Tensor::scalar(
-                    &bk,
-                    AdamParams {
-                        lr,
-                        beta1: 0.9,
-                        beta2: 0.999,
-                        eps: 1e-8,
-                        bias_correction1: bc1,
-                        bias_correction2: bc2,
-                        pad0: 0.0,
-                        pad1: 0.0,
-                    },
-                    BufferUsages::UNIFORM,
-                )
-                .unwrap();
-                let t_enc = Instant::now();
-                let mut cur = EncCursor::new(&bk);
+                // rsl_rl-parity: PER-MINIBATCH KL-adaptive LR. Each minibatch is
+                // encoded+executed on its own cursor with the CURRENT lr baked
+                // into its AdamParams; the full Gaussian KL of THIS minibatch
+                // (vs the rollout policy) then updates lr for the next one.
+                // (One-minibatch lag vs rsl_rl's same-minibatch application —
+                // the braking cadence, n_mb×EPOCHS corrections per iteration
+                // instead of EPOCHS, is what matters.) Costs one sync +
+                // ~1 MB readback per minibatch instead of one per epoch.
+                let mut kl = 0.0f32;
                 for k in 0..n_mb {
+                    let adp = Tensor::scalar(
+                        &bk,
+                        AdamParams {
+                            lr,
+                            beta1: 0.9,
+                            beta2: 0.999,
+                            eps: 1e-8,
+                            bias_correction1: bc1,
+                            bias_correction2: bc2,
+                            pad0: 0.0,
+                            pad1: 0.0,
+                        },
+                        BufferUsages::UNIFORM,
+                    )
+                    .unwrap();
+                    let t_enc = Instant::now();
+                    let mut cur = EncCursor::new(&bk);
                     let off = (k * mb) as u32;
                     let nb = mb as u32;
                     {
@@ -1403,57 +1414,50 @@ fn main() {
                         )
                         .unwrap();
                     }
-                }
-                enc_s += t_enc.elapsed().as_secs_f64();
-                let t_exec = Instant::now();
-                cur.flush();
-                bk.synchronize().unwrap();
-                exec_s += t_exec.elapsed().as_secs_f64();
+                    enc_s += t_enc.elapsed().as_secs_f64();
+                    let t_exec = Instant::now();
+                    cur.flush();
+                    bk.synchronize().unwrap();
+                    exec_s += t_exec.elapsed().as_secs_f64();
 
-                // Per-epoch KL (last minibatch) → adaptive-KL LR for the next epoch.
-                let t_kl = Instant::now();
-                let mn = bk.slow_read_vec(a_net.a[la + 1].buffer()).await.unwrap(); // [ad x mb]
-                let ls = bk.slow_read_vec(lst.buffer()).await.unwrap(); // [ad]
-                // Full analytic Gaussian KL(old‖new) per rsl_rl:
-                //   Σ_k  log(σ_new/σ_old) + (σ_old² + (μ_old−μ_new)²)/(2σ_new²) − ½
-                // (ls = log σ_new current; log_std_old = log σ_old rollout). The
-                // old mean-only form dropped the σ terms, under-reading KL when the
-                // std moved and letting the LR controller overshoot.
-                let mut kl = 0.0f32;
-                for c in 0..mb {
-                    for k in 0..ad_ {
-                        let ls_new = ls[k];
-                        let ls_old = log_std_old[k];
-                        let sig_old2 = (2.0 * ls_old).exp();
-                        let inv_sig_new2 = (-2.0 * ls_new).exp();
-                        let dmu = mn[k * mb + c] - mean_old_last[c][k];
-                        kl += (ls_new - ls_old)
-                            + 0.5 * (sig_old2 + dmu * dmu) * inv_sig_new2
-                            - 0.5;
+                    // Full analytic Gaussian KL(old‖new) of THIS minibatch, per
+                    // rsl_rl:  Σ_j log(σ_new/σ_old) + (σ_old² + Δμ²)/(2σ_new²) − ½
+                    // (ls = log σ_new current; log_std_old = log σ_old rollout).
+                    let t_kl = Instant::now();
+                    let mn = bk.slow_read_vec(a_net.a[la + 1].buffer()).await.unwrap(); // [ad x mb]
+                    let ls = bk.slow_read_vec(lst.buffer()).await.unwrap(); // [ad]
+                    kl = 0.0;
+                    let boff = k * mb;
+                    for c in 0..mb {
+                        let mo = &batch[boff + c].mean_old;
+                        for j in 0..ad_ {
+                            let ls_new = ls[j];
+                            let ls_old = log_std_old[j];
+                            let sig_old2 = (2.0 * ls_old).exp();
+                            let inv_sig_new2 = (-2.0 * ls_new).exp();
+                            let dmu = mn[j * mb + c] - mo[j];
+                            kl += (ls_new - ls_old)
+                                + 0.5 * (sig_old2 + dmu * dmu) * inv_sig_new2
+                                - 0.5;
+                        }
+                    }
+                    kl /= mb as f32;
+                    kl_s += t_kl.elapsed().as_secs_f64();
+                    // Adapt lr immediately (rsl_rl cadence: every minibatch).
+                    if kl > DESIRED_KL * 2.0 {
+                        lr = (lr / 1.5).max(lr_min);
+                    } else if kl > 0.0 && kl < DESIRED_KL / 2.0 {
+                        lr = (lr * 1.5).min(LR_MAX);
                     }
                 }
-                kl /= mb as f32;
-                kl_s += t_kl.elapsed().as_secs_f64();
                 last_kl = kl;
                 if kl_probe {
                     println!("[klprobe] epoch {_epoch} cumulative kl = {kl:.6} (lr {lr:.2e})");
                 }
-                if kl > DESIRED_KL * 2.0 {
-                    lr = (lr / 1.5).max(lr_min);
-                } else if kl > 0.0 && kl < DESIRED_KL / 2.0 {
-                    lr = (lr * 1.5).min(LR_MAX);
-                }
-                // KL early-stop (rsl_rl / WBC-AGILE): if this iteration's policy has
-                // already drifted far past target, stop the remaining epochs so one
-                // iteration can't run KL away. Without it the loop ran all EPOCHS
-                // regardless, letting per-iter KL blow to ~100 during the walk-command
-                // ramp (the policy thrashed instead of refining a gait). `kl` here is
-                // current-vs-rollout policy, i.e. cumulative per-iter drift, so this
-                // caps per-iter KL at ~5× target. (Tightening this to 1.5× was tried
-                // and crippled learning ~40× — it sits inside the per-epoch KL
-                // estimate's noise floor and trips constantly. The late-phase
-                // degradation is instead handled by the cosine LR-ceiling decay, so
-                // this early-phase safety stays loose.)
+                // Safety net: if cumulative drift vs the rollout policy still ran
+                // away despite the per-minibatch braking, stop the remaining
+                // epochs (historically per-iter KL blew to ~100 during the
+                // walk-command ramp without this).
                 if kl > DESIRED_KL * 5.0 {
                     break;
                 }
