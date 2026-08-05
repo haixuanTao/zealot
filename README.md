@@ -87,7 +87,7 @@ Organized as a [Diátaxis](https://diataxis.fr) set, hub at
 [**haixuantao.github.io/zealot/doc**](https://haixuantao.github.io/zealot/doc/):
 
 - **[Getting started](docs/getting-started.md)** — the [live demo](https://haixuantao.github.io/zealot/)
-  is step one (nothing to install), then pendulum → humanoid training → your
+  is step one (nothing to install), then humanoid training, then your
   checkpoint back in the demo.
 - **How-to guides** — [building & development](docs/development.md),
   [reproducing the benchmarks](docs/benchmarks.md), [the demo site](website/README.md).
