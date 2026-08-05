@@ -756,8 +756,15 @@ fn main() {
         // Grad-clip machinery: GPU-side squared norms (one SqNorm reduce per
         // grad tensor into a slot of `sqn`, single tiny readback per
         // minibatch) + per-shape scale tensors for the (rare) clip events.
+        // Tensor storage is ROW-major: 64 floats per slot row = 256 bytes, so
+        // every rows_mut(slot, 1) view starts at a 256-byte-aligned buffer
+        // offset — WebGPU/Metal bind groups reject unaligned storage offsets
+        // (Vulkan wants 256, Metal 32); the old 1x32 layout bound slot k at
+        // offset 4k and panicked on any non-CUDA backend (grad clip was
+        // CUDA-only until the defaults change).
+        const SQN_STRIDE: usize = 64;
         let red = Reduce::from_backend(&bk).unwrap();
-        let mut sqn = mk(&bk, &DMatrix::<f32>::zeros(1, 32), rw);
+        let mut sqn = mk(&bk, &DMatrix::<f32>::zeros(32, SQN_STRIDE), rw);
         let (mut gc_scales, mut gc_lens): (Vec<Tensor<f32>>, Vec<usize>) = (vec![], vec![]);
         let mut gc_slots = 0usize;
         if grad_clip > 0.0 {
@@ -1366,7 +1373,7 @@ fn main() {
                                         &mut p,
                                         ReduceVariant::SqNorm,
                                         t,
-                                        sqn.columns_mut(slot, 1),
+                                        sqn.rows_mut(slot, 1),
                                     )
                                     .unwrap();
                                     slot += 1;
@@ -1378,14 +1385,19 @@ fn main() {
                                 &mut p,
                                 ReduceVariant::SqNorm,
                                 &dls,
-                                sqn.columns_mut(slot, 1),
+                                sqn.rows_mut(slot, 1),
                             )
                             .unwrap();
                         }
                         cur.flush();
                         bk.synchronize().unwrap();
                         let sums = bk.slow_read_vec(sqn.buffer()).await.unwrap();
-                        let norm = sums[..gc_slots].iter().sum::<f32>().sqrt();
+                        let norm = sums
+                            .iter()
+                            .step_by(SQN_STRIDE)
+                            .take(gc_slots)
+                            .sum::<f32>()
+                            .sqrt();
                         if norm > grad_clip {
                             let sc = grad_clip / norm;
                             for (buf, len) in gc_scales.iter_mut().zip(gc_lens.iter()) {

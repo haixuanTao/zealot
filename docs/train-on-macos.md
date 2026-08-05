@@ -1,5 +1,26 @@
 # Training the biped on macOS (Apple Silicon / Metal)
 
+> **Current stack (pinned 2026-08-05, post-restructure).** Sibling checkouts
+> under `$WORK` (all on the user's GitHub unless noted):
+>
+> | repo | checkout | branch @ rev |
+> |---|---|---|
+> | zealot | `$WORK/zealot` | `master` @ 329fb3b (+`git pull`) |
+> | nexus | `$WORK/nexus` | `feat/browser-web-demo` @ d2451e0 |
+> | khal (worktree `khal-unified`) | `$WORK/khal-unified` | `khal/unified` @ c6175be |
+> | vortx (worktree `vortx-unified`) | `$WORK/vortx-unified` | `vortx/unified` @ 1495fe4 |
+> | rapier | `$WORK/rapier` | `world` @ ddb7ae1 (haixuanTao/rapier) |
+> | parry | `$WORK/parry` | haixuanTao/parry-vendored `master` |
+> | naga-fixed | `$WORK/naga-fixed` | haixuanTao/naga-fixed `vendored-20260805` |
+> | cutile-rs | `$WORK/cutile-rs` | NVlabs/cutile-rs tag `v0.2.0` (path dep must exist even on macOS) |
+>
+> Launch: `scripts/train.sh [iters] [envs] [ckpt]` — it auto-detects the
+> backend (WebGPU/Metal on a Mac) and the production config is the code
+> default (no env-var litany). Demo/bench assets fetch from Hugging Face via
+> `scripts/fetch_demo_assets.sh` (train does not need them). The WebGPU leg
+> incl. default grad-clip is verified on Vulkan; Metal shares the wgpu path.
+
+
 macOS is a first-class training target since 2026-07-06: at 1024 envs an
 M-series Mac matches an RTX 5060 wall-clock (~4.1 s/iter, ~6.1k samples/s).
 Before that date the sim was broken on Metal by a shader-compiler bug — the
