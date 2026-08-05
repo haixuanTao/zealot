@@ -32,7 +32,28 @@ compiled to whatever GPU is available.**
   sim2sim on rapier.js, MuJoCo (wasm and native), Genesis, and Isaac — and on
   the physical G1 via `deploy/`.
 
-The long-form version: [docs/explanation.md](docs/explanation.md).
+## What's different about the physics
+
+Most GPU RL simulators buy speed by simplifying the dynamics. nexus doesn't:
+
+- **Articulated dynamics computed as dynamics.** A Featherstone-style
+  multibody solver runs *on the GPU*: the mass matrix is rebuilt and
+  LU-refactored **every 5 ms substep**, with TGS joint/contact iterations on
+  top — the fidelity class of CPU MuJoCo, batched across thousands of envs.
+- **Real actuator gains.** The env runs Unitree's actual PD gains and torque
+  limits. At the real ankle gains a humanoid can't even *stand* without
+  proper implicit-PD solver support (MuJoCo agrees) — many RL setups quietly
+  inflate gains; the sim2sim and hardware-deploy contract here forbids it.
+- **Honest speed.** Against PhysX 5 running the *same* TGS budget on the same
+  RTX 5090, zealot is ~0.85× at 2048 envs ([full tables](docs/benchmarks.md)
+  — including where the gap opens, and why Genesis's bigger headline numbers
+  are not iteration-equivalent).
+- **MuJoCo as the referee, not a rival.** The same checkpoint steps through
+  official MuJoCo (wasm in the browser, native in CI harnesses) on
+  bit-identical terrain. Where the engines agree, trust the policy; where
+  they diverge, you've found an exploit or a robustness gap.
+
+The long-form version of both sections: [docs/explanation.md](docs/explanation.md).
 
 ## Getting started
 

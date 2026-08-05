@@ -62,6 +62,36 @@ kernels (`zealot-obs-shaders`, `zealot-gpu-obs`) chained with the physics
 substeps. The CPU's only steady-state job is deciding how many steps to run
 and reading back poses for rendering — pipelined, never fenced.
 
+## What's different about the physics (vs MuJoCo, PhysX, Genesis)
+
+GPU RL simulators usually buy throughput by weakening the dynamics —
+rigid-body soups with stiff joints, frozen mass matrices, inflated actuator
+gains. nexus keeps the dynamics and batches them:
+
+- **Featherstone on the GPU, refreshed every substep.** The articulated-body
+  mass matrix is rebuilt and LU-factored *per 5 ms substep*, per environment,
+  as GPU kernels; joint and contact constraints re-linearize on the same
+  cadence, with TGS iterations on top. This is the fidelity class of CPU
+  MuJoCo — but batched across thousands of environments on whatever GPU is
+  present.
+- **Real gains are non-negotiable.** The training env runs Unitree's actual
+  PD gains and torque limits. At the real ankle gains a G1 cannot passively
+  stand — the gains are far below the m·g·L gravity stiffness, and MuJoCo
+  reproduces the same result — so stability at 5 ms timesteps comes from
+  solver structure (implicit PD through the constraint solver, per-substep
+  refresh, contact stiffness tuned at 240 Hz), not from quietly multiplying
+  the gains the way many RL configs do. What trains is what deploys.
+- **Throughput with the caveats attached.** On one RTX 5090 with the same
+  TGS budget (4 substeps × 8 position iterations), zealot runs ~0.85× of
+  Isaac/PhysX 5 at 2048 envs, with the gap opening at larger batches;
+  Genesis posts bigger headline numbers by integrating 2×10 ms strides per
+  control step vs zealot's 4×5 ms substeps — per integration step it is
+  roughly engine parity. Full methodology: [benchmarks.md](benchmarks.md).
+- **And it runs where the others don't.** PhysX is CUDA; MJX is XLA; the
+  same nexus solver runs in a browser tab, on Metal, and on CUDA from one
+  Rust source — with the CUDA and WebGPU builds verified bit-exact against
+  each other.
+
 ## A policy is only trustworthy if it survives a different solver
 
 The same checkpoint runs sim2sim on rapier.js and on the official MuJoCo
