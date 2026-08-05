@@ -20,10 +20,13 @@ import numpy as np
 SRC, OUT = sys.argv[1], sys.argv[2]
 PROBE = sys.argv[3] if len(sys.argv) > 3 else None
 
-P = os.path.expanduser(
-    "~/miniforge3/envs/mjx/lib/python3.12/site-packages/mujoco_playground/_src/locomotion/g1/xmls"
+# G1_SCENE_XML overrides the scene (any G1 model with a `floating_base_joint`
+# free joint works for playback — e.g. mujoco_menagerie unitree_g1/scene.xml).
+SCENE = os.environ.get("G1_SCENE_XML") or os.path.expanduser(
+    "~/miniforge3/envs/mjx/lib/python3.12/site-packages/mujoco_playground/_src"
+    "/locomotion/g1/xmls/scene_mjx_feetonly_flat_terrain.xml"
 )
-model = mujoco.MjModel.from_xml_path(f"{P}/scene_mjx_feetonly_flat_terrain.xml")
+model = mujoco.MjModel.from_xml_path(SCENE)
 model.vis.global_.offwidth, model.vis.global_.offheight = 1280, 720
 data = mujoco.MjData(model)
 # Start from the model's home keyframe so non-driven joints (waist/arms) hold

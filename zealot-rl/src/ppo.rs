@@ -576,9 +576,15 @@ impl ActorCritic {
 
     /// Load a policy previously written by [`save`]. Adam state is reinitialised.
     pub fn load(path: &str) -> std::io::Result<Self> {
-        use safetensors::SafeTensors;
         let bytes = std::fs::read(path)?;
-        let st = SafeTensors::deserialize(&bytes).map_err(io_err)?;
+        Self::load_from_bytes(&bytes)
+    }
+
+    /// [`load`], but from an in-memory `.safetensors` image — for targets with
+    /// no filesystem (wasm demos embed the checkpoint via `include_bytes!`).
+    pub fn load_from_bytes(bytes: &[u8]) -> std::io::Result<Self> {
+        use safetensors::SafeTensors;
+        let st = SafeTensors::deserialize(bytes).map_err(io_err)?;
         // Read an Mlp by scanning `<prefix>.w_{l}` and `<prefix>.b_{l}` for
         // contiguous l starting at 0. `dims` is reconstructed from the shapes.
         let read_mlp = |prefix: &str| -> std::io::Result<Mlp> {

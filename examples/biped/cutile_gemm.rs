@@ -63,6 +63,16 @@ impl<'b> EncCursor<'b> {
     pub fn new(bk: &'b GpuBackend) -> Self {
         Self { bk, enc: None }
     }
+    /// Wrap an existing encoder so GEMM passes share the caller's command
+    /// buffer (single-submit control steps in the browser demo).
+    pub fn from_encoder(bk: &'b GpuBackend, enc: <GpuBackend as Backend>::Encoder) -> Self {
+        Self { bk, enc: Some(enc) }
+    }
+    /// Hand the (possibly created) encoder back to the caller WITHOUT
+    /// submitting — the inverse of [`Self::from_encoder`].
+    pub fn into_encoder(mut self) -> Option<<GpuBackend as Backend>::Encoder> {
+        self.enc.take()
+    }
     pub fn pass(&mut self, name: &str) -> khal::backend::GpuPass {
         if self.enc.is_none() {
             self.enc = Some(self.bk.begin_encoding());

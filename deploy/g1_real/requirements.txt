@@ -1,0 +1,7 @@
+# Robot-side deps. unitree_sdk2py is only needed on the machine that talks
+# to the robot (Linux recommended); --mock runs everywhere without it.
+numpy
+pyyaml
+safetensors
+onnxruntime
+unitree_sdk2py; sys_platform == "linux"

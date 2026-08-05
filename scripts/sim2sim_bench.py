@@ -65,7 +65,8 @@ def nexus_leg(name, cmd):
 
 def mujoco_leg(name, cmd):
     mjson = f"{OUT}/mujoco_{name}.metrics.json"
-    env = dict(os.environ, BIPED_CMD=cmd, S2S_METRICS_JSON=mjson, MUJOCO_GL="egl")
+    env = dict(os.environ, BIPED_CMD=cmd, S2S_METRICS_JSON=mjson,
+               MUJOCO_GL=os.environ.get("MUJOCO_GL", "egl"))  # cgl on macOS
     subprocess.run([BENCH_PY, f"{ROOT}/examples/biped/sim2sim_g1_mujoco.py",
                     CKPT, f"{OUT}/mujoco_{name}.mp4", str(CLIP_S)],
                    env=env, check=True, capture_output=True)

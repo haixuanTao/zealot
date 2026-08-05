@@ -1,0 +1,20 @@
+{
+ "engine": "mujoco",
+ "model_xml": "/Users/xaviertao/Documents/work/mujoco_menagerie/unitree_g1/scene.xml",
+ "policy": "/Users/xaviertao/Documents/work/zealot/g1_v19_final.safetensors",
+ "command": [
+  0.8,
+  0.0,
+  0.0,
+  0.0
+ ],
+ "clip_seconds": 15.0,
+ "falls": 0,
+ "episodes": [
+  {
+   "seconds": 15.0,
+   "traveled_m": 5.089314225173842,
+   "end": "clip_end"
+  }
+ ]
+}

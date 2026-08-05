@@ -1,0 +1,46 @@
+# WBC-AGILE pretrained end-to-end velocity policy (Unitree G1 29-DOF).
+# The ONNX emits joint targets AND per-joint kp/kd for the 14 controlled
+# joints (12 legs + waist_roll + waist_pitch); use this proven sim2real
+# policy for first hardware bring-up.
+control_dt: 0.02
+imu_type: pelvis
+lowcmd_topic: rt/lowcmd
+lowstate_topic: rt/lowstate
+
+policy:
+  type: agile_e2e
+  path: assets/unitree_g1_velocity_e2e.onnx
+  # descriptor defaults to the .yaml next to the .onnx
+
+startup:
+  # Ramp targets for the 14 policy-controlled joints (legs + waist roll/pitch).
+  leg_motors: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14]
+  leg_angles: [-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
+               -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
+               0.0, 0.0]
+  leg_kps: [100.0, 100.0, 100.0, 200.0, 40.0, 40.0,
+            100.0, 100.0, 100.0, 200.0, 40.0, 40.0,
+            300.0, 300.0]
+  leg_kds: [2.5, 2.5, 2.5, 5.0, 2.0, 2.0,
+            2.5, 2.5, 2.5, 5.0, 2.0, 2.0,
+            5.0, 5.0]
+  # Held for the whole session: waist_yaw + both arms.
+  hold_motors: [12,
+                15, 16, 17, 18, 19, 20, 21,
+                22, 23, 24, 25, 26, 27, 28]
+  hold_angles: [0.0,
+                0.0, 0.2, 0.0, 0.9, 0.0, 0.0, 0.0,
+                0.0, -0.2, 0.0, 0.9, 0.0, 0.0, 0.0]
+  hold_kps: [300.0,
+             90.0, 60.0, 20.0, 60.0, 4.0, 4.0, 4.0,
+             90.0, 60.0, 20.0, 60.0, 4.0, 4.0, 4.0]
+  hold_kds: [5.0,
+             2.0, 1.0, 0.4, 1.0, 0.2, 0.2, 0.2,
+             2.0, 1.0, 0.4, 1.0, 0.2, 0.2, 0.2]
+
+max_cmd: [0.5, 0.3, 0.6]
+
+safety:
+  max_tilt_deg: 55
+  lowstate_timeout: 0.2
+  max_target_step: 0.6

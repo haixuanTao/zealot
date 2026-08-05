@@ -88,9 +88,14 @@ def leg_gains(name):
         return 200.0, 5.0, 139.0
     if "hip" in name:
         return 100.0, 2.5, 88.0
+    # Ankle gains follow the trainer's BIPED_ANKLE_KP/KD overrides when set
+    # (e.g. the v19 run trains ankles at 40/2.0, not the spec's 20/0.2);
+    # evaluating a checkpoint with the wrong ankle stiffness mis-tests it.
+    akp = float(os.environ.get("BIPED_ANKLE_KP", 0) or 0)
+    akd = float(os.environ.get("BIPED_ANKLE_KD", 0) or 0)
     if "ankle_roll" in name:
-        return 20.0, 0.1, 50.0
-    return 20.0, 0.2, 50.0  # ankle_pitch
+        return akp or 20.0, akd or 0.1, 50.0
+    return akp or 20.0, akd or 0.2, 50.0  # ankle_pitch
 
 
 # Upper-body holding gains: zealot's held_joints table (first fragment wins).
@@ -158,6 +163,8 @@ def main():
     data = mujoco.MjData(model)
 
     key_home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    if key_home < 0:  # menagerie names its keyframe "stand"
+        key_home = 0
 
     # Joint bookkeeping: policy legs + PD-held upper body.
     pol_q = np.array([model.joint(n).qposadr[0] for n in POLICY_JOINTS])
@@ -212,12 +219,47 @@ def main():
 
     rng = np.random.default_rng(7)
 
+    # S2S_INIT_POSE="joint=rad;..." + S2S_INIT_RP="roll,pitch": start every
+    # episode from a recorded real-robot state instead of the home pose
+    # (snapshot replay; mirrors nexus's BIPED_INIT_POSE / BIPED_INIT_RP).
+    # The base height is reconstructed by dropping the robot until the closest
+    # foot geom sits 2 mm above the floor.
+    init_pose = {}
+    for kv in os.environ.get("S2S_INIT_POSE", "").split(";"):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            init_pose[k.strip()] = float(v)
+    init_rp = None
+    if os.environ.get("S2S_INIT_RP"):
+        r, p = (float(x) for x in os.environ["S2S_INIT_RP"].split(","))
+        init_rp = (r, p)
+
     def reset():
         mujoco.mj_resetDataKeyframe(model, data, key_home)
         data.qpos[pol_q] = DEFAULT_POS
-        # small yaw jitter so attempts differ
-        yaw = rng.uniform(-0.3, 0.3)
-        data.qpos[free_q + 3:free_q + 7] = [np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
+        if init_pose or init_rp:
+            for n, a in init_pose.items():
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)
+                if jid >= 0:
+                    data.qpos[model.jnt_qposadr[jid]] = a
+            r, p = init_rp or (0.0, 0.0)
+            cr, sr = np.cos(r / 2), np.sin(r / 2)
+            cp, sp = np.cos(p / 2), np.sin(p / 2)
+            # yaw 0: quat = Ry(pitch) * Rx(roll), wxyz
+            data.qpos[free_q + 3:free_q + 7] = [cp * cr, cp * sr, sp * cr, -sp * sr]
+            mujoco.mj_forward(model, data)
+            floor = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+            gap = np.inf
+            for g in range(model.ngeom):
+                bname = model.body(model.geom_bodyid[g]).name
+                if "ankle_roll" in bname or "foot" in bname:
+                    gap = min(gap, mujoco.mj_geomDistance(model, data, floor, g, 1.0, None))
+            if np.isfinite(gap):
+                data.qpos[free_q + 2] -= gap - 0.002
+        else:
+            # small yaw jitter so attempts differ
+            yaw = rng.uniform(-0.3, 0.3)
+            data.qpos[free_q + 3:free_q + 7] = [np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
         data.qvel[:] = 0.0
         mujoco.mj_forward(model, data)
 

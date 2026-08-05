@@ -246,4 +246,24 @@ impl GpuPolicy {
         let values: Vec<f32> = (0..n).map(|e| c_out[e]).collect();
         Ok((means, values))
     }
+
+    /// GPU-resident actor access: the input activation tensor (row-major
+    /// [obs_dim × n]) for an external writer (e.g. the GPU obs-assembly
+    /// kernel, which writes ALREADY-normalized values), …
+    pub fn actor_input_mut(&mut self) -> &mut Tensor<f32> {
+        &mut self.actor.a[0]
+    }
+
+    /// … the output activation (row-major [act_dim × n]) …
+    pub fn actor_output(&self) -> &Tensor<f32> {
+        self.actor.output()
+    }
+
+    /// … and an encode-only mean forward (no host copies, no sync — caller
+    /// owns submission via the cursor).
+    pub fn encode_actor(&mut self, backend: &GpuBackend, cur: &mut EncCursor) -> anyhow::Result<()> {
+        self.actor
+            .encode(backend, &self.ops, &mut self.shapes, cur, self.ct)?;
+        Ok(())
+    }
 }
