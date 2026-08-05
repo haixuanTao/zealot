@@ -7,40 +7,6 @@ physics engine.
 
 [![The web demo: Unitree G1s walking the training terrain in the browser](docs/img/web-demo.png)](https://haixuantao.github.io/zealot/)
 
-The **training environment itself, compiled to wasm**: the same nexus GPU
-physics the trainer runs (real Unitree PD gains, 5 ms substeps + per-substep
-refresh, 50 Hz control) executing as WebGPU compute shaders in the browser,
-with the whole control loop GPU-resident — observation assembly, the policy
-GEMMs, and PD-target scatter never leave the GPU (`zealot-obs-shaders` +
-`examples/biped/gpu_policy.rs`).
-
-- **Three engines, one policy, one terrain** — the nexus (WebGPU) tab plus two
-  sim2sim tabs stepping the identical checkpoint through
-  [rapier.js](https://rapier.rs) and the official MuJoCo wasm build, on a
-  bit-faithful JS port of the training terrain generator. Browser-grade
-  sim2sim, no install.
-- **Run any published checkpoint** — the Policy picker lists
-  [`haixuantao/zealot-g1-locomotion`](https://huggingface.co/haixuantao/zealot-g1-locomotion),
-  and pasting any Hugging Face handle (`owner/repo`), model-page URL, or direct
-  `.safetensors` link loads that policy instead. Obs layout (45- vs 48-dim
-  frames) and the matching gait clock are detected from the checkpoint, so
-  pre- and post-gyro policies both walk.
-- **Interactive** — terrain difficulty / roughness / slope and robot-count
-  sliders; drive the robot with arrows/WASD or a gamepad; the URL carries the
-  configuration, so a link like
-  [`?ckpt=haixuantao/zealot-g1-locomotion&n=1`](https://haixuantao.github.io/zealot/?ckpt=haixuantao/zealot-g1-locomotion&n=1)
-  is a shareable pointer at a specific policy.
-- **Browser support** — the WebGPU tab needs Chrome (or another Chromium);
-  Safari, Firefox and iOS automatically open on the CPU engines instead.
-- Diagnostics for the curious: `?prof=1` prints a per-kernel GPU-time
-  breakdown to the console; the HUD reports sim speed, pose-fence time and
-  GPU-boundary counters.
-
-The demo sources are `examples/biped/g1_web_demo.rs` (shared implementation)
-behind the `g1_terrain_web` / `g1_web` examples; the site lives in
-[`website/`](website/) (Vite + React, deployed to GitHub Pages —
-see `website/README.md`).
-
 ## Why it's built this way
 
 **Every layer — physics, model, training loop, deployment — is Rust,
