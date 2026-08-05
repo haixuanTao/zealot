@@ -34,31 +34,28 @@ compiled to whatever GPU is available.**
 
 ## What's different about the physics
 
-Read from the solver source, not the marketing (details + file pointers in
+Derived from the solver source (full analysis with file pointers:
 [docs/explanation.md](docs/explanation.md)):
 
-- **Generalized-coordinate dynamics on the GPU.** Each robot is a reduced-
-  coordinate multibody: per 5 ms substep, GPU kernels run forward kinematics,
-  body Jacobians, velocity propagation, a CRBA mass matrix, then a dense LU
-  factor + solve in workgroup shared memory — the same algorithmic family as
-  MuJoCo's CRB + factorization, batched across thousands of environments.
-  Most GPU RL engines don't do articulated dynamics this way.
-- **Soft-TGS constraint solver** (rapier's algorithm): substepping,
-  warmstarting, graph-colored Gauss–Seidel, soft contacts parameterized by
-  natural frequency/damping ratio (240 Hz/ζ=1 in training), speculative
-  contacts, box friction. Contact/joint constraints re-linearize from live
-  poses every substep.
-- **Actuators modeled like hardware.** PD torque (τ = kp·Δq − kd·v, clamped
-  to the real Unitree torque limits) is computed inside the dynamics kernel
-  each substep, with optional per-env actuator delay; armature, implicit
-  joint damping, and Coulomb friction-loss come from the official Unitree
-  model values. At the real ankle gains a G1 cannot passively stand (MuJoCo
-  reproduces this) — no gain inflation anywhere.
-- **Honest speed, MuJoCo as referee.** ~0.85× Isaac/PhysX 5 at 2048 envs on
-  the same TGS budget and GPU ([tables](docs/benchmarks.md), including why
-  Genesis's headline numbers aren't iteration-equivalent) — and the same
-  checkpoint steps through official MuJoCo on bit-identical terrain, in the
-  browser and natively, as the standing cross-check.
+| | **zealot (nexus)** | MuJoCo | Isaac Lab (PhysX 5) | MJX | Genesis |
+| --- | --- | --- | --- | --- | --- |
+| Articulated dynamics | generalized coords: CRBA + dense LU, rebuilt **every 5 ms substep**, on GPU | generalized coords: CRB + sparse LᵀDL (the reference) | reduced-coord articulations, Featherstone-style | MuJoCo's model via XLA | own solvers (Taichi) |
+| Constraint solver | Soft-TGS (rapier's algorithm): colored Gauss–Seidel, soft contacts 240 Hz/ζ=1, speculative contacts, box friction¹ | convex smooth contact optimization | TGS | MuJoCo-like, with restrictions | own |
+| Actuation in the shipped env | real Unitree PD gains + torque limits, per-substep PD in-kernel, actuator delay, armature / damping / friction-loss from official models | config-dependent | config-dependent | config-dependent | config-dependent |
+| Runs on | WebGPU (browser!) + Metal + CUDA, one Rust source | CPU | CUDA | GPU/TPU via XLA | CUDA |
+| G1 throughput, same RTX 5090² | 61 k / 71 k / 82 k | — (CPU) | 72 k / 115 k / 180 k | 77 k / 89 k / 98 k | 342 k / 622 k / 963 k³ |
+| Cross-checked here | is the trainer | browser + native harness | harness | — | harness |
+
+¹ per-tangent ±μ·N clamp; the circular cone is noted in-source as future work.
+² env-steps/s at N = 2048/4096/8192, sequential same-hour runs
+  ([methodology](docs/benchmarks.md)); zealot & Genesis 12-DOF, Isaac & MJX
+  full-body — read the notes before quoting.
+³ not iteration-equivalent: Genesis integrates 2×10 ms strides per control
+  step vs zealot's 4×5 ms substeps, each with 8 TGS iterations.
+
+The load-bearing realism claim: at Unitree's real ankle gains a G1 cannot
+passively stand (MuJoCo reproduces this) — stability at 5 ms comes from the
+per-substep refresh and soft-contact structure, not from inflating gains.
 
 ## Getting started
 
