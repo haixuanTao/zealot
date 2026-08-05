@@ -37,6 +37,8 @@ a {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  /* Phones: 100vh includes the collapsed browser chrome; dvh tracks it. */
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -564,4 +566,112 @@ a {
 
 .featureIcon {
   font-size: 2.4rem;
+}
+
+
+/* ---------- Phone layout: the demo owns the screen ---------- */
+
+/* Desktop: the gear does not exist; the knob row is always visible. */
+.knobsToggle {
+  display: none;
+}
+
+@media (max-width: 720px) {
+  .toolbar {
+    gap: 0.45rem;
+    padding: 0.45rem 0.6rem;
+  }
+
+  .tabs {
+    display: flex;
+    flex: 1;
+    gap: 0.3rem;
+  }
+
+  .tab {
+    flex: 1;
+    padding: 0.45rem 0.3rem;
+    font-size: 0.82rem;
+    white-space: nowrap;
+  }
+
+  /* "nexus" beats "nexus (WebGPU)" when three tabs share 350px. */
+  .tabSub {
+    display: none;
+  }
+
+  .knobsToggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2.3rem;
+    height: 2.3rem;
+    border: 1px solid #d6e0e0;
+    border-radius: 8px;
+    background: #fff;
+    font: inherit;
+    font-size: 1rem;
+    cursor: pointer;
+  }
+
+  /* Collapsed by default; the gear opens a stacked panel. */
+  .knobs {
+    display: none;
+  }
+
+  .knobs.knobsOpen {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+    gap: 0.65rem;
+    margin-left: 0;
+    padding-bottom: 0.2rem;
+  }
+
+  .knobs.knobsOpen .knob {
+    justify-content: space-between;
+  }
+
+  /* The checkbox stays glued to its label — space-between reads as two
+     unrelated widgets on a full-width row. */
+  .knobs.knobsOpen .knobCheck {
+    justify-content: flex-start;
+    gap: 0.55rem;
+  }
+
+  .knobs.knobsOpen .knob input[type='range'] {
+    flex: 1;
+    width: auto;
+    max-width: 12rem;
+  }
+
+  .policy {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .knobSelect,
+  .knobInput {
+    width: 100%;
+    max-width: none;
+  }
+
+  .warning,
+  .notice {
+    font-size: 0.72rem;
+    padding: 0.35rem 0.6rem;
+    line-height: 1.35;
+  }
+
+  /* The overlay pills were sized for a desktop canvas. */
+  .scrollCue {
+    transform: scale(0.85);
+    transform-origin: bottom center;
+  }
+
+  .sourceLink {
+    font-size: 0.7rem;
+    padding: 0.3rem 0.55rem;
+  }
 }

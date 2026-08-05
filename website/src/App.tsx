@@ -412,6 +412,9 @@ function Demo() {
   const [knobs, setKnobs] = useState<Knobs>(knobsFromUrl);
   const [applied, setApplied] = useState<Knobs>(knobsFromUrl);
   const [reloading, setReloading] = useState(false);
+  // Phones: the full knob set buried the demo below a screen of controls, so
+  // there it collapses behind the gear (CSS decides; desktop always shows it).
+  const [knobsOpen, setKnobsOpen] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   const current = DEMOS.find((d) => d.name === selected)!;
@@ -456,12 +459,22 @@ function Demo() {
               className={`tab${selected === d.name ? ' tabActive' : ''}`}
               onClick={() => selected !== d.name && remount(() => setSelected(d.name))}
             >
-              {d.title}
+              {d.title.split(' (')[0]}
+              <span className="tabSub"> ({d.title.split(' (')[1]}</span>
             </button>
           ))}
         </div>
 
-        <div className="knobs">
+        <button
+          className="knobsToggle"
+          aria-label="Demo settings"
+          aria-expanded={knobsOpen}
+          onClick={() => setKnobsOpen((v) => !v)}
+        >
+          {knobsOpen ? '✕' : '⚙︎'}
+        </button>
+
+        <div className={`knobs${knobsOpen ? ' knobsOpen' : ''}`}>
           <PolicyPicker
             value={knobs.ckpt}
             options={checkpoints}
@@ -513,6 +526,7 @@ function Demo() {
               remount(() => {
                 setApplied(knobs);
                 writeUrl(knobs);
+                setKnobsOpen(false);
               })
             }
           >

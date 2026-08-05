@@ -7,6 +7,11 @@
     * { margin: 0; }
     body { background: #0d2b2e; color: #9fd8dc; font-family: ui-monospace, monospace; }
     #hud { position: fixed; top: 10px; left: 10px; background: #000a; padding: 10px 14px; font-size: 13px; white-space: pre; z-index: 2; border-radius: 6px; }
+    /* Phones: the fixed-width columns overflow a 390px viewport — wrap and
+       shrink; the numbers matter more than the alignment there. */
+    @media (max-width: 700px) {
+      #hud { font-size: 9.5px; padding: 6px 8px; right: 10px; white-space: pre-wrap; word-break: break-word; }
+    }
     canvas { display: block; }
   </style>
 </head>
