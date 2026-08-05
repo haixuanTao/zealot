@@ -375,7 +375,7 @@ function PolicyPicker({
       <label className="knob">
         <span className="knobLabel">Policy</span>
         <select className="knobSelect" value={value} onChange={(e) => onChange(e.target.value)}>
-          <option value="">g1_walk_v24 (built in)</option>
+          <option value="">g1_walk_v26 (built in)</option>
           {all.map((o) => (
             <option key={o.value} value={o.value}>
               {o.label}

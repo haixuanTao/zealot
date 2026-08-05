@@ -50,6 +50,7 @@ use glamx::{Pose3, Rot3, Vec3};
 use kiss3d::camera::OrbitCamera3d;
 use kiss3d::color::Color;
 use kiss3d::scene::SceneNode3d;
+use kiss3d::event::{Action as KAction, MouseButton as KMouseButton, WindowEvent as KWindowEvent};
 use kiss3d::window::Window;
 use zealot_env::robots::NUM_JOINTS;
 use zealot_env::terrain::{TerrainFamily, TerrainParams, TerrainStrip};
@@ -69,13 +70,14 @@ const MJCF_XML: &str = include_str!("../../assets/robots/unitree_g1_29dof.xml");
 /// `tools/bake_g1_visuals.py`): per kept body, decimated menagerie meshes.
 const VISUALS_BIN: &[u8] = include_bytes!("assets/g1_visuals_29dof.bin");
 
-/// The v24 walking checkpoint (2026-07-31, iter 34k): ActorCritic weights +
-/// Welford normalizer stats. First policy with the GYRO in its observation —
-/// 48-dim frames instead of 45 — so it needs the matching env/shader obs.
-const POLICY_BIN: &[u8] = include_bytes!("assets/g1_walk_v24.safetensors");
+/// The v26 walking checkpoint (iter 42290): ActorCritic weights + Welford
+/// normalizer stats. 48-dim frames (gyro era), trained with the widened yaw
+/// command range and the yaw-inclusive gait clock — markedly stronger
+/// turning than v24.
+const POLICY_BIN: &[u8] = include_bytes!("assets/g1_walk_v26.safetensors");
 
 /// What the HUD calls the embedded checkpoint (see `POLICY_BIN`).
-const DEFAULT_CKPT: &str = "g1_walk_v24 (embedded)";
+const DEFAULT_CKPT: &str = "g1_walk_v26 (embedded)";
 
 /// Surface a demo-level problem where it can actually be seen: the browser
 /// console, or stderr natively.
@@ -1120,14 +1122,131 @@ pub async fn run(cfg: DemoCfg) {
     // first tap bumps up from the visible value instead of from zero.
     drive::sync(cmd_ui);
 
+    // ---- Tap-to-walk: click/tap the ground and robot 0 walks there. The
+    // policy still only ever sees a velocity command — a tiny P-controller
+    // steers heading + the lateral channel toward the target, which is
+    // exactly what a higher-level navigator does on hardware.
+    let mut nav_target: Option<Vec3> = None; // render-space ground point
+    let mut nav_marker = scene.add_cylinder(0.22, 0.02);
+    nav_marker.set_color(Color::new(0.21, 0.76, 0.80, 1.0));
+    nav_marker.set_visible(false);
+    let mut cursor_px = (0.0f64, 0.0f64);
+    let mut press_px: Option<(f64, f64)> = None;
+    let mut last_drive_cmd = drive::command();
+
     // One blocking snapshot to prime the pipeline; every frame after this one
     // reads back without waiting.
     let mut pose_stream = PoseStream::new(env.snapshot().await);
 
     while window.render_3d(&mut scene, &mut camera).await {
-        // Driving: each key press bumped the latched command, so apply it
-        // whenever it differs from what the robots are already running.
-        if let Some(c) = drive::command() {
+        // Tap detection: a left-button press that releases within a few
+        // pixels is a tap; anything longer is the camera orbit. Events the
+        // UI already consumed are skipped, as is the HUD panel's corner.
+        for event in window.events().iter() {
+            if event.inhibited {
+                continue;
+            }
+            match event.value {
+                KWindowEvent::CursorPos(x, y, _) => cursor_px = (x, y),
+                KWindowEvent::MouseButton(KMouseButton::Button1, KAction::Press, _) => {
+                    press_px = Some(cursor_px);
+                }
+                KWindowEvent::MouseButton(KMouseButton::Button1, KAction::Release, _) => {
+                    if let Some((px, py)) = press_px.take() {
+                        let moved = (cursor_px.0 - px).hypot(cursor_px.1 - py);
+                        let size = window.size();
+                        let in_panel = px < 0.30 * size.x as f64 && py < 0.60 * size.y as f64;
+                        if moved < 8.0 && !in_panel {
+                            // Ray through the tap; walk it onto the ground
+                            // surface (terrain height varies, so fixed-point
+                            // iterate z = h(x, y) — converges in a few steps
+                            // on these gentle slopes).
+                            let (o, d) = kiss3d::camera::Camera3d::unproject(
+                                &camera,
+                                glamx::Vec2::new(px as f32, py as f32),
+                                glamx::Vec2::new(size.x as f32, size.y as f32),
+                            );
+                            if d.z < -1e-3 {
+                                let off0 = offset_of(0);
+                                let mut t = -o.z / d.z;
+                                for _ in 0..6 {
+                                    let hit = o + d * t;
+                                    let h = if terrain {
+                                        strips[0].height(hit.x - off0.x, hit.y - off0.y)
+                                    } else {
+                                        0.0
+                                    };
+                                    t = (h - o.z) / d.z;
+                                }
+                                let hit = o + d * t;
+                                nav_target = Some(hit);
+                                nav_marker.set_pose(Pose3::from_parts(
+                                    hit + Vec3::new(0.0, 0.0, 0.03),
+                                    Rot3::from_rotation_x(core::f32::consts::FRAC_PI_2),
+                                ));
+                                nav_marker.set_visible(true);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Manual driving cancels the autopilot.
+        let drive_now = drive::command();
+        if drive_now != last_drive_cmd {
+            last_drive_cmd = drive_now;
+            nav_target = None;
+            nav_marker.set_visible(false);
+        }
+
+        // Autopilot: steer robot 0's velocity command at the target. Heading
+        // via yaw, but the LATERAL channel carries the approach too — the
+        // policy tracks ±0.4 m/s sideways well, which closes on the target
+        // even mid-turn.
+        if let Some(tgt) = nav_target {
+            let off0 = offset_of(0);
+            let (base, brot) = env.base_pose_for(0, &pose_stream.poses);
+            let bx = base[0] + off0.x;
+            let by = base[1] + off0.y;
+            let (dx, dy) = (tgt.x - bx, tgt.y - by);
+            let dist = dx.hypot(dy);
+            let c: [f32; 3] = if dist < 0.3 {
+                nav_target = None;
+                nav_marker.set_visible(false);
+                [0.0, 0.0, 0.0]
+            } else {
+                let q = Rot3::from_xyzw(brot[0], brot[1], brot[2], brot[3]);
+                let fwd = q * Vec3::X;
+                let yaw = fwd.y.atan2(fwd.x);
+                let mut err = dy.atan2(dx) - yaw;
+                err = err.sin().atan2(err.cos());
+                // Target direction in the body frame.
+                let cb = (-yaw).cos();
+                let sb = (-yaw).sin();
+                let fx = cb * dx - sb * dy;
+                let fy = sb * dx + cb * dy;
+                let slow = dist.min(1.0);
+                [
+                    (0.8 * fx * slow).clamp(-0.3, 0.6),
+                    (0.8 * fy * slow).clamp(-0.4, 0.4),
+                    (1.5 * err).clamp(-1.0, 1.0),
+                ]
+            };
+            cmd_ui = c;
+            drive::sync(c);
+            last_drive_cmd = drive::command();
+            for e in 0..n_robots {
+                if cmds[e] != c {
+                    cmds[e] = c;
+                    env.pin_command_for(e, c[0], c[1], c[2]);
+                    gobs.set_cmd(&backend, e, c).expect("cmd");
+                }
+            }
+        } else if let Some(c) = drive_now {
+            // Driving: each key press bumped the latched command, so apply it
+            // whenever it differs from what the robots are already running.
             if cmds.iter().any(|p| *p != c) {
                 cmd_ui = c;
                 for e in 0..n_robots {
@@ -1557,11 +1676,15 @@ pub async fn run(cfg: DemoCfg) {
                             *reset_clicked = true;
                         }
                         ui.label("drag: orbit camera   scroll: zoom out");
-                        ui.label("drive: tap ↑↓ ±0.2, ←→ turn, space stops");
+                        ui.label("tap ground: walk there · keys ↑↓ ±0.2, ←→ turn, space stops");
                     });
             });
         }
         if let Some(c) = choice {
+            // Buttons and sliders take over from the autopilot.
+            nav_target = None;
+            nav_marker.set_visible(false);
+            last_drive_cmd = drive::command();
             for e in 0..n_robots {
                 cmds[e] = match c {
                     CmdChoice::All(v) => v,

@@ -117,7 +117,7 @@
         if (!files.length) throw new Error(`${ref.repo}: no .safetensors in the repo`);
         return `https://huggingface.co/${ref.repo}/resolve/main/${files[0]}`;
       }
-      const ckpt = new URLSearchParams(location.search).get('ckpt') || 'g1_walk_v24';
+      const ckpt = new URLSearchParams(location.search).get('ckpt') || 'g1_walk_v26';
       const url = await ckptUrl(ckpt);
       const resp = await fetch(url);
       if (!resp.ok) throw new Error('checkpoint fetch failed: ' + ckpt + ' (' + resp.status + ')');
@@ -358,8 +358,9 @@
     // with commanded speed. A free-running clock is a train/deploy mismatch:
     // the obs keeps asking for swings, so the robot marches in place at a stop.
     const GAIT_SLOW = 0.8, GAIT_FAST = 0.55;
-    function gaitAdvance(ph, vx, vy) {
-      const sp = Math.hypot(vx, vy);
+    function gaitAdvance(ph, vx, vy, wz) {
+      // 48-dim policies (v26+): FULL command magnitude incl. yaw rate.
+      const sp = Math.hypot(vx, vy, wz || 0);
       if (sp < 0.1) return ph;
       const t = (Math.min(sp, 0.5) - 0.1) / 0.4;
       return (ph + DT / (GAIT_SLOW + (GAIT_FAST - GAIT_SLOW) * t)) % 1.0;
@@ -725,7 +726,7 @@
         o[40] = g.x; o[41] = g.y; o[42] = g.z;
         const ph = r.gaitPh;
         o[43] = Math.sin(2 * Math.PI * ph); o[44] = Math.cos(2 * Math.PI * ph);
-        r.gaitPh = HAS_GYRO ? gaitAdvance(ph, o[12], o[13]) : (ph + DT / 0.7) % 1.0;
+        r.gaitPh = HAS_GYRO ? gaitAdvance(ph, o[12], o[13], o[14]) : (ph + DT / 0.7) % 1.0;
         // Gyro: rapier reports angular velocity in WORLD frame, so rotate it
         // into the body frame with the same inverse quat used for gravity —
         // matching the trainer's quat_rotate_inv(orientation, ang_vel_world).

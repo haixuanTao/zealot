@@ -249,7 +249,12 @@ pub fn gpu_assemble_obs(
     // the frame width picks it — published checkpoints of both eras walk.
     let mut next_ph = ph;
     if fr == FRAME {
-        let cmd_speed = (o[12] * o[12] + o[13] * o[13]).sqrt();
+        // FULL command magnitude INCLUDING yaw rate (the training env's
+        // `VelocityCommand::speed()`, since ab7c811): a turn-in-place command
+        // must tick the clock or the policy will not step through the turn.
+        // (v24 trained with the vx/vy-only form; running it under this clock
+        // is the one known mismatch of loading it from the Hub.)
+        let cmd_speed = (o[12] * o[12] + o[13] * o[13] + o[14] * o[14]).sqrt();
         if cmd_speed >= 0.1 {
             let capped = if cmd_speed > 0.5 { 0.5 } else { cmd_speed };
             let t = (capped - 0.1) / 0.4;
