@@ -837,7 +837,7 @@ fn main() {
         // from iter 0). Note: episodes under a STANDING command travel < 2 m
         // and count as curriculum failures (AGILE has the same coupling);
         // consider BIPED_STAND_PROB=0 for terrain runs.
-        let terrain_on = std::env::var("BIPED_TERRAIN").as_deref() == Ok("1");
+        let terrain_on = std::env::var("BIPED_TERRAIN").as_deref() != Ok("0");
         if terrain_on {
             println!(
                 "terrain curriculum drives difficulty: command scale pinned to 1.0 \
