@@ -29,19 +29,16 @@ license.workspace = true
 #
 #   gpu      — vortx (dimforge's GPU tensor lib): hand-rolled MLP forward/backward
 #              + Adam (vortx has no autograd). Used by the tensor examples.
-#   pendulum — nexus3d GPU rigid-body physics + rapier3d (CPU-side scene build).
-#              Used by the pendulum examples under examples/pendulum/.
 #
 # vortx/khal/rapier3d are taken from crates.io but redirected to local dimforge
 # forks by [patch.crates-io] below — the same forks nexus3d is built against.
 [features]
 default = []
 gpu = ["dep:vortx", "dep:khal"]
-pendulum = ["dep:nexus3d", "dep:rapier3d", "dep:pollster", "dep:khal"]
 # biped_gpu — biped on nexus GPU physics, MJCF model. Pulls zealot-rl so the
 # nexus trainer can build (the smoke example doesn't need it, but it's a
 # negligible link-time addition).
-biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "dep:rayon", "dep:nalgebra", "dep:async-std", "dep:anyhow"]
+biped_gpu = ["dep:nexus3d", "dep:rapier3d", "dep:pollster", "dep:khal", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "dep:rayon", "dep:nalgebra", "dep:async-std", "dep:anyhow"]
 # cuda_backend — additively enables the native-CUDA (cuda-oxide) khal backend on
 # the vortx + nexus3d stack, alongside WebGPU. Selected at runtime via BIPED_CUDA=1.
 # Used for the all-native end-to-end benchmark (iter_e2e_bench). The cubins are
@@ -117,10 +114,7 @@ getrandom = { version = "0.2", features = ["js"] }
 console_error_panic_hook = "0.1"
 
 [dev-dependencies]
-nalgebra = "0.35"
 wgpu = "29"
-async-std = { version = "1", features = ["attributes"] }
-anyhow = "1"
 
 # Fully GPU-resident trainer: GPU policy forward + GPU PPO update (vortx).
 # Full-iteration end-to-end benchmark (rollout + PPO update), the perf-table
