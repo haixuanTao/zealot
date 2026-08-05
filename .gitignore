@@ -18,3 +18,5 @@ overnight/STATUS
 *.safetensors
 .venv/
 bench/sim2sim/
+examples/biped/assets/
+website/public/bench/g1_*
