@@ -127,6 +127,51 @@ if _sw:
 # touchdown force in units of body weight; settle metric: |angvel| decay
 # after a command drop.
 TRANS_JSON = os.environ.get("S2S_TRANS_JSON")
+ARM_LOG = [] if os.environ.get("S2S_ARM_LOG") else None
+
+# S2S_ARM_MOTION=<sonic csv>: replay a retargeted AMASS clip on the PD-held
+# upper-body joints while the POLICY does whatever the command says -- the
+# cross-engine version of the trainer's BIPED_ARM_MOTION disturbance.
+# Angles in the csv are DEGREES, 30 fps, columns "<joint>_dof"; the target
+# fades home->clip over 0.5 s (smoothstep) like training, and is clamped to
+# the model's joint range. S2S_ARM_T0 picks the start offset (s),
+# S2S_ARM_SCALE the amplitude about the hold pose.
+ARM_MOTION = os.environ.get("S2S_ARM_MOTION")
+ARM_T0 = float(os.environ.get("S2S_ARM_T0", "0"))
+ARM_SCALE = float(os.environ.get("S2S_ARM_SCALE", "1"))
+ARM_FPS = 30.0
+_arm_clip = None  # {joint_name: np.ndarray of radians per frame}
+if ARM_MOTION:
+    import csv as _csv
+    with open(ARM_MOTION) as _f:
+        _rows = list(_csv.DictReader(_f))
+    _arm_clip = {}
+    for _c in _rows[0]:
+        if _c.endswith("_joint_dof"):
+            _v = np.deg2rad(
+                np.array([float(r[_c]) for r in _rows], dtype=np.float64))
+            # Median-of-3: the retarget leaves isolated single-frame glitches
+            # (9-15 deg in one 33 ms frame) that whip the PD; a 3-tap median
+            # deletes them and leaves genuine motion untouched. Mirrors the
+            # trainer's loader (zealot-env/src/motion.rs).
+            if len(_v) >= 3:
+                _m = _v.copy()
+                _m[1:-1] = np.median(
+                    np.stack([_v[:-2], _v[1:-1], _v[2:]]), axis=0)
+                _v = _m
+            _arm_clip[_c[:-4]] = _v
+    print(f"arm-motion clip: {os.path.basename(ARM_MOTION)}, "
+          f"{len(_rows)} frames, {len(_arm_clip)} joint columns, t0={ARM_T0}s")
+
+def arm_clip_pose(name, t):
+    """Clip angle (rad) for held joint `name` at time t (clamped ends)."""
+    tr = _arm_clip.get(name)
+    if tr is None:
+        return None
+    ft = min(max(t * ARM_FPS, 0.0), len(tr) - 1)
+    f0 = int(ft)
+    f1 = min(f0 + 1, len(tr) - 1)
+    return float(tr[f0] + (ft - f0) * (tr[f1] - tr[f0]))
 
 # Canonical policy joint order + zealot g1_29dof_agile actuator table
 # (zealot-env/src/robots/unitree_g1.rs — unitree_g1_agile leg deltas applied).
@@ -336,7 +381,9 @@ def main():
             if frag in name:
                 qa, da = model.jnt_qposadr[j], model.jnt_dofadr[j]
                 q_hold = 0.0 if HELD_POSE == "rest" else home_qpos[qa]
-                held.append((qa, da, kp, kd, eff, q_hold))
+                lo, hi = (model.jnt_range[j] if model.jnt_limited[j]
+                          else (-3.2, 3.2))
+                held.append((qa, da, kp, kd, eff, q_hold, name, lo, hi))
                 break
     print(f"policy joints: 12, held joints: {len(held)}")
 
@@ -357,7 +404,7 @@ def main():
         data.qpos[pol_q] = DEFAULT_POS
         # Start the held joints AT the pose we hold them at, or every reset
         # begins with the arms being dragged from the keyframe to the target.
-        for _qa, _da, _kp, _kd, _eff, _qh in held:
+        for _qa, _da, _kp, _kd, _eff, _qh, _nm, _lo, _hi in held:
             data.qpos[_qa] = _qh
         # small yaw jitter so attempts differ
         yaw = rng.uniform(-0.3, 0.3)
@@ -475,14 +522,34 @@ def main():
 
         target = np.clip(DEFAULT_POS + ACTION_SCALE * action, pol_rng[:, 0], pol_rng[:, 1])
 
+        # Per-step held-joint targets: home, or the arm clip (faded in).
+        held_tgt = {}
+        if _arm_clip is not None:
+            _fade = min(1.0, (t * CONTROL_DT) / 0.5)
+            _fade = _fade * _fade * (3.0 - 2.0 * _fade)
+            for _qa, _da, _kp, _kd, _eff, _qh, _nm, _lo, _hi in held:
+                _cq = arm_clip_pose(_nm, ARM_T0 + t * CONTROL_DT)
+                if _cq is not None:
+                    _dst = _qh + ARM_SCALE * (_cq - _qh)
+                    held_tgt[_qa] = float(np.clip(
+                        _qh + _fade * (_dst - _qh), _lo, _hi))
+
+        if ARM_LOG is not None and _arm_clip is not None:
+            _r=[t*CONTROL_DT]
+            for _qa,_da,_kp,_kd,_eff,_qh,_nm,_lo,_hi in held:
+                if _nm in ("left_elbow_joint","left_shoulder_pitch_joint"):
+                    _r += [held_tgt.get(_qa,_qh), float(data.qpos[_qa])]
+            ARM_LOG.append(_r)
+
         # --- 4 physics substeps with explicit torque PD @200 Hz ---
         for _ in range(DECIMATION):
             tau_leg = pol_kp * (target - data.qpos[pol_q]) - pol_kd * data.qvel[pol_d]
             data.qfrc_applied[:] = 0.0
             data.qfrc_applied[pol_d] = np.clip(tau_leg, -pol_eff, pol_eff)
-            for qa, da, kp, kd, eff, qh in held:
+            for qa, da, kp, kd, eff, qh, _nm, _lo, _hi in held:
+                tgt = held_tgt.get(qa, qh)
                 data.qfrc_applied[da] = np.clip(
-                    kp * (qh - data.qpos[qa]) - kd * data.qvel[da], -eff, eff)
+                    kp * (tgt - data.qpos[qa]) - kd * data.qvel[da], -eff, eff)
             mujoco.mj_step(model, data)
 
         prev_q = q
@@ -567,6 +634,10 @@ def main():
             json.dump({"cols": ["L_toe_z", "L_heel_z", "R_toe_z", "R_heel_z"],
                        "half_len": float(model.geom_size[_foot_gids[0]][0]),
                        "rows": foot_track}, f)
+    if ARM_LOG is not None:
+        with open(os.environ["S2S_ARM_LOG"], "w") as f:
+            json.dump({"cols": ["t","tgt_elbow","q_elbow","tgt_shp","q_shp"],
+                       "rows": ARM_LOG}, f)
     if TRANS_JSON and trans_track is not None:
         with open(TRANS_JSON, "w") as f:
             json.dump({"cols": ["t", "angvel", "base_z", "F_left", "F_right"],

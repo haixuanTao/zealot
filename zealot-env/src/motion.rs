@@ -63,6 +63,26 @@ impl MotionClip {
         if frames.is_empty() {
             return Err(format!("{name}: no data rows"));
         }
+        // Median-of-3 per joint column: the AMASS→G1 retarget leaves isolated
+        // single-frame glitches (measured 9-15° jumps in one 33 ms frame ≈
+        // 8 rad/s commanded spikes — the PD whips the arm visibly). A 3-tap
+        // median deletes exactly those while leaving genuine motion (which is
+        // never a one-frame excursion) bit-untouched.
+        let nj = joints.len();
+        let nf = frames.len() / nj;
+        if nf >= 3 {
+            let raw = frames.clone();
+            for t in 1..nf - 1 {
+                for j in 0..nj {
+                    let (a, b, c) = (
+                        raw[(t - 1) * nj + j],
+                        raw[t * nj + j],
+                        raw[(t + 1) * nj + j],
+                    );
+                    frames[t * nj + j] = a.max(b.min(c)).min(b.max(c));
+                }
+            }
+        }
         Ok(Self {
             name: name.to_string(),
             fps,
@@ -158,6 +178,21 @@ Frame,root_translateX,root_translateY,root_translateZ,waist_yaw_joint_dof,left_e
     fn missing_requested_joint_is_a_hard_error() {
         let j = vec!["right_elbow_joint".to_string()];
         assert!(MotionClip::parse_csv("t", CSV, &j, 30.0).is_err());
+    }
+
+    #[test]
+    fn single_frame_retarget_glitch_is_median_filtered_out() {
+        // An isolated one-frame 30° spike (a retarget glitch) disappears;
+        // the surrounding still pose and the genuine ramp survive.
+        let csv = "Frame,waist_yaw_joint_dof\n0,0\n1,0\n2,30\n3,0\n4,0\n5,10\n6,20\n7,30\n";
+        let j = vec!["waist_yaw_joint".to_string()];
+        let c = MotionClip::parse_csv("t", csv, &j, 30.0).unwrap();
+        let mut out = [0.0f32];
+        c.sample(2.0 / 30.0, &mut out);
+        assert!(out[0].abs() < 1e-6, "glitch survived: {}", out[0]);
+        // Ramp frames keep their values (median of a monotone triple).
+        c.sample(6.0 / 30.0, &mut out);
+        assert!((out[0] - 20f32.to_radians()).abs() < 1e-5);
     }
 
     #[test]
