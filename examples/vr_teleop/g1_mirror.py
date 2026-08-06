@@ -199,6 +199,34 @@ def retarget_ik(j, L1r, L2r):
     return arm_angles_ik(j, "left", L1r, L2r), arm_angles_ik(j, "right", L1r, L2r)
 
 
+def _swivel_ref(a):
+    """Natural swivel reference ⊥ axis `a`: prefer 'down', fall back to 'back'."""
+    n = np.array([0.0, 0.0, -1.0]) + a * a[2]
+    if np.linalg.norm(n) < 1e-3:
+        n = np.array([-1.0, 0.0, 0.0]) + a * a[0]
+    return n / (np.linalg.norm(n) + 1e-9)
+
+
+def swivel_transfer(u_hint, a_human, a_robot):
+    """Carry the operator's elbow-swivel ANGLE onto the robot's arm axis.
+
+    Copying the raw elbow DIRECTION is only valid when the operator's and
+    robot's arms point the same way — in clutched (relative) mode they don't,
+    and a raw hint twists the elbow into nonsense. Measuring the swivel as an
+    angle about the operator's own shoulder→wrist axis and re-applying it
+    about the robot's axis preserves 'elbow low / elbow raised' semantics in
+    any configuration. Degenerates to the raw hint when the axes coincide.
+    """
+    n_h, n_r = _swivel_ref(a_human), _swivel_ref(a_robot)
+    e = u_hint - (u_hint @ a_human) * a_human
+    if np.linalg.norm(e) < 1e-6:
+        return n_r
+    e /= np.linalg.norm(e)
+    cos_p = np.clip(n_h @ e, -1, 1)
+    sin_p = np.clip(np.cross(n_h, e) @ a_human, -1, 1)
+    return n_r * cos_p + np.cross(a_robot, n_r) * sin_p
+
+
 def _quat_conj_mul_xyzw(qa, qb):
     """conj(qa) ⊗ qb for xyzw quats — the rotation FROM qa TO qb."""
     ax, ay, az, aw = -qa[0], -qa[1], -qa[2], qa[3]
@@ -293,7 +321,13 @@ class ClutchIK:
             if blocked and time.monotonic() - self._last_keepout_log > 2.0:
                 self._last_keepout_log = time.monotonic()
                 print(f"[keepout] {side} wrist target grazing the torso — sliding on the surface")
-            out[side] = solve_arm_ik(t, hint[side], self.L1r, self.L2r)
+            # Swivel TRANSFER: the operator's raw elbow direction is only
+            # meaningful for the operator's arm axis; in relative mode the
+            # robot's axis differs, so carry the swivel angle instead.
+            a_h = th[side] / (np.linalg.norm(th[side]) + 1e-9)
+            a_r = t / (np.linalg.norm(t) + 1e-9)
+            hint_r = swivel_transfer(hint[side], a_h, a_r)
+            out[side] = solve_arm_ik(t, hint_r, self.L1r, self.L2r)
 
         tw_out = np.clip(tw_out, -1.9, 1.9)
         return out["left"], out["right"], tw_out
