@@ -54,6 +54,15 @@ https://haixuantao.github.io/zealot/?ckpt=your-name/your-repo
 
 The demo detects the observation layout from the checkpoint itself.
 
+To make a policy the one the site loads by default, tag it as the latest
+release — the demo fetches the fixed name `g1_walk_latest.safetensors` from
+the [policy repo](https://huggingface.co/haixuantao/zealot-g1-locomotion)
+at boot, so this needs no site redeploy:
+
+```sh
+scripts/publish_policy.sh my_policy.safetensors g1_v27_iter50000
+```
+
 ---
 
 Next: [explanation.md](explanation.md) for how and why the stack is built

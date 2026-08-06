@@ -266,6 +266,8 @@ HTMLEOF
 # Main logic
 check_requirements
 resolve_wasm_bindgen
+# The wasm demos include_bytes! checkpoints/visuals that are not in git.
+"$ZEALOT_DIR/scripts/fetch_demo_assets.sh"
 
 if [ -n "$1" ]; then
     if [ -z "$(bin_of "$1")" ]; then

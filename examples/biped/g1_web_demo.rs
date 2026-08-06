@@ -79,6 +79,12 @@ const POLICY_BIN: &[u8] = include_bytes!("assets/g1_walk_v26.safetensors");
 /// What the HUD calls the embedded checkpoint (see `POLICY_BIN`).
 const DEFAULT_CKPT: &str = "g1_walk_v26 (embedded)";
 
+/// The release pointer the browser demo loads at boot when no `?ckpt=` is
+/// given: `scripts/publish_policy.sh` re-uploads this fixed name on every
+/// release, so the live site follows the newest published policy without a
+/// site redeploy. Fetch/parse failures fall back to the embedded checkpoint.
+const LATEST_CKPT: &str = "haixuantao/zealot-g1-locomotion/g1_walk_latest.safetensors";
+
 /// Surface a demo-level problem where it can actually be seen: the browser
 /// console, or stderr natively.
 fn log_warn(msg: &str) {
@@ -589,6 +595,17 @@ async fn load_ckpt(spec: &str) -> Result<(ActorCritic, String), String> {
     let bytes = fetch_ckpt(&url).await?;
     let ac = ActorCritic::load_from_bytes(&bytes)
         .map_err(|e| format!("{}: not a zealot checkpoint ({e})", ckpt_label(&url)))?;
+    // The GPU obs shader assembles 45- or 48-dim frames; refuse anything
+    // else (e.g. a 53-dim step-cue policy) HERE so the caller's fallback
+    // runs instead of the demo dying at GpuObs setup.
+    use zealot_gpu_obs::shaders::{FRAME, FRAME_NO_GYRO, HIST};
+    let fr = ac.obs_norm.state().0.len() / HIST;
+    if fr != FRAME && fr != FRAME_NO_GYRO {
+        return Err(format!(
+            "{}: {fr}-dim obs frames — the demo runs {FRAME_NO_GYRO}- or {FRAME}-dim policies",
+            ckpt_label(&url)
+        ));
+    }
     Ok((ac, ckpt_label(&url)))
 }
 
@@ -985,10 +1002,16 @@ pub async fn run(cfg: DemoCfg) {
     //
     // `?ckpt=` swaps in a published checkpoint (Hugging Face by default). Its
     // obs width comes from the checkpoint itself, so pre-gyro policies (v21
-    // and earlier, 45×5) and gyro ones (v24 on, 48×5) both just run. A fetch
-    // or parse failure falls back to the embedded default rather than showing
-    // a dead canvas — the HUD says which one is actually driving.
-    let (ac, ckpt_name) = match &cfg.ckpt {
+    // and earlier, 45×5) and gyro ones (v24 on, 48×5) both just run. In the
+    // browser, no `?ckpt=` means the `g1_walk_latest` release pointer, so
+    // the site tracks releases by itself. A fetch or parse failure (or being
+    // offline, or running natively) falls back to the embedded default
+    // rather than showing a dead canvas — the HUD says which one is driving.
+    #[cfg(target_arch = "wasm32")]
+    let want = cfg.ckpt.clone().or_else(|| Some(LATEST_CKPT.to_string()));
+    #[cfg(not(target_arch = "wasm32"))]
+    let want = cfg.ckpt.clone();
+    let (ac, ckpt_name) = match &want {
         Some(spec) => match load_ckpt(spec).await {
             Ok((ac, label)) => (ac, label),
             Err(e) => {
@@ -1317,10 +1340,15 @@ pub async fn run(cfg: DemoCfg) {
                 let fx = cb * dx - sb * dy;
                 let fy = sb * dx + cb * dy;
                 let slow = dist.min(1.0);
+                // Keep the combined objective modest: full forward + full
+                // lateral + full yaw at once is more than the policy can
+                // stabilize when the upper body is also in motion (VR
+                // teleop drives the arms live), and falls look worse in a
+                // demo than a slightly slower walk.
                 [
-                    (0.8 * fx * slow).clamp(-0.3, 0.6),
-                    (0.8 * fy * slow).clamp(-0.4, 0.4),
-                    (1.5 * err).clamp(-1.0, 1.0),
+                    (0.8 * fx * slow).clamp(-0.25, 0.5),
+                    (0.8 * fy * slow).clamp(-0.25, 0.25),
+                    (1.5 * err).clamp(-0.9, 0.9),
                 ]
             };
             slew(&mut nav_cmd, c);

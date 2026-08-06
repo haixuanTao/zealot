@@ -164,8 +164,10 @@ function demoSrc(name: DemoName, k: Knobs): string {
   // The nexus demo is always on terrain; the sim2sim tabs take a flag.
   const query =
     name === 'nexus' ? `?${terrain}&n=${k.n}` : k.terrain ? `?${terrain}&n=${k.n}` : `?n=${k.n}`;
-  // Empty = the checkpoint embedded in the demo. `ckpt` is last so that a
-  // pasted URL keeps working even if it carries its own query string.
+  // Empty = the `g1_walk_latest` release pointer on Hugging Face (each demo
+  // falls back to its embedded checkpoint if the fetch fails). `ckpt` is
+  // last so that a pasted URL keeps working even if it carries its own
+  // query string.
   const ckpt = k.ckpt ? `&ckpt=${encodeURIComponent(k.ckpt)}` : '';
   return `${BASE}${demo.path}${query}${ckpt}`;
 }
@@ -375,7 +377,7 @@ function PolicyPicker({
       <label className="knob">
         <span className="knobLabel">Policy</span>
         <select className="knobSelect" value={value} onChange={(e) => onChange(e.target.value)}>
-          <option value="">g1_walk_v26 (built in)</option>
+          <option value="">latest release</option>
           {all.map((o) => (
             <option key={o.value} value={o.value}>
               {o.label}

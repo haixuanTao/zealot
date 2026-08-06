@@ -127,7 +127,12 @@
         if (!files.length) throw new Error(`${ref.repo}: no .safetensors in the repo`);
         return `https://huggingface.co/${ref.repo}/resolve/main/${files[0]}`;
       }
-      const ckpt = new URLSearchParams(location.search).get('ckpt') || 'g1_walk_v26';
+      // Default: the `g1_walk_latest` release pointer — republished on each
+      // release (scripts/publish_policy.sh), so this page follows releases
+      // without a redeploy.
+      const ckpt =
+        new URLSearchParams(location.search).get('ckpt') ||
+        'haixuantao/zealot-g1-locomotion/g1_walk_latest.safetensors';
       const url = await ckptUrl(ckpt);
       const resp = await fetch(url);
       if (!resp.ok) throw new Error('checkpoint fetch failed: ' + ckpt + ' (' + resp.status + ')');
