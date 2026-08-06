@@ -140,6 +140,7 @@ ARM_MOTION = os.environ.get("S2S_ARM_MOTION")
 ARM_T0 = float(os.environ.get("S2S_ARM_T0", "0"))
 ARM_SCALE = float(os.environ.get("S2S_ARM_SCALE", "1"))
 ARM_FPS = 30.0
+ACT_LPF = float(os.environ.get("S2S_ACT_LPF", "1.0"))
 _arm_clip = None  # {joint_name: np.ndarray of radians per frame}
 if ARM_MOTION:
     import csv as _csv
@@ -430,6 +431,7 @@ def main():
     reset()
     frozen_phase = 0.0
     ep_t = 0          # control steps since episode start
+    act_f = np.zeros(12)
     act_hist = [np.zeros(12), np.zeros(12)]  # [t-2, t-1]
     vel_track = []
     pitch_track = []
@@ -520,6 +522,12 @@ def main():
             _off = _INIT["step"] if _INIT is not None else 0
             action = _REPLAY[min(_off + t, len(_REPLAY) - 1)]
 
+        # S2S_ACT_LPF=alpha: exponential smoothing of the action (deploy-style
+        # anti-tremor filter; alpha = fraction of NEW action per 20 ms step;
+        # unset/1.0 = off).
+        if ACT_LPF < 1.0:
+            act_f[:] = ACT_LPF * action + (1.0 - ACT_LPF) * act_f
+            action = act_f.copy()
         target = np.clip(DEFAULT_POS + ACTION_SCALE * action, pol_rng[:, 0], pol_rng[:, 1])
 
         # Per-step held-joint targets: home, or the arm clip (faded in).
@@ -546,7 +554,7 @@ def main():
             tau_leg = pol_kp * (target - data.qpos[pol_q]) - pol_kd * data.qvel[pol_d]
             if os.environ.get("S2S_TRACE"):
                 globals().setdefault("_tr", []).append(
-                    (data.qpos[pol_q].copy(), np.clip(tau_leg, -pol_eff, pol_eff).copy()))
+                    (data.qpos[pol_q].copy(), np.clip(tau_leg, -pol_eff, pol_eff).copy(), action.copy()))
             data.qfrc_applied[:] = 0.0
             data.qfrc_applied[pol_d] = np.clip(tau_leg, -pol_eff, pol_eff)
             for qa, da, kp, kd, eff, qh, _nm, _lo, _hi in held:
@@ -669,11 +677,27 @@ def main():
             "final_x": float(data.qpos[free_q]),
             }, f, indent=1)
     if os.environ.get("S2S_TRACE") and globals().get("_tr"):
-        _q = np.array([a for a, b in _tr])
-        _t = np.array([b for a, b in _tr])
+        _q = np.array([tr[0] for tr in _tr])
+        _t = np.array([tr[1] for tr in _tr])
+        _a = np.array([tr[2] for tr in _tr])
         for k, nm in [(3, "L_knee"), (9, "R_knee"), (0, "L_hip_pitch"), (4, "L_ankle_pitch")]:
             print(f"TRACE {nm}: q min/mean/max = {_q[:,k].min():+.3f}/{_q[:,k].mean():+.3f}/{_q[:,k].max():+.3f} rad"
                   f" | |tau| mean/p95/max = {np.abs(_t[:,k]).mean():.1f}/{np.percentile(np.abs(_t[:,k]),95):.1f}/{np.abs(_t[:,k]).max():.1f} N.m")
+        da = np.diff(_a, axis=0); dda = np.diff(_a, n=2, axis=0); dtau = np.diff(_t, axis=0)
+        # PD-target units: rad (action * 0.5 scale). 50 Hz control.
+        for k, nm in [(3, "L_knee"), (4, "L_ankle_pitch"), (0, "L_hip_pitch"), (1, "L_hip_roll")]:
+            print(f"TREMOR {nm}: |dtarget| mean={np.abs(da[:,k]).mean()*0.5*1000:.1f} mrad/step"
+                  f" p95={np.percentile(np.abs(da[:,k]),95)*0.5*1000:.1f}"
+                  f" | dd-action rms={dda[:,k].std()*0.5*1000:.1f} mrad"
+                  f" | |dtau| mean={np.abs(dtau[:,k]).mean():.1f} p95={np.percentile(np.abs(dtau[:,k]),95):.1f} N.m/step")
+        # spectral: fraction of target-motion power above 5 Hz (50 Hz nyquist 25)
+        import numpy.fft as fft
+        for k, nm in [(3, "L_knee"), (4, "L_ankle_pitch")]:
+            x = _a[:, k] - _a[:, k].mean()
+            ps = np.abs(fft.rfft(x))**2
+            f = fft.rfftfreq(len(x), 1/50)
+            hi = ps[f > 5].sum() / max(ps.sum(), 1e-12)
+            print(f"SPECTRUM {nm}: {100*hi:.1f}% of action power above 5 Hz")
     if survived:
         ts = [s for s, _, _ in survived]
         print(f"\n{len(survived)} completed attempts; mean survival "
