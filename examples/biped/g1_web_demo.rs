@@ -1153,16 +1153,18 @@ pub async fn run(cfg: DemoCfg) {
     // Marker z: the terrain is quantized box cells, so a disc placed at the
     // CENTER's height buries itself in (or floats over) neighboring cells —
     // sample the footprint and sit on the highest cell under it.
-    let marker_ground = |strips: &[TerrainStrip], terrain: bool, off: Vec3, x: f32, y: f32| -> f32 {
-        if !terrain || strips.is_empty() {
-            return 0.0;
-        }
-        let mut h = f32::MIN;
-        for (dx, dy) in [(0.0, 0.0), (0.14, 0.0), (-0.14, 0.0), (0.0, 0.14), (0.0, -0.14)] {
-            h = h.max(strips[0].height(x + dx - off.x, y + dy - off.y));
-        }
-        h
-    };
+    let marker_ground =
+        |strips: &[TerrainStrip], terrain: bool, fam: usize, off: Vec3, x: f32, y: f32| -> f32 {
+            if !terrain || strips.is_empty() {
+                return 0.0;
+            }
+            let s = &strips[fam % strips.len()];
+            let mut h = f32::MIN;
+            for (dx, dy) in [(0.0, 0.0), (0.14, 0.0), (-0.14, 0.0), (0.0, 0.14), (0.0, -0.14)] {
+                h = h.max(s.height(x + dx - off.x, y + dy - off.y));
+            }
+            h
+        };
     let mut nav_marker = scene.add_cylinder(0.16, 0.02);
     nav_marker.set_color(Color::new(0.21, 0.76, 0.80, 1.0));
     nav_marker.set_visible(false);
@@ -1178,6 +1180,24 @@ pub async fn run(cfg: DemoCfg) {
     // visibly staggers the robot, so each component ramps toward the target
     // command instead (≈1.3 m/s² linear, ≈2.6 rad/s² yaw at ~26 fps).
     let mut nav_cmds: Vec<[f32; 3]> = vec![[0.0; 3]; n_robots];
+    // A tapped target is "reached" by the FIRST robot to get there; the
+    // marker hides and everyone ramps down to a stand (settle phase).
+    let mut nav_settle = false;
+    // Wander strolls are LANE-RELATIVE (each robot walks the same offset on
+    // its own lane — the pack strolls in formation); taps are GLOBAL: every
+    // robot heads for the marker itself, not a lane-shifted copy of it.
+    let mut nav_lane_relative = true;
+    // The lane (render offset + strip family) a tap actually landed on.
+    let lane_of = |y: f32| -> (usize, Vec3) {
+        let mut best = (0usize, offset_of(0));
+        for e in 1..n_robots {
+            let o = offset_of(e);
+            if (y - o.y).abs() < (y - best.1.y).abs() {
+                best = (e, o);
+            }
+        }
+        (best.0 % 3, best.1)
+    };
     let slew = |cur: &mut [f32; 3], want: [f32; 3]| {
         for (i, limit) in [0.05f32, 0.05, 0.10].into_iter().enumerate() {
             cur[i] += (want[i] - cur[i]).clamp(-limit, limit);
@@ -1239,27 +1259,34 @@ pub async fn run(cfg: DemoCfg) {
                                 glamx::Vec2::new(size.x as f32, size.y as f32),
                             );
                             if d.z < -1e-3 {
-                                let off0 = offset_of(0);
+                                // The tap belongs to whichever lane is
+                                // nearest under the cursor — its strip
+                                // decides the ray height.
                                 let mut t = -o.z / d.z;
                                 for _ in 0..6 {
                                     let hit = o + d * t;
                                     let h = if terrain {
-                                        strips[0].height(hit.x - off0.x, hit.y - off0.y)
+                                        let (fam, off) = lane_of(hit.y);
+                                        strips[fam % strips.len()]
+                                            .height(hit.x - off.x, hit.y - off.y)
                                     } else {
                                         0.0
                                     };
                                     t = (h - o.z) / d.z;
                                 }
                                 let mut hit = o + d * t;
-                                let off0 = offset_of(0);
+                                let (fam, lane) = lane_of(hit.y);
                                 // Keep targets ON the strip: taps past its
                                 // edge clamp to the nearest on-terrain point
                                 // (the strip is the demo's world).
                                 if terrain {
-                                    hit.y = hit.y.clamp(off0.y - 3.6, off0.y + 3.6);
+                                    hit.y = hit.y.clamp(lane.y - 3.6, lane.y + 3.6);
                                 }
-                                hit.z = marker_ground(&strips, terrain, off0, hit.x, hit.y);
+                                hit.z =
+                                    marker_ground(&strips, terrain, fam, lane, hit.x, hit.y);
                                 wander = false;
+                                nav_lane_relative = false;
+                                nav_settle = false;
                                 nav_target = Some(hit);
                                 nav_marker.set_pose(Pose3::from_parts(
                                     hit + Vec3::new(0.0, 0.0, 0.03),
@@ -1299,8 +1326,10 @@ pub async fn run(cfg: DemoCfg) {
             // Keep the stroll on the strip (it is ~PATCH wide; lane center
             // is the robot's spawn y).
             let ty = (base[1] + off0.y + dist * ang.sin()).clamp(off0.y - 3.0, off0.y + 3.0);
-            let tz = marker_ground(&strips, terrain, off0, tx, ty);
+            let tz = marker_ground(&strips, terrain, 0, off0, tx, ty);
             let hit = Vec3::new(tx, ty, tz);
+            nav_lane_relative = true;
+            nav_settle = false;
             nav_target = Some(hit);
             nav_marker.set_pose(Pose3::from_parts(
                 hit + Vec3::new(0.0, 0.0, 0.03),
@@ -1310,42 +1339,66 @@ pub async fn run(cfg: DemoCfg) {
         }
 
         // Autopilot: steer EVERY robot's velocity command at the target,
-        // each from its own pose. The envs are separate worlds rendered
-        // side by side, so a robot aims at the tap point RELATIVE TO ITS
-        // OWN LANE — the literal render-space point can be a lane (9 m on
-        // terrain) off a robot's 8 m-wide strip. Robots that share a lane
-        // (terrain, env % 3) fan onto a small ring so they don't render
-        // inside each other on arrival. Heading via yaw, but the LATERAL
-        // channel carries the approach too — the policy tracks sideways
-        // well, which closes on the target even mid-turn.
+        // each from its own pose. Taps are GLOBAL: each robot heads for
+        // the marker itself, clamped into its own walkable band — the envs
+        // are separate worlds rendered side by side, so a robot can only
+        // reach points that exist on ITS strip (the tapped lane's robots
+        // get there exactly; the others close in as far as their world
+        // allows). Wander strolls stay LANE-RELATIVE so the pack walks in
+        // formation. Robots aiming at the same spot fan onto a small ring
+        // so they don't render inside each other on arrival. Heading via
+        // yaw, but the LATERAL channel carries the approach too — the
+        // policy tracks sideways well, which closes on the target even
+        // mid-turn.
         if let Some(tgt) = nav_target {
-            let local = tgt - offset_of(0); // the tap, in lane coordinates
-            let mut all_arrived = true;
-            let mut dist0 = f32::MAX;
+            let local = tgt - offset_of(0); // the stroll, in lane coordinates
+            let mut any_arrived = false;
             for e in 0..n_robots {
                 let off = offset_of(e);
-                let peers: Vec<usize> =
-                    (0..n_robots).filter(|&o| offset_of(o) == off).collect();
+                let peers: Vec<usize> = if nav_lane_relative {
+                    // Formation: only robots SHARING a lane contend.
+                    (0..n_robots).filter(|&o| offset_of(o) == off).collect()
+                } else {
+                    // Global tap: everyone converges — everyone contends.
+                    (0..n_robots).collect()
+                };
                 let slot = if peers.len() > 1 {
                     let j = peers.iter().position(|&o| o == e).unwrap() as f32;
                     let a = core::f32::consts::TAU * j / peers.len() as f32;
-                    Vec3::new(0.6 * a.cos(), 0.6 * a.sin(), 0.0)
+                    let r = (0.35 * (peers.len() as f32).sqrt()).max(0.6);
+                    Vec3::new(r * a.cos(), r * a.sin(), 0.0)
                 } else {
                     Vec3::ZERO
                 };
-                let tx = local.x + off.x + slot.x;
-                // Stay on the strip whatever the slot ring does.
-                let ty = (local.y + off.y + slot.y).clamp(off.y - 3.6, off.y + 3.6);
+                let (rx, ry) = if nav_lane_relative {
+                    (local.x + off.x, local.y + off.y)
+                } else {
+                    (tgt.x, tgt.y)
+                };
+                let tx = rx + slot.x;
+                // Stay on the strip whatever the target or slot ring does
+                // (the flat fleet's plane is unbounded — no clamp needed).
+                let ty = if terrain {
+                    (ry + slot.y).clamp(off.y - 3.6, off.y + 3.6)
+                } else {
+                    ry + slot.y
+                };
                 let (base, brot) = env.base_pose_for(e, &pose_stream.poses);
                 let (dx, dy) = (tx - (base[0] + off.x), ty - (base[1] + off.y));
                 let dist = dx.hypot(dy);
-                if e == 0 {
-                    dist0 = dist;
+                if dist < 0.3 {
+                    if !any_arrived && !nav_settle {
+                        log_warn(&format!(
+                            "nav: robot {e} at target: dist={dist:.2} tgt=({tx:.1},{ty:.1}) base=({:.1},{:.1})",
+                            base[0] + off.x,
+                            base[1] + off.y
+                        ));
+                    }
+                    any_arrived = true;
                 }
-                let c: [f32; 3] = if dist < 0.3 {
+                let c: [f32; 3] = if nav_settle || dist < 0.3 {
                     [0.0, 0.0, 0.0]
                 } else {
-                    all_arrived = false;
                     let q = Rot3::from_xyzw(brot[0], brot[1], brot[2], brot[3]);
                     let fwd = q * Vec3::X;
                     let yaw = fwd.y.atan2(fwd.x);
@@ -1381,15 +1434,23 @@ pub async fn run(cfg: DemoCfg) {
             drive::sync(cmd_ui);
             last_drive_cmd = drive::command();
             if wander {
-                // Robot 0 arriving at a stroll point draws the next one;
+                // The first robot to arrive draws the next stroll point;
                 // the others re-aim mid-route (a strolling pack, not a
                 // parade waiting for its slowest member).
-                if dist0 < 0.3 {
+                if any_arrived {
                     wander_seeded = false;
                 }
-            } else if all_arrived {
-                // A tapped target stays up until every robot has made it.
-                nav_target = None;
+            } else if nav_settle {
+                // Settle phase: everyone ramps to a stand, then the
+                // autopilot disengages.
+                if nav_cmds.iter().all(|c| c.iter().all(|v| v.abs() < 0.01)) {
+                    nav_settle = false;
+                    nav_target = None;
+                }
+            } else if any_arrived {
+                // First robot there wins the tap: hide the marker and
+                // stand the pack down.
+                nav_settle = true;
                 nav_marker.set_visible(false);
             }
         } else if let Some(c) = drive_now {

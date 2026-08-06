@@ -674,6 +674,7 @@
       const ty = TERRAIN ? Math.max(-3.6, Math.min(3.6, h.y)) : h.y;
       const tz = TERRAIN && terrain ? terrain.groundAt(tx, ty) : h.z;
       wander = false;
+      navSettle = false;
       navTarget = { x: tx, y: ty };
       navMarker.position.set(tx, ty, tz + 0.03);
       navMarker.visible = true;
@@ -682,8 +683,12 @@
       wander = false;
       navTarget = null;
       navMarker.visible = false;
+      navSettle = false;
       robots.forEach((r) => { r.cmd = null; });
     }
+    // A tapped target is "reached" by the FIRST robot to get there; the
+    // marker hides and everyone ramps down to a stand (settle phase).
+    let navSettle = false;
     // Slew-limit the autopilot command, PER ROBOT: a stand-to-full step
     // input staggers the robot. Runs per 50 Hz control step (≈1 m/s²
     // linear, 2 rad/s² yaw). Robot 0's command mirrors into CMD for the HUD.
@@ -704,7 +709,7 @@
       }
       if (!navTarget || !robots.length) return;
       const n = robots.length;
-      let allArrived = true;
+      let anyArrived = false;
       for (let i = 0; i < n; i++) {
         const r = robots[i];
         // Every robot navigates on its own pose, aiming at its slot on a
@@ -718,12 +723,11 @@
         const qp = r.data.qpos;
         const dx = tx - qp[0], dy = ty - qp[1];
         const dist = Math.hypot(dx, dy);
-        if (dist < 0.3) {
-          if (i === 0 && wander) wanderSeeded = false; // next stroll point
+        if (dist < 0.3) anyArrived = true;
+        if (navSettle || dist < 0.3) {
           slewR(r, [0, 0, 0]);
           continue;
         }
-        allArrived = false;
         // Free-joint quat is WXYZ; three's is (x, y, z, w).
         const f = new THREE.Vector3(1, 0, 0)
           .applyQuaternion(new THREE.Quaternion(qp[4], qp[5], qp[6], qp[3]));
@@ -737,10 +741,20 @@
           Math.max(-1, Math.min(1, 1.6 * err)),
         ]);
       }
-      // A tapped target stays up until EVERY robot has made it there.
-      if (!wander && allArrived) {
-        CMD[0] = CMD[1] = CMD[2] = 0;
-        cancelNav();
+      if (wander) {
+        // The FIRST robot to arrive draws the next stroll point.
+        if (anyArrived) wanderSeeded = false;
+      } else if (navSettle) {
+        // Settle: everyone ramps to a stand, then the autopilot disengages.
+        if (robots.every((r) => (r.navCmd ?? [0, 0, 0]).every((v) => Math.abs(v) < 0.01))) {
+          CMD[0] = CMD[1] = CMD[2] = 0;
+          navSettle = false;
+          cancelNav();
+        }
+      } else if (anyArrived) {
+        // First robot there wins the tap: hide the marker, stand down.
+        navSettle = true;
+        navMarker.visible = false;
       }
     }
 
