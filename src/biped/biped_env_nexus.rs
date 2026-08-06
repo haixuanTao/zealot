@@ -1832,10 +1832,18 @@ impl BipedNexusBatchEnv {
         }
         // Action-side slam/tremor pair (the engine-agnostic replacement for
         // the retired sensor-side force_rate): both weights NEGATIVE.
+        // -0.3 (was -0.1): v28's measured gait carried 68.7% of its knee
+        // action power above 5 Hz (knee target slew p95 282 mrad/20ms) — at
+        // -0.1 chatter cost ~14% of income, a tax the policy happily paid.
+        // 3x makes tremor a first-order cost so the policy LEARNS smoothness
+        // instead of needing a deploy-side low-pass (S2S_ACT_LPF measured the
+        // headroom: filtering to 2% high-freq power cost only 4% travel).
+        // Verify on the next run with S2S_TRACE=1; escalate to -0.5 or
+        // train-with-filter if high-freq power stays >5%.
         task.weights.action_rate_rate = std::env::var("BIPED_W_ACTION_RATE_RATE")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(-0.1);
+            .unwrap_or(-0.3);
         task.weights.touchdown_vz = std::env::var("BIPED_W_TOUCHDOWN_VZ")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
