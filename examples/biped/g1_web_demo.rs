@@ -1352,6 +1352,32 @@ pub async fn run(cfg: DemoCfg) {
         // mid-turn.
         if let Some(tgt) = nav_target {
             let local = tgt - offset_of(0); // the stroll, in lane coordinates
+            // A robot's own aim point (pre-slot): the marker, clamped into
+            // its walkable band — plus its distance to it. The WIN check
+            // runs against THIS point, so the marker disappears exactly
+            // when someone touches it, never because a ring slot 0.6 m
+            // away was reached.
+            let aims: Vec<(f32, f32, f32, bool)> = (0..n_robots)
+                .map(|o| {
+                    let off = offset_of(o);
+                    let (rx, ry) = if nav_lane_relative {
+                        (local.x + off.x, local.y + off.y)
+                    } else {
+                        (tgt.x, tgt.y)
+                    };
+                    let ry = if terrain {
+                        ry.clamp(off.y - 3.6, off.y + 3.6)
+                    } else {
+                        ry
+                    };
+                    let (base, _) = env.base_pose_for(o, &pose_stream.poses);
+                    let d = (rx - (base[0] + off.x)).hypot(ry - (base[1] + off.y));
+                    // Whether this robot's aim IS the marker (an off-lane
+                    // robot's aim clamps to its strip edge instead).
+                    let on_marker = nav_lane_relative || (ry - tgt.y).abs() < 1e-4;
+                    (rx, ry, d, on_marker)
+                })
+                .collect();
             let mut any_arrived = false;
             for e in 0..n_robots {
                 let off = offset_of(e);
@@ -1362,22 +1388,46 @@ pub async fn run(cfg: DemoCfg) {
                     // Global tap: everyone converges — everyone contends.
                     (0..n_robots).collect()
                 };
-                let slot = if peers.len() > 1 {
-                    let j = peers.iter().position(|&o| o == e).unwrap() as f32;
-                    let a = core::f32::consts::TAU * j / peers.len() as f32;
+                let (rx, ry, d_win, on_marker) = aims[e];
+                // Only a robot whose aim IS the marker can win the tap —
+                // an off-lane robot's aim clamps to its strip edge, and
+                // reaching that must not end the target.
+                if on_marker && d_win < 0.35 {
+                    if !any_arrived && !nav_settle {
+                        log_warn(&format!(
+                            "nav: robot {e} touched the marker: dist={d_win:.2} at ({rx:.1},{ry:.1})"
+                        ));
+                    }
+                    any_arrived = true;
+                }
+                // The nearest robot that can actually TOUCH the marker
+                // aims at it exactly (else the tap could never complete);
+                // the rest fan onto a ring so they don't render inside
+                // each other on arrival.
+                let center = peers
+                    .iter()
+                    .copied()
+                    .filter(|&o| aims[o].3)
+                    .min_by(|&a, &b| aims[a].2.total_cmp(&aims[b].2))
+                    .or_else(|| {
+                        peers
+                            .iter()
+                            .copied()
+                            .min_by(|&a, &b| aims[a].2.total_cmp(&aims[b].2))
+                    })
+                    .unwrap_or(e);
+                let slot = if peers.len() > 1 && e != center {
+                    let j = peers.iter().filter(|&&o| o != center).position(|&o| o == e);
+                    let a = core::f32::consts::TAU * j.unwrap_or(0) as f32
+                        / (peers.len() - 1) as f32;
                     let r = (0.35 * (peers.len() as f32).sqrt()).max(0.6);
                     Vec3::new(r * a.cos(), r * a.sin(), 0.0)
                 } else {
                     Vec3::ZERO
                 };
-                let (rx, ry) = if nav_lane_relative {
-                    (local.x + off.x, local.y + off.y)
-                } else {
-                    (tgt.x, tgt.y)
-                };
                 let tx = rx + slot.x;
-                // Stay on the strip whatever the target or slot ring does
-                // (the flat fleet's plane is unbounded — no clamp needed).
+                // Stay on the strip whatever the slot ring does (the flat
+                // fleet's plane is unbounded — no clamp needed).
                 let ty = if terrain {
                     (ry + slot.y).clamp(off.y - 3.6, off.y + 3.6)
                 } else {
@@ -1386,16 +1436,6 @@ pub async fn run(cfg: DemoCfg) {
                 let (base, brot) = env.base_pose_for(e, &pose_stream.poses);
                 let (dx, dy) = (tx - (base[0] + off.x), ty - (base[1] + off.y));
                 let dist = dx.hypot(dy);
-                if dist < 0.3 {
-                    if !any_arrived && !nav_settle {
-                        log_warn(&format!(
-                            "nav: robot {e} at target: dist={dist:.2} tgt=({tx:.1},{ty:.1}) base=({:.1},{:.1})",
-                            base[0] + off.x,
-                            base[1] + off.y
-                        ));
-                    }
-                    any_arrived = true;
-                }
                 let c: [f32; 3] = if nav_settle || dist < 0.3 {
                     [0.0, 0.0, 0.0]
                 } else {

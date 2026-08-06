@@ -709,21 +709,27 @@
       }
       if (!navTarget || !robots.length) return;
       const n = robots.length;
-      let anyArrived = false;
+      // The WIN check runs against the MARKER itself — the tap ends when a
+      // robot touches the disc, never because a ring slot 0.6 m away was
+      // reached. The robot nearest the marker aims at it EXACTLY (so a
+      // touch can actually happen); the rest fan onto a ring so they don't
+      // render inside each other on arrival (the worlds are independent).
+      const dMark = robots.map((r) => {
+        const qp = r.data.qpos;
+        return Math.hypot(navTarget.x - qp[0], navTarget.y - qp[1]);
+      });
+      const center = dMark.indexOf(Math.min(...dMark));
+      const anyArrived = dMark.some((d) => d < 0.35);
       for (let i = 0; i < n; i++) {
         const r = robots[i];
-        // Every robot navigates on its own pose, aiming at its slot on a
-        // small ring around the tap — the worlds are independent, so
-        // converging on the exact same point would render the robots
-        // inside each other.
-        const sr = n > 1 ? 0.5 * Math.sqrt(n) : 0;
-        const sa = (2 * Math.PI * i) / n;
+        const ring = n > 1 && i !== center;
+        const sr = ring ? 0.5 * Math.sqrt(n) : 0;
+        const sa = ring ? (2 * Math.PI * (i > center ? i - 1 : i)) / (n - 1) : 0;
         const tx = navTarget.x + sr * Math.cos(sa);
         const ty = Math.max(-3.6, Math.min(3.6, navTarget.y + sr * Math.sin(sa)));
         const qp = r.data.qpos;
         const dx = tx - qp[0], dy = ty - qp[1];
         const dist = Math.hypot(dx, dy);
-        if (dist < 0.3) anyArrived = true;
         if (navSettle || dist < 0.3) {
           slewR(r, [0, 0, 0]);
           continue;
