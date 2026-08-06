@@ -235,6 +235,15 @@ def swivel_transfer(u_hint, a_human, a_robot):
     return n_r * cos_p + np.cross(a_robot, n_r) * sin_p
 
 
+def _quat_xyzw_to_mat_cols(q):
+    x, y, z, w = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
 def _quat_conj_mul_xyzw(qa, qb):
     """conj(qa) ⊗ qb for xyzw quats — the rotation FROM qa TO qb."""
     ax, ay, az, aw = -qa[0], -qa[1], -qa[2], qa[3]
@@ -273,6 +282,7 @@ class ClutchIK:
         self.t_down = np.array([0.0, 0.0, -0.995 * self.Lr])  # arms along body
         self.prev_a = False
         self.anchor = None
+        self.tw_state = {}
         self._last_keepout_log = 0.0
 
     @property
@@ -306,19 +316,42 @@ class ClutchIK:
                      "right": np.asarray(wrist_quats[3], dtype=float)}
 
         if rising:
-            self.anchor = {
-                "h": {s: th[s].copy() for s in th},
-                "q": {s: qhand[s].copy() for s in qhand},
-            }
+            # (Re)zero the wrist state: pick, per side, the hand-frame axis
+            # most PERPENDICULAR to the forearm right now (robust marker for
+            # twist), and reset the accumulated angle.
+            self.tw_state = {}
+            for side in ("left", "right"):
+                if side not in qhand:
+                    continue
+                a = self._forearm_axis_yup(j, side)
+                Rh = _quat_xyzw_to_mat_cols(qhand[side])
+                perp = [np.linalg.norm(Rh[:, c] - (Rh[:, c] @ a) * a) for c in range(3)]
+                col = int(np.argmax(perp))
+                h = Rh[:, col] - (Rh[:, col] @ a) * a
+                h /= np.linalg.norm(h) + 1e-9
+                self.tw_state[side] = {"col": col, "h": h, "acc": 0.0}
+            self.anchor = {"zeroed": True}
 
         out = {}
         tw_out = np.zeros(2)
         for i, side in enumerate(("left", "right")):
             t = th[side]                          # positions: always absolute
-            if self.anchor is not None and side in self.anchor["q"] and side in qhand:
-                q_rel = _quat_conj_mul_xyzw(self.anchor["q"][side], qhand[side])
-                axis = self._forearm_axis_yup(j, side)
-                tw_out[i] = TWIST_SIGN[side] * _twist_about_axis(q_rel, axis)
+            st = self.tw_state.get(side)
+            if st is not None and side in qhand:
+                # Differential twist: per-frame increment of the marker axis
+                # about the CURRENT forearm axis, previous marker parallel-
+                # transported onto the new plane — arm motion injects no
+                # phantom twist, and accumulation never wraps (no flips).
+                a = self._forearm_axis_yup(j, side)
+                prev = st["h"] - (st["h"] @ a) * a
+                Rh = _quat_xyzw_to_mat_cols(qhand[side])
+                cur = Rh[:, st["col"]] - (Rh[:, st["col"]] @ a) * a
+                if np.linalg.norm(prev) > 1e-4 and np.linalg.norm(cur) > 0.15:
+                    prev /= np.linalg.norm(prev)
+                    curn = cur / np.linalg.norm(cur)
+                    st["acc"] += np.arctan2(np.cross(prev, curn) @ a, prev @ curn)
+                    st["h"] = curn
+                tw_out[i] = TWIST_SIGN[side] * st["acc"]
             t, blocked = apply_keepout(t, side)   # self-collision fail-safe
             t = clamp_reach(t, self.L1r, self.L2r)
             if blocked and time.monotonic() - self._last_keepout_log > 2.0:
