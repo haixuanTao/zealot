@@ -403,7 +403,7 @@
       const bodies = [];
       const children = model.map(() => []);
       model.forEach((b, i) => { if (b.parent >= 0) children[b.parent].push(i); });
-      const r = { bodies, joints: [], epT: 0, actHist: [new Float64Array(12), new Float64Array(12)], prevQ: new Float64Array(12), hist: null, gaitPh: 0, x0, y0, z0 };
+      const r = { bodies, joints: [], epT: 0, actHist: [new Float64Array(12), new Float64Array(12)], prevQ: new Float64Array(12), hist: null, gaitPh: 0, x0, y0, z0, navCmd: [0, 0, 0], cmd: null };
       model.forEach((b, i) => {
         // The body carries the REAL inertial properties from the MJCF
         // (mass, center of mass, principal inertia — colliders stay
@@ -718,17 +718,19 @@
       wander = false;
       navTarget = null;
       navMarker.visible = false;
+      robots.forEach((r) => { r.cmd = null; });
     }
-    // Slew-limit the autopilot command: a stand-to-full step input staggers
-    // the robot. Runs per 50 Hz control step (≈1 m/s² linear, 2 rad/s² yaw).
-    const navCmd = [0, 0, 0];
-    function slewTo(want) {
+    // Slew-limit the autopilot command, PER ROBOT: a stand-to-full step
+    // input staggers the robot. Runs per 50 Hz control step (≈1 m/s²
+    // linear, 2 rad/s² yaw). Robot 0's command mirrors into CMD for the HUD.
+    function slewR(r, want) {
       const lim = [0.02, 0.02, 0.04];
       for (let i = 0; i < 3; i++) {
-        const d = want[i] - navCmd[i];
-        navCmd[i] += Math.max(-lim[i], Math.min(lim[i], d));
-        CMD[i] = navCmd[i];
+        const d = want[i] - r.navCmd[i];
+        r.navCmd[i] += Math.max(-lim[i], Math.min(lim[i], d));
       }
+      r.cmd = r.navCmd;
+      if (r === robots[0]) { CMD[0] = r.navCmd[0]; CMD[1] = r.navCmd[1]; CMD[2] = r.navCmd[2]; }
     }
     function navDrive() {
       if (wander && !wanderSeeded && simTime > 0.3) {
@@ -736,31 +738,45 @@
         pickStroll();
       }
       if (!navTarget || !robots.length) return;
-      const t = robots[0].bodies[0].translation();
-      const dx = navTarget.x - t.x, dy = navTarget.y - t.y;
-      const dist = Math.hypot(dx, dy);
-      if (dist < 0.3) {
-        if (wander) {
-          wanderSeeded = false; // arrived: next stroll point next step
-        } else {
-          cancelNav();
+      const n = robots.length;
+      let allArrived = true;
+      for (let i = 0; i < n; i++) {
+        const r = robots[i];
+        // Every robot navigates on its own pose, aiming at its slot on a
+        // small ring around the tap — converging on the exact same point
+        // would shove the robots into each other on arrival.
+        const sr = n > 1 ? 0.5 * Math.sqrt(n) : 0;
+        const sa = (2 * Math.PI * i) / n;
+        const tx = navTarget.x + sr * Math.cos(sa);
+        const ty = Math.max(-3.6, Math.min(3.6, navTarget.y + sr * Math.sin(sa)));
+        const t = r.bodies[0].translation();
+        const dx = tx - t.x, dy = ty - t.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < 0.3) {
+          if (i === 0 && wander) wanderSeeded = false; // next stroll point
+          slewR(r, [0, 0, 0]);
+          continue;
         }
-        slewTo([0, 0, 0]);
-        return;
+        allArrived = false;
+        const q = r.bodies[0].rotation();
+        const f = new THREE.Vector3(1, 0, 0).applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w));
+        let err = Math.atan2(dy, dx) - Math.atan2(f.y, f.x);
+        err = Math.atan2(Math.sin(err), Math.cos(err));
+        // Turn toward the target; walk once roughly facing it, slowing on
+        // approach so the stop is a settle rather than an overshoot.
+        slewR(r, [
+          Math.abs(err) > 1.1
+            ? 0.1
+            : Math.max(0, Math.cos(err)) * Math.min(0.5, 0.2 + 0.3 * Math.min(dist, 1)),
+          0,
+          Math.max(-1, Math.min(1, 1.6 * err)),
+        ]);
       }
-      const q = robots[0].bodies[0].rotation();
-      const f = new THREE.Vector3(1, 0, 0).applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w));
-      let err = Math.atan2(dy, dx) - Math.atan2(f.y, f.x);
-      err = Math.atan2(Math.sin(err), Math.cos(err));
-      // Turn toward the target; walk once roughly facing it, slowing on
-      // approach so the stop is a settle rather than an overshoot.
-      slewTo([
-        Math.abs(err) > 1.1
-          ? 0.1
-          : Math.max(0, Math.cos(err)) * Math.min(0.5, 0.2 + 0.3 * Math.min(dist, 1)),
-        0,
-        Math.max(-1, Math.min(1, 1.6 * err)),
-      ]);
+      // A tapped target stays up until EVERY robot has made it there.
+      if (!wander && allArrived) {
+        CMD[0] = CMD[1] = CMD[2] = 0;
+        cancelNav();
+      }
     }
 
     const js = {};
@@ -778,8 +794,9 @@
           o[28 + j] = r.epT === 0 ? 0 : (q[j] - r.prevQ[j]) / DT;
         }
         const rot = r.bodies[0].rotation();
-        const cmdYaw = CMD[2];
-        o[12] = CMD[0]; o[13] = CMD[1]; o[14] = cmdYaw; o[15] = CMD[3];
+        // Autopilot steers each robot separately; manual input is global.
+        const rc = r.cmd ?? CMD;
+        o[12] = rc[0]; o[13] = rc[1]; o[14] = rc[2]; o[15] = CMD[3];
         // world-down in base frame (conjugate rotation of [0,0,-1])
         _qp.set(rot.x, rot.y, rot.z, rot.w).invert();
         const g = new THREE.Vector3(0, 0, -1).applyQuaternion(_qp);

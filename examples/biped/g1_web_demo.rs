@@ -1177,7 +1177,7 @@ pub async fn run(cfg: DemoCfg) {
     // The autopilot's command is slew-limited: a stand-to-full step input
     // visibly staggers the robot, so each component ramps toward the target
     // command instead (≈1.3 m/s² linear, ≈2.6 rad/s² yaw at ~26 fps).
-    let mut nav_cmd: [f32; 3] = [0.0; 3];
+    let mut nav_cmds: Vec<[f32; 3]> = vec![[0.0; 3]; n_robots];
     let slew = |cur: &mut [f32; 3], want: [f32; 3]| {
         for (i, limit) in [0.05f32, 0.05, 0.10].into_iter().enumerate() {
             cur[i] += (want[i] - cur[i]).clamp(-limit, limit);
@@ -1281,7 +1281,8 @@ pub async fn run(cfg: DemoCfg) {
             wander = false;
             nav_target = None;
             nav_marker.set_visible(false);
-            nav_cmd = drive_now.unwrap_or(cmd_ui);
+            let c0 = drive_now.unwrap_or(cmd_ui);
+            nav_cmds.iter_mut().for_each(|c| *c = c0);
         }
 
         // Wander: pick a stroll point 2–3.5 m out at a random bearing once
@@ -1308,60 +1309,88 @@ pub async fn run(cfg: DemoCfg) {
             nav_marker.set_visible(true);
         }
 
-        // Autopilot: steer robot 0's velocity command at the target. Heading
-        // via yaw, but the LATERAL channel carries the approach too — the
-        // policy tracks ±0.4 m/s sideways well, which closes on the target
-        // even mid-turn.
+        // Autopilot: steer EVERY robot's velocity command at the target,
+        // each from its own pose. The envs are separate worlds rendered
+        // side by side, so a robot aims at the tap point RELATIVE TO ITS
+        // OWN LANE — the literal render-space point can be a lane (9 m on
+        // terrain) off a robot's 8 m-wide strip. Robots that share a lane
+        // (terrain, env % 3) fan onto a small ring so they don't render
+        // inside each other on arrival. Heading via yaw, but the LATERAL
+        // channel carries the approach too — the policy tracks sideways
+        // well, which closes on the target even mid-turn.
         if let Some(tgt) = nav_target {
-            let off0 = offset_of(0);
-            let (base, brot) = env.base_pose_for(0, &pose_stream.poses);
-            let bx = base[0] + off0.x;
-            let by = base[1] + off0.y;
-            let (dx, dy) = (tgt.x - bx, tgt.y - by);
-            let dist = dx.hypot(dy);
-            let c: [f32; 3] = if dist < 0.3 {
-                if wander {
-                    // Arrived at a stroll point: draw the next one.
-                    wander_seeded = false;
-                } else {
-                    nav_target = None;
-                    nav_marker.set_visible(false);
-                }
-                [0.0, 0.0, 0.0]
-            } else {
-                let q = Rot3::from_xyzw(brot[0], brot[1], brot[2], brot[3]);
-                let fwd = q * Vec3::X;
-                let yaw = fwd.y.atan2(fwd.x);
-                let mut err = dy.atan2(dx) - yaw;
-                err = err.sin().atan2(err.cos());
-                // Target direction in the body frame.
-                let cb = (-yaw).cos();
-                let sb = (-yaw).sin();
-                let fx = cb * dx - sb * dy;
-                let fy = sb * dx + cb * dy;
-                let slow = dist.min(1.0);
-                // Keep the combined objective modest: full forward + full
-                // lateral + full yaw at once is more than the policy can
-                // stabilize when the upper body is also in motion (VR
-                // teleop drives the arms live), and falls look worse in a
-                // demo than a slightly slower walk.
-                [
-                    (0.8 * fx * slow).clamp(-0.25, 0.5),
-                    (0.8 * fy * slow).clamp(-0.25, 0.25),
-                    (1.5 * err).clamp(-0.9, 0.9),
-                ]
-            };
-            slew(&mut nav_cmd, c);
-            let c = nav_cmd;
-            cmd_ui = c;
-            drive::sync(c);
-            last_drive_cmd = drive::command();
+            let local = tgt - offset_of(0); // the tap, in lane coordinates
+            let mut all_arrived = true;
+            let mut dist0 = f32::MAX;
             for e in 0..n_robots {
+                let off = offset_of(e);
+                let peers: Vec<usize> =
+                    (0..n_robots).filter(|&o| offset_of(o) == off).collect();
+                let slot = if peers.len() > 1 {
+                    let j = peers.iter().position(|&o| o == e).unwrap() as f32;
+                    let a = core::f32::consts::TAU * j / peers.len() as f32;
+                    Vec3::new(0.6 * a.cos(), 0.6 * a.sin(), 0.0)
+                } else {
+                    Vec3::ZERO
+                };
+                let tx = local.x + off.x + slot.x;
+                // Stay on the strip whatever the slot ring does.
+                let ty = (local.y + off.y + slot.y).clamp(off.y - 3.6, off.y + 3.6);
+                let (base, brot) = env.base_pose_for(e, &pose_stream.poses);
+                let (dx, dy) = (tx - (base[0] + off.x), ty - (base[1] + off.y));
+                let dist = dx.hypot(dy);
+                if e == 0 {
+                    dist0 = dist;
+                }
+                let c: [f32; 3] = if dist < 0.3 {
+                    [0.0, 0.0, 0.0]
+                } else {
+                    all_arrived = false;
+                    let q = Rot3::from_xyzw(brot[0], brot[1], brot[2], brot[3]);
+                    let fwd = q * Vec3::X;
+                    let yaw = fwd.y.atan2(fwd.x);
+                    let mut err = dy.atan2(dx) - yaw;
+                    err = err.sin().atan2(err.cos());
+                    // Target direction in the body frame.
+                    let cb = (-yaw).cos();
+                    let sb = (-yaw).sin();
+                    let fx = cb * dx - sb * dy;
+                    let fy = sb * dx + cb * dy;
+                    let slow = dist.min(1.0);
+                    // Keep the combined objective modest: full forward +
+                    // full lateral + full yaw at once is more than the
+                    // policy can stabilize when the upper body is also in
+                    // motion (VR teleop drives the arms live), and falls
+                    // look worse in a demo than a slightly slower walk.
+                    [
+                        (0.8 * fx * slow).clamp(-0.25, 0.5),
+                        (0.8 * fy * slow).clamp(-0.25, 0.25),
+                        (1.5 * err).clamp(-0.9, 0.9),
+                    ]
+                };
+                slew(&mut nav_cmds[e], c);
+                let c = nav_cmds[e];
                 if cmds[e] != c {
                     cmds[e] = c;
                     env.pin_command_for(e, c[0], c[1], c[2]);
                     gobs.set_cmd(&backend, e, c).expect("cmd");
                 }
+            }
+            // HUD sliders mirror robot 0's autopilot command.
+            cmd_ui = nav_cmds[0];
+            drive::sync(cmd_ui);
+            last_drive_cmd = drive::command();
+            if wander {
+                // Robot 0 arriving at a stroll point draws the next one;
+                // the others re-aim mid-route (a strolling pack, not a
+                // parade waiting for its slowest member).
+                if dist0 < 0.3 {
+                    wander_seeded = false;
+                }
+            } else if all_arrived {
+                // A tapped target stays up until every robot has made it.
+                nav_target = None;
+                nav_marker.set_visible(false);
             }
         } else if let Some(c) = drive_now {
             // Driving: each key press bumped the latched command, so apply it
