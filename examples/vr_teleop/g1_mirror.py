@@ -93,11 +93,19 @@ def retarget(j):
     return arm_angles(j, "left"), arm_angles(j, "right")
 
 
+# Slight amplification of fractional reach: trackers overestimate the
+# shoulder→elbow→wrist span (and human "reach" includes the hand, which the
+# SMPL wrist joint stops short of), so a 1:1 mapping leaves the robot ~10%
+# short of full extension when the operator is fully stretched. The reach
+# clamp catches any overshoot at the top end.
+REACH_GAIN = 1.12
+
+
 def scaled_wrist_target(j, side, Lr):
     """Torso-frame wrist target at ROBOT scale + upper-arm swivel hint.
 
-    Fractional reach (|wrist-shoulder| / arm length) maps 1:1 between human
-    and robot, so depth control is linear.
+    Fractional reach (|wrist-shoulder| / arm length) maps ~1:1 between human
+    and robot (× REACH_GAIN), so depth control is linear.
     """
     R = torso_frame(j)
     sh, el, wr = (
@@ -108,7 +116,7 @@ def scaled_wrist_target(j, side, Lr):
     u = R @ (el - sh)
     L1h = np.linalg.norm(u) + 1e-9
     L2h = np.linalg.norm(wr - el) + 1e-9
-    t = R @ (wr - sh) * (Lr / (L1h + L2h))
+    t = R @ (wr - sh) * (REACH_GAIN * Lr / (L1h + L2h))
     return t, u
 
 
