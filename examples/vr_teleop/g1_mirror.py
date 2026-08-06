@@ -127,10 +127,15 @@ KEEPOUT_RADIUS = 0.12          # slim enough that hands hanging at the thighs cl
 KEEPOUT_Z = (-0.35, 0.30)      # waist to head, relative to shoulder height
 KEEPOUT_AXIS_X = -0.02         # axis slightly behind the shoulder line
 SHOULDER_HALF_WIDTH = 0.147
+BEHIND_LIMIT_X = -0.08         # wrist targets may not go behind the torso plane
 
 
 def apply_keepout(t, side):
-    """Project a shoulder-relative wrist target out of the torso capsule."""
+    """Project a shoulder-relative wrist target out of the torso capsule,
+    and never let it go behind the torso plane (arms don't sweep backward)."""
+    if t[0] < BEHIND_LIMIT_X:
+        t = t.copy()
+        t[0] = BEHIND_LIMIT_X
     sign = 1.0 if side == "left" else -1.0
     ax, ay = KEEPOUT_AXIS_X, -sign * SHOULDER_HALF_WIDTH
     if not (KEEPOUT_Z[0] < t[2] < KEEPOUT_Z[1]):
@@ -296,7 +301,7 @@ class ClutchIK:
 
 # Wrist-twist extraction tunables (Pico wrist-joint local-frame conventions)
 TWIST_AXIS_COL = 0     # which column of the hand rotation matrix to project
-TWIST_SIGN = {"left": 1.0, "right": -1.0}
+TWIST_SIGN = {"left": 1.0, "right": 1.0}
 TWIST_OFFSET = {"left": 0.0, "right": 0.0}
 
 
