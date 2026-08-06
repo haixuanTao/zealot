@@ -252,6 +252,7 @@ mod vr {
         targets: HashMap<String, f32>,
         stick: [f32; 4],
         fresh: bool,
+        estop: bool,
         last_msg_ms: f64,
         enabled: bool,
     }
@@ -314,6 +315,27 @@ mod vr {
                     }
                 }
                 st.fresh = get("fresh").map(|f| f.is_truthy()).unwrap_or(false);
+                let estop_now = get("estop").map(|e| e.is_truthy()).unwrap_or(false);
+                if estop_now != st.estop {
+                    st.estop = estop_now;
+                    // Mirror the state on the page's VR button so the operator
+                    // sees the latch without looking at any console.
+                    if let Some(btn) = web_sys::window()
+                        .and_then(|w| w.document())
+                        .and_then(|d| d.get_element_by_id("vrBtn"))
+                    {
+                        if estop_now {
+                            btn.set_text_content(Some("🛑 E-STOP — A resumes"));
+                            let _ = btn.set_attribute(
+                                "style",
+                                "color:#ff6b6b;border-color:#ff6b6b;font-weight:bold",
+                            );
+                        } else {
+                            btn.set_text_content(Some("🥽 VR ✓"));
+                            let _ = btn.set_attribute("style", "");
+                        }
+                    }
+                }
                 st.last_msg_ms = now_ms();
             });
         });
@@ -329,6 +351,14 @@ mod vr {
 
     pub fn enabled() -> bool {
         STATE.with(|s| s.borrow().enabled)
+    }
+
+    /// Latched operator e-stop (X on the headset; A clears it bridge-side).
+    pub fn estop() -> bool {
+        STATE.with(|s| {
+            let st = s.borrow();
+            st.enabled && st.estop && (now_ms() - st.last_msg_ms) < 2000.0
+        })
     }
 
     /// Held-joint targets in the given (env staging) order; None when the
@@ -377,6 +407,9 @@ mod vr {
     }
     pub fn install(_url: &str) {}
     pub fn enabled() -> bool {
+        false
+    }
+    pub fn estop() -> bool {
         false
     }
     pub fn arm_targets(_names: &[String], _homes: &[f32]) -> Option<Vec<f32>> {
@@ -1282,6 +1315,7 @@ pub async fn run(cfg: DemoCfg) {
     let held_names = env.held_joint_names();
     let held_homes = env.held_joint_homes();
     let mut vr_stick_live = false;
+    let mut vr_estop_latch = false;
     // Start the latched command at what the demo is already running, so the
     // first tap bumps up from the visible value instead of from zero.
     drive::sync(cmd_ui);
@@ -1429,6 +1463,26 @@ pub async fn run(cfg: DemoCfg) {
         // (fading home whenever it goes stale), and let the headset's left
         // stick drive the velocity command like the keyboard does.
         if vr::enabled() {
+            // Operator e-stop (X on the headset, latched bridge-side): on the
+            // rising edge cancel the autopilot and stand the whole fleet; the
+            // stale/zeroed stream below already fades the arms home.
+            let es = vr::estop();
+            if es && !vr_estop_latch {
+                wander = false;
+                nav_target = None;
+                nav_marker.set_visible(false);
+                let c = [0.0f32; 3];
+                cmd_ui = c;
+                drive::sync(c);
+                last_drive_cmd = drive::command();
+                for e in 0..n_robots {
+                    cmds[e] = c;
+                    env.pin_command_for(e, c[0], c[1], c[2]);
+                    gobs.set_cmd(&backend, e, c).expect("cmd");
+                }
+            }
+            vr_estop_latch = es;
+
             match vr::arm_targets(&held_names, &held_homes) {
                 Some(t) => env.set_live_arm_targets(&t),
                 None => env.clear_live_arm_targets(),
