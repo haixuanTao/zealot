@@ -31,7 +31,7 @@ RESET_FLAG = []  # non-empty -> physics loop resets robot + box
 
 HERE = Path(__file__).parent
 SCENE = str(HERE / "playground_g1/xmls/scene_mjx_feetonly_flat_terrain.xml")
-POLICY_PATH = str(Path(__file__).parent / "checkpoints/velocity_v28/policy.safetensors")
+POLICY_PATH = str(Path(__file__).parent / "checkpoints/velocity_v28_31350/policy.safetensors")
 
 CONTROL_DT = 0.02
 DECIMATION = 4
