@@ -288,6 +288,17 @@ class ArmStream:
                 return np.zeros(2)
             return self.trig.copy()
 
+    def is_estop(self):
+        with self.lock:
+            return self.estop
+
+    def trip_estop(self, reason):
+        with self.lock:
+            if self.estop:
+                return
+            self.estop = True
+        print(f"[E-STOP] tripped ({reason}) — press A to resume")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -352,6 +363,9 @@ def main():
         print(f"[{side}] home={np.round(home,2)} offset={np.round(arm_off[side],2)}")
 
     box_body = model.body("ball").id
+    ball_gid = model.geom("ball_geom").id
+    grasp_gids = {s: {model.geom(f"{s}_hand_collision").id,
+                      model.geom(f"{s}_forearm_collision").id} for s in ("left", "right")}
     wrist_adr = {s: model.joint(f"{s}_wrist_roll_joint").qposadr[0] for s in ("left", "right")}
     wrist_rng = {s: model.jnt_range[model.joint(f"{s}_wrist_roll_joint").id] for s in ("left", "right")}
     grab_eq = {s: model.equality(f"grab_{s}").id for s in ("left", "right")}
@@ -399,8 +413,15 @@ def main():
         wrist_sm = np.zeros(2)
         frozen_phase = 0.0
         ball_floor_t = 0.0
+        prev_estop = False
         next_t = time.monotonic()
         while True:
+            # X e-stop also resets the scene (robot + ball back home)
+            es = arms.is_estop()
+            if es and not prev_estop:
+                RESET_FLAG.append(True)
+            prev_estop = es
+
             if RESET_FLAG:
                 RESET_FLAG.clear()
                 print("MANUAL RESET")
@@ -419,24 +440,39 @@ def main():
                 data.qvel[free_d + 1] += kick[1]
                 print(f"PUSH applied: {kick}")
 
-            # --- triggers -> grab/release welds ---
+            # --- triggers -> CONTACT-GATED grasp lock (no magnet: the hand
+            # must physically touch the ball; the weld then freezes the TRUE
+            # current relative pose so nothing snaps or teleports) ---
+            touching = {"left": False, "right": False}
+            for ci in range(data.ncon):
+                g1, g2 = data.contact[ci].geom1, data.contact[ci].geom2
+                if ball_gid in (g1, g2):
+                    other = g2 if g1 == ball_gid else g1
+                    for side in ("left", "right"):
+                        if other in grasp_gids[side]:
+                            touching[side] = True
             trig = arms.get_trig()
             for i, side in enumerate(("left", "right")):
                 eid = grab_eq[side]
                 active = bool(data.eq_active[eid])
                 if trig[i] > 0.7 and not active:
+                    if not touching[side]:
+                        if ep_t % 50 == 0:
+                            print(f"grasp {side}: trigger held but hand not touching the ball")
+                        continue
                     hp = data.xpos[hand_body[side]]
-                    bp = data.xpos[box_body]
-                    dist = np.linalg.norm(bp - hp)
-                    if dist >= GRAB_RADIUS and ep_t % 25 == 0:
-                        print(f"grab {side} MISS: hand {dist:.2f} m from ball (need < {GRAB_RADIUS})")
-                    if dist < GRAB_RADIUS:
-                        # magnet grab: snap the ball into the palm
-                        model.eq_data[eid][0:3] = 0.0
-                        model.eq_data[eid][3:6] = [0.09, 0.0, 0.0]  # palm center, hand frame
-                        model.eq_data[eid][6:10] = [1.0, 0.0, 0.0, 0.0]
-                        data.eq_active[eid] = 1
-                        print(f"GRAB {side} (from {dist:.2f} m)")
+                    hq = data.xquat[hand_body[side]]
+                    bq = data.xquat[box_body]
+                    hq_inv = np.array([hq[0], -hq[1], -hq[2], -hq[3]])
+                    rel_p = np.zeros(3)
+                    mujoco.mju_rotVecQuat(rel_p, data.xpos[box_body] - hp, hq_inv)
+                    rel_q = np.zeros(4)
+                    mujoco.mju_mulQuat(rel_q, hq_inv, bq)
+                    model.eq_data[eid][0:3] = 0.0
+                    model.eq_data[eid][3:6] = rel_p
+                    model.eq_data[eid][6:10] = rel_q
+                    data.eq_active[eid] = 1
+                    print(f"GRASP {side} (contact lock)")
                 elif trig[i] < 0.3 and active:
                     data.eq_active[eid] = 0
                     print(f"RELEASE {side}")
@@ -535,6 +571,7 @@ def main():
             if z < FALL_Z or np.arccos(np.clip(-g[2], -1, 1)) > TILT_LIMIT:
                 state["falls"] += 1
                 print(f"FALL #{state['falls']} at ep_t={ep_t} — resetting")
+                arms.trip_estop("fall")  # stay safe until A resumes
                 reset()
                 ep_t = 0
                 act_hist = [np.zeros(12), np.zeros(12)]
