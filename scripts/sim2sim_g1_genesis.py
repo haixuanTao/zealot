@@ -113,6 +113,44 @@ ACTION_SCALE = float(os.environ.get("S2S_ACTION_SCALE", "0.5"))
 # actually trained with.
 HELD_POSE = os.environ.get("S2S_HELD_POSE", "home")
 
+# S2S_ARM_MOTION: replay a clip (csv, degrees, 30 fps, "<joint>_dof" columns)
+# on the PD-held upper-body joints — same contract as the MuJoCo harness
+# (S2S_ARM_T0 start offset, S2S_ARM_SCALE amplitude about the hold pose,
+# 0.5 s smoothstep fade-in from the hold pose).
+ARM_MOTION = os.environ.get("S2S_ARM_MOTION")
+ARM_T0 = float(os.environ.get("S2S_ARM_T0", "0"))
+ARM_SCALE = float(os.environ.get("S2S_ARM_SCALE", "1"))
+ARM_FPS = 30.0
+_arm_clip = {}
+if ARM_MOTION:
+    import csv as _csv
+    with open(ARM_MOTION) as _f:
+        _rows = list(_csv.DictReader(_f))
+    for _c in _rows[0]:
+        if _c.endswith("_joint_dof"):
+            _v = np.deg2rad(np.array([float(r[_c]) for r in _rows], dtype=np.float64))
+            if len(_v) >= 3:
+                _m = _v.copy()
+                _m[1:-1] = np.median(np.stack([_v[:-2], _v[1:-1], _v[2:]]), axis=0)
+                _v = _m
+            _arm_clip[_c[:-4]] = _v
+    print(f"arm-motion clip: {os.path.basename(ARM_MOTION)}, {len(_rows)} frames,"
+          f" {len(_arm_clip)} joint columns", flush=True)
+
+def arm_hold(name, qh, t):
+    """Held-joint target at time t: clip pose when a clip drives it, else home."""
+    tr = _arm_clip.get(name)
+    if tr is None:
+        return qh
+    i = (ARM_T0 + t) * ARM_FPS
+    i0 = int(np.clip(i, 0, len(tr) - 1))
+    i1 = min(i0 + 1, len(tr) - 1)
+    v = tr[i0] + (i - i0) * (tr[i1] - tr[i0]) if i1 > i0 else tr[i0]
+    fade = min(t / 0.5, 1.0)
+    fade = fade * fade * (3.0 - 2.0 * fade)
+    return qh + fade * ARM_SCALE * (v - qh)
+
+
 
 
 KP_SCALE = float(os.environ.get("S2S_KP_SCALE", "1"))
@@ -304,7 +342,7 @@ def main():
                 idx = j.dofs_idx_local if hasattr(j, "dofs_idx_local") else [j.dof_idx_local]
                 q_hold = 0.0 if HELD_POSE == "rest" else HELD_HOME.get(n, 0.0)
                 held.append((int(np.atleast_1d(np.asarray(idx))[0]), kp, kd, eff,
-                             q_hold))
+                             q_hold, n))
                 break
     print(f"policy joints: 12, held joints: {len(held)}")
 
@@ -404,8 +442,9 @@ def main():
             tau_leg = np.clip(pol_kp * (target - qq[:12]) - pol_kd * qd[:12],
                               -pol_eff, pol_eff)
             tau_held = np.array([
-                np.clip(kp * (qh - qq[12 + k]) - kd * qd[12 + k], -eff, eff)
-                for k, (_, kp, kd, eff, qh) in enumerate(held)])
+                np.clip(kp * (arm_hold(nm, qh, ep_t * CONTROL_DT) - qq[12 + k])
+                        - kd * qd[12 + k], -eff, eff)
+                for k, (_, kp, kd, eff, qh, nm) in enumerate(held)])
             tau = np.concatenate([tau_leg, tau_held]) if held else tau_leg
             robot.control_dofs_force(tau, all_idx)
             scene.step()

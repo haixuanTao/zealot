@@ -134,6 +134,44 @@ ACTION_SCALE = float(os.environ.get("S2S_ACTION_SCALE", "0.5"))
 # actually trained with.
 HELD_POSE = os.environ.get("S2S_HELD_POSE", "home")
 
+# S2S_ARM_MOTION: replay a clip (csv, degrees, 30 fps, "<joint>_dof" columns)
+# on the PD-held upper-body joints — same contract as the MuJoCo harness
+# (S2S_ARM_T0 start offset, S2S_ARM_SCALE amplitude about the hold pose,
+# 0.5 s smoothstep fade-in from the hold pose).
+ARM_MOTION = os.environ.get("S2S_ARM_MOTION")
+ARM_T0 = float(os.environ.get("S2S_ARM_T0", "0"))
+ARM_SCALE = float(os.environ.get("S2S_ARM_SCALE", "1"))
+ARM_FPS = 30.0
+_arm_clip = {}
+if ARM_MOTION:
+    import csv as _csv
+    with open(ARM_MOTION) as _f:
+        _rows = list(_csv.DictReader(_f))
+    for _c in _rows[0]:
+        if _c.endswith("_joint_dof"):
+            _v = np.deg2rad(np.array([float(r[_c]) for r in _rows], dtype=np.float64))
+            if len(_v) >= 3:
+                _m = _v.copy()
+                _m[1:-1] = np.median(np.stack([_v[:-2], _v[1:-1], _v[2:]]), axis=0)
+                _v = _m
+            _arm_clip[_c[:-4]] = _v
+    print(f"arm-motion clip: {os.path.basename(ARM_MOTION)}, {len(_rows)} frames,"
+          f" {len(_arm_clip)} joint columns", flush=True)
+
+def arm_hold(name, qh, t):
+    """Held-joint target at time t: clip pose when a clip drives it, else home."""
+    tr = _arm_clip.get(name)
+    if tr is None:
+        return qh
+    i = (ARM_T0 + t) * ARM_FPS
+    i0 = int(np.clip(i, 0, len(tr) - 1))
+    i1 = min(i0 + 1, len(tr) - 1)
+    v = tr[i0] + (i - i0) * (tr[i1] - tr[i0]) if i1 > i0 else tr[i0]
+    fade = min(t / 0.5, 1.0)
+    fade = fade * fade * (3.0 - 2.0 * fade)
+    return qh + fade * ARM_SCALE * (v - qh)
+
+
 
 
 KP_SCALE = float(os.environ.get("S2S_KP_SCALE", "1"))
@@ -329,7 +367,7 @@ def main():
         for frag, kp, kd, eff in HELD:
             if frag in jn:
                 q_hold = 0.0 if HELD_POSE == "rest" else HELD_HOME.get(jn, 0.0)
-                held.append((d, kp, kd, eff, q_hold))
+                held.append((d, kp, kd, eff, q_hold, jn))
                 break
     print(f"policy joints: 12, held joints: {len(held)}, total dofs: {n}")
 
@@ -343,7 +381,7 @@ def main():
     def reset():
         jp = np.zeros(n)
         jp[pol_d] = DEFAULT_POS
-        for d, _, _, _, qh in held:
+        for d, _, _, _, qh, _nm in held:
             jp[d] = qh
         yaw = rng.uniform(-0.3, 0.3)
         robot.set_world_pose(position=np.array([0.0, 0.0, 0.79]),
@@ -445,8 +483,9 @@ def main():
             tau = np.zeros(n)
             tl = pol_kp * (target - jq[pol_d]) - pol_kd * jv[pol_d]
             tau[pol_d] = np.clip(tl, -pol_eff, pol_eff)
-            for d, kp, kd, eff, qh in held:
-                tau[d] = np.clip(kp * (qh - jq[d]) - kd * jv[d], -eff, eff)
+            for d, kp, kd, eff, qh, nm in held:
+                qt = arm_hold(nm, qh, ep_t * CONTROL_DT)
+                tau[d] = np.clip(kp * (qt - jq[d]) - kd * jv[d], -eff, eff)
             robot.apply_action(ArticulationAction(joint_efforts=tau))
             if os.environ.get("S2S_DEBUG") and ep_t < 2:
                 print(f"  dbg tau|max|={np.abs(tau).max():.1f} knee_q={jq[pol_d][3]:.3f} target_knee={target[3]:.3f}", flush=True)
