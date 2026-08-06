@@ -32,8 +32,9 @@ SECONDS = float(sys.argv[3]) if len(sys.argv) > 3 else 20.0
 # joints) → USD via isaacsim.asset.importer.mjcf, cached under /tmp.
 # The old URDF route is dead on the Isaac Sim 6.0.1 install (no
 # URDFParseAndImportFile command, unitree_ros checkout gone).
-FLAT_XML = ("/home/champagne/rt_build/bench-venv/lib/python3.12/site-packages/"
-            "mujoco_playground/_src/locomotion/g1/xmls/_g1_isaac_flat.xml")
+FLAT_XML = os.environ.get("S2S_MODEL_XML") or __import__("os").path.join(
+    __import__("mujoco_playground").__file__.rsplit("/", 1)[0],
+    "_src/locomotion/g1/xmls/scene_mjx_feetonly_flat_terrain.xml")
 USD_DIR = "/tmp/g1_isaac_usd"
 USD_FILE = os.path.join(USD_DIR, "_g1_isaac_flat", "_g1_isaac_flat.usda")
 
@@ -447,6 +448,8 @@ def main():
             for d, kp, kd, eff, qh in held:
                 tau[d] = np.clip(kp * (qh - jq[d]) - kd * jv[d], -eff, eff)
             robot.apply_action(ArticulationAction(joint_efforts=tau))
+            if os.environ.get("S2S_DEBUG") and ep_t < 2:
+                print(f"  dbg tau|max|={np.abs(tau).max():.1f} knee_q={jq[pol_d][3]:.3f} target_knee={target[3]:.3f}", flush=True)
             world.step(render=False)
 
         prev_q = q
@@ -481,6 +484,8 @@ def main():
         z = np.asarray(p)[2]
         up = projected_gravity(np.asarray(quat2))
         tilt = np.arccos(np.clip(-up[2], -1.0, 1.0))
+        if os.environ.get("S2S_DEBUG") and ep_t % 10 == 0:
+            print(f"  dbg t={ep_t * CONTROL_DT:.2f} p={np.asarray(p)} tilt={np.rad2deg(tilt):.1f}", flush=True)
         if z < FALL_Z or tilt > TILT_LIMIT or ep_t >= int(20.0 / CONTROL_DT):
             d = np.linalg.norm(np.asarray(p)[:2] - dist0)
             why = "timeout" if ep_t >= int(20.0 / CONTROL_DT) else "fell"

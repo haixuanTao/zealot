@@ -43,12 +43,13 @@ FALL_Z = 0.45
 TILT_LIMIT = np.deg2rad(70.0)
 W, H = 960, 540
 
-PLAYGROUND_XML = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "")
-MODEL_XML = os.environ.get(
-    "S2S_MODEL_XML",
-    "/home/champagne/rt_build/bench-venv/lib/python3.12/site-packages/"
-    "mujoco_playground/_src/locomotion/g1/xmls/g1_mjx_feetonly.xml")
+def _default_model_xml() -> str:
+    import mujoco_playground
+    return os.path.join(
+        os.path.dirname(mujoco_playground.__file__),
+        "_src/locomotion/g1/xmls/g1_mjx_feetonly.xml")
+
+MODEL_XML = os.environ.get("S2S_MODEL_XML") or _default_model_xml()
 
 POLICY_JOINTS = [
     "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
