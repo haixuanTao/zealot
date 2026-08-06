@@ -259,7 +259,7 @@ class ArmStream:
             was_rel = self.clutch.relative
             left, right, twists = self.clutch.update(frame_j, msg.get("wrist_quat"), a_pressed)
             if self.clutch.relative and not was_rel:
-                print("[clutch] ANCHORED — relative mode (press A to re-anchor)")
+                print("[wrist] twist reference zeroed (A) — positions stay absolute")
             with self.lock:
                 self.twists = tuple(twists)
                 self.latest = (left, right)

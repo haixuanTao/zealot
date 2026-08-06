@@ -109,7 +109,7 @@ class Bridge:
             was_rel = self._clutch.relative
             left, right, tw = self._clutch.update(frame, msg.get("wrist_quat"), a_pressed)
             if self._clutch.relative and not was_rel:
-                print("[clutch] ANCHORED — relative mode (press A to re-anchor)")
+                print("[wrist] twist reference zeroed (A) — positions stay absolute")
             raw = {"left": left + ARM_OFFSET["left"], "right": right + ARM_OFFSET["right"]}
             with self.lock:
                 if self._smooth is None:

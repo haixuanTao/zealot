@@ -247,18 +247,16 @@ def _twist_about_axis(q_rel_xyzw, axis):
 
 
 class ClutchIK:
-    """SONIC-style CANONICAL-pose anchored retargeting.
+    """Absolute position retargeting + A-calibrated wrist twist.
 
-    Calibration contract (mirrors SONIC's calibrate_now zero-ref pose):
-    stand with arms hanging along the body, hands relaxed, and press A.
-    The robot's reference becomes arms-down; your pose at that moment is
-    the zero for BOTH position deltas and wrist twist. From then on your
-    motion applies as scaled cartesian deltas on the arms-down reference,
-    and twist is the swing-twist of your hand's rotation SINCE the anchor
-    about the current forearm axis — reference-frame-free, zero at anchor,
-    no flipping when the arm swings. Press A again any time to
-    re-calibrate. Before the first press: absolute positions, neutral
-    wrists.
+    Arm POSITIONS are always absolute (scaled fractional-reach IK) — the
+    relative/clutched position mode was tried and retired: it read as
+    unpredictable in practice. A retains one job: press it with hands
+    relaxed to (re)zero the WRIST TWIST reference — twist is the
+    swing-twist of the hand's rotation since that moment about the current
+    forearm axis, which cannot flip when the arm swings. Before the first
+    press wrists stay neutral. The torso keep-out, behind-the-back limit,
+    and swivel handling all still apply.
     """
 
     def __init__(self, L1r, L2r):
@@ -308,22 +306,17 @@ class ClutchIK:
         out = {}
         tw_out = np.zeros(2)
         for i, side in enumerate(("left", "right")):
-            if self.anchor is None:
-                t = th[side]
-            else:
-                t = self.t_down + (th[side] - self.anchor["h"][side])
-                if side in self.anchor["q"] and side in qhand:
-                    q_rel = _quat_conj_mul_xyzw(self.anchor["q"][side], qhand[side])
-                    axis = self._forearm_axis_yup(j, side)
-                    tw_out[i] = TWIST_SIGN[side] * _twist_about_axis(q_rel, axis)
+            t = th[side]                          # positions: always absolute
+            if self.anchor is not None and side in self.anchor["q"] and side in qhand:
+                q_rel = _quat_conj_mul_xyzw(self.anchor["q"][side], qhand[side])
+                axis = self._forearm_axis_yup(j, side)
+                tw_out[i] = TWIST_SIGN[side] * _twist_about_axis(q_rel, axis)
             t, blocked = apply_keepout(t, side)   # self-collision fail-safe
             t = clamp_reach(t, self.L1r, self.L2r)
             if blocked and time.monotonic() - self._last_keepout_log > 2.0:
                 self._last_keepout_log = time.monotonic()
                 print(f"[keepout] {side} wrist target grazing the torso — sliding on the surface")
-            # Swivel TRANSFER: the operator's raw elbow direction is only
-            # meaningful for the operator's arm axis; in relative mode the
-            # robot's axis differs, so carry the swivel angle instead.
+            # keepout/limits can shift the axis; transfer keeps the swivel sane
             a_h = th[side] / (np.linalg.norm(th[side]) + 1e-9)
             a_r = t / (np.linalg.norm(t) + 1e-9)
             hint_r = swivel_transfer(hint[side], a_h, a_r)
