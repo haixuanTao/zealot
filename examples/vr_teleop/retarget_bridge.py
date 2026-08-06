@@ -61,6 +61,8 @@ class Bridge:
         self.trig = [0.0, 0.0]
         self.relative = False
         self.estop = False
+        self.paused = False
+        self._prev_a = False
         self._prev_x = False
         self.t_body = 0.0
         self._smooth = None
@@ -98,10 +100,17 @@ class Bridge:
                         self.estop = True
                         print("[E-STOP] X pressed — targets stale, stick zeroed. Press A to resume.")
             self._prev_x = x_pressed
-            if a_pressed and self.estop:
+            if a_pressed and not self._prev_a:
                 with self.lock:
-                    self.estop = False
-                print("[E-STOP] cleared by A — resuming (clutch re-anchored)")
+                    if self.estop:
+                        self.estop = False
+                        self.paused = False
+                        print("[E-STOP] cleared by A — resuming")
+                    else:
+                        self.paused = not self.paused
+                        print("[pause] arms HOME — press A to resume" if self.paused
+                              else "[pause] resumed — tracking (wrists re-zeroed)")
+            self._prev_a = a_pressed
             sj = msg.get("smpl_joints")
             if sj is None:
                 continue
@@ -135,7 +144,7 @@ class Bridge:
                 "trig": [0.0, 0.0] if self.estop else self.trig,
                 "relative": self.relative,
                 "estop": self.estop,
-                "fresh": (time.time() - self.t_body) < 1.0 and not self.estop,
+                "fresh": (time.time() - self.t_body) < 1.0 and not self.estop and not self.paused,
             })
 
 

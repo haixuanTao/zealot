@@ -206,6 +206,8 @@ class ArmStream:
         self.arm_lengths = arm_lengths
         self.clutch = ClutchIK(*arm_lengths)
         self.estop = False
+        self.paused = False
+        self.prev_a = False
         self.prev_x = False
         self.latest = None  # (left4, right4) in retarget convention
         self.twists = (0.0, 0.0)
@@ -248,10 +250,17 @@ class ArmStream:
                         self.estop = True
                         print("[E-STOP] X pressed — arms home, command zeroed, grabs released. Press A to resume.")
             self.prev_x = x_pressed
-            if a_pressed and self.estop:
+            if a_pressed and not self.prev_a:
                 with self.lock:
-                    self.estop = False
-                print("[E-STOP] cleared by A — resuming (clutch re-anchored)")
+                    if self.estop:
+                        self.estop = False
+                        self.paused = False
+                        print("[E-STOP] cleared by A — resuming")
+                    else:
+                        self.paused = not self.paused
+                        print("[pause] arms HOME — press A to resume" if self.paused
+                              else "[pause] resumed — tracking (wrists re-zeroed)")
+            self.prev_a = a_pressed
             sj = msg.get("smpl_joints")
             if sj is None:
                 continue
@@ -269,7 +278,7 @@ class ArmStream:
 
     def get(self):
         with self.lock:
-            fresh = (time.time() - self.t_last) < self.STALE_S and not self.estop
+            fresh = (time.time() - self.t_last) < self.STALE_S and not self.estop and not self.paused
             return (self.latest if fresh else None), len(self.rx) / 2.0
 
     def get_twists(self):
