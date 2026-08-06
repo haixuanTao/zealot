@@ -421,6 +421,7 @@ def main():
         vr_tgt_smooth = None
         wrist_sm = np.zeros(2)
         frozen_phase = 0.0
+        stand_tgt_filt = None
         ball_floor_t = 0.0
         prev_estop = False
         next_t = time.monotonic()
@@ -520,6 +521,14 @@ def main():
                 frames_hist = frames_hist[1:] + [o.copy()]
             action = policy.act(np.concatenate(frames_hist))
             target = np.clip(DEFAULT_POS + ACTION_SCALE * action, pol_rng[:, 0], pol_rng[:, 1])
+            # Stand-only target filter: v28 dithers at idle in MuJoCo
+            # (measured 0.63 rad/s mean joint speed; the trainer's anti-tremor
+            # rewards are default-off). EMA the APPLIED targets while the
+            # command is zero -- the policy still observes its raw actions, and
+            # the filter disengages the moment a command arrives.
+            if cmd_speed < 0.1:
+                target = 0.3 * target + 0.7 * stand_tgt_filt if stand_tgt_filt is not None else target
+            stand_tgt_filt = target.copy()
 
             # --- live VR arm targets with fade in/out ---
             vr, rx_hz = arms.get()
