@@ -544,6 +544,9 @@ def main():
         # --- 4 physics substeps with explicit torque PD @200 Hz ---
         for _ in range(DECIMATION):
             tau_leg = pol_kp * (target - data.qpos[pol_q]) - pol_kd * data.qvel[pol_d]
+            if os.environ.get("S2S_TRACE"):
+                globals().setdefault("_tr", []).append(
+                    (data.qpos[pol_q].copy(), np.clip(tau_leg, -pol_eff, pol_eff).copy()))
             data.qfrc_applied[:] = 0.0
             data.qfrc_applied[pol_d] = np.clip(tau_leg, -pol_eff, pol_eff)
             for qa, da, kp, kd, eff, qh, _nm, _lo, _hi in held:
@@ -665,6 +668,12 @@ def main():
             "crossed": (float(data.qpos[free_q]) > (STEP_EDGE_X + 0.3)) if STEP_EDGE_X is not None else None,
             "final_x": float(data.qpos[free_q]),
             }, f, indent=1)
+    if os.environ.get("S2S_TRACE") and globals().get("_tr"):
+        _q = np.array([a for a, b in _tr])
+        _t = np.array([b for a, b in _tr])
+        for k, nm in [(3, "L_knee"), (9, "R_knee"), (0, "L_hip_pitch"), (4, "L_ankle_pitch")]:
+            print(f"TRACE {nm}: q min/mean/max = {_q[:,k].min():+.3f}/{_q[:,k].mean():+.3f}/{_q[:,k].max():+.3f} rad"
+                  f" | |tau| mean/p95/max = {np.abs(_t[:,k]).mean():.1f}/{np.percentile(np.abs(_t[:,k]),95):.1f}/{np.abs(_t[:,k]).max():.1f} N.m")
     if survived:
         ts = [s for s, _, _ in survived]
         print(f"\n{len(survived)} completed attempts; mean survival "

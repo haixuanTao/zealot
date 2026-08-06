@@ -3669,7 +3669,14 @@ impl BipedNexusBatchEnv {
         // matched the lerobot-only name "anklex", which never fires on the
         // G1's `ankle_roll` joints.
         let env_f32 = |k: &str| env_or_override(k).and_then(|s| s.parse::<f32>().ok());
-        let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(5e-4);
+        // 1e-4 = 2x WBC-AGILE's G1 value (5e-5). The lerobot-magnitude 5e-4 the
+        // v28 run trained with prices the knee out of flexing: measured gait
+        // never bends past the 0.3 rad home pose (ROM 0.02-0.30, mean 0.12)
+        // and the two knees burn 20-50% of the positive reward at stance
+        // peaks — the likely terrain-curriculum blocker (clearance needs
+        // knee flexion). 2x (not 1x) keeps some extra effort pressure since
+        // nexus's torque-to-stand runs higher than PhysX's.
+        let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(1e-4);
         let w_ankle_torques = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1.5e-3);
         let w_ankle_roll_torques = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(0.0);
         // Knee-specific torque extra (BIPED_W_KNEE_TORQUES, per-step weight on
