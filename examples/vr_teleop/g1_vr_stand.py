@@ -45,12 +45,12 @@ GAIT_SPEED_CAP = 0.8   # v28 env.yaml gait_speed_cap
 VX_MAX, WZ_MAX = 0.6, 0.8
 STICK_DEADZONE = 0.15
 
-# Pick-and-place: two tables + a light ball to carry between them
+# Pick-and-place: two tables + a light box to carry between them
 TABLE_HALF = [0.25, 0.2, 0.44]          # solid slab, top at 0.88 m
 TABLE_POS = {"table1": [0.68, 0.45, 0.44], "table2": [0.68, -0.45, 0.44]}
-BALL_R = 0.07
-BALL_HOME = [0.435, 0.45, 0.96]         # overhanging table1's front edge
-BALL_DENSITY = 200.0                    # ~0.29 kg
+BOX_HALF = [0.09, 0.09, 0.09]           # 18 cm cube, a bit bigger than the old ball
+BALL_HOME = [0.46, 0.45, 0.98]          # near table1's front edge (stable base now)
+BALL_DENSITY = 170.0                    # ~1.0 kg
 GRAB_RADIUS = 0.55
 
 
@@ -72,7 +72,7 @@ def build_model():
     body = spec.worldbody.add_body(name="ball", pos=BALL_HOME)
     body.add_freejoint(name="ball_free")
     body.add_geom(
-        name="ball_geom", type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[BALL_R, 0, 0],
+        name="ball_geom", type=mujoco.mjtGeom.mjGEOM_BOX, size=BOX_HALF,
         density=BALL_DENSITY, rgba=[0.85, 0.25, 0.25, 1.0],
         contype=0, conaffinity=0,
     )
