@@ -93,12 +93,11 @@ def retarget(j):
     return arm_angles(j, "left"), arm_angles(j, "right")
 
 
-def arm_angles_ik(j, side, L1r, L2r):
-    """Position-based retarget: scaled wrist target + human-elbow swivel hint.
+def scaled_wrist_target(j, side, Lr):
+    """Torso-frame wrist target at ROBOT scale + upper-arm swivel hint.
 
-    Maps FRACTIONAL reach (|wrist-shoulder| / arm length) 1:1 between human
-    and robot, so depth control is linear. Output in the same convention as
-    arm_angles(): (pitch, roll, yaw, elbow_qpos with pi/2 = straight).
+    Fractional reach (|wrist-shoulder| / arm length) maps 1:1 between human
+    and robot, so depth control is linear.
     """
     R = torso_frame(j)
     sh, el, wr = (
@@ -109,13 +108,53 @@ def arm_angles_ik(j, side, L1r, L2r):
     u = R @ (el - sh)
     L1h = np.linalg.norm(u) + 1e-9
     L2h = np.linalg.norm(wr - el) + 1e-9
-    Lr = L1r + L2r
+    t = R @ (wr - sh) * (Lr / (L1h + L2h))
+    return t, u
 
-    t = R @ (wr - sh) * (Lr / (L1h + L2h))          # scaled wrist target
+
+def clamp_reach(t, L1r, L2r):
     d = np.linalg.norm(t) + 1e-9
-    d_cl = np.clip(d, abs(L1r - L2r) + 1e-3, 0.995 * Lr)
-    t = t * (d_cl / d)
-    d = d_cl
+    d_cl = np.clip(d, abs(L1r - L2r) + 1e-3, 0.995 * (L1r + L2r))
+    return t * (d_cl / d)
+
+
+# Self-collision fail-safe: a vertical keep-out capsule around the robot's
+# torso/head/waist (torso axes). Wrist targets that would enter it are
+# projected OUT to the surface — the hand slides along the body instead of
+# being commanded through the chest. Coordinates are shoulder-relative
+# (the IK's frame); the torso axis sits half a shoulder-width inboard.
+KEEPOUT_RADIUS = 0.12          # slim enough that hands hanging at the thighs clear it
+KEEPOUT_Z = (-0.35, 0.30)      # waist to head, relative to shoulder height
+KEEPOUT_AXIS_X = -0.02         # axis slightly behind the shoulder line
+SHOULDER_HALF_WIDTH = 0.147
+
+
+def apply_keepout(t, side):
+    """Project a shoulder-relative wrist target out of the torso capsule."""
+    sign = 1.0 if side == "left" else -1.0
+    ax, ay = KEEPOUT_AXIS_X, -sign * SHOULDER_HALF_WIDTH
+    if not (KEEPOUT_Z[0] < t[2] < KEEPOUT_Z[1]):
+        return t, False
+    dx, dy = t[0] - ax, t[1] - ay
+    dist = np.hypot(dx, dy)
+    if dist >= KEEPOUT_RADIUS:
+        return t, False
+    if dist < 1e-6:
+        dx, dy = 0.0, sign  # degenerate: push out to the arm's own side
+        dist = 1.0
+    s = KEEPOUT_RADIUS / dist
+    out = t.copy()
+    out[0] = ax + dx * s
+    out[1] = ay + dy * s
+    return out, True
+
+
+def solve_arm_ik(t, u_hint, L1r, L2r):
+    """Wrist target (torso frame, within reach) -> (pitch, roll, yaw,
+    elbow_qpos with pi/2 = straight). `u_hint` = human upper-arm direction,
+    picks the elbow-swivel solution closest to the operator's."""
+    t = clamp_reach(t, L1r, L2r)
+    d = np.linalg.norm(t)
 
     # elbow flexion from the triangle (L1r, L2r, d); 0 = straight
     cos_int = (L1r**2 + L2r**2 - d**2) / (2 * L1r * L2r)
@@ -127,7 +166,7 @@ def arm_angles_ik(j, side, L1r, L2r):
     a = t / d
     cos_sh = (L1r**2 + d**2 - L2r**2) / (2 * L1r * d)
     cos_sh = np.clip(cos_sh, -1, 1)
-    perp = u - (u @ a) * a
+    perp = u_hint - (u_hint @ a) * a
     if np.linalg.norm(perp) < 1e-6:
         perp = np.array([0.0, 0.0, -1.0]) - a * (-a[2])
     perp /= np.linalg.norm(perp) + 1e-9
@@ -139,12 +178,88 @@ def arm_angles_ik(j, side, L1r, L2r):
 
     f_r = t - e_pos
     w = rot_x(-r) @ rot_y(-p) @ f_r
-    yaw = np.arctan2(w[1], w[0]) if np.sin(flex) > 0.15 else 0.0
+    # Near-straight arms: the swivel is ill-defined and atan2 flips wildly —
+    # hold yaw neutral until there's a real elbow bend.
+    yaw = np.arctan2(w[1], w[0]) if np.sin(flex) > 0.3 else 0.0
     return np.array([p, r, yaw, elbow_q])
+
+
+def arm_angles_ik(j, side, L1r, L2r):
+    t, u = scaled_wrist_target(j, side, L1r + L2r)
+    t, _ = apply_keepout(t, side)
+    return solve_arm_ik(t, u, L1r, L2r)
 
 
 def retarget_ik(j, L1r, L2r):
     return arm_angles_ik(j, "left", L1r, L2r), arm_angles_ik(j, "right", L1r, L2r)
+
+
+class ClutchIK:
+    """SONIC-style anchored (relative) retargeting.
+
+    Absolute until the first A press. Pressing A captures BOTH the operator's
+    current wrist positions and the robot's current wrist targets; from then
+    on the operator's motion is applied as a scaled cartesian DELTA on top of
+    the robot anchor — no jump at the anchor moment, and systematic
+    calibration offset cancels. Press A again any time to re-anchor (lift the
+    mouse). Wrist twist gets the same treatment.
+    """
+
+    def __init__(self, L1r, L2r):
+        self.L1r, self.L2r = L1r, L2r
+        self.Lr = L1r + L2r
+        self.prev_a = False
+        self.anchor = None
+        self.last_t = {}
+        self.last_tw = np.zeros(2)
+        self._last_keepout_log = 0.0
+
+    @property
+    def relative(self):
+        return self.anchor is not None
+
+    def update(self, j, wrist_quats, a_pressed):
+        """One frame: SMPL joints + wrist quats + A state -> (left4, right4, twists2)."""
+        rising = a_pressed and not self.prev_a
+        self.prev_a = a_pressed
+
+        th, hint = {}, {}
+        for side in ("left", "right"):
+            th[side], hint[side] = scaled_wrist_target(j, side, self.Lr)
+        tw = np.zeros(2)
+        if wrist_quats is not None:
+            tw = np.array([wrist_twist(j, wrist_quats, "left"),
+                           wrist_twist(j, wrist_quats, "right")])
+
+        if rising:
+            self.anchor = {
+                "h": {s: th[s].copy() for s in th},
+                "r": {s: self.last_t.get(s, th[s]).copy() for s in th},
+                "tw_h": tw.copy(),
+                "tw_r": self.last_tw.copy(),
+            }
+
+        out = {}
+        for side in ("left", "right"):
+            if self.anchor is None:
+                t = th[side]
+            else:
+                t = self.anchor["r"][side] + (th[side] - self.anchor["h"][side])
+            t, blocked = apply_keepout(t, side)   # self-collision fail-safe
+            t = clamp_reach(t, self.L1r, self.L2r)  # clamp BEFORE storing: no windup
+            if blocked and time.monotonic() - self._last_keepout_log > 2.0:
+                self._last_keepout_log = time.monotonic()
+                print(f"[keepout] {side} wrist target grazing the torso — sliding on the surface")
+            self.last_t[side] = t.copy()
+            out[side] = solve_arm_ik(t, hint[side], self.L1r, self.L2r)
+
+        if self.anchor is None:
+            tw_out = tw
+        else:
+            tw_out = self.anchor["tw_r"] + (tw - self.anchor["tw_h"])
+        tw_out = np.clip(tw_out, -1.9, 1.9)
+        self.last_tw = tw_out.copy()
+        return out["left"], out["right"], tw_out
 
 
 # Wrist-twist extraction tunables (Pico wrist-joint local-frame conventions)

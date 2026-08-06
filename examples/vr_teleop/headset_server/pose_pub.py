@@ -33,6 +33,13 @@ def get_trig():
     except Exception:
         return np.zeros(2, dtype=np.float32)
 
+def get_btn():
+    try:
+        return np.array([float(xrt.get_A_button()), float(xrt.get_B_button()),
+                         float(xrt.get_X_button()), float(xrt.get_Y_button())], dtype=np.float32)
+    except Exception:
+        return np.zeros(4, dtype=np.float32)
+
 def get_stick():
     try:
         l = list(xrt.get_left_axis())[:2]
@@ -52,7 +59,8 @@ last_body = None
 frozen_count = 0
 while True:
     time.sleep(1 / 90)
-    fields = {"stick": get_stick(), "trig": get_trig(), "frame_index": np.array([frame], dtype=np.int64)}
+    fields = {"stick": get_stick(), "trig": get_trig(), "btn": get_btn(),
+              "frame_index": np.array([frame], dtype=np.int64)}
     fresh = False
     if xrt.is_body_data_available():
         stamp = int(xrt.get_time_stamp_ns())

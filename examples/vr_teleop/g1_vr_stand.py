@@ -23,7 +23,7 @@ import websockets
 import zmq
 from safetensors.numpy import load_file
 
-from g1_mirror import parse_pose, retarget_ik, wrist_twist
+from g1_mirror import ClutchIK, parse_pose
 from g1_web import Shared, build_manifest, serve_http
 
 PUSH_QUEUE = []  # [vx, vy] velocity kicks from the web page
@@ -204,6 +204,9 @@ class ArmStream:
     def __init__(self, host, port, topic, arm_lengths=(0.19, 0.26)):
         self.lock = threading.Lock()
         self.arm_lengths = arm_lengths
+        self.clutch = ClutchIK(*arm_lengths)
+        self.estop = False
+        self.prev_x = False
         self.latest = None  # (left4, right4) in retarget convention
         self.twists = (0.0, 0.0)
         self.t_last = 0.0
@@ -231,17 +234,34 @@ class ArmStream:
                     self.t_stick = now
                 if tr is not None:
                     self.trig = np.asarray(tr, dtype=float).flatten()[:2]
+            btn = msg.get("btn")
+            a_pressed = x_pressed = False
+            if btn is not None:
+                b = np.asarray(btn).flatten()
+                a_pressed = bool(b[0] > 0.5)
+                x_pressed = bool(len(b) > 2 and b[2] > 0.5)
+            # X = latching e-stop; A = resume (and clutch re-anchor, so the
+            # comeback is jump-free).
+            if x_pressed and not self.prev_x:
+                with self.lock:
+                    if not self.estop:
+                        self.estop = True
+                        print("[E-STOP] X pressed — arms home, command zeroed, grabs released. Press A to resume.")
+            self.prev_x = x_pressed
+            if a_pressed and self.estop:
+                with self.lock:
+                    self.estop = False
+                print("[E-STOP] cleared by A — resuming (clutch re-anchored)")
             sj = msg.get("smpl_joints")
             if sj is None:
                 continue
             frame_j = np.asarray(sj)[-1]
-            left, right = retarget_ik(frame_j, *self.arm_lengths)
-            wq = msg.get("wrist_quat")
-            twists = (0.0, 0.0)
-            if wq is not None:
-                twists = (wrist_twist(frame_j, wq, "left"), wrist_twist(frame_j, wq, "right"))
+            was_rel = self.clutch.relative
+            left, right, twists = self.clutch.update(frame_j, msg.get("wrist_quat"), a_pressed)
+            if self.clutch.relative and not was_rel:
+                print("[clutch] ANCHORED — relative mode (press A to re-anchor)")
             with self.lock:
-                self.twists = twists
+                self.twists = tuple(twists)
                 self.latest = (left, right)
                 self.t_last = now
                 self.rx.append(now)
@@ -249,7 +269,7 @@ class ArmStream:
 
     def get(self):
         with self.lock:
-            fresh = (time.time() - self.t_last) < self.STALE_S
+            fresh = (time.time() - self.t_last) < self.STALE_S and not self.estop
             return (self.latest if fresh else None), len(self.rx) / 2.0
 
     def get_twists(self):
@@ -258,13 +278,13 @@ class ArmStream:
 
     def get_stick(self):
         with self.lock:
-            if (time.time() - self.t_stick) > self.STALE_S:
+            if self.estop or (time.time() - self.t_stick) > self.STALE_S:
                 return np.zeros(4)
             return self.stick.copy()
 
     def get_trig(self):
         with self.lock:
-            if (time.time() - self.t_stick) > self.STALE_S:
+            if self.estop or (time.time() - self.t_stick) > self.STALE_S:
                 return np.zeros(2)
             return self.trig.copy()
 

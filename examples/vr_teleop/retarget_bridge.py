@@ -33,7 +33,7 @@ import numpy as np
 import websockets
 import zmq
 
-from g1_mirror import parse_pose, retarget_ik, wrist_twist
+from g1_mirror import ClutchIK, parse_pose
 
 # retarget-convention -> Unitree G1 MJCF zero conventions (playground model):
 # home (arms hanging) = pitch 0.2, roll ±0.2, elbow 1.28; retarget's hanging
@@ -59,9 +59,13 @@ class Bridge:
         self.targets = {}
         self.stick = [0.0] * 4
         self.trig = [0.0, 0.0]
+        self.relative = False
+        self.estop = False
+        self._prev_x = False
         self.t_body = 0.0
         self._smooth = None
         self._wrist_sm = np.zeros(2)
+        self._clutch = ClutchIK(L1R, L2R)
         threading.Thread(target=self._run, args=(host, port, topic), daemon=True).start()
 
     def _run(self, host, port, topic):
@@ -81,16 +85,32 @@ class Bridge:
                     self.stick = [float(v) for v in np.asarray(st).flatten()[:4]]
                 if tr is not None:
                     self.trig = [float(v) for v in np.asarray(tr).flatten()[:2]]
+            btn = msg.get("btn")
+            a_pressed = x_pressed = False
+            if btn is not None:
+                b = np.asarray(btn).flatten()
+                a_pressed = bool(b[0] > 0.5)
+                x_pressed = bool(len(b) > 2 and b[2] > 0.5)
+            # X = latching e-stop, A = resume (+ clutch re-anchor)
+            if x_pressed and not self._prev_x:
+                with self.lock:
+                    if not self.estop:
+                        self.estop = True
+                        print("[E-STOP] X pressed — targets stale, stick zeroed. Press A to resume.")
+            self._prev_x = x_pressed
+            if a_pressed and self.estop:
+                with self.lock:
+                    self.estop = False
+                print("[E-STOP] cleared by A — resuming (clutch re-anchored)")
             sj = msg.get("smpl_joints")
             if sj is None:
                 continue
             frame = np.asarray(sj)[-1]
-            left, right = retarget_ik(frame, L1R, L2R)
+            was_rel = self._clutch.relative
+            left, right, tw = self._clutch.update(frame, msg.get("wrist_quat"), a_pressed)
+            if self._clutch.relative and not was_rel:
+                print("[clutch] ANCHORED — relative mode (press A to re-anchor)")
             raw = {"left": left + ARM_OFFSET["left"], "right": right + ARM_OFFSET["right"]}
-            wq = msg.get("wrist_quat")
-            tw = np.zeros(2)
-            if wq is not None:
-                tw = np.array([wrist_twist(frame, wq, "left"), wrist_twist(frame, wq, "right")])
             with self.lock:
                 if self._smooth is None:
                     self._smooth = raw
@@ -104,15 +124,18 @@ class Bridge:
                 t["left_wrist_roll_joint"] = round(float(self._wrist_sm[0]), 4)
                 t["right_wrist_roll_joint"] = round(float(self._wrist_sm[1]), 4)
                 self.targets = t
+                self.relative = self._clutch.relative
                 self.t_body = now
 
     def snapshot(self):
         with self.lock:
             return json.dumps({
                 "arm_targets": self.targets,
-                "stick": self.stick,
-                "trig": self.trig,
-                "fresh": (time.time() - self.t_body) < 1.0,
+                "stick": [0.0] * 4 if self.estop else self.stick,
+                "trig": [0.0, 0.0] if self.estop else self.trig,
+                "relative": self.relative,
+                "estop": self.estop,
+                "fresh": (time.time() - self.t_body) < 1.0 and not self.estop,
             })
 
 
