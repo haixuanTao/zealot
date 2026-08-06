@@ -194,29 +194,62 @@ def retarget_ik(j, L1r, L2r):
     return arm_angles_ik(j, "left", L1r, L2r), arm_angles_ik(j, "right", L1r, L2r)
 
 
-class ClutchIK:
-    """SONIC-style anchored (relative) retargeting.
+def _quat_conj_mul_xyzw(qa, qb):
+    """conj(qa) ⊗ qb for xyzw quats — the rotation FROM qa TO qb."""
+    ax, ay, az, aw = -qa[0], -qa[1], -qa[2], qa[3]
+    bx, by, bz, bw = qb
+    return np.array([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ])
 
-    Absolute until the first A press. Pressing A captures BOTH the operator's
-    current wrist positions and the robot's current wrist targets; from then
-    on the operator's motion is applied as a scaled cartesian DELTA on top of
-    the robot anchor — no jump at the anchor moment, and systematic
-    calibration offset cancels. Press A again any time to re-anchor (lift the
-    mouse). Wrist twist gets the same treatment.
+
+def _twist_about_axis(q_rel_xyzw, axis):
+    """Swing-twist decomposition: signed rotation of q_rel about `axis`."""
+    proj = q_rel_xyzw[0] * axis[0] + q_rel_xyzw[1] * axis[1] + q_rel_xyzw[2] * axis[2]
+    ang = 2.0 * np.arctan2(proj, q_rel_xyzw[3])
+    return (ang + np.pi) % (2 * np.pi) - np.pi
+
+
+class ClutchIK:
+    """SONIC-style CANONICAL-pose anchored retargeting.
+
+    Calibration contract (mirrors SONIC's calibrate_now zero-ref pose):
+    stand with arms hanging along the body, hands relaxed, and press A.
+    The robot's reference becomes arms-down; your pose at that moment is
+    the zero for BOTH position deltas and wrist twist. From then on your
+    motion applies as scaled cartesian deltas on the arms-down reference,
+    and twist is the swing-twist of your hand's rotation SINCE the anchor
+    about the current forearm axis — reference-frame-free, zero at anchor,
+    no flipping when the arm swings. Press A again any time to
+    re-calibrate. Before the first press: absolute positions, neutral
+    wrists.
     """
 
     def __init__(self, L1r, L2r):
         self.L1r, self.L2r = L1r, L2r
         self.Lr = L1r + L2r
+        self.t_down = np.array([0.0, 0.0, -0.995 * self.Lr])  # arms along body
         self.prev_a = False
         self.anchor = None
-        self.last_t = {}
-        self.last_tw = np.zeros(2)
         self._last_keepout_log = 0.0
 
     @property
     def relative(self):
         return self.anchor is not None
+
+    @staticmethod
+    def _yup(p):
+        # stream positions are z-up; the wrist quats live in the y-up frame
+        return np.array([p[0], p[2], -p[1]])
+
+    def _forearm_axis_yup(self, j, side):
+        ei, wi = (L_ELBOW, L_WRIST) if side == "left" else (R_ELBOW, R_WRIST)
+        a = self._yup(j[wi]) - self._yup(j[ei])
+        n = np.linalg.norm(a)
+        return a / n if n > 1e-6 else np.array([0.0, -1.0, 0.0])
 
     def update(self, j, wrist_quats, a_pressed):
         """One frame: SMPL joints + wrist quats + A state -> (left4, right4, twists2)."""
@@ -226,39 +259,38 @@ class ClutchIK:
         th, hint = {}, {}
         for side in ("left", "right"):
             th[side], hint[side] = scaled_wrist_target(j, side, self.Lr)
-        tw = np.zeros(2)
+
+        # hand orientation rows of the wrist_quat block: [lw, rw, lhand, rhand]
+        qhand = {}
         if wrist_quats is not None:
-            tw = np.array([wrist_twist(j, wrist_quats, "left"),
-                           wrist_twist(j, wrist_quats, "right")])
+            qhand = {"left": np.asarray(wrist_quats[2], dtype=float),
+                     "right": np.asarray(wrist_quats[3], dtype=float)}
 
         if rising:
             self.anchor = {
                 "h": {s: th[s].copy() for s in th},
-                "r": {s: self.last_t.get(s, th[s]).copy() for s in th},
-                "tw_h": tw.copy(),
-                "tw_r": self.last_tw.copy(),
+                "q": {s: qhand[s].copy() for s in qhand},
             }
 
         out = {}
-        for side in ("left", "right"):
+        tw_out = np.zeros(2)
+        for i, side in enumerate(("left", "right")):
             if self.anchor is None:
                 t = th[side]
             else:
-                t = self.anchor["r"][side] + (th[side] - self.anchor["h"][side])
+                t = self.t_down + (th[side] - self.anchor["h"][side])
+                if side in self.anchor["q"] and side in qhand:
+                    q_rel = _quat_conj_mul_xyzw(self.anchor["q"][side], qhand[side])
+                    axis = self._forearm_axis_yup(j, side)
+                    tw_out[i] = TWIST_SIGN[side] * _twist_about_axis(q_rel, axis)
             t, blocked = apply_keepout(t, side)   # self-collision fail-safe
-            t = clamp_reach(t, self.L1r, self.L2r)  # clamp BEFORE storing: no windup
+            t = clamp_reach(t, self.L1r, self.L2r)
             if blocked and time.monotonic() - self._last_keepout_log > 2.0:
                 self._last_keepout_log = time.monotonic()
                 print(f"[keepout] {side} wrist target grazing the torso — sliding on the surface")
-            self.last_t[side] = t.copy()
             out[side] = solve_arm_ik(t, hint[side], self.L1r, self.L2r)
 
-        if self.anchor is None:
-            tw_out = tw
-        else:
-            tw_out = self.anchor["tw_r"] + (tw - self.anchor["tw_h"])
         tw_out = np.clip(tw_out, -1.9, 1.9)
-        self.last_tw = tw_out.copy()
         return out["left"], out["right"], tw_out
 
 
