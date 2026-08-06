@@ -369,7 +369,7 @@ class ClutchIK:
 
 # Wrist-twist extraction tunables (Pico wrist-joint local-frame conventions)
 TWIST_AXIS_COL = 0     # which column of the hand rotation matrix to project
-TWIST_SIGN = {"left": -1.0, "right": 1.0}
+TWIST_SIGN = {"left": 1.0, "right": 1.0}
 TWIST_OFFSET = {"left": 0.0, "right": 0.0}
 
 
