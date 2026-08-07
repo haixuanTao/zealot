@@ -22,8 +22,12 @@ lowered with full O3 (`opt` -> `llc` -> `ptxas`). The whole chain is one
 script:
 
 ```sh
-scripts/full_unified_chain.sh   # backend -> .ll -> O3 cubins -> trainer
+scripts/build_cubins.sh   # backend -> .ll -> O3 cubins -> trainer re-embed
 ```
+
+The backend is cloned + built automatically (cached under
+`~/.cache/zealot/cuda-oxide`); `BACKEND_REV` / `CUDA_OXIDE_BACKEND` override
+it.
 
 Prerequisites: sibling checkouts `../nexus`, `../vortx-unified`,
 `../khal-unified` (see the `[patch.crates-io]` table), a CUDA >= 12.8 `ptxas`,
@@ -33,6 +37,17 @@ our two blocking fixes, [#518](https://github.com/NVlabs/cuda-oxide/pull/518)
 and [#520](https://github.com/NVlabs/cuda-oxide/pull/520), merged 2026-07-28). Cubins are embedded at trainer build time via
 `CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D` / `..._VORTX_SHADERS` — rebuild
 the trainer after rebuilding cubins.
+
+
+## Configuration: one source of truth
+
+Runtime knobs are `BIPED_*` / `NEXUS_*` env vars, and **the default IS the
+production training config** — a bare run needs zero of them. Any knob read
+by more than one crate (env + trainer + web demo) is declared exactly once in
+`zealot-env/src/knobs.rs` (name, default, doc); consumers share the static,
+so defaults cannot diverge between sites. Single-site knobs stay at their
+call site — move them to `knobs.rs` the moment a second reader appears. Wasm
+demos configure via `Knob::set_override` (no process env in the browser).
 
 ## Development
 

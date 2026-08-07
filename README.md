@@ -62,10 +62,10 @@ Three steps — full walkthrough in
    [development.md](docs/development.md)):
 
    ```sh
-   # RTX-class GPU: ~71 k env-steps/s at N=4096 on a 5090
-   BIPED_ROBOT=g1_29dof_agile BIPED_CUTILE_GEMM=1 BIPED_TERRAIN=1 \
-     cargo run --release --bin biped_train_gpu \
-     --features "gpu biped_gpu cutile" -- 50000 4096 my_policy.safetensors
+   # RTX-class GPU: ~71 k env-steps/s at N=4096 on a 5090. The production
+   # config (robot, terrain, DR, reward weights) IS the default — no env-var
+   # litany; every knob remains overridable (BIPED_*).
+   scripts/train.sh 50000 4096 my_policy.safetensors
    ```
 
 3. **Watch *your* policy walk** — upload the checkpoint to Hugging Face and
