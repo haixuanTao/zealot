@@ -1,0 +1,12 @@
+# Per-method `cargo run` — no wrapper script, no exported env:
+#   WebGPU/Metal:      cargo run --release --bin biped_train_gpu --features "gpu biped_gpu"
+#   native CUDA+cuTile: cargo run --release --bin biped_train_gpu --features "gpu biped_gpu cutile"
+#
+# The CUDA feature set embeds the sm_120 cubins from ./cubins/ (gitignored;
+# populate with scripts/build_cubins.sh, or download from the
+# cubins-sm120-* GitHub release). Machine-specific paths (CUDA headers shim,
+# tileiras) belong in ~/.cargo/config.toml [env] — see docs/development.md.
+[env]
+CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D = { value = "cubins/nexus_rbd_shaders3d.cubin", relative = true }
+CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS = { value = "cubins/vortx_shaders.cubin", relative = true }
+NEXUS_SMALL_SORT = "1"

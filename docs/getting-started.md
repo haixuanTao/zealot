@@ -33,10 +33,18 @@ Rust-GPU shader builds — see [development.md](development.md) for the exact
 versions and gotchas. Then:
 
 ```sh
-# Auto-detects the backend: native CUDA (+cuTile) on an NVIDIA box,
-# WebGPU/Metal otherwise. ~71 k env-steps/s at N=4096 on a 5090.
-scripts/train.sh 50000 4096 my_policy.safetensors
+# Any GPU (WebGPU → Metal/Vulkan):
+cargo run --release --bin biped_train_gpu --features "gpu biped_gpu" \
+    -- 50000 4096 my_policy.safetensors
+
+# NVIDIA fast path (native CUDA + cuTile; ~71 k env-steps/s at N=4096 on a
+# 5090) — one-time machine setup in development.md:
+cargo run --release --bin biped_train_gpu --features "gpu biped_gpu cutile" \
+    -- 50000 4096 my_policy.safetensors
 ```
+
+(`scripts/train.sh` wraps the same two commands with backend auto-detection
+and a dated checkpoint name.)
 
 The **production config is the code default** — bare `train.sh` trains the
 29-DOF G1 with terrain curriculum, AGILE domain randomization, pushes, motor

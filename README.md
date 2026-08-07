@@ -62,11 +62,18 @@ Three steps — full walkthrough in
    [development.md](docs/development.md)):
 
    ```sh
-   # RTX-class GPU: ~71 k env-steps/s at N=4096 on a 5090. The production
-   # config (robot, terrain, DR, reward weights) IS the default — no env-var
-   # litany; every knob remains overridable (BIPED_*).
-   scripts/train.sh 50000 4096 my_policy.safetensors
+   # Any GPU (WebGPU: Metal / Vulkan) — pure cargo, no setup beyond cargo-gpu:
+   cargo run --release --bin biped_train_gpu --features "gpu biped_gpu" \
+       -- 50000 4096 my_policy.safetensors
+
+   # NVIDIA fast path (native CUDA + cuTile tf32; ~71 k env-steps/s at
+   # N=4096 on a 5090) — needs the one-time machine setup in development.md:
+   cargo run --release --bin biped_train_gpu --features "gpu biped_gpu cutile" \
+       -- 50000 4096 my_policy.safetensors
    ```
+
+   The production config (robot, terrain, DR, reward weights) **is the
+   default** — the feature flags select the backend, env vars only override.
 
 3. **Watch *your* policy walk** — upload the checkpoint to Hugging Face and
    open `https://haixuantao.github.io/zealot/?ckpt=your-name/your-repo`.

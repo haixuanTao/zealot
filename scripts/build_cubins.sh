@@ -17,7 +17,8 @@ TOOL=$HOME/.rustup/toolchains/nightly-2026-04-03-x86_64-unknown-linux-gnu/lib/ru
 LIBDEV=$HOME/nvvm-wheel/extracted/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc
 PTXAS=$HOME/cuda-13.3-tile/bin/ptxas
 BACKEND_REV="${BACKEND_REV:-62472763}"
-export CUDA_OXIDE_PTX_DIR="${PTX_OUT:-$HOME/nexus_ptx}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export CUDA_OXIDE_PTX_DIR="${PTX_OUT:-$ROOT/cubins}"
 export CUDA_OXIDE_DEVICE_ARCH=sm_120
 WORK=$HOME/Documents/work
 mkdir -p "$CUDA_OXIDE_PTX_DIR"
@@ -60,10 +61,9 @@ for name in nexus_rbd_shaders3d vortx_shaders; do
 done
 
 echo "=== STAGE 4: rebuild trainer (forced re-embed) ==="
+# Cubin paths + toolkit come from .cargo/config.toml [env] (repo) and
+# ~/.cargo/config.toml [env] (machine) — see docs/development.md.
 cd $WORK/zealot
-export CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D=$CUDA_OXIDE_PTX_DIR/nexus_rbd_shaders3d.cubin
-export CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS=$CUDA_OXIDE_PTX_DIR/vortx_shaders.cubin
-export CUDA_TOOLKIT_PATH=$HOME/cuda-13-shim
 cargo clean -p nexus_rbd_shaders3d -p vortx-shaders 2>/dev/null || true
 cargo build --release --bin biped_train_gpu --features "gpu biped_gpu cutile" 2>&1 | tail -1
 echo CHAIN_DONE

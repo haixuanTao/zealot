@@ -29,6 +29,17 @@ The backend is cloned + built automatically (cached under
 `~/.cache/zealot/cuda-oxide`); `BACKEND_REV` / `CUDA_OXIDE_BACKEND` override
 it.
 
+Cubins land in `./cubins/` (gitignored), which the repo's
+`.cargo/config.toml [env]` feeds to the embed step — so
+`cargo run --features "gpu biped_gpu cutile"` needs no exported env. The two
+machine-specific paths go in `~/.cargo/config.toml` once per box:
+
+```toml
+[env]
+CUDA_TOOLKIT_PATH = "/path/to/cuda-13-headers-shim"   # CUDA >= 13.2 headers (build)
+CUTILE_TILEIRAS_PATH = "/path/to/cuda-13.3/bin/tileiras"  # cuTile runtime JIT
+```
+
 Prerequisites: sibling checkouts `../nexus`, `../vortx-unified`,
 `../khal-unified` (see the `[patch.crates-io]` table), a CUDA >= 12.8 `ptxas`,
 and libdevice. The backend builds from stock
