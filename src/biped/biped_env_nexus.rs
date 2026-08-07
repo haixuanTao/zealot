@@ -2220,6 +2220,13 @@ impl BipedNexusBatchEnv {
         for tpl in &templates {
             template_snapshots.push(tpl.snapshot(&gpu).await);
         }
+        // Publish the templates to the GPU ONCE. Resets then reference them by
+        // index, so a reset uploads only (env, template id, offset, velocities)
+        // instead of re-sending ~10 KB of template state per env.
+        {
+            let refs: Vec<&RbdSnapshot> = template_snapshots.iter().collect();
+            state.upload_reset_templates(&gpu, &refs);
+        }
 
         // Per-env initial sole-normal: every env starts from the corresponding
         // template, so its foot_sole_local matches that template's. Look up the
@@ -4338,8 +4345,15 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
             .filter(|c| *c > 0)
             .unwrap_or(usize::MAX);
 
+        // Phase split for `[prof-reset]` (BIPED_RESET_PROF=1) — prepare is host
+        // RNG + spawn placement, scatter is staging build + dispatch, finish is
+        // per-env bookkeeping + the post-reset obs.
+        let prof = env_var("BIPED_RESET_PROF").is_ok();
+        let (mut t_prep, mut t_scatter, mut t_finish) = (0u128, 0u128, 0u128);
+
         let mut out = Vec::with_capacity(envs.len());
         for group in envs.chunks(chunk.min(envs.len().max(1))) {
+            let t0 = std::time::Instant::now();
             let mut ts = Vec::with_capacity(group.len());
             let mut plans = Vec::with_capacity(group.len());
             for &e in group {
@@ -4347,6 +4361,10 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
                 ts.push(t);
                 plans.push((offset, vels));
             }
+            if prof {
+                t_prep += t0.elapsed().as_micros();
+            }
+            let t1 = std::time::Instant::now();
             // Borrow the templates directly — the spawn teleport is applied by
             // the scatter kernel and the velocity override lands in the staging
             // build, so nothing is cloned per reset.
@@ -4356,16 +4374,32 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
                 .zip(ts.iter())
                 .map(|((e, (offset, vels)), t)| EnvResetSpec {
                     dst_env: *e as u32,
-                    template: &self.template_snapshots[*t],
+                    template_idx: *t as u32,
                     offset: *offset,
                     dof_vels: vels.as_deref(),
                 })
                 .collect();
             self.state.reset_envs_from_snapshots(&self.gpu, &specs);
             drop(specs);
+            if prof {
+                t_scatter += t1.elapsed().as_micros();
+            }
+            let t2 = std::time::Instant::now();
             for (i, &e) in group.iter().enumerate() {
                 out.push(self.reset_finish(e, ts[i]).await);
             }
+            if prof {
+                t_finish += t2.elapsed().as_micros();
+            }
+        }
+        if prof && !envs.is_empty() {
+            eprintln!(
+                "[prof-reset] n={} prepare={:.1}ms scatter={:.1}ms finish={:.1}ms",
+                envs.len(),
+                t_prep as f64 / 1000.0,
+                t_scatter as f64 / 1000.0,
+                t_finish as f64 / 1000.0,
+            );
         }
         out
     }
