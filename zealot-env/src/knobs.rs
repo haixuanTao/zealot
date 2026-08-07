@@ -124,8 +124,23 @@ pub static CONTACT_DR: Knob<f32> = Knob::new("BIPED_CONTACT_DR", 1.0);
 /// Physics decimation (substeps per control step at fixed control_dt=0.02).
 pub static DECIMATION: Knob<u32> = Knob::new("BIPED_DECIMATION", 4);
 
-/// Substep refresh mode ("1" = per-substep constraint refresh).
-pub static SUBSTEP_REFRESH: Knob<u32> = Knob::new("NEXUS_SUBSTEP_REFRESH", 1);
+/// Substep refresh mode: 0 = refresh dynamics + constraints ONCE per control
+/// step (default), 1 = rebuild them every substep, 2 = light split cadence
+/// (constraints per substep, M/LU per step).
+///
+/// This is the single biggest physics-cost dial in the stack. Measured on a
+/// 5090 at N=4096 with the production config: mode 1 costs 114.6 ms of GPU per
+/// control step vs 22.5 ms at mode 0 — 4.4 s/iter vs 2.1 s/iter, i.e. per-substep
+/// refresh is ~5x the physics bill for the whole trainer.
+///
+/// The knob arrived with the nexus branch that added per-substep refresh and
+/// defaulted to 1, which silently halved throughput relative to v28 (2.5 s/iter,
+/// 62 ms/step) — that regression is what this default reverses.
+///
+/// NOTE: refresh cadence changes the physics slightly, so train and eval with
+/// the SAME setting; a policy trained at mode 1 is not guaranteed to transfer to
+/// mode 0 unchanged.
+pub static SUBSTEP_REFRESH: Knob<u32> = Knob::new("NEXUS_SUBSTEP_REFRESH", 0);
 
 #[cfg(test)]
 mod tests {

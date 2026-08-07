@@ -4314,26 +4314,19 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         // for a given seed.
         let r = self.rng[env].range(0.0, 1.0);
         let t = ((r * self.templates.len() as f32) as usize).min(self.templates.len() - 1);
-        if self.terrain.is_some() {
-            // Teleport to the env's current difficulty patch (level was
-            // already updated by the curriculum when the episode ended).
-            let off = self.terrain_spawn_offset(env, t);
-            self.state.reset_env_from_snapshot_offset(
-                &self.gpu,
-                env as u32,
-                &self.template_snapshots[t],
-                off,
-            );
-        } else {
-            self.state
-                .reset_env_from_snapshot(&self.gpu, env as u32, &self.template_snapshots[t]);
-        }
-        // AGILE reset-velocity randomization: overwrite the fresh env's dof
-        // velocities (snapshot resets them to 0) so the episode starts in
-        // motion. Layout per env in `dof_state`: [0..3) root lin, [3..6) root
-        // ang, [6..dpb) joint velocities; element-offset write touches only
-        // this env's slice of the velocity section.
-        if self.reset_vel {
+        // AGILE reset-velocity randomization: the fresh env starts in motion
+        // rather than at rest. Layout per env: [0..3) root lin, [3..6) root
+        // ang, [6..dpb) joint velocities.
+        //
+        // Drawn BEFORE the reset so it can ride along in the reset's own
+        // staging upload. The alternative — reset, then write `dof_state` —
+        // costs one 4-byte H2D copy PER DOF (the buffer is batch-interleaved,
+        // dof d of env e at d·n + e, so an env's velocities are strided), which
+        // measured ~65 µs of the ~90 µs per reset and 42% of a cold iteration.
+        // Draw order on `self.rng[env]` is unchanged (the template pick above
+        // is the only earlier draw; `terrain_spawn_offset` uses the terrain's
+        // own per-env stream), so this stays bit-identical to the old path.
+        let vels: Option<Vec<f32>> = if self.reset_vel {
             let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
             let mut v = vec![0.0f32; dpb];
             v[0] = self.rng[env].range(-0.25, 0.25);
@@ -4344,17 +4337,42 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
             for d in 6..dpb {
                 v[d] = self.rng[env].range(-1.0, 1.0);
             }
-            // Upstream-base layout is BATCH-INTERLEAVED (dof d of env e at
-            // d·n + e), so one env's velocities are strided — write per-dof.
-            // Fine at reset frequency; a real port would batch this.
-            for (d, val) in v.iter().enumerate() {
-                self.gpu
-                    .write_buffer(
-                        self.state.multibodies_mut().dof_state_mut().buffer_mut(),
-                        (d * self.n + env) as u64,
-                        core::slice::from_ref(val),
-                    )
-                    .expect("dof_state reset-velocity write");
+            Some(v)
+        } else {
+            None
+        };
+        if self.terrain.is_some() {
+            // Teleport to the env's current difficulty patch (level was
+            // already updated by the curriculum when the episode ended).
+            let off = self.terrain_spawn_offset(env, t);
+            match &vels {
+                Some(v) => self.state.reset_env_from_snapshot_offset_vels(
+                    &self.gpu,
+                    env as u32,
+                    &self.template_snapshots[t],
+                    off,
+                    v,
+                ),
+                None => self.state.reset_env_from_snapshot_offset(
+                    &self.gpu,
+                    env as u32,
+                    &self.template_snapshots[t],
+                    off,
+                ),
+            }
+        } else {
+            match &vels {
+                Some(v) => self.state.reset_env_from_snapshot_vels(
+                    &self.gpu,
+                    env as u32,
+                    &self.template_snapshots[t],
+                    v,
+                ),
+                None => self.state.reset_env_from_snapshot(
+                    &self.gpu,
+                    env as u32,
+                    &self.template_snapshots[t],
+                ),
             }
         }
         // Mirror the template's sole-normal so update_feet's tilt makes sense.
