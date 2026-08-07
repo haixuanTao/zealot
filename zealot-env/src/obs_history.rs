@@ -33,7 +33,11 @@ impl ObsHistory {
             std::env::var("BIPED_OBS_HISTORY")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(1)
+                // 5 = the production default; MUST agree with the trainer's
+                // OBS_H read (src/bin/biped_train_gpu.rs). This defaulted to
+                // 1 while the trainer said 5 — v29's first 12k iters trained
+                // single-frame because only the trainer copy was updated.
+                .unwrap_or(5)
         });
         (h > 1).then(|| Self::new(n, h, dim))
     }
