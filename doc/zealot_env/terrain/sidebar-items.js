@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MOVE_DOWN_DISTANCE","MOVE_UP_DISTANCE","N_FAILURES","N_SUCCESSES","PATCH","ROWS","SLAB_BOTTOM","SLOPE_GRADE_MAX","SLOPE_RAMP","STEP_RISE_MAX","STRIP_HALF_W","STRIP_X0","VERTICAL_SCALE"],"enum":["TerrainFamily"],"struct":["TerrainCurriculum","TerrainParams","TerrainStrip"]};

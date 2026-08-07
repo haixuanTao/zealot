@@ -1,0 +1,9 @@
+(function() {
+    const implementors = Object.fromEntries([["zealot_env",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.97.0/core/cmp/trait.PartialEq.html\" title=\"trait core::cmp::PartialEq\">PartialEq</a> for <a class=\"enum\" href=\"zealot_env/terrain/enum.TerrainFamily.html\" title=\"enum zealot_env::terrain::TerrainFamily\">TerrainFamily</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.97.0/core/cmp/trait.PartialEq.html\" title=\"trait core::cmp::PartialEq\">PartialEq</a> for <a class=\"struct\" href=\"zealot_env/config/struct.BodyState.html\" title=\"struct zealot_env::config::BodyState\">BodyState</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.97.0/core/cmp/trait.PartialEq.html\" title=\"trait core::cmp::PartialEq\">PartialEq</a> for <a class=\"struct\" href=\"zealot_env/robots/struct.JointSpec.html\" title=\"struct zealot_env::robots::JointSpec\">JointSpec</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.97.0/core/cmp/trait.PartialEq.html\" title=\"trait core::cmp::PartialEq\">PartialEq</a> for <a class=\"struct\" href=\"zealot_env/tasks/velocity_flat/struct.VelocityCommand.html\" title=\"struct zealot_env::tasks::velocity_flat::VelocityCommand\">VelocityCommand</a>",0]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":59,"fragment_lengths":[1217]}

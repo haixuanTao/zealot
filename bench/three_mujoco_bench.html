@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>three.js + MuJoCo wasm — Unitree G1 walking the v24 policy</title>
+  <style>
+    * { margin: 0; }
+    body { background: #0d2b2e; color: #9fd8dc; font-family: ui-monospace, monospace; }
+    /* Diagnostics live behind the (i) pill — the demo is the show, the
+       numbers are for the curious (and the puppeteer harnesses, which read
+       textContent and don't care about visibility). */
+    #hud { position: fixed; top: 48px; left: 10px; background: #000c; padding: 10px 14px; font-size: 13px; white-space: pre; z-index: 2; border-radius: 6px; display: none; max-width: calc(100vw - 20px); }
+    #hud.open { display: block; }
+    #hudToggle { position: fixed; top: 10px; left: 10px; z-index: 3; width: 30px; height: 30px; border-radius: 50%; border: none; background: #000a; color: #9fd8dc; font: 700 15px/1 system-ui; cursor: pointer; }
+    /* Phones: the fixed-width columns overflow a 390px viewport — wrap and
+       shrink; the numbers matter more than the alignment there. */
+    @media (max-width: 700px) {
+      #hud { font-size: 9.5px; padding: 6px 8px; right: 10px; white-space: pre-wrap; word-break: break-word; }
+    }
+    /* Boot indicator: the wasm download + compile takes seconds (tens on a
+       phone) and the HUD that used to show it is now hidden by default — an
+       explicit centered spinner keeps "loading" from looking like "broken". */
+    #boot { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 14px;
+            align-items: center; justify-content: center; color: #9fd8dc;
+            font: 14px system-ui; background: #0d2b2e; z-index: 5; text-align: center; }
+    #boot .spin { width: 30px; height: 30px; border: 3px solid #1c4a4f;
+            border-top-color: #35c1cd; border-radius: 50%; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <button id="hudToggle" aria-label="Toggle diagnostics" onclick="document.getElementById('hud').classList.toggle('open')">ⓘ</button>
+  <div id="boot"><div class="spin"></div><div>loading MuJoCo (~10 MB WebAssembly)…</div></div>
+  <div id="hud">loading MuJoCo wasm…</div>
+  <script type="module">
+    // The reference engine, in the browser: Google DeepMind's official
+    // MuJoCo WebAssembly build (@mujoco/mujoco, single-threaded) + three.js
+    // WebGL, running the SAME 29-DOF G1 model the Python cross-engine
+    // validator uses (mujoco_playground scene_mjx_feetonly, meshes stripped
+    // — see tools/bake_g1_mjcf_web.py) and the SAME v24 policy as the other
+    // demos. The control loop is a 1:1 port of
+    // examples/biped/sim2sim_g1_mujoco.py: 45-dim obs frames (lag-2 action,
+    // cmd, q−default, finite-diff qd, projected gravity, gait clock) ×
+    // 5-frame history, Welford normalizer + ELU MLP, explicit torque PD @
+    // 200 Hz (model actuation disabled), implicitfast/100 iters, dt = 5 ms ×
+    // 4 substeps per 20 ms control step. Each robot is its own MjData
+    // (independent worlds, like zealot's batched envs).
+    // ?n= robots; ?ckpt= checkpoint; ?lvl/amp/slope = the zealot terrain
+    // knobs (MuJoCo heightfield built from the SAME bit-faithful generator).
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.169.0/+esm';
+    import loadMujoco from './mujoco/mujoco.js';
+
+    const hud = document.getElementById('hud');
+    window.addEventListener('error', (e) => { const b = document.getElementById('boot'); if (b) b.textContent = 'failed to load: ' + e.message; hud.textContent = 'ERROR ' + e.message; console.log('[bench] ERROR ' + e.message); });
+    window.addEventListener('unhandledrejection', (e) => { const b = document.getElementById('boot'); if (b) b.textContent = 'failed to load: ' + e.reason; hud.textContent = 'ERROR ' + e.reason; console.log('[bench] ERROR ' + e.reason); });
+
+    const params = new URLSearchParams(location.search);
+    const mujoco = await loadMujoco();
+
+    // ---- Constants (sim2sim_g1_mujoco.py).
+    const PHYS_DT = 1 / 200, DECIMATION = 4, DT = PHYS_DT * DECIMATION;
+    // Gait clock. Which one depends on the checkpoint: the command-derived
+    // clock below landed in the same training branch as the gyro observation,
+    // so a 48-wide frame wants it and a 45-wide one (v21 and earlier) keeps
+    // its original free-running 0.7 s period. Derived from the command:
+    // a standing command (< 0.1 m/s) FREEZES the phase — standing is its own
+    // observation state — and above that the cycle period lerps 0.8 s -> 0.55 s
+    // with commanded speed. A free-running clock is a train/deploy mismatch:
+    // the obs keeps asking for swings, so the robot marches in place at a stop.
+    const GAIT_SLOW = 0.8, GAIT_FAST = 0.55;
+    function gaitAdvance(ph, vx, vy, wz) {
+      // 48-dim policies (v26+): FULL command magnitude incl. yaw rate.
+      const sp = Math.hypot(vx, vy, wz || 0);
+      if (sp < 0.1) return ph;
+      const t = (Math.min(sp, 0.5) - 0.1) / 0.4;
+      return (ph + DT / (GAIT_SLOW + (GAIT_FAST - GAIT_SLOW) * t)) % 1.0;
+    }
+    const HIST = 5, ACTION_SCALE = 0.5;
+    const FALL_Z = 0.45, TILT_COS = Math.cos((70 * Math.PI) / 180);
+    const _cmd = (params.get('cmd') || '0.4,0,0').split(',').map(Number);
+    const CMD = [_cmd[0] || 0, _cmd[1] || 0, _cmd[2] || 0, 0];
+
+    // ---- Live driving: each arrow / WASD press BUMPS the policy's velocity
+    // command by a fixed step and the command latches, so you steer with taps
+    // rather than holding a key. Space stops. A gamepad stick overrides while
+    // deflected. Same mapping as the nexus demo.
+    const STEP = 0.2;
+    const RANGE = [[-0.6, 1.0], [-0.4, 0.4], [-0.6, 0.6]];   // vx, vy, yaw
+    const clampAxis = (i, v) => Math.max(RANGE[i][0], Math.min(RANGE[i][1], v));
+    const KEY_BUMP = {
+      ArrowUp: [0, STEP], KeyW: [0, STEP],
+      ArrowDown: [0, -STEP], KeyS: [0, -STEP],
+      KeyA: [1, STEP], KeyD: [1, -STEP],
+      ArrowLeft: [2, STEP], KeyQ: [2, STEP],
+      ArrowRight: [2, -STEP], KeyE: [2, -STEP],
+    };
+    addEventListener('keydown', (e) => {
+      if (e.repeat) return;                 // one press, one step
+      if (e.code === 'Space') {
+        cancelNav();
+        CMD[0] = CMD[1] = CMD[2] = 0;
+        e.preventDefault();
+        return;
+      }
+      const bump = KEY_BUMP[e.code];
+      if (bump) cancelNav();
+      if (!bump) return;
+      const [axis, delta] = bump;
+      // Snap to 2 decimals: repeated float adds drift, and even 3*0.2 is
+      // 0.6000000000000001, which the HUD would print verbatim.
+      CMD[axis] = clampAxis(axis, Math.round((CMD[axis] + delta) * 100) / 100);
+      e.preventDefault();                   // arrows would scroll the page
+    });
+
+    // A deflected stick overrides the latched command for as long as it's held.
+    let padLatch = null;
+    function applyDrive() {
+      const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      for (const pad of pads) {
+        if (!pad) continue;
+        const dead = (v) => (Math.abs(v) < 0.15 ? 0 : v);
+        const lx = dead(pad.axes[0] || 0), ly = dead(pad.axes[1] || 0), rx = dead(pad.axes[2] || 0);
+        if (lx || ly || rx) {
+          cancelNav();
+          if (!padLatch) padLatch = CMD.slice(0, 3);   // remember the keyed value
+          CMD[0] = clampAxis(0, -ly > 0 ? -ly * RANGE[0][1] : -ly * -RANGE[0][0]);
+          CMD[1] = clampAxis(1, -lx * RANGE[1][1]);
+          CMD[2] = clampAxis(2, -rx * RANGE[2][1]);
+          return;
+        }
+      }
+      if (padLatch) {                        // stick released: back to keys
+        [CMD[0], CMD[1], CMD[2]] = padLatch;
+        padLatch = null;
+      }
+    }
+
+    const POLICY_JOINTS = [
+      'left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint',
+      'left_knee_joint', 'left_ankle_pitch_joint', 'left_ankle_roll_joint',
+      'right_hip_pitch_joint', 'right_hip_roll_joint', 'right_hip_yaw_joint',
+      'right_knee_joint', 'right_ankle_pitch_joint', 'right_ankle_roll_joint',
+    ];
+    const DEFAULT_POS = [-0.1, 0, 0, 0.3, -0.2, 0, -0.1, 0, 0, 0.3, -0.2, 0];
+    const legGains = (n) =>
+      n.includes('knee') ? [200, 5, 139]
+        : n.includes('hip') ? [100, 2.5, 88]
+          : n.includes('ankle_roll') ? [20, 0.1, 50]
+            : [20, 0.2, 50];
+    // Upper-body holding gains (first fragment wins), zealot's held_joints.
+    const HELD_TABLE = [
+      ['waist_yaw', 300, 5, 88], ['waist', 300, 5, 50],
+      ['shoulder_pitch', 90, 2, 25], ['shoulder_roll', 60, 1, 25],
+      ['shoulder', 20, 0.4, 25], ['elbow', 60, 1, 25], ['wrist', 4, 0.2, 25],
+    ];
+
+    // ---- Visual meshes in RAW menagerie/MuJoCo body frames (see
+    // tools/bake_g1_visuals_mj.py — the zealot bins are in converted frames).
+    const visBuf = await (await fetch('g1_visuals_mj29.bin')).arrayBuffer();
+    const visuals = new Map();
+    {
+      const dv = new DataView(visBuf);
+      let o = 0;
+      const n = dv.getUint32(o, true); o += 4;
+      for (let i = 0; i < n; i++) {
+        const l = dv.getUint8(o); o += 1;
+        const name = new TextDecoder().decode(new Uint8Array(visBuf, o, l)); o += l;
+        o += 16;
+        const nv = dv.getUint32(o, true); o += 4;
+        const nf = dv.getUint32(o, true); o += 4;
+        const pos = new Float32Array(visBuf.slice(o, o + nv * 12)); o += nv * 12;
+        const idx = new Uint32Array(visBuf.slice(o, o + nf * 12)); o += nf * 12;
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        geo.setIndex(new THREE.BufferAttribute(idx, 1));
+        geo.computeVertexNormals();
+        visuals.set(name, geo);
+      }
+    }
+
+    // ---- Policy (same loader as the rapier page).
+    const policy = await (async () => {
+      // What `?ckpt=` points at. A handle copied off a model page, the page
+      // URL, a link to one file in it, or a direct URL elsewhere all mean
+      // "run this policy" — same rules as the wasm demo's `parse_ckpt`.
+      // A bare `owner/repo` asks the Hub what is in the repo and takes the
+      // newest checkpoint by the numbers in the filenames.
+      function parseCkpt(spec) {
+        spec = decodeURIComponent(spec).trim().replace(/\/+$/, '');
+        const hub = spec.match(/^(?:https?:\/\/(?:huggingface\.co|hf\.co)\/|hf\.co\/|hf:)(.+)$/);
+        if (hub) {
+          const p = hub[1].split('?')[0].split('/');
+          if (p.length > 4 && (p[2] === 'blob' || p[2] === 'resolve'))
+            return {url: `https://huggingface.co/${p[0]}/${p[1]}/resolve/${p[3]}/${p.slice(4).join('/')}`};
+          if (p.length >= 2) return {repo: `${p[0]}/${p[1]}`};
+        }
+        if (/^https?:\/\//.test(spec)) return {url: spec};
+        const p = spec.split('/');
+        if (p.length >= 3) return {url: `https://huggingface.co/${p[0]}/${p[1]}/resolve/main/${p.slice(2).join('/')}`};
+        if (p.length === 2) return {repo: spec};
+        return {url: spec + '.safetensors'};
+      }
+
+      // Newest first by the numbers in the name, so g1_v24_iter32780 beats
+      // g1_v21_iter4560 without demanding an exact naming convention.
+      function newestFirst(files) {
+        const nums = (s) => (s.match(/\d+/g) ?? []).map(Number);
+        return files.sort((a, b) => {
+          const [x, y] = [nums(a), nums(b)];
+          for (let i = 0; i < Math.max(x.length, y.length); i++) {
+            const d = (y[i] ?? -1) - (x[i] ?? -1);
+            if (d) return d;
+          }
+          return b.localeCompare(a);
+        });
+      }
+
+      async function ckptUrl(spec) {
+        const ref = parseCkpt(spec);
+        if (ref.url) return ref.url;
+        const meta = await fetch(`https://huggingface.co/api/models/${ref.repo}`);
+        if (!meta.ok) throw new Error(`${ref.repo}: Hub lookup failed (${meta.status})`);
+        const files = newestFirst(
+          ((await meta.json()).siblings ?? [])
+            .map((s) => s.rfilename)
+            .filter((f) => f.endsWith('.safetensors')),
+        );
+        if (!files.length) throw new Error(`${ref.repo}: no .safetensors in the repo`);
+        return `https://huggingface.co/${ref.repo}/resolve/main/${files[0]}`;
+      }
+      // Default: the `g1_walk_latest` release pointer — republished on each
+      // release (scripts/publish_policy.sh), so this page follows releases
+      // without a redeploy.
+      const ckpt =
+        params.get('ckpt') || 'haixuantao/zealot-g1-locomotion/g1_walk_latest.safetensors';
+      const url = await ckptUrl(ckpt);
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error('checkpoint fetch failed: ' + ckpt + ' (' + resp.status + ')');
+      const buf = await resp.arrayBuffer();
+      let sum = 0 >>> 0;
+      const u32 = new Uint32Array(buf.slice(0, Math.floor(buf.byteLength / 4) * 4));
+      for (let i = 0; i < u32.length; i += 997) sum = (sum ^ u32[i]) >>> 0;
+      const shortName = url.split('?')[0].split('/').pop().replace(/\.safetensors$/, '');
+      window.__ckptInfo = shortName + ' (' + (buf.byteLength / 1e6).toFixed(2) + ' MB, x' + sum.toString(16) + ')';
+      const dv = new DataView(buf);
+      const hlen = Number(dv.getBigUint64(0, true));
+      const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hlen)));
+      const tensor = (name) => {
+        const t = header[name];
+        if (!t) return null;
+        const [a, b] = t.data_offsets;
+        return { shape: t.shape, data: new Float32Array(buf.slice(8 + hlen + a, 8 + hlen + b)) };
+      };
+      const W = [], B = [];
+      for (let l = 0; ; l++) {
+        const w = tensor(`actor.w_${l}`);
+        if (!w) break;
+        W.push(w);
+        B.push(tensor(`actor.b_${l}`));
+      }
+      const mean = tensor('obs_norm.mean').data;
+      const m2 = tensor('obs_norm.m2').data;
+      const count = tensor('obs_norm.count').data[0];
+      const std = mean.map((_, i) => Math.sqrt(Math.max(m2[i] / count, 1e-8)));
+      const obsDim = W[0].shape[1];
+      return {
+        obsDim,
+        act(obs) {
+          let a = new Float64Array(obsDim);
+          for (let i = 0; i < obsDim; i++) {
+            a[i] = Math.min(5, Math.max(-5, (obs[i] - mean[i]) / std[i]));
+          }
+          for (let l = 0; l < W.length; l++) {
+            const { shape: [out, inn], data: w } = W[l];
+            const b = B[l].data;
+            const z = new Float64Array(out);
+            for (let r = 0; r < out; r++) {
+              let s = b[r];
+              const row = r * inn;
+              for (let c = 0; c < inn; c++) s += w[row + c] * a[c];
+              z[r] = l === W.length - 1 ? s : (s > 0 ? s : Math.expm1(s));
+            }
+            a = z;
+          }
+          return a;
+        },
+      };
+    })();
+    // v24 and later append the base angular velocity (gyro) to the frame.
+    // v28 appends the 5-slot step cue after the gyro; it stays all-zero here
+    // (the trainer's "no step detected" pattern — no step oracle in this
+    // scene), so the Float64Array's zero-init already assembles it.
+    const FRAME = policy.obsDim / HIST;
+    if (FRAME !== 45 && FRAME !== 48 && FRAME !== 53) throw new Error('obs dim ' + policy.obsDim);
+    const HAS_GYRO = FRAME >= 48;
+
+    // ---- Terrain generator: identical JS port as the rapier page
+    // (bit-faithful to zealot-env's TerrainStrip::generate_with, seed
+    // 0xC0FFEE, Boxes family; see that page for the f32 parity notes).
+    function genBoxesTerrain(lvl, amp, slope) {
+      const F = Math.fround;
+      const MASK = (1n << 64n) - 1n;
+      let st = ((0xC0FFEEn * 0x9E3779B97F4A7C15n) & MASK) ^ 0x7E44A11n;
+      st |= 1n;
+      const unit = () => {
+        st = (st * 6364136223846793005n + 1442695040888963407n) & MASK;
+        return F(Number(st >> 40n) / 16777216);
+      };
+      const range = (a, b) => F(a + F(F(b - a) * unit()));
+      const VS = F(0.005);
+      const rnd = (v) => (v < 0 ? -Math.round(-v) : Math.round(v));
+      const Q = (h) => F(rnd(F(h / VS)) * VS);
+      const HS = F(0.075), PATCH = 8, ROWS = 20, X0 = 8, HALF_W = 4;
+      const nx = Math.round((PATCH * ROWS) / HS), ny = Math.round((2 * HALF_W) / HS);
+      const wa = Math.max(0, Math.floor((PATCH * lvl - 4) / HS));
+      const wb = Math.min(nx, Math.ceil((PATCH * (lvl + 1) + 28) / HS));
+      const heights = new Float32Array((wb - wa + 1) * (ny + 1));
+      const cell = F(0.15), G0 = F(0.04);
+      const cnx = Math.floor(F(PATCH / cell)), cny = Math.floor(F((2 * HALF_W) / cell));
+      for (let p = 0; p < ROWS; p++) {
+        const d = F(F(p + range(0, 1)) / ROWS);
+        const g = F(F(G0 * d) * amp);
+        const ch = new Float32Array(cnx * cny);
+        for (let k = 0; k < cnx * cny; k++) ch[k] = Q(range(-g, g));
+        const i0 = rnd(F(F(PATCH * p) / HS));
+        const i1 = Math.min(rnd(F(F(PATCH * (p + 1)) / HS)), nx);
+        for (let i = Math.max(i0, wa); i <= Math.min(i1, wb); i++) {
+          const lx = F(F(i * HS) - PATCH * p);
+          const ci = Math.min(Math.max(Math.trunc(F(lx / cell)), 0), cnx - 1);
+          for (let j = 0; j <= ny; j++) {
+            const cj = Math.min(Math.max(Math.trunc(F(F(j * HS) / cell)), 0), cny - 1);
+            heights[(i - wa) * (ny + 1) + j] = ch[cj * cnx + ci];
+          }
+        }
+      }
+      if (slope !== 0) {
+        for (let i = wa; i <= wb; i++) {
+          const dz = F(F(slope * i) * HS);
+          for (let j = 0; j <= ny; j++) heights[(i - wa) * (ny + 1) + j] = F(heights[(i - wa) * (ny + 1) + j] + dz);
+        }
+      }
+      const node = (i, j) => heights[(i - wa) * (ny + 1) + j];
+      const height = (x, y) => {
+        const fx = (x - X0) / HS, fy = (y + HALF_W) / HS;
+        if (fx < wa || fx >= wb || fy < 0 || fy >= ny) return 0;
+        const i = Math.floor(fx), j = Math.floor(fy), u = fx - i, v = fy - j;
+        const h00 = node(i, j), h10 = node(i + 1, j), h01 = node(i, j + 1), h11 = node(i + 1, j + 1);
+        return u >= v ? h00 + u * (h10 - h00) + v * (h11 - h10)
+                      : h00 + v * (h01 - h00) + u * (h11 - h01);
+      };
+      const groundAt = (x, y, r = 0.2) => {
+        let m = 0;
+        for (let a = -2; a <= 2; a++)
+          for (let b = -2; b <= 2; b++) m = Math.max(m, height(x + (a * r) / 2, y + (b * r) / 2));
+        return m;
+      };
+      const nw = wb - wa + 1;
+      const v = new Float32Array(nw * (ny + 1) * 3);
+      for (let i = wa; i <= wb; i++)
+        for (let j = 0; j <= ny; j++) {
+          const o = ((i - wa) * (ny + 1) + j) * 3;
+          v[o] = F(X0 + i * HS);
+          v[o + 1] = F(-HALF_W + j * HS);
+          v[o + 2] = node(i, j);
+        }
+      const idx = new Uint32Array((nw - 1) * ny * 6);
+      let k = 0;
+      const vid = (i, j) => (i - wa) * (ny + 1) + j;
+      for (let i = wa; i < wb; i++)
+        for (let j = 0; j < ny; j++) {
+          idx[k++] = vid(i, j); idx[k++] = vid(i + 1, j); idx[k++] = vid(i + 1, j + 1);
+          idx[k++] = vid(i, j); idx[k++] = vid(i + 1, j + 1); idx[k++] = vid(i, j + 1);
+        }
+      return {
+        v, i: idx, height, groundAt,
+        spawnX: X0 + PATCH * lvl + PATCH / 2,
+        grid: { heights, wa, wb, ny, HS, X0, HALF_W },
+      };
+    }
+
+    const TLVL = params.has('lvl') ? Math.min(Math.max(parseInt(params.get('lvl')) || 0, 0), 19) : -1;
+    const TERRAIN = TLVL >= 0;
+    const TAMP = Math.min(Math.max(parseInt(params.get('amp') || '100') || 0, 0), 300) / 100;
+    const TSLOPE_DEG = Math.min(Math.max(parseInt(params.get('slope') || '0') || 0, 0), 20);
+    const terrain = TERRAIN
+      ? genBoxesTerrain(TLVL, TAMP, Math.tan((TSLOPE_DEG * Math.PI) / 180))
+      : null;
+
+    // ---- Model: baked mesh-free playground MJCF; terrain becomes a native
+    // MuJoCo heightfield (asset declared in XML, data written after load).
+    let xml = await (await fetch('g1_mjcf_web.xml')).text();
+    let hfInfo = null;
+    if (TERRAIN) {
+      const { heights, wa, wb, ny, HS, X0, HALF_W } = terrain.grid;
+      const ncol = wb - wa + 1, nrow = ny + 1;
+      let minH = Infinity, maxH = -Infinity;
+      for (const h of heights) { minH = Math.min(minH, h); maxH = Math.max(maxH, h); }
+      const zscale = Math.max(maxH - minH, 0.005);
+      const sx = ((ncol - 1) * HS) / 2, sy = ((nrow - 1) * HS) / 2;
+      const cx = X0 + ((wa + wb) / 2) * HS, cy = -HALF_W + ((nrow - 1) * HS) / 2;
+      hfInfo = { ncol, nrow, minH, zscale };
+      xml = xml.replace('</worldbody>',
+        `<geom name="terrain" type="hfield" hfield="terrain" pos="${cx} ${cy} ${minH}"/></worldbody>`);
+      xml = xml.replace('</mujoco>',
+        `<asset><hfield name="terrain" nrow="${nrow}" ncol="${ncol}" size="${sx} ${sy} ${zscale} 0.1"/></asset></mujoco>`);
+      // The feetonly model collides via EXPLICIT contact pairs (robot geoms
+      // are contype/conaffinity 0) — without foot↔terrain pairs the feet
+      // fall straight through the heightfield.
+      xml = xml.replace('</contact>',
+        `<pair name="left_foot_terrain" geom1="left_foot" geom2="terrain" condim="3" friction="0.6 0.6"/>` +
+        `<pair name="right_foot_terrain" geom1="right_foot" geom2="terrain" condim="3" friction="0.6 0.6"/>` +
+        `</contact>`);
+    }
+    const model = mujoco.MjModel.from_xml_string(xml);
+    if (TERRAIN) {
+      // MuJoCo hfield: row-major from ymin, normalized [0,1] × zscale.
+      const { heights, wa, wb, ny } = terrain.grid;
+      const hf = model.hfield_data;
+      for (let r = 0; r < ny + 1; r++)
+        for (let c = 0; c < wb - wa + 1; c++)
+          hf[r * (wb - wa + 1) + c] = (heights[c * (ny + 1) + r] - hfInfo.minH) / hfInfo.zscale;
+      // View-vs-copy check: embind properties can return snapshots; a silent
+      // copy here means an all-zero (flat) physics terrain.
+      console.log('[bench] hfield write-back:', model.hfield_data[42], 'expected', hf[42]);
+      window.__probeTerrain = (data) => {
+        for (const [px, py] of [[terrain.spawnX, 0], [terrain.spawnX, -1.5], [terrain.spawnX + 2, 1.5]]) {
+          const geomid = new Int32Array(1);
+          const d = mujoco.mj_ray(model, data, [px, py, 50], [0, 0, -1], null, true, -1, geomid, null);
+          console.log(`[bench] probe (${px.toFixed(1)},${py}): phys z=${(50 - d).toFixed(3)} sampler=${terrain.height(px, py).toFixed(3)} geom=${geomid[0]}`);
+        }
+      };
+    }
+
+    // Solver/actuation setup — exactly sim2sim_g1_mujoco.py.
+    model.opt.timestep = PHYS_DT;
+    model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST.value;
+    model.opt.iterations = 100;
+    model.opt.ls_iterations = 50;
+    model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_ACTUATION.value;
+
+    const OBJ_JOINT = mujoco.mjtObj.mjOBJ_JOINT.value;
+    const OBJ_BODY = mujoco.mjtObj.mjOBJ_BODY.value;
+    const OBJ_KEY = mujoco.mjtObj.mjOBJ_KEY.value;
+    const keyHome = mujoco.mj_name2id(model, OBJ_KEY, 'home');
+    if (keyHome < 0) throw new Error('home keyframe missing');
+
+    // Policy joints: addresses, gains, ranges; passive dynamics aligned with
+    // the trained spec (see the Python script for the double-damping story).
+    const polQ = [], polD = [], polKp = [], polKd = [], polEff = [], polRng = [];
+    for (const n of POLICY_JOINTS) {
+      const j = mujoco.mj_name2id(model, OBJ_JOINT, n);
+      if (j < 0) throw new Error('joint missing: ' + n);
+      polQ.push(model.jnt_qposadr[j]);
+      polD.push(model.jnt_dofadr[j]);
+      const [kp, kd, eff] = legGains(n);
+      polKp.push(kp); polKd.push(kd); polEff.push(eff);
+      polRng.push([model.jnt_range[2 * j], model.jnt_range[2 * j + 1]]);
+      const da = model.jnt_dofadr[j];
+      model.dof_damping[da] = 0.001;
+      model.dof_frictionloss[da] = 0.1;
+      model.dof_armature[da] = 0.02;
+    }
+    // Held upper body: every other hinge, gains by name fragment.
+    const HELD_JOINTS = [
+      'waist_yaw_joint', 'waist_roll_joint', 'waist_pitch_joint',
+      'left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint',
+      'left_elbow_joint', 'left_wrist_roll_joint', 'left_wrist_pitch_joint', 'left_wrist_yaw_joint',
+      'right_shoulder_pitch_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint',
+      'right_elbow_joint', 'right_wrist_roll_joint', 'right_wrist_pitch_joint', 'right_wrist_yaw_joint',
+    ];
+    const held = []; // [qposadr, dofadr, kp, kd, eff, qHome]
+    {
+      const homeQ = model.key_qpos;
+      for (const n of HELD_JOINTS) {
+        const j = mujoco.mj_name2id(model, OBJ_JOINT, n);
+        if (j < 0) continue;
+        for (const [frag, kp, kd, eff] of HELD_TABLE) {
+          if (n.includes(frag)) {
+            const qa = model.jnt_qposadr[j];
+            held.push([qa, model.jnt_dofadr[j], kp, kd, eff, homeQ[keyHome * model.nq + qa]]);
+            break;
+          }
+        }
+      }
+    }
+    console.log(`[bench] policy joints: 12, held joints: ${held.length}`);
+    console.log('[bench] dof_damping write-back:', model.dof_damping[polD[0]], 'expected 0.001');
+
+    // ---- three.js scene (same look/camera as the rapier page).
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0d2b2e);
+    const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 300);
+    camera.up.set(0, 0, 1);
+    const cam = { target: new THREE.Vector3(0, 0, 0.5), yaw: -0.5, pitch: 0.35, dist: 8 };
+    {
+      let drag = null;
+      let downAt = null;
+      const el = renderer.domElement;
+      el.style.touchAction = 'none';
+      el.addEventListener('pointerdown', (e) => {
+        drag = [e.clientX, e.clientY];
+        downAt = [e.clientX, e.clientY];
+        el.setPointerCapture(e.pointerId);
+      });
+      el.addEventListener('pointermove', (e) => {
+        if (!drag) return;
+        cam.yaw -= (e.clientX - drag[0]) * 0.005;
+        cam.pitch = Math.min(1.45, Math.max(0.02, cam.pitch + (e.clientY - drag[1]) * 0.005));
+        drag = [e.clientX, e.clientY];
+      });
+      el.addEventListener('pointerup', (e) => {
+        // A press that never turned into a drag is a TAP: send the robot
+        // to that spot on the ground.
+        if (downAt && Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) < 6) {
+          tapToWalk(e.clientX, e.clientY);
+        }
+        drag = null;
+        downAt = null;
+      });
+      el.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        // Scrolling DOWN belongs to the embedding page (the story below the
+        // fold); the wheel only zooms out from the framing we open at.
+        if (e.deltaY > 0 && parent !== window) {
+          parent.postMessage({zealotScroll: e.deltaY}, location.origin);
+          return;
+        }
+        cam.dist = Math.min(60, Math.max(2, cam.dist * Math.exp(e.deltaY * 0.001)));
+      }, { passive: false });
+    }
+    function applyCamera() {
+      const cp = Math.cos(cam.pitch);
+      camera.position.set(
+        cam.target.x + cam.dist * cp * Math.cos(cam.yaw),
+        cam.target.y + cam.dist * cp * Math.sin(cam.yaw),
+        cam.target.z + cam.dist * Math.sin(cam.pitch),
+      );
+      camera.lookAt(cam.target);
+    }
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+    sun.position.set(-2, 3, 5);
+    scene.add(sun);
+    // Terrain visual, kept for the tap-to-walk raycast (assigned during the
+    // scene build below — declared here so the assignment isn't a
+    // temporal-dead-zone error).
+    let terrainMesh = null;
+    const ground = new THREE.Mesh(
+      new THREE.BoxGeometry(200, 200, 0.1),
+      new THREE.MeshStandardMaterial({ color: 0x24565a, roughness: 0.95 }));
+    ground.position.z = -0.05;
+    scene.add(ground);
+    const grid = new THREE.GridHelper(200, 200, 0x35787d, 0x2c6165);
+    grid.rotation.x = Math.PI / 2;
+    grid.position.z = 0.002;
+    scene.add(grid);
+    if (TERRAIN) {
+      const tg = new THREE.BufferGeometry();
+      tg.setAttribute('position', new THREE.BufferAttribute(terrain.v, 3));
+      tg.setIndex(new THREE.BufferAttribute(terrain.i, 1));
+      tg.computeVertexNormals();
+      terrainMesh = new THREE.Mesh(tg, new THREE.MeshStandardMaterial({ color: 0x3a5f5c, roughness: 0.95 }));
+      scene.add(terrainMesh);
+    }
+    const matOf = (name) =>
+      name === 'pelvis'
+        ? new THREE.MeshStandardMaterial({ color: 0xcdd2d9, roughness: 0.5 })
+        : name.includes('ankle_roll')
+          ? new THREE.MeshStandardMaterial({ color: 0x40454c, roughness: 0.6 })
+          : new THREE.MeshStandardMaterial({ color: 0x9aa2ab, roughness: 0.55 });
+
+    // Visual bodies: map baked visual names → MuJoCo body ids.
+    const visBodies = []; // [bodyId, geometry, material]
+    for (const [name, geo] of visuals) {
+      const b = mujoco.mj_name2id(model, OBJ_BODY, name);
+      if (b >= 0) visBodies.push([b, geo, matOf(name)]);
+      else console.log('[bench] no MuJoCo body for visual', name);
+    }
+
+    // ---- Robots: one MjData each (independent worlds).
+    const N = Math.min(Math.max(parseInt(params.get('n') || '10') || 10, 1), 20);
+    const robots = [];
+    function resetRobot(r) {
+      mujoco.mj_resetDataKeyframe(model, r.data, keyHome);
+      const qpos = r.data.qpos;
+      for (let j = 0; j < 12; j++) qpos[polQ[j]] = DEFAULT_POS[j];
+      qpos[0] = r.x0;
+      qpos[1] = r.y0;
+      qpos[2] += r.z0;
+      // Fixed per-robot yaw jitter so attempts differ but stay deterministic.
+      const yaw = ((r.idx * 2654435761 % 1000) / 1000 - 0.5) * 0.6;
+      qpos[3] = Math.cos(yaw / 2); qpos[4] = 0; qpos[5] = 0; qpos[6] = Math.sin(yaw / 2);
+      r.data.qvel.fill(0);
+      mujoco.mj_forward(model, r.data);
+      r.epT = 0;
+      r.gaitPh = 0;
+      r.actHist = [new Float64Array(12), new Float64Array(12)];
+      r.prevQ = new Float64Array(12);
+      r.hist = null;
+      r.lastXY = null;
+    }
+    {
+      const cols = Math.min(N, 5);
+      for (let i = 0; i < N; i++) {
+        const px = TERRAIN ? terrain.spawnX + Math.floor(i / 5) * 3 : Math.floor(i / 5) * -1.6;
+        const py = TERRAIN ? ((i % 5) - (cols - 1) / 2) * 1.5 : ((i % 5) - (cols - 1) / 2) * 1.6;
+        const r = {
+          idx: i, data: new mujoco.MjData(model),
+          x0: px, y0: py, z0: TERRAIN ? terrain.groundAt(px, py) + 0.02 : 0,
+          groups: [],
+        };
+        for (const [b, geo, mat] of visBodies) {
+          const m = new THREE.Mesh(geo, mat);
+          scene.add(m);
+          r.groups.push([b, m]);
+        }
+        resetRobot(r);
+        robots.push(r);
+      }
+      const rows = Math.ceil(N / 5);
+      const cx = TERRAIN ? terrain.spawnX + ((rows - 1) * 3) / 2 : -(rows - 1) * 0.8;
+      const cz = TERRAIN ? terrain.groundAt(cx, 0) : 0;
+      cam.target.set(cx, 0, cz + 0.5);
+      const ox = 5, oy = -(cols * 1.6 * 0.7 + 4), oz = 2.3;
+      cam.dist = Math.hypot(ox, oy, oz);
+      cam.yaw = Math.atan2(oy, ox);
+      cam.pitch = Math.asin(oz / cam.dist);
+      applyCamera();
+    }
+
+    let falls = 0;
+    // ---- Tap-to-walk: raycast the tap to a ground point and steer the
+    // velocity command toward it (P-controller on heading + distance — the
+    // policy still only ever sees a velocity command).
+    let navTarget = null;
+    // Wander: open with a random stroll target so the robot is visibly going
+    // somewhere; every arrival draws the next one, until any user input
+    // (tap, key, gamepad) takes over.
+    let wander = true;
+    let wanderSeeded = false;
+    function pickStroll() {
+      if (!robots.length) return;
+      const qp = robots[0].data.qpos; const px = qp[0], py = qp[1];
+      const ang = Math.random() * Math.PI * 2;
+      const dist = 2 + 1.5 * Math.random();
+      const tx = px + dist * Math.cos(ang);
+      const ty = Math.max(-3, Math.min(3, py + dist * Math.sin(ang)));
+      const tz = TERRAIN && terrain ? terrain.groundAt(tx, ty) : 0;
+      navTarget = { x: tx, y: ty };
+      navMarker.position.set(tx, ty, tz + 0.03);
+      navMarker.visible = true;
+    }
+    const navMarker = (() => {
+      const g = new THREE.RingGeometry(0.16, 0.24, 32);
+      const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0x35c1cd, transparent: true, opacity: 0.9, side: THREE.DoubleSide }));
+      m.visible = false;
+      scene.add(m);
+      return m;
+    })();
+    const navRay = new THREE.Raycaster();
+    function tapToWalk(px, py) {
+      navRay.setFromCamera(
+        new THREE.Vector2((px / innerWidth) * 2 - 1, -(py / innerHeight) * 2 + 1),
+        camera,
+      );
+      const hits = navRay.intersectObjects(terrainMesh ? [terrainMesh] : [ground]);
+      if (!hits.length) return;
+      const h = hits[0].point;
+      // Clamp taps onto the strip; the flat apron past its edge is walkable
+      // but off the demo's world.
+      const tx = h.x;
+      const ty = TERRAIN ? Math.max(-3.6, Math.min(3.6, h.y)) : h.y;
+      const tz = TERRAIN && terrain ? terrain.groundAt(tx, ty) : h.z;
+      wander = false;
+      navSettle = false;
+      navTarget = { x: tx, y: ty };
+      navMarker.position.set(tx, ty, tz + 0.03);
+      navMarker.visible = true;
+    }
+    function cancelNav() {
+      wander = false;
+      navTarget = null;
+      navMarker.visible = false;
+      navSettle = false;
+      robots.forEach((r) => { r.cmd = null; });
+    }
+    // A tapped target is "reached" by the FIRST robot to get there; the
+    // marker hides and everyone ramps down to a stand (settle phase).
+    let navSettle = false;
+    // Slew-limit the autopilot command, PER ROBOT: a stand-to-full step
+    // input staggers the robot. Runs per 50 Hz control step (≈1 m/s²
+    // linear, 2 rad/s² yaw). Robot 0's command mirrors into CMD for the HUD.
+    function slewR(r, want) {
+      const lim = [0.02, 0.02, 0.04];
+      if (!r.navCmd) r.navCmd = [0, 0, 0];
+      for (let i = 0; i < 3; i++) {
+        const d = want[i] - r.navCmd[i];
+        r.navCmd[i] += Math.max(-lim[i], Math.min(lim[i], d));
+      }
+      r.cmd = r.navCmd;
+      if (r === robots[0]) { CMD[0] = r.navCmd[0]; CMD[1] = r.navCmd[1]; CMD[2] = r.navCmd[2]; }
+    }
+    function navDrive() {
+      if (wander && !wanderSeeded && simTime > 0.3) {
+        wanderSeeded = true;
+        pickStroll();
+      }
+      if (!navTarget || !robots.length) return;
+      const n = robots.length;
+      // The WIN check runs against the MARKER itself — the tap ends when a
+      // robot touches the disc, never because a ring slot 0.6 m away was
+      // reached. The robot nearest the marker aims at it EXACTLY (so a
+      // touch can actually happen); the rest fan onto a ring so they don't
+      // render inside each other on arrival (the worlds are independent).
+      const dMark = robots.map((r) => {
+        const qp = r.data.qpos;
+        return Math.hypot(navTarget.x - qp[0], navTarget.y - qp[1]);
+      });
+      const center = dMark.indexOf(Math.min(...dMark));
+      const anyArrived = dMark.some((d) => d < 0.35);
+      for (let i = 0; i < n; i++) {
+        const r = robots[i];
+        const ring = n > 1 && i !== center;
+        const sr = ring ? 0.5 * Math.sqrt(n) : 0;
+        const sa = ring ? (2 * Math.PI * (i > center ? i - 1 : i)) / (n - 1) : 0;
+        const tx = navTarget.x + sr * Math.cos(sa);
+        const ty = Math.max(-3.6, Math.min(3.6, navTarget.y + sr * Math.sin(sa)));
+        const qp = r.data.qpos;
+        const dx = tx - qp[0], dy = ty - qp[1];
+        const dist = Math.hypot(dx, dy);
+        if (navSettle || dist < 0.3) {
+          slewR(r, [0, 0, 0]);
+          continue;
+        }
+        // Free-joint quat is WXYZ; three's is (x, y, z, w).
+        const f = new THREE.Vector3(1, 0, 0)
+          .applyQuaternion(new THREE.Quaternion(qp[4], qp[5], qp[6], qp[3]));
+        let err = Math.atan2(dy, dx) - Math.atan2(f.y, f.x);
+        err = Math.atan2(Math.sin(err), Math.cos(err));
+        slewR(r, [
+          Math.abs(err) > 1.1
+            ? 0.1
+            : Math.max(0, Math.cos(err)) * Math.min(0.5, 0.2 + 0.3 * Math.min(dist, 1)),
+          0,
+          Math.max(-1, Math.min(1, 1.6 * err)),
+        ]);
+      }
+      if (wander) {
+        // The FIRST robot to arrive draws the next stroll point.
+        if (anyArrived) wanderSeeded = false;
+      } else if (navSettle) {
+        // Settle: everyone ramps to a stand, then the autopilot disengages.
+        if (robots.every((r) => (r.navCmd ?? [0, 0, 0]).every((v) => Math.abs(v) < 0.01))) {
+          CMD[0] = CMD[1] = CMD[2] = 0;
+          navSettle = false;
+          cancelNav();
+        }
+      } else if (anyArrived) {
+        // First robot there wins the tap: hide the marker, stand down.
+        navSettle = true;
+        navMarker.visible = false;
+      }
+    }
+
+    function controlStep() {
+      applyDrive();
+      navDrive();
+      for (const r of robots) {
+        const qpos = r.data.qpos, qvel = r.data.qvel;
+        const o = new Float64Array(FRAME);
+        const q = new Float64Array(12);
+        for (let j = 0; j < 12; j++) q[j] = qpos[polQ[j]];
+        for (let j = 0; j < 12; j++) {
+          o[j] = r.epT >= 2 ? r.actHist[0][j] : 0;
+          o[16 + j] = q[j] - DEFAULT_POS[j];
+          o[28 + j] = r.epT === 0 ? 0 : (q[j] - r.prevQ[j]) / DT;
+        }
+        // Autopilot steers each robot separately; manual input is global.
+        const rc = r.cmd ?? CMD;
+        o[12] = rc[0]; o[13] = rc[1]; o[14] = rc[2]; o[15] = CMD[3];
+        // Projected gravity: world-down in base frame (MuJoCo quats WXYZ).
+        const w = qpos[3], x = qpos[4], y = qpos[5], z = qpos[6];
+        // conjugate rotation of [0,0,-1]: v + 2*u×(u×v + w·v), u = −(x,y,z)
+        const ux = -x, uy = -y, uz = -z;
+        const c1x = uy * -1 - 0, c1y = 0 - ux * -1, c1z = 0; // u × v, v=(0,0,−1)
+        const t1x = c1x + w * 0, t1y = c1y + w * 0, t1z = c1z + w * -1;
+        o[40] = 0 + 2 * (uy * t1z - uz * t1y);
+        o[41] = 0 + 2 * (uz * t1x - ux * t1z);
+        o[42] = -1 + 2 * (ux * t1y - uy * t1x);
+        const ph = r.gaitPh;
+        o[43] = Math.sin(2 * Math.PI * ph); o[44] = Math.cos(2 * Math.PI * ph);
+        r.gaitPh = HAS_GYRO ? gaitAdvance(ph, o[12], o[13], o[14]) : (ph + DT / 0.7) % 1.0;
+        // Gyro: base angular velocity in the BODY frame. A MuJoCo free joint
+        // already stores its rotational qvel body-local, so it goes in as-is
+        // (this is what an on-robot IMU reads).
+        if (HAS_GYRO) {
+          o[45] = qvel[3]; o[46] = qvel[4]; o[47] = qvel[5];
+        }
+
+        if (r.hist === null) r.hist = Array.from({ length: HIST }, () => o.slice());
+        else { r.hist.shift(); r.hist.push(o.slice()); }
+        const stacked = new Float64Array(FRAME * HIST);
+        r.hist.forEach((f, k) => stacked.set(f, k * FRAME));
+        const action = policy.act(stacked);
+
+        const tgt = new Float64Array(12);
+        for (let j = 0; j < 12; j++) {
+          tgt[j] = Math.min(polRng[j][1], Math.max(polRng[j][0], DEFAULT_POS[j] + ACTION_SCALE * action[j]));
+        }
+        r.prevQ.set(q);
+        r.actHist = [r.actHist[1], Float64Array.from(action)];
+        r.epT += 1;
+
+        // 4 physics substeps with explicit torque PD @ 200 Hz.
+        const qfrc = r.data.qfrc_applied;
+        for (let s = 0; s < DECIMATION; s++) {
+          for (let j = 0; j < 12; j++) {
+            const tau = polKp[j] * (tgt[j] - qpos[polQ[j]]) - polKd[j] * qvel[polD[j]];
+            qfrc[polD[j]] = Math.min(polEff[j], Math.max(-polEff[j], tau));
+          }
+          for (const [qa, da, kp, kd, eff, qh] of held) {
+            const tau = kp * (qh - qpos[qa]) - kd * qvel[da];
+            qfrc[da] = Math.min(eff, Math.max(-eff, tau));
+          }
+          mujoco.mj_step(model, r.data);
+        }
+
+        // Speed accumulation + fall/timeout, LOCAL-ground relative.
+        if (r.lastXY) {
+          window.__spdAcc = (window.__spdAcc || 0) +
+            Math.hypot(qpos[0] - r.lastXY[0], qpos[1] - r.lastXY[1]) / DT;
+          window.__spdN = (window.__spdN || 0) + 1;
+        }
+        r.lastXY = [qpos[0], qpos[1]];
+        const groundZ = TERRAIN ? terrain.height(qpos[0], qpos[1]) : 0;
+        const upz = 1 - 2 * (qpos[4] * qpos[4] + qpos[5] * qpos[5]);
+        if (qpos[2] - groundZ < FALL_Z || upz < TILT_COS) { // fall only — no episode timeout in a demo
+          const why = qpos[2] - groundZ < FALL_Z ? 'below-ground-z' : upz < TILT_COS ? 'tilt' : 'timeout';
+          console.log(`[bench] reset robot ${r.idx}: ${why} after ${(r.epT * DT).toFixed(1)}s ` +
+            `(pelvis ${qpos[2].toFixed(2)} ground ${groundZ.toFixed(2)} upz ${upz.toFixed(2)} ` +
+            `xy ${qpos[0].toFixed(1)},${qpos[1].toFixed(1)})`);
+          if (qpos[2] - groundZ < FALL_Z || upz < TILT_COS) falls += 1;
+          resetRobot(r);
+        }
+      }
+    }
+
+    // ---- Main loop: real-time catch-up, ≤4 control steps per frame.
+    let simTime = 0;
+    let t0 = performance.now();
+    let frames = 0, steps = 0, physMs = 0, winT0 = performance.now();
+    let bootGone = false;
+    function dropBoot() {
+      if (!bootGone) {
+        bootGone = true;
+        document.getElementById('boot')?.remove();
+      }
+    }
+    function frame() {
+      dropBoot();
+      const wall = (performance.now() - t0) / 1000;
+      let stepsThisFrame = 0;
+      while (simTime < wall && stepsThisFrame < 4) {
+        const p0 = performance.now();
+        controlStep();
+        physMs += performance.now() - p0;
+        steps += 1;
+        simTime += DT;
+        stepsThisFrame += 1;
+      }
+      if (simTime < wall - 0.25) simTime = wall;
+
+      for (const r of robots) {
+        const xpos = r.data.xpos, xquat = r.data.xquat;
+        for (const [b, m] of r.groups) {
+          m.position.set(xpos[3 * b], xpos[3 * b + 1], xpos[3 * b + 2]);
+          m.quaternion.set(xquat[4 * b + 1], xquat[4 * b + 2], xquat[4 * b + 3], xquat[4 * b]);
+        }
+      }
+      // Camera follows the pelvis centroid (body 1 in every world).
+      if (robots.length) {
+        let mx = 0, my = 0, mz = 0;
+        for (const r of robots) {
+          mx += r.data.qpos[0]; my += r.data.qpos[1]; mz += r.data.qpos[2];
+        }
+        const k = 0.05;
+        cam.target.x += (mx / robots.length - cam.target.x) * k;
+        cam.target.y += (my / robots.length - cam.target.y) * k;
+        cam.target.z += (mz / robots.length - 0.2 - cam.target.z) * k;
+      }
+      applyCamera();
+      renderer.render(scene, camera);
+
+      frames += 1;
+      const win = (performance.now() - winT0) / 1000;
+      if (win >= 1.0) {
+        const fps = frames / win;
+        const ms = steps ? physMs / steps : 0;
+        const rt = Math.min(steps / (win / DT), 1);
+        hud.textContent =
+          `three.js + MuJoCo ${mujoco.mj_versionString ? mujoco.mj_versionString() : ''} (official wasm) — REAL G1 29-DOF   policy: ${window.__ckptInfo}   robots: ${N}\n` +
+          (TERRAIN ? `terrain: level ${TLVL}/19   roughness ${Math.round(TAMP * 100)}%   slope ${TSLOPE_DEG}° (native heightfield)\n` : '') +
+          `render: ${fps.toFixed(0)} fps   physics+policy: ${ms.toFixed(2)} ms/ctrl-step\n` +
+          `sim speed: ${(rt * 100).toFixed(0)}% of real time   falls: ${falls}\n` +
+          `mean speed: ${(window.__spdN ? window.__spdAcc / window.__spdN : 0).toFixed(2)} m/s (cmd ${CMD[0].toFixed(2)})\n` +
+          `tap ground: walk there   drag: orbit camera   scroll: zoom   keys: ↑↓ ±0.2, ←→ turn, space stops`;
+        window.__spdAcc = 0; window.__spdN = 0;
+        frames = 0; steps = 0; physMs = 0; winT0 = performance.now();
+        console.log('[bench] tick');
+      }
+      requestAnimationFrame(frame);
+    }
+    window.addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+    hud.textContent = 'running…';
+    if (window.__probeTerrain) window.__probeTerrain(robots[0].data);
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
