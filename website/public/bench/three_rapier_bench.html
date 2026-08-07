@@ -188,10 +188,13 @@
       };
     })();
     const HIST = 5;
-    // v24 and later append the base angular velocity (gyro) to the frame.
+    // v24 and later append the base angular velocity (gyro) to the frame;
+    // v28 appends the 5-slot step cue, which stays all-zero here (the
+    // trainer's "no step detected" pattern — this scene has no step oracle),
+    // so the Float64Array's zero-init already assembles it.
     const FRAME = policy.obsDim / HIST;
-    if (FRAME !== 45 && FRAME !== 48) throw new Error('obs dim ' + policy.obsDim);
-    const HAS_GYRO = FRAME === 48;
+    if (FRAME !== 45 && FRAME !== 48 && FRAME !== 53) throw new Error('obs dim ' + policy.obsDim);
+    const HAS_GYRO = FRAME >= 48;
 
     // ---- Scene.
     const renderer = new THREE.WebGLRenderer({ antialias: true });

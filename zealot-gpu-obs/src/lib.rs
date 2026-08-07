@@ -17,7 +17,8 @@ use khal::{BufferUsages, Shader};
 use vortx::tensor::Tensor;
 
 use shaders::{
-    C_DEFAULT, C_HI, C_LEN, C_LINK, C_LO, C_MEAN, C_STD, FRAME, FRAME_NO_GYRO, HIST, N_ACT,
+    C_DEFAULT, C_HI, C_LEN, C_LINK, C_LO, C_MEAN, C_STD, FRAME, FRAME_GYRO, FRAME_NO_GYRO, HIST,
+    N_ACT,
     STATE_STRIDE,
 };
 
@@ -74,12 +75,14 @@ impl GpuObs {
         cfg: &GpuObsConfig,
     ) -> Result<Self, GpuBackendError> {
         // The checkpoint's normalizer length picks the obs width: 45 for
-        // pre-gyro policies (v21 and earlier), 48 with the gyro (v24 on).
+        // pre-gyro policies (v21 and earlier), 48 with the gyro (v24 on),
+        // 53 with the step cue (v28 on — the kernel zero-fills the cue).
         assert_eq!(cfg.norm_mean.len(), cfg.norm_std.len());
         let frame = cfg.norm_mean.len() / HIST;
         assert!(
-            (frame == FRAME || frame == FRAME_NO_GYRO) && frame * HIST == cfg.norm_mean.len(),
-            "unsupported obs layout: {} = {HIST} x {frame} (expected a frame of {FRAME_NO_GYRO} or {FRAME})",
+            (frame == FRAME || frame == FRAME_GYRO || frame == FRAME_NO_GYRO)
+                && frame * HIST == cfg.norm_mean.len(),
+            "unsupported obs layout: {} = {HIST} x {frame} (expected a frame of {FRAME_NO_GYRO}, {FRAME_GYRO} or {FRAME})",
             cfg.norm_mean.len(),
         );
         let mut consts = vec![0.0f32; C_LEN];

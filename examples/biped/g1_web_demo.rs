@@ -589,14 +589,15 @@ async fn load_ckpt(spec: &str) -> Result<(ActorCritic, String), String> {
     let bytes = fetch_ckpt(&url).await?;
     let ac = ActorCritic::load_from_bytes(&bytes)
         .map_err(|e| format!("{}: not a zealot checkpoint ({e})", ckpt_label(&url)))?;
-    // The GPU obs shader assembles 45- or 48-dim frames; refuse anything
-    // else (e.g. a 53-dim step-cue policy) HERE so the caller's fallback
-    // runs instead of the demo dying at GpuObs setup.
-    use zealot_gpu_obs::shaders::{FRAME, FRAME_NO_GYRO, HIST};
+    // The GPU obs shader assembles 45-, 48- or 53-dim frames (the 53-dim
+    // step-cue block is fed the all-zero "no step detected" pattern);
+    // refuse anything else HERE so the caller's fallback runs instead of
+    // the demo dying at GpuObs setup.
+    use zealot_gpu_obs::shaders::{FRAME, FRAME_GYRO, FRAME_NO_GYRO, HIST};
     let fr = ac.obs_norm.state().0.len() / HIST;
-    if fr != FRAME && fr != FRAME_NO_GYRO {
+    if fr != FRAME && fr != FRAME_GYRO && fr != FRAME_NO_GYRO {
         return Err(format!(
-            "{}: {fr}-dim obs frames — the demo runs {FRAME_NO_GYRO}- or {FRAME}-dim policies",
+            "{}: {fr}-dim obs frames — the demo runs {FRAME_NO_GYRO}-, {FRAME_GYRO}- or {FRAME}-dim policies",
             ckpt_label(&url)
         ));
     }

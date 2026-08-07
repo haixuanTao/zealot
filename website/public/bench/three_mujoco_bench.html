@@ -288,9 +288,12 @@
       };
     })();
     // v24 and later append the base angular velocity (gyro) to the frame.
+    // v28 appends the 5-slot step cue after the gyro; it stays all-zero here
+    // (the trainer's "no step detected" pattern — no step oracle in this
+    // scene), so the Float64Array's zero-init already assembles it.
     const FRAME = policy.obsDim / HIST;
-    if (FRAME !== 45 && FRAME !== 48) throw new Error('obs dim ' + policy.obsDim);
-    const HAS_GYRO = FRAME === 48;
+    if (FRAME !== 45 && FRAME !== 48 && FRAME !== 53) throw new Error('obs dim ' + policy.obsDim);
+    const HAS_GYRO = FRAME >= 48;
 
     // ---- Terrain generator: identical JS port as the rapier page
     // (bit-faithful to zealot-env's TerrainStrip::generate_with, seed

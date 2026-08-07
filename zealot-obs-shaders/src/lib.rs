@@ -16,21 +16,24 @@
 //! - `state` (STATE_STRIDE per env): [0..12) prev_q, [12..24) action t−2,
 //!   [24..36) action t−1, [36] episode step counter (f32), [37] gait phase.
 //! - `hist`: 5×`frame` obs-frame ring per env, slot s = ep % 5 (allocated at
-//!   the 5×48 maximum; a 45-dim policy uses the first 5×45).
+//!   the 5×53 maximum; a narrower policy uses the first 5×frame).
 //! - `consts`: [0..12) actuated dof ids (as f32), [12..24) default_pos,
-//!   [24..36) target lo, [36..48) target hi, [48..273) normalizer mean (225),
-//!   [273..498) normalizer std (225).
+//!   [24..36) target lo, [36..48) target hi, then normalizer mean and std
+//!   (HIST·FRAME each, of which a narrower policy fills the first
+//!   HIST·frame).
 //! - `gemm_input`: row-major [5·frame × n_envs] — the vortx GEMM a0 buffer.
 //! - `actions`/`targets`: row-major [12 × n_envs] (matches
 //!   `scatter_motor_targets`).
 //!
-//! Obs frame (48), mirroring `sim2sim_g1_mujoco.py` / the training env:
+//! Obs frame (53), mirroring `sim2sim_g1_mujoco.py` / the training env:
 //! [0..12) lag-2 action · [12..16) command · [16..28) q − default ·
 //! [28..40) finite-diff joint velocity · [40..43) projected gravity ·
 //! [43..45) gait-clock sin/cos · [45..48) base angular velocity (gyro,
-//! body frame — added for v24; the first 45 slots keep their v21 meaning).
-//! History ×5 oldest-first, reset-replicated;
-//! Welford-normalized (clip ±5).
+//! body frame — added for v24) · [48..53) step cue (v28: distance, height,
+//! edge sin/cos, validity — ALWAYS ZERO here, the trainer's "no step
+//! detected" pattern; the demo terrain has no step-cue oracle). The first
+//! 45 slots keep their v21 meaning. History ×5 oldest-first,
+//! reset-replicated; Welford-normalized (clip ±5).
 //!
 //! No panics anywhere (no `[]` indexing, no `clamp`, no `step_by`): panic
 //! edges become naga switch-breaks that Tint rejects — see the
@@ -63,12 +66,16 @@ pub const HIST: usize = 5;
 /// WIDEST single-frame obs the kernel can assemble, and the stride every
 /// fixed-size buffer here is allocated at. The frame a given policy actually
 /// wants is narrower or equal and comes in as the `frame` uniform: v21 and
-/// earlier were 45, v24 added the gyro at [45..48). Checkpoints published
-/// before and after that change both have to load and walk, so the width is a
-/// runtime value, not a rebuild.
-pub const FRAME: usize = 48;
+/// earlier were 45, v24 added the gyro at [45..48), v28 the step cue at
+/// [48..53). Checkpoints published before and after each change all have to
+/// load and walk, so the width is a runtime value, not a rebuild.
+pub const FRAME: usize = 53;
 /// The pre-gyro frame, still used by every v21-and-earlier checkpoint.
 pub const FRAME_NO_GYRO: usize = 45;
+/// The gyro-era frame (v24–v27): everything of [[FRAME]] except the step cue.
+/// Also the boundary above which a checkpoint expects the command-derived
+/// gait clock (the clock landed in the same training branch as the gyro).
+pub const FRAME_GYRO: usize = 48;
 /// consts offsets. C_LINK: child-link id of each policy joint.
 pub const C_LINK: usize = 0;
 pub const C_DEFAULT: usize = 12;
@@ -112,9 +119,10 @@ pub fn gpu_assemble_obs(
     let ne = n as usize;
     let eu = e as usize;
     let sb = |i: usize| i * ne + eu; // batch-interleaved slot
-    // Obs width this policy was trained with (45 pre-gyro, 48 with it). The
-    // `o` scratch is always FRAME wide; the loops below stop at `fr`, so the
-    // gyro slots simply never reach the history ring for a 45-dim policy.
+    // Obs width this policy was trained with (45 pre-gyro, 48 with gyro, 53
+    // with the step cue). The `o` scratch is always FRAME wide; the loops
+    // below stop at `fr`, so the wider slots simply never reach the history
+    // ring for a narrower policy.
     let fr = *frame as usize;
 
     let ep = state.read(sb(36));
@@ -143,7 +151,10 @@ pub fn gpu_assemble_obs(
     let c2z = ux * c1y - uy * c1x;
     let g = [2.0 * c2x, 2.0 * c2y, -1.0 + 2.0 * c2z];
 
-    // 48-dim frame.
+    // FRAME-wide scratch, zero-initialized — which already IS the step-cue
+    // block for a 53-dim policy: all-zero = "no step detected", the exact
+    // pattern the trainer emits off the Step family. Slots [48..53) are
+    // never written below.
     let mut o = [0.0f32; FRAME];
     let lag2_ok = ep >= 2.0;
     let mut j = 0;
@@ -243,12 +254,13 @@ pub fn gpu_assemble_obs(
     // Advance the gait phase for the next step. WHICH clock depends on the
     // policy: the command-derived one (freeze at a stand, period lerped with
     // commanded speed) landed in the same training branch as the gyro
-    // observation, so a 48-wide frame means the checkpoint expects it and a
-    // 45-wide one (v21 and earlier) expects the older free-running fixed
-    // period. Feeding either the wrong clock is a train/deploy mismatch, so
-    // the frame width picks it — published checkpoints of both eras walk.
+    // observation, so a gyro-era frame (48 or 53 wide) means the checkpoint
+    // expects it and a 45-wide one (v21 and earlier) expects the older
+    // free-running fixed period. Feeding either the wrong clock is a
+    // train/deploy mismatch, so the frame width picks it — published
+    // checkpoints of every era walk.
     let mut next_ph = ph;
-    if fr == FRAME {
+    if fr >= FRAME_GYRO {
         // FULL command magnitude INCLUDING yaw rate (the training env's
         // `VelocityCommand::speed()`, since ab7c811): a turn-in-place command
         // must tick the clock or the policy will not step through the turn.
