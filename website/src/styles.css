@@ -664,9 +664,10 @@ a {
     line-height: 1.35;
   }
 
-  /* The overlay pills were sized for a desktop canvas. */
+  /* The overlay pills were sized for a desktop canvas. NOTE: the base
+     rule centers via transform, so the scale must keep the translate. */
   .scrollCue {
-    transform: scale(0.85);
+    transform: translateX(-50%) scale(0.85);
     transform-origin: bottom center;
   }
 

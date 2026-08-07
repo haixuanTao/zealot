@@ -320,7 +320,7 @@ impl Default for CommandSampler {
             // unreachable max command the curriculum forces the policy into a
             // regime where tracking reward is uniformly tiny → it gives up.
             // Override per-axis with BIPED_VX / BIPED_VY / BIPED_YAW ("lo,hi").
-            lin_vel_x: range_env("BIPED_VX", (-0.5, 0.5)),
+            lin_vel_x: range_env("BIPED_VX", (-0.8, 0.8)),
             lin_vel_y: range_env("BIPED_VY", (-0.3, 0.3)),
             // Yaw was ±0.2 through v21 — 5× narrower than WBC-AGILE T1's ±1.0,
             // and too narrow to learn from: at |yaw| ≤ 0.2 the exp tracking
@@ -381,7 +381,7 @@ impl CommandSampler {
         let slow_prob: f32 = std::env::var("BIPED_SLOW_PROB")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.25);
+            .unwrap_or(0.5);
         // Arc bias (BIPED_ARC_PROB, default 0.25): with the yaw range widened
         // to +/-0.6, independent uniform draws still put almost no mass on
         // CURVED walking -- measured only ~5% of moving commands were strong
@@ -984,9 +984,8 @@ impl VelocityFlatTask {
         // walking), so this codifies an existing preference rather than
         // fighting one. See the field docs for the knee-angle geometry and why
         // anything above ~0.837 rides the knee stop.
-        if let Some(v) = env_f32("BIPED_BASE_HEIGHT_STAND") {
-            weights.base_height_target_stand = v;
-        }
+        weights.base_height_target_stand =
+            env_f32("BIPED_BASE_HEIGHT_STAND").unwrap_or(weights.base_height_target + 0.01);
         // AGILE-alignment override: WBC has NO air-time reward — its gait
         // economy comes from torque/energy regularizers. Paying completed
         // swing DURATION (capped 0.4s ≈ our natural swing) selects for
@@ -1008,9 +1007,7 @@ impl VelocityFlatTask {
         // there. Tightening to ~0.05 makes a crouch cost the height reward
         // outright -- the direct way to price posture, instead of taxing knee
         // torque and hoping the posture follows.
-        if let Some(v) = env_f32("BIPED_STD_BASE_H") {
-            stds.base_height = v;
-        }
+        stds.base_height = env_f32("BIPED_STD_BASE_H").unwrap_or(0.05);
         // Width of the ANGULAR tracking kernel. The default 0.1 is far too
         // narrow for the +/-0.6 command range: a policy sitting at the measured
         // 0.06 rad/s scores exp(-(0.4-0.06)^2/0.1^2) = 1e-5 on a 0.4 command,
@@ -1023,9 +1020,7 @@ impl VelocityFlatTask {
         // after which a 0.4 command scores 96% and self-reinforces. That is
         // luck, not a gradient. 0.3 makes a 0.4 command pay 28% from a standing
         // start, so there is a slope the whole way in.
-        if let Some(v) = env_f32("BIPED_STD_ANG") {
-            stds.ang_vel = v;
-        }
+        stds.ang_vel = env_f32("BIPED_STD_ANG").unwrap_or(0.3);
         // Action-rate penalty gain (NEGATIVE). Exposed because it is denominated
         // in ACTION units, not radians: it charges (delta action)^2, so halving
         // BIPED_ACTION_SCALE makes the same PHYSICAL motion cost 4x more here.
@@ -1695,7 +1690,7 @@ mod tests {
         // it means updating them too, not just this number.
         assert_eq!(OBS_DIM, 53);
         assert_eq!(ACTION_DIM, 12);
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         let mut obs = vec![0.0; OBS_DIM];
         task.observe(&upright_state(), &VelocityCommand::default(), &mut obs);
         // Layout: last_action[0..12], command[12..16], joint_pos_rel[16..28],
@@ -1711,14 +1706,14 @@ mod tests {
 
     #[test]
     fn control_timing() {
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         assert!((task.control_dt() - 0.02).abs() < 1e-9);
         assert_eq!(task.max_steps(), 1000); // 20 s / 0.02 s
     }
 
     #[test]
     fn joint_targets_offset_by_scale() {
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         let mut a = [0.0; NUM_JOINTS];
         a[0] = 1.0; // anklex_left, scale 0.55, pos_limit ±0.175
         let t = task.joint_targets(&a);
@@ -1730,7 +1725,7 @@ mod tests {
 
     #[test]
     fn perfect_tracking_gives_full_reward() {
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         // Command zero velocity; robot at rest, upright, neutral pose. Standing is
         // commanded, so the (gated) pose term is active and tracking kernels are max.
         let r = task.reward(&upright_state(), &VelocityCommand::default());
@@ -1752,7 +1747,7 @@ mod tests {
 
     #[test]
     fn foot_rewards_behave() {
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         let cmd = VelocityCommand {
             vx: 0.5,
             vy: 0.0,
@@ -1861,7 +1856,7 @@ mod tests {
 
     #[test]
     fn velocity_error_reduces_tracking_reward() {
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         let mut s = upright_state();
         s.base.lin_vel_world = [0.5, 0.0, 0.0]; // moving forward
         // Command standing → big tracking error → reward below the max.
@@ -1872,7 +1867,7 @@ mod tests {
 
     #[test]
     fn fell_over_detects_tilt() {
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         let mut base = BaseState::default();
         assert!(!task.fell_over(&base));
         // Tip 80° about X (> 70° limit): (x,y,z,w)=(sin40,0,0,cos40).
@@ -2006,7 +2001,7 @@ mod tests {
     /// than act on whatever the last successful probe said.
     #[test]
     fn invalid_step_cue_zeroes_the_whole_block() {
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         let mut st = RobotState::default();
         let cmd = VelocityCommand::default();
         let mut obs = vec![0.0; OBS_DIM];
@@ -2025,7 +2020,7 @@ mod tests {
     /// 0..48 by offset.
     #[test]
     fn step_cue_is_appended_not_inserted() {
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         let mut st = RobotState::default();
         st.joint_pos[3] = 0.3;
         let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
@@ -2041,7 +2036,7 @@ mod tests {
 
     #[test]
     fn symmetry_error_zero_for_mirrored_pose() {
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         // Neutral pose is trivially symmetric.
         assert_eq!(task.symmetry_error(&[0.0; NUM_JOINTS], 1.0), 0.0);
     }
@@ -2051,7 +2046,7 @@ mod tests {
     /// otherwise gating a turn also stops enforcing an even gait.
     #[test]
     fn lateral_gate_spares_sagittal_symmetry() {
-        let task = VelocityFlatTask::new();
+        let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         // Derive the indices from the SPEC rather than hardcoding a layout --
         // VelocityFlatTask::new() honours BIPED_ROBOT, so the default here is
         // lerobot, not the G1, and the joint order differs.
@@ -2174,18 +2169,16 @@ mod moving_gate_tests {
             .base_height;
         assert_eq!(turning, moving, "a pure yaw command must use the MOVING target");
 
-        // Default: both targets equal -> command must not change the score.
-        let mut plain = launcher_task();
-        plain.weights.base_height = 2.0;
-        assert_eq!(
-            plain.weights.base_height_target, plain.weights.base_height_target_stand,
-            "the stand target must default to the moving target"
+        // Default: the stand target sits 1 cm above the moving target (the
+        // production preference — v24 measured 0.816 standing vs 0.807 walking).
+        let plain = launcher_task();
+        assert!(
+            (plain.weights.base_height_target_stand
+                - (plain.weights.base_height_target + 0.01))
+                .abs()
+                < 1e-6,
+            "the stand target must default to the moving target + 0.01"
         );
-        let a = plain.reward(&st, &VelocityCommand::default()).base_height;
-        let b = plain
-            .reward(&st, &VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 })
-            .base_height;
-        assert_eq!(a, b, "split leaked while both targets are equal");
     }
 
     /// Yaw counts toward the speed magnitude, so a pure turn-in-place command

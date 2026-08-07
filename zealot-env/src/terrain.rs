@@ -83,7 +83,7 @@ pub const SLAB_BOTTOM: f32 = -0.05;
 /// invisible to it — a sustained grade is the disturbance that makes them
 /// observable to the reward. Up-only (heights ≥ family field) so the flat
 /// z = 0 backstop cuboid and slab bottom stay valid.
-pub const SLOPE_GRADE_MAX: f32 = 0.125;
+pub const SLOPE_GRADE_MAX: f32 = 0.268;
 /// Ramp run from patch edge before the apex plateau (m): apex ≤ 0.75 m, with
 /// a ~2 m flat top so the apex is standable.
 pub const SLOPE_RAMP: f32 = 3.0;

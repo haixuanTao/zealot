@@ -29,26 +29,16 @@ license.workspace = true
 #
 #   gpu      — vortx (dimforge's GPU tensor lib): hand-rolled MLP forward/backward
 #              + Adam (vortx has no autograd). Used by the tensor examples.
-#   pendulum — nexus3d GPU rigid-body physics + rapier3d (CPU-side scene build).
-#              Used by the pendulum examples under examples/pendulum/.
 #
 # vortx/khal/rapier3d are taken from crates.io but redirected to local dimforge
 # forks by [patch.crates-io] below — the same forks nexus3d is built against.
 [features]
 default = []
 gpu = ["dep:vortx", "dep:khal"]
-pendulum = ["dep:nexus3d", "dep:rapier3d", "dep:pollster", "dep:khal"]
-# biped — the LeRobot bipedal on nexus GPU physics + the URDF loader
-# (rapier3d-urdf, stl meshes → cheap Obb colliders). Used by the GPU biped examples.
-biped = ["pendulum", "dep:rapier3d-urdf", "dep:zealot-env"]
-# cpu — the LeRobot bipedal on rapier's CPU multibody (mature floating-base +
-# contacts). No nexus / cargo-gpu needed, so it builds and runs on any machine.
-# Includes the MuJoCo-XML model loader (roxmltree) — the curated standing model.
-cpu = ["dep:rapier3d", "dep:rapier3d-urdf", "dep:zealot-env", "dep:zealot-rl", "dep:roxmltree", "dep:rayon"]
 # biped_gpu — biped on nexus GPU physics, MJCF model. Pulls zealot-rl so the
 # nexus trainer can build (the smoke example doesn't need it, but it's a
 # negligible link-time addition).
-biped_gpu = ["pendulum", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "dep:rayon"]
+biped_gpu = ["dep:nexus3d", "dep:rapier3d", "dep:pollster", "dep:khal", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "dep:rayon", "dep:nalgebra", "dep:async-std", "dep:anyhow"]
 # cuda_backend — additively enables the native-CUDA (cuda-oxide) khal backend on
 # the vortx + nexus3d stack, alongside WebGPU. Selected at runtime via BIPED_CUDA=1.
 # Used for the all-native end-to-end benchmark (iter_e2e_bench). The cubins are
@@ -73,6 +63,10 @@ g1_web = ["web_demo"]
 g1_terrain_web = ["web_demo"]
 
 [dependencies]
+# Used by the operational [[bin]] targets (bins cannot see dev-dependencies).
+nalgebra = { version = "0.35", optional = true }
+async-std = { version = "1", features = ["attributes"], optional = true }
+anyhow = { version = "1", optional = true }
 cutile = { path = "../cutile-rs/cutile", optional = true }
 cutile-compiler = { path = "../cutile-rs/cutile-compiler", optional = true }
 cuda-core = { path = "../cutile-rs/cuda-core", optional = true }
@@ -80,9 +74,8 @@ cuda-async = { path = "../cutile-rs/cuda-async", optional = true }
 vortx = { version = "0.3", optional = true }
 zealot-gpu-obs = { path = "zealot-gpu-obs", optional = true }
 khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
-nexus3d = { path = "../nexus-unified/crates/nexus3d", features = ["rbd"], optional = true }
+nexus3d = { path = "../nexus/crates/nexus3d", features = ["rbd"], optional = true }
 rapier3d = { version = "0.34", optional = true }
-rapier3d-urdf = { version = "0.34", features = ["stl"], optional = true }
 roxmltree = { version = "0.20", optional = true }
 rayon = { version = "1", optional = true }
 pollster = { version = "0.4", optional = true }
@@ -123,20 +116,24 @@ getrandom = { version = "0.2", features = ["js"] }
 console_error_panic_hook = "0.1"
 
 [dev-dependencies]
-nalgebra = "0.35"
 wgpu = "29"
-async-std = { version = "1", features = ["attributes"] }
-anyhow = "1"
 
 # Fully GPU-resident trainer: GPU policy forward + GPU PPO update (vortx).
-[[example]]
+# Full-iteration end-to-end benchmark (rollout + PPO update), the perf-table
+# generator (scripts/perf_bench.sh -> bench/perf/).
+[[bin]]
+name = "iter_e2e_bench"
+path = "src/bin/iter_e2e_bench.rs"
+required-features = ["gpu", "biped_gpu"]
+
+[[bin]]
 name = "biped_train_gpu"
-path = "examples/biped/biped_train_gpu.rs"
+path = "src/bin/biped_train_gpu.rs"
 required-features = ["gpu", "biped_gpu"]
 
-[[example]]
+[[bin]]
 name = "zero_action_probe"
-path = "examples/biped/zero_action_probe.rs"
+path = "src/bin/zero_action_probe.rs"
 required-features = ["gpu", "biped_gpu"]
 
 # Train briefly on nexus then record a deterministic env-0 rollout to JSON.
@@ -144,9 +141,9 @@ required-features = ["gpu", "biped_gpu"]
 
 # Train briefly on nexus then record a deterministic env-0 rollout to JSON.
 # Render with `python3 examples/biped/render_biped.py <out.json> <out.mp4>`.
-[[example]]
+[[bin]]
 name = "biped_render_nexus"
-path = "examples/biped/biped_render_nexus.rs"
+path = "src/bin/biped_render_nexus.rs"
 required-features = ["biped_gpu", "gpu"]
 
 # Drive a trained policy with a constant velocity command and report where the
@@ -154,9 +151,9 @@ required-features = ["biped_gpu", "gpu"]
 
 # Drive a trained policy with a constant velocity command and report where the
 # robot goes (per-second pose, commanded-vs-achieved summary, ASCII path map).
-[[example]]
+[[bin]]
 name = "biped_drive"
-path = "examples/biped/biped_drive.rs"
+path = "src/bin/biped_drive.rs"
 required-features = ["biped_gpu"]
 
 # Numerical parity: GPU PPO output-grad kernels (vortx) vs scalar-CPU reference.
@@ -195,9 +192,4 @@ required-features = ["g1_web"]
 name = "g1_terrain_web"
 path = "examples/biped/g1_terrain_web.rs"
 required-features = ["g1_terrain_web"]
-
-[[example]]
-name = "passive_stand"
-path = "examples/biped/passive_stand.rs"
-required-features = ["gpu", "biped_gpu"]
 

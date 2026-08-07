@@ -127,7 +127,12 @@
         if (!files.length) throw new Error(`${ref.repo}: no .safetensors in the repo`);
         return `https://huggingface.co/${ref.repo}/resolve/main/${files[0]}`;
       }
-      const ckpt = new URLSearchParams(location.search).get('ckpt') || 'g1_walk_v26';
+      // Default: the `g1_walk_latest` release pointer — republished on each
+      // release (scripts/publish_policy.sh), so this page follows releases
+      // without a redeploy.
+      const ckpt =
+        new URLSearchParams(location.search).get('ckpt') ||
+        'haixuantao/zealot-g1-locomotion/g1_walk_latest.safetensors';
       const url = await ckptUrl(ckpt);
       const resp = await fetch(url);
       if (!resp.ok) throw new Error('checkpoint fetch failed: ' + ckpt + ' (' + resp.status + ')');
@@ -183,10 +188,13 @@
       };
     })();
     const HIST = 5;
-    // v24 and later append the base angular velocity (gyro) to the frame.
+    // v24 and later append the base angular velocity (gyro) to the frame;
+    // v28 appends the 5-slot step cue, which stays all-zero here (the
+    // trainer's "no step detected" pattern — this scene has no step oracle),
+    // so the Float64Array's zero-init already assembles it.
     const FRAME = policy.obsDim / HIST;
-    if (FRAME !== 45 && FRAME !== 48) throw new Error('obs dim ' + policy.obsDim);
-    const HAS_GYRO = FRAME === 48;
+    if (FRAME !== 45 && FRAME !== 48 && FRAME !== 53) throw new Error('obs dim ' + policy.obsDim);
+    const HAS_GYRO = FRAME >= 48;
 
     // ---- Scene.
     const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -398,7 +406,7 @@
       const bodies = [];
       const children = model.map(() => []);
       model.forEach((b, i) => { if (b.parent >= 0) children[b.parent].push(i); });
-      const r = { bodies, joints: [], epT: 0, actHist: [new Float64Array(12), new Float64Array(12)], prevQ: new Float64Array(12), hist: null, gaitPh: 0, x0, y0, z0 };
+      const r = { bodies, joints: [], epT: 0, actHist: [new Float64Array(12), new Float64Array(12)], prevQ: new Float64Array(12), hist: null, gaitPh: 0, x0, y0, z0, navCmd: [0, 0, 0], cmd: null };
       model.forEach((b, i) => {
         // The body carries the REAL inertial properties from the MJCF
         // (mass, center of mass, principal inertia — colliders stay
@@ -705,6 +713,7 @@
       const ty = TERRAIN ? Math.max(-3.6, Math.min(3.6, h.y)) : h.y;
       const tz = TERRAIN && terrain ? terrain.groundAt(tx, ty) : h.z;
       wander = false;
+      navSettle = false;
       navTarget = { x: tx, y: ty };
       navMarker.position.set(tx, ty, tz + 0.03);
       navMarker.visible = true;
@@ -713,17 +722,23 @@
       wander = false;
       navTarget = null;
       navMarker.visible = false;
+      navSettle = false;
+      robots.forEach((r) => { r.cmd = null; });
     }
-    // Slew-limit the autopilot command: a stand-to-full step input staggers
-    // the robot. Runs per 50 Hz control step (≈1 m/s² linear, 2 rad/s² yaw).
-    const navCmd = [0, 0, 0];
-    function slewTo(want) {
+    // A tapped target is "reached" by the FIRST robot to get there; the
+    // marker hides and everyone ramps down to a stand (settle phase).
+    let navSettle = false;
+    // Slew-limit the autopilot command, PER ROBOT: a stand-to-full step
+    // input staggers the robot. Runs per 50 Hz control step (≈1 m/s²
+    // linear, 2 rad/s² yaw). Robot 0's command mirrors into CMD for the HUD.
+    function slewR(r, want) {
       const lim = [0.02, 0.02, 0.04];
       for (let i = 0; i < 3; i++) {
-        const d = want[i] - navCmd[i];
-        navCmd[i] += Math.max(-lim[i], Math.min(lim[i], d));
-        CMD[i] = navCmd[i];
+        const d = want[i] - r.navCmd[i];
+        r.navCmd[i] += Math.max(-lim[i], Math.min(lim[i], d));
       }
+      r.cmd = r.navCmd;
+      if (r === robots[0]) { CMD[0] = r.navCmd[0]; CMD[1] = r.navCmd[1]; CMD[2] = r.navCmd[2]; }
     }
     function navDrive() {
       if (wander && !wanderSeeded && simTime > 0.3) {
@@ -731,31 +746,61 @@
         pickStroll();
       }
       if (!navTarget || !robots.length) return;
-      const t = robots[0].bodies[0].translation();
-      const dx = navTarget.x - t.x, dy = navTarget.y - t.y;
-      const dist = Math.hypot(dx, dy);
-      if (dist < 0.3) {
-        if (wander) {
-          wanderSeeded = false; // arrived: next stroll point next step
-        } else {
+      const n = robots.length;
+      // The WIN check runs against the MARKER itself — the tap ends when a
+      // robot touches the disc, never because a ring slot 0.6 m away was
+      // reached. The robot nearest the marker aims at it EXACTLY (so a
+      // touch can actually happen); the rest fan onto a ring so they don't
+      // shove each other on arrival.
+      const dMark = robots.map((r) => {
+        const t = r.bodies[0].translation();
+        return Math.hypot(navTarget.x - t.x, navTarget.y - t.y);
+      });
+      const center = dMark.indexOf(Math.min(...dMark));
+      const anyArrived = dMark.some((d) => d < 0.35);
+      for (let i = 0; i < n; i++) {
+        const r = robots[i];
+        const ring = n > 1 && i !== center;
+        const sr = ring ? 0.5 * Math.sqrt(n) : 0;
+        const sa = ring ? (2 * Math.PI * (i > center ? i - 1 : i)) / (n - 1) : 0;
+        const tx = navTarget.x + sr * Math.cos(sa);
+        const ty = Math.max(-3.6, Math.min(3.6, navTarget.y + sr * Math.sin(sa)));
+        const t = r.bodies[0].translation();
+        const dx = tx - t.x, dy = ty - t.y;
+        const dist = Math.hypot(dx, dy);
+        if (navSettle || dist < 0.3) {
+          slewR(r, [0, 0, 0]);
+          continue;
+        }
+        const q = r.bodies[0].rotation();
+        const f = new THREE.Vector3(1, 0, 0).applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w));
+        let err = Math.atan2(dy, dx) - Math.atan2(f.y, f.x);
+        err = Math.atan2(Math.sin(err), Math.cos(err));
+        // Turn toward the target; walk once roughly facing it, slowing on
+        // approach so the stop is a settle rather than an overshoot.
+        slewR(r, [
+          Math.abs(err) > 1.1
+            ? 0.1
+            : Math.max(0, Math.cos(err)) * Math.min(0.5, 0.2 + 0.3 * Math.min(dist, 1)),
+          0,
+          Math.max(-1, Math.min(1, 1.6 * err)),
+        ]);
+      }
+      if (wander) {
+        // The FIRST robot to arrive draws the next stroll point.
+        if (anyArrived) wanderSeeded = false;
+      } else if (navSettle) {
+        // Settle: everyone ramps to a stand, then the autopilot disengages.
+        if (robots.every((r) => r.navCmd.every((v) => Math.abs(v) < 0.01))) {
+          CMD[0] = CMD[1] = CMD[2] = 0;
+          navSettle = false;
           cancelNav();
         }
-        slewTo([0, 0, 0]);
-        return;
+      } else if (anyArrived) {
+        // First robot there wins the tap: hide the marker, stand down.
+        navSettle = true;
+        navMarker.visible = false;
       }
-      const q = robots[0].bodies[0].rotation();
-      const f = new THREE.Vector3(1, 0, 0).applyQuaternion(new THREE.Quaternion(q.x, q.y, q.z, q.w));
-      let err = Math.atan2(dy, dx) - Math.atan2(f.y, f.x);
-      err = Math.atan2(Math.sin(err), Math.cos(err));
-      // Turn toward the target; walk once roughly facing it, slowing on
-      // approach so the stop is a settle rather than an overshoot.
-      slewTo([
-        Math.abs(err) > 1.1
-          ? 0.1
-          : Math.max(0, Math.cos(err)) * Math.min(0.5, 0.2 + 0.3 * Math.min(dist, 1)),
-        0,
-        Math.max(-1, Math.min(1, 1.6 * err)),
-      ]);
     }
 
     const js = {};
@@ -773,8 +818,9 @@
           o[28 + j] = r.epT === 0 ? 0 : (q[j] - r.prevQ[j]) / DT;
         }
         const rot = r.bodies[0].rotation();
-        const cmdYaw = CMD[2];
-        o[12] = CMD[0]; o[13] = CMD[1]; o[14] = cmdYaw; o[15] = CMD[3];
+        // Autopilot steers each robot separately; manual input is global.
+        const rc = r.cmd ?? CMD;
+        o[12] = rc[0]; o[13] = rc[1]; o[14] = rc[2]; o[15] = CMD[3];
         // world-down in base frame (conjugate rotation of [0,0,-1])
         _qp.set(rot.x, rot.y, rot.z, rot.w).invert();
         const g = new THREE.Vector3(0, 0, -1).applyQuaternion(_qp);

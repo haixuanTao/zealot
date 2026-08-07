@@ -25,7 +25,7 @@ script:
 scripts/full_unified_chain.sh   # backend -> .ll -> O3 cubins -> trainer
 ```
 
-Prerequisites: sibling checkouts `../nexus-unified`, `../vortx-unified`,
+Prerequisites: sibling checkouts `../nexus`, `../vortx-unified`,
 `../khal-unified` (see the `[patch.crates-io]` table), a CUDA >= 12.8 `ptxas`,
 and libdevice. The backend builds from stock
 [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide) `main` (>= `6247276`;

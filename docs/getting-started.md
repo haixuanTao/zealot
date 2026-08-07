@@ -35,7 +35,7 @@ versions and gotchas. Then:
 ```sh
 # RTX-class GPU; ~71 k env-steps/s at N=4096 on a 5090
 BIPED_ROBOT=g1_29dof_agile BIPED_CUTILE_GEMM=1 BIPED_TERRAIN=1 \
-  cargo run --release --example biped_train_gpu \
+  cargo run --release --bin biped_train_gpu \
   --features "gpu biped_gpu cutile" -- 50000 4096 my_policy.safetensors
 ```
 
@@ -53,6 +53,15 @@ https://haixuantao.github.io/zealot/?ckpt=your-name/your-repo
 ```
 
 The demo detects the observation layout from the checkpoint itself.
+
+To make a policy the one the site loads by default, tag it as the latest
+release — the demo fetches the fixed name `g1_walk_latest.safetensors` from
+the [policy repo](https://huggingface.co/haixuantao/zealot-g1-locomotion)
+at boot, so this needs no site redeploy:
+
+```sh
+scripts/publish_policy.sh my_policy.safetensors g1_v27_iter50000
+```
 
 ---
 

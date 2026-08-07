@@ -17,3 +17,7 @@ overnight/STATUS
 /naga-fixed/
 *.safetensors
 checkpoints/
+.venv/
+bench/sim2sim/
+examples/biped/assets/
+website/public/bench/g1_*

@@ -17,7 +17,7 @@ handle or URL.
 
 Prerequisites: Node.js ≥ 20, Rust with the `wasm32-unknown-unknown` target
 (shader compilation needs the [`cargo-gpu`](https://github.com/Rust-GPU/cargo-gpu)
-toolchain), and the sibling `../nexus-unified` / `../khal-unified` checkouts
+toolchain), and the sibling `../nexus` / `../khal-unified` checkouts
 the workspace `[patch]` table points at.
 
 ```bash
