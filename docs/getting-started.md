@@ -33,15 +33,23 @@ Rust-GPU shader builds — see [development.md](development.md) for the exact
 versions and gotchas. Then:
 
 ```sh
-# RTX-class GPU; ~71 k env-steps/s at N=4096 on a 5090
-BIPED_ROBOT=g1_29dof_agile BIPED_CUTILE_GEMM=1 BIPED_TERRAIN=1 \
-  cargo run --release --bin biped_train_gpu \
-  --features "gpu biped_gpu cutile" -- 50000 4096 my_policy.safetensors
+# Auto-detects the backend: native CUDA (+cuTile) on an NVIDIA box,
+# WebGPU/Metal otherwise. ~71 k env-steps/s at N=4096 on a 5090.
+scripts/train.sh 50000 4096 my_policy.safetensors
 ```
+
+The **production config is the code default** — bare `train.sh` trains the
+29-DOF G1 with terrain curriculum, AGILE domain randomization, pushes, motor
+delay, 5-frame observation history, and the production reward weights. Every
+knob stays overridable via its `BIPED_*` env var; knobs consumed by more than
+one crate are declared exactly once in `zealot_env::knobs` (one source of
+truth — a default cannot fork between the env and the trainer). The startup
+log echoes the effective config, including
+`actor obs: 265 = 5 frames x 53 dims`.
 
 The checkpoint is a plain safetensors file: actor-critic weights plus the
 observation-normalizer state. Sim2sim harnesses for MuJoCo / Genesis / Isaac
-live in `scripts/` and `examples/biped/`.
+live in `scripts/`.
 
 ## 3. Watch *your* policy walk
 

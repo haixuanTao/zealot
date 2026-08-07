@@ -47,7 +47,8 @@ nexus itself provides the GPU physics + parallel environments (the Isaac Sim tie
 
 1. **Asset / scene description** — bodies, joints, collision, mass. Ships as
    MJCF in `assets/robots/`, generated from Unitree's official models and
-   parsed by an in-repo subset loader. `BIPED_ROBOT=` selects at runtime.
+   parsed by an in-repo subset loader. `BIPED_ROBOT=` selects at runtime
+   (default: `g1_29dof_agile`, the production platform).
 2. **Engine model** — nexus consumes rapier types; the asset path is always
    `MJCF → rapier → GPU`.
 3. **The MDP** — observations, rewards, terminations, resets. This is *code*
@@ -143,4 +144,4 @@ demo's JS terrain generator is a bit-faithful port of the Rust one, verified
 to 2e-10). Where the engines agree, believe the policy; where they diverge,
 you have found either an engine artifact being exploited or a genuine
 robustness gap. The same discipline extends natively to Genesis and Isaac
-harnesses, and to the real G1 via the deployment stack in `deploy/`.
+harnesses, and to the real G1 via the LeRobot deployment stack.

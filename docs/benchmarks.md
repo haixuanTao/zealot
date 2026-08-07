@@ -242,7 +242,7 @@ Reproduce:
 cargo run --release --bin iter_e2e_bench --features "gpu biped_gpu" -- <num_envs> 32 5 16
 # native CUDA + cuTile tf32 (the current native-CUDA column; needs the cuda-oxide
 # toolchain + embedded cubins; fixed-grid is the CUDA default)
-BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 cargo run --release --bin iter_e2e_bench \
+KHAL_BACKEND=cuda cargo run --release --bin iter_e2e_bench \
     --features "gpu biped_gpu cuda_backend cutile" -- <num_envs> 32 5 16
 # BIPED_CAPTURE=1 (rollout CUDA-graph capture) and the update's default graph path
 # are currently pathological on this driver (replay 4–7× slower than eager, see the
@@ -306,7 +306,7 @@ its repo):
 # bold column: full-body + AGILE-parity realism + terrain curriculum
 BIPED_ROBOT=g1_29dof_agile BIPED_SOLVER_ITERS=8 BIPED_MOTOR_DELAY=0,4 BIPED_OBS_HISTORY=5 \
     BIPED_TERRAIN=1 BIPED_CONTACT_REDUCE=1 BIPED_CONTACT_CAP=128 \
-    BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 \
+    KHAL_BACKEND=cuda \
     cargo run --release --bin iter_e2e_bench \
     --features "gpu biped_gpu cuda_backend cutile" -- <num_envs> 32 5 16
 ```
@@ -329,7 +329,7 @@ WBC-AGILE's T1 velocity policy (actor `[obs,256,256,128,12]`, critic
 ```sh
 # The fast path: native CUDA + cuTile tf32 GEMMs. Build WITH the `cutile` feature —
 # without it BIPED_CUTILE_GEMM silently no-ops and the update falls back ~20× slower.
-BIPED_ROBOT=g1 BIPED_CUTILE_GEMM=1 BIPED_CUDA=1 cargo run --release --bin biped_train_gpu \
+BIPED_ROBOT=g1 KHAL_BACKEND=cuda cargo run --release --bin biped_train_gpu \
     --features "gpu biped_gpu cuda_backend cutile" -- <iters> <num_envs> <ckpt.safetensors>
 ```
 
