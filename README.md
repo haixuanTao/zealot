@@ -71,3 +71,28 @@ Three steps — full walkthrough in
 3. **Watch *your* policy walk** — upload the checkpoint to Hugging Face and
    open `https://haixuantao.github.io/zealot/?ckpt=your-name/your-repo`.
 
+## Acknowledgements
+
+zealot stands on the shoulders of giants:
+
+- [**WBC-AGILE**](https://github.com/nvidia-isaac/WBC-AGILE) — the
+  whole-body-control velocity-tracking task, rewards, and curriculum this
+  stack ports; the reference implementation our policies are benchmarked
+  against.
+- [**nexus**](https://github.com/dimforge/nexus) — dimforge's cross-platform
+  GPU physics engine, the simulation core of the training environment.
+- [**vortx**](https://github.com/dimforge/vortx) and
+  [**khal**](https://github.com/dimforge/khal) — dimforge's portable GPU
+  compute layer that physics and learning both run on.
+- [**cuda-oxide**](https://github.com/NVlabs/cuda-oxide) — NVlabs'
+  Rust-to-PTX native CUDA backend, which lets the same kernels target
+  tensor-core CUDA.
+- [**Rust-GPU**](https://github.com/Rust-GPU/rust-gpu) — the Rust → SPIR-V
+  compiler behind the portable kernel builds.
+- [**wgpu**](https://github.com/gfx-rs/wgpu) and its shader translator
+  **naga** — WebGPU/Metal/Vulkan execution, including the in-browser demo.
+- [**rsl_rl**](https://github.com/leggedrobotics/rsl_rl) — the PPO trainer
+  design that `zealot-rl` reimplements in Rust.
+- [**MuJoCo**](https://github.com/google-deepmind/mujoco) — the reference
+  simulator used for sim-to-sim validation of every policy.
+
