@@ -21,24 +21,12 @@ pub struct ObsHistory {
     head: Vec<usize>,
 }
 
-/// Programmatic override for `BIPED_OBS_HISTORY` — for wasm demos, where env
-/// vars can't be set (same pattern as `robots::set_robot_override`).
-pub static OBS_HISTORY_OVERRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
 impl ObsHistory {
-    /// Parse `BIPED_OBS_HISTORY` (or [`OBS_HISTORY_OVERRIDE`]); `None` unless
-    /// it resolves to an `H > 1`.
+    /// Frame count from [`crate::knobs::OBS_HISTORY`] (THE single source —
+    /// the trainer sizes its network from the same knob); `None` unless
+    /// `H > 1`.
     pub fn from_env(n: usize, dim: usize) -> Option<Self> {
-        let h: usize = OBS_HISTORY_OVERRIDE.get().copied().unwrap_or_else(|| {
-            std::env::var("BIPED_OBS_HISTORY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                // 5 = the production default; MUST agree with the trainer's
-                // OBS_H read (src/bin/biped_train_gpu.rs). This defaulted to
-                // 1 while the trainer said 5 — v29's first 12k iters trained
-                // single-frame because only the trainer copy was updated.
-                .unwrap_or(5)
-        });
+        let h = crate::knobs::OBS_HISTORY.get();
         (h > 1).then(|| Self::new(n, h, dim))
     }
 

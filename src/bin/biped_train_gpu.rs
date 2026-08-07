@@ -98,11 +98,9 @@ static JSIGN: std::sync::LazyLock<[f32; NUM_JOINTS]> =
     std::sync::LazyLock::new(|| ROBOT.mirror_sign);
 /// BIPED_OBS_HISTORY frame count (1 = feature off) — must match the env's.
 static OBS_H: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("BIPED_OBS_HISTORY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&h| h > 1)
-        .unwrap_or(5)
+    // THE single source (zealot_env::knobs) — the env's frame stacking and
+    // this network sizing can no longer disagree (v29 lesson).
+    zealot_env::knobs::OBS_HISTORY.get().max(1)
 });
 fn jmirror(v: &[f32]) -> Vec<f32> {
     (0..NUM_JOINTS).map(|i| JSIGN[i] * v[JMIRROR[i]]).collect()
@@ -853,7 +851,7 @@ fn main() {
         // from iter 0). Note: episodes under a STANDING command travel < 2 m
         // and count as curriculum failures (AGILE has the same coupling);
         // consider BIPED_STAND_PROB=0 for terrain runs.
-        let terrain_on = std::env::var("BIPED_TERRAIN").as_deref() != Ok("0");
+        let terrain_on = zealot_env::knobs::TERRAIN.get();
         if terrain_on {
             println!(
                 "terrain curriculum drives difficulty: command scale pinned to 1.0 \

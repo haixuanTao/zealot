@@ -268,18 +268,12 @@ fn configure_env(terrain: bool, terrain_level: u32, terrain_amp_pct: u32, terrai
     // on. Obs layout: 5-frame history + force-sensed foot contact + the v7
     // gait-clock swing ratio. Training-only knobs (DR, pushes, mirror aug,
     // LR/grad, terrain curriculum) are intentionally NOT replicated.
-    let _ = biped_env_nexus::DECIMATION_OVERRIDE.set(4);
-    let _ = zealot_env::obs_history::OBS_HISTORY_OVERRIDE.set(5);
+    zealot_env::knobs::DECIMATION.set_override(4);
+    zealot_env::knobs::OBS_HISTORY.set_override(5);
     let mut overrides: std::collections::HashMap<&'static str, &'static str> = [
-        ("NEXUS_SUBSTEP_REFRESH", "1"),
         ("BIPED_SOLVER_ITERS", "4"),
-        ("BIPED_CONTACT_NF", "240"),
-        ("BIPED_CONTACT_DR", "1"),
         ("BIPED_MAX_CORR_VEL", "0.2"),
-        ("BIPED_OBS_HISTORY", "5"),
-        ("BIPED_CONTACT_SENSE", "1"),
         ("BIPED_GAIT_SWING_RATIO", "0.5"),
-        ("BIPED_CONTACT_CAP", "128"),
         // Hold the arms at the natural stand pose (joint zero = Unitree's
         // elbows-bent CAD zero — the "zombie arms").
     ]
@@ -288,8 +282,8 @@ fn configure_env(terrain: bool, terrain_level: u32, terrain_amp_pct: u32, terrai
     if terrain {
         // Rough-terrain strips (v7 trained on them): the robot spawns on its
         // difficulty patch; per-triangle contacts merged like training.
-        overrides.insert("BIPED_TERRAIN", "1");
-        overrides.insert("BIPED_CONTACT_REDUCE", "1");
+        zealot_env::knobs::TERRAIN.set_override(true);
+        zealot_env::knobs::CONTACT_REDUCE.set_override(true);
         // Start on visibly rough ground (levels 0-1 are near-flat); the
         // curriculum still promotes/demotes from here.
         overrides.insert(

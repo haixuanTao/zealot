@@ -59,10 +59,6 @@ use zealot_env::tasks::velocity_flat::{
 // gain at our timescales.
 const SOLVER_ITERS: u32 = 8;
 
-/// Programmatic override for `BIPED_DECIMATION` — for wasm demos, where env
-/// vars can't be set (`std::env::set_var` panics on wasm32-unknown-unknown).
-pub static DECIMATION_OVERRIDE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-
 /// Programmatic overrides for the `BIPED_*` sim-param knobs (same wasm
 /// rationale as [`DECIMATION_OVERRIDE`]). Consulted BEFORE the process
 /// environment by the sim-param reads in `build_scene`.
@@ -1167,8 +1163,8 @@ fn build_env_scene(
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(SOLVER_ITERS);
     sp.contact_natural_frequency =
-        env_f32("BIPED_CONTACT_NF").unwrap_or(240.0);
-    sp.contact_damping_ratio = env_f32("BIPED_CONTACT_DR").unwrap_or(1.0);
+        env_f32("BIPED_CONTACT_NF").unwrap_or_else(|| zealot_env::knobs::CONTACT_NF.get());
+    sp.contact_damping_ratio = env_f32("BIPED_CONTACT_DR").unwrap_or_else(|| zealot_env::knobs::CONTACT_DR.get());
     // Penetration-recovery knobs (A/B vs the Rapier game defaults 1mm/10m/s).
     // MuJoCo has NO velocity-level depenetration (critically-damped soft constraint
     // only); Isaac clamps max_depenetration_velocity to ~1 m/s in RL configs. The
@@ -1754,12 +1750,8 @@ impl BipedNexusBatchEnv {
         // vary ONLY how often the contact manifold is refreshed — the
         // deconfounding test for the "stale multibody contact across substeps"
         // hypothesis. Diagnostic only.
-        if let Some(d) = DECIMATION_OVERRIDE
-            .get()
-            .copied()
-            .or_else(|| env_var("BIPED_DECIMATION").ok().and_then(|s| s.parse().ok()))
-            .or(Some(4))
         {
+            let d = zealot_env::knobs::DECIMATION.get();
             task.decimation = d;
             task.sim_dt = 0.02 / d as f32;
         }
@@ -1885,7 +1877,7 @@ impl BipedNexusBatchEnv {
         // points per collider pair before the solvers (training-grade
         // approximation; flat-ground contacts unaffected). Biggest terrain
         // perf lever — the mb contact-constraint kernels scale with points.
-        if env_var("BIPED_CONTACT_REDUCE").as_deref() != Ok("0") {
+        if zealot_env::knobs::CONTACT_REDUCE.get() {
             pipeline.contact_reduction = true;
             println!("contact reduction ENABLED (per-pair manifolds merged to ≤4 points)");
         }
@@ -1911,7 +1903,7 @@ impl BipedNexusBatchEnv {
         // in ONE SharedShape (cloned across that family's envs so nexus dedupes
         // the mesh buffers to 3 uploads). ORIENTED pseudo-normals are required
         // by the nexus trimesh contact path; the strips are closed slabs.
-        let terrain_on = env_var("BIPED_TERRAIN").as_deref() != Ok("0");
+        let terrain_on = zealot_env::knobs::TERRAIN.get();
         let terrain_build = if terrain_on {
             let t0 = Instant::now();
             // BIPED_TERRAIN_AMP (amplitude multiplier, default 1) and
@@ -2018,10 +2010,7 @@ impl BipedNexusBatchEnv {
         // lazy in-step resize can't run once a CUDA graph is captured, and
         // overflowing pairs are silently dropped (feet sink into the mesh).
         {
-            let cap = env_var("BIPED_CONTACT_CAP")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(128);
+            let cap = zealot_env::knobs::CONTACT_CAP.get();
             state.reserve_contacts(&gpu, cap);
             println!("contact buffers pre-sized to {cap}/batch");
         }
@@ -2033,7 +2022,7 @@ impl BipedNexusBatchEnv {
         // foot-height proxy (which can't tell a planted foot from one hovering
         // just under the threshold). Threshold BIPED_CONTACT_FORCE_N (default
         // 1.0 N = AGILE's feet_slip contact_threshold).
-        let contact_sense = env_var("BIPED_CONTACT_SENSE").map_or(true, |v| v != "0");
+        let contact_sense = zealot_env::knobs::CONTACT_SENSE.get();
         let contact_force_n = env_var("BIPED_CONTACT_FORCE_N")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
@@ -2108,14 +2097,14 @@ impl BipedNexusBatchEnv {
             .set_implicit_coriolis(implicit_coriolis);
         // Decomposed refresh probe: implicit mode's per-substep dynamics +
         // constraint rebuild cadence with the explicit (coriolis-free) kernels.
-        let refresh_mode = env_or_override("NEXUS_SUBSTEP_REFRESH").unwrap_or_else(|| "1".into());
+        let refresh_mode = zealot_env::knobs::SUBSTEP_REFRESH.get();
         state
             .multibodies_mut()
-            .set_substep_refresh(refresh_mode == "1");
+            .set_substep_refresh(refresh_mode == 1);
         // "2": light split-cadence — constraints per substep, M/LU per sim-step.
         state
             .multibodies_mut()
-            .set_substep_refresh_light(refresh_mode == "2");
+            .set_substep_refresh_light(refresh_mode == 2);
 
         // Seed per-DOF Coulomb joint friction (MJCF `frictionloss`) into the
         // multibody. Env-major `[env][dof]` layout matching the velocity section:
