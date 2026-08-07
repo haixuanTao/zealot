@@ -53,7 +53,7 @@ fn full_body_agile_legs_match() {
 #[test]
 fn default_g1_known_deviations_from_agile() {
     let spec = unitree_g1();
-    for (i, &(name, kp, kd, effort, vel, armature, _sat, q0)) in
+    for (i, &(name, kp, kd, effort, vel, _armature, _sat, q0)) in
         AGILE_G1_ACTUATORS.iter().enumerate()
     {
         let j = &spec.joints[i];
