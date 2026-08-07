@@ -4309,7 +4309,60 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
 
     /// Reset one env by copying a randomly-chosen spawn template into its slot.
     /// Returns the fresh obs / critic_obs for that env.
+    /// Reset one env. Thin wrapper over [`Self::reset_envs`] — prefer the
+    /// batched form in the rollout loop, where the per-dispatch overhead of a
+    /// reset dwarfs the few kilobytes it moves.
     pub async fn reset_env(&mut self, env: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut out = self.reset_envs(&[env]).await;
+        out.pop().expect("reset_envs returns one entry per env")
+    }
+
+    /// Reset many envs with ONE multibody scatter dispatch for the whole set.
+    ///
+    /// Split into three phases so the GPU work batches: per-env host draws +
+    /// snapshot preparation, a single batched scatter, then per-env host
+    /// bookkeeping. Every env draws from its own RNG stream, so batching does
+    /// not perturb per-env determinism.
+    pub async fn reset_envs(&mut self, envs: &[usize]) -> Vec<(Vec<f32>, Vec<f32>)> {
+        if envs.is_empty() {
+            return Vec::new();
+        }
+        // Max envs per scatter dispatch. Default = the whole set (one dispatch
+        // per rollout step); `BIPED_RESET_BATCH=1` forces the old
+        // one-dispatch-per-env cadence, which is the A/B for isolating batching
+        // bugs from everything else.
+        let chunk = env_var("BIPED_RESET_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|c| *c > 0)
+            .unwrap_or(usize::MAX);
+
+        let mut out = Vec::with_capacity(envs.len());
+        for group in envs.chunks(chunk.min(envs.len().max(1))) {
+            let mut ts = Vec::with_capacity(group.len());
+            let mut snaps = Vec::with_capacity(group.len());
+            for &e in group {
+                let (t, snap) = self.reset_prepare(e);
+                ts.push(t);
+                snaps.push(snap);
+            }
+            let pairs: Vec<(u32, &RbdSnapshot)> = group
+                .iter()
+                .zip(snaps.iter())
+                .map(|(e, s)| (*e as u32, s))
+                .collect();
+            self.state.reset_envs_from_snapshots(&self.gpu, &pairs);
+            drop(pairs);
+            for (i, &e) in group.iter().enumerate() {
+                out.push(self.reset_finish(e, ts[i]).await);
+            }
+        }
+        out
+    }
+
+    /// Host half of a reset: the RNG draws + spawn placement, returning the
+    /// template index and the snapshot to scatter. No GPU work.
+    fn reset_prepare(&mut self, env: usize) -> (usize, RbdSnapshot) {
         // Pick a template via this env's RNG so reset choices are deterministic
         // for a given seed.
         let r = self.rng[env].range(0.0, 1.0);
@@ -4341,40 +4394,25 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         } else {
             None
         };
-        if self.terrain.is_some() {
-            // Teleport to the env's current difficulty patch (level was
-            // already updated by the curriculum when the episode ended).
-            let off = self.terrain_spawn_offset(env, t);
-            match &vels {
-                Some(v) => self.state.reset_env_from_snapshot_offset_vels(
-                    &self.gpu,
-                    env as u32,
-                    &self.template_snapshots[t],
-                    off,
-                    v,
-                ),
-                None => self.state.reset_env_from_snapshot_offset(
-                    &self.gpu,
-                    env as u32,
-                    &self.template_snapshots[t],
-                    off,
-                ),
-            }
+        // Teleport to the env's current difficulty patch (level was already
+        // updated by the curriculum when the episode ended).
+        let off = if self.terrain.is_some() {
+            Some(self.terrain_spawn_offset(env, t))
         } else {
-            match &vels {
-                Some(v) => self.state.reset_env_from_snapshot_vels(
-                    &self.gpu,
-                    env as u32,
-                    &self.template_snapshots[t],
-                    v,
-                ),
-                None => self.state.reset_env_from_snapshot(
-                    &self.gpu,
-                    env as u32,
-                    &self.template_snapshots[t],
-                ),
-            }
-        }
+            None
+        };
+        let snap = match (off, &vels) {
+            (Some(o), Some(v)) => self.template_snapshots[t].translated_with_dof_vels(o, v),
+            (Some(o), None) => self.template_snapshots[t].translated(o),
+            (None, Some(v)) => self.template_snapshots[t].with_dof_vels(v),
+            (None, None) => self.template_snapshots[t].clone(),
+        };
+        (t, snap)
+    }
+
+    /// Host half of a reset that runs AFTER the scatter: per-env bookkeeping and
+    /// the post-reset observation.
+    async fn reset_finish(&mut self, env: usize, t: usize) -> (Vec<f32>, Vec<f32>) {
         // Mirror the template's sole-normal so update_feet's tilt makes sense.
         // Cached per-template (constant) — NO per-reset rapier-scene rebuild.
         self.foot_sole_local[env] = self.template_foot_sole[t];

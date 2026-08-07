@@ -898,6 +898,8 @@ fn main() {
             let (mut total_reward, mut falls) = (0.0f32, 0u32);
             let t_roll = Instant::now();
             let mut reset_dur = std::time::Duration::ZERO;
+            // Envs terminating on the current step, reset as one batch.
+            let mut to_reset: Vec<usize> = Vec::with_capacity(n);
             for _ in 0..T {
                 for e in 0..n {
                     if norm_freeze {
@@ -954,15 +956,24 @@ fn main() {
                     rs[e].push(r);
                     ds[e].push(outs[e].done);
                     if outs[e].done {
-                        let tr = Instant::now();
-                        let (o, c) = env.reset_env(e).await;
-                        reset_dur += tr.elapsed();
-                        gc[e] = o;
-                        gcc[e] = c;
+                        // Deferred: every env terminating on this step is reset
+                        // together below, so the multibody scatter is ONE
+                        // dispatch for the whole step instead of one per env.
+                        to_reset.push(e);
                     } else {
                         gc[e].clone_from(&outs[e].obs);
                         gcc[e].clone_from(&outs[e].critic_obs);
                     }
+                }
+                if !to_reset.is_empty() {
+                    let tr = Instant::now();
+                    let fresh = env.reset_envs(&to_reset).await;
+                    reset_dur += tr.elapsed();
+                    for (&e, (o, c)) in to_reset.iter().zip(fresh) {
+                        gc[e] = o;
+                        gcc[e] = c;
+                    }
+                    to_reset.clear();
                 }
             }
 
