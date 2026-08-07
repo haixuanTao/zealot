@@ -648,6 +648,15 @@ fn main() {
         if mirror_aug {
             println!("mirror augmentation ENABLED (symmetric policy)");
         }
+        // Print the obs geometry so a config-echo comparison catches any
+        // trainer/env disagreement (the v29 single-frame bug hid because
+        // nothing echoed the dims).
+        println!(
+            "actor obs: {} = {} frames x {} dims (BIPED_OBS_HISTORY)",
+            OBS_FRAME * *OBS_H,
+            *OBS_H,
+            OBS_FRAME
+        );
         // Symmetry method 2 — LOSS (BIPED_MIRROR_LOSS=<weight>, 0=off): add an
         // auxiliary symmetry penalty ½·w·‖μ(s) − mirror(μ(mirror(s)))‖² to the
         // actor loss. Stop-gradient on the mirrored branch (the mirrored output
