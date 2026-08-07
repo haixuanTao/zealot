@@ -28,7 +28,8 @@ use khal::backend::{Backend, Buffer, GpuBackend as KhalGpuBackend};
 use khal::re_exports::wgpu;
 use nexus3d::rbd::dynamics::RbdSimParams;
 use nexus3d::rbd::math::Pose as NexusPose;
-use nexus3d::rbd::pipeline::{RbdPipeline, RbdSnapshot, RbdState};
+use nexus3d::rbd::math::Vector as NexusVector;
+use nexus3d::rbd::pipeline::{EnvResetSpec, RbdPipeline, RbdSnapshot, RbdState};
 use nexus3d::rbd::queries::GpuIndexedContact as NexusIndexedContact;
 use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint as NexusMbContact;
 use nexus3d::rbd::shaders::dynamics::MAX_CONTACT_SENSORS;
@@ -4340,19 +4341,28 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         let mut out = Vec::with_capacity(envs.len());
         for group in envs.chunks(chunk.min(envs.len().max(1))) {
             let mut ts = Vec::with_capacity(group.len());
-            let mut snaps = Vec::with_capacity(group.len());
+            let mut plans = Vec::with_capacity(group.len());
             for &e in group {
-                let (t, snap) = self.reset_prepare(e);
+                let (t, offset, vels) = self.reset_prepare(e);
                 ts.push(t);
-                snaps.push(snap);
+                plans.push((offset, vels));
             }
-            let pairs: Vec<(u32, &RbdSnapshot)> = group
+            // Borrow the templates directly — the spawn teleport is applied by
+            // the scatter kernel and the velocity override lands in the staging
+            // build, so nothing is cloned per reset.
+            let specs: Vec<EnvResetSpec<'_>> = group
                 .iter()
-                .zip(snaps.iter())
-                .map(|(e, s)| (*e as u32, s))
+                .zip(plans.iter())
+                .zip(ts.iter())
+                .map(|((e, (offset, vels)), t)| EnvResetSpec {
+                    dst_env: *e as u32,
+                    template: &self.template_snapshots[*t],
+                    offset: *offset,
+                    dof_vels: vels.as_deref(),
+                })
                 .collect();
-            self.state.reset_envs_from_snapshots(&self.gpu, &pairs);
-            drop(pairs);
+            self.state.reset_envs_from_snapshots(&self.gpu, &specs);
+            drop(specs);
             for (i, &e) in group.iter().enumerate() {
                 out.push(self.reset_finish(e, ts[i]).await);
             }
@@ -4361,8 +4371,9 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
     }
 
     /// Host half of a reset: the RNG draws + spawn placement, returning the
-    /// template index and the snapshot to scatter. No GPU work.
-    fn reset_prepare(&mut self, env: usize) -> (usize, RbdSnapshot) {
+    /// template index, the spawn offset and any velocity override. No GPU work,
+    /// and no snapshot clone — the kernel consumes the template in place.
+    fn reset_prepare(&mut self, env: usize) -> (usize, NexusVector, Option<Vec<f32>>) {
         // Pick a template via this env's RNG so reset choices are deterministic
         // for a given seed.
         let r = self.rng[env].range(0.0, 1.0);
@@ -4401,13 +4412,7 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         } else {
             None
         };
-        let snap = match (off, &vels) {
-            (Some(o), Some(v)) => self.template_snapshots[t].translated_with_dof_vels(o, v),
-            (Some(o), None) => self.template_snapshots[t].translated(o),
-            (None, Some(v)) => self.template_snapshots[t].with_dof_vels(v),
-            (None, None) => self.template_snapshots[t].clone(),
-        };
-        (t, snap)
+        (t, off.unwrap_or(NexusVector::ZERO), vels)
     }
 
     /// Host half of a reset that runs AFTER the scatter: per-env bookkeeping and
