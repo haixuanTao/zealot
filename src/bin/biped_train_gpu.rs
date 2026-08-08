@@ -39,7 +39,7 @@ use nalgebra::DMatrix;
 use std::time::Instant;
 use vortx::linalg::{
     Activation, Adam, AdamParams, Contiguous, Gemm, OpAssign, OpAssignVariant, Ppo, PpoActorParams,
-    PpoValueParams, Reduce, ReduceVariant,
+    PpoStageParams, PpoValueParams, Reduce, ReduceVariant,
 };
 use rayon::prelude::*;
 use vortx::shapes::TensorLayoutBuffers;
@@ -792,6 +792,34 @@ fn main() {
         let ad = Adam::from_backend(&bk).unwrap();
 
         let ppo = Ppo::from_backend(&bk).unwrap();
+        // Retain raw rollout observations on device so the PPO batch is built
+        // there (normalize + clamp + mirror) instead of on the host.
+        gpu.init_raw_batch(&bk, T).expect("raw batch buffers");
+        // Mirror as an explicit signed permutation, cross-checked against the
+        // real mirror functions before anything depends on it.
+        let (mirror_perm_obs, mirror_sign_obs) = mirror_table(od, mirror_obs);
+        let (mirror_perm_cobs, mirror_sign_cobs) = mirror_table(cd, mirror_critic);
+        // Mirror tables are constant; upload once.
+        let t_po = Tensor::vector(&bk, &mirror_perm_obs, BufferUsages::STORAGE).unwrap();
+        let t_so = Tensor::vector(&bk, &mirror_sign_obs, BufferUsages::STORAGE).unwrap();
+        let t_pc = Tensor::vector(&bk, &mirror_perm_cobs, BufferUsages::STORAGE).unwrap();
+        let t_sc = Tensor::vector(&bk, &mirror_sign_cobs, BufferUsages::STORAGE).unwrap();
+        {
+            let mut r = Lcg::new(7);
+            let xo: Vec<f32> = (0..od).map(|_| (r.unit() * 6.0 - 3.0)).collect();
+            let xc: Vec<f32> = (0..cd).map(|_| (r.unit() * 6.0 - 3.0)).collect();
+            let (ro, rc) = (mirror_obs(&xo), mirror_critic(&xc));
+            let mo = (0..od)
+                .map(|i| (mirror_sign_obs[i] * xo[mirror_perm_obs[i] as usize] - ro[i]).abs())
+                .fold(0.0f32, f32::max);
+            let mc = (0..cd)
+                .map(|i| (mirror_sign_cobs[i] * xc[mirror_perm_cobs[i] as usize] - rc[i]).abs())
+                .fold(0.0f32, f32::max);
+            assert!(mo == 0.0 && mc == 0.0, "mirror table mismatch: obs {mo}, critic {mc}");
+            println!(
+                "device batch staging ENABLED: mirror table verified (obs {od}, critic {cd}, exact)"
+            );
+        }
         let cont = Contiguous::from_backend(&bk).unwrap();
         let mut sh = TensorLayoutBuffers::new(&bk);
         let (st, rw) = (
@@ -915,6 +943,8 @@ fn main() {
         if norm_freeze {
             println!("obs-normalizer FREEZE enabled: per-iteration stats snapshot (exact PPO ratios)");
         }
+        // Persistent device-side PPO batch tensors (obs, critic).
+        let mut stage_out: Option<(Tensor<f32>, Tensor<f32>)> = None;
         let mut pn_obs = zealot_rl::ppo::PendingNorm::default();
         let mut pn_cobs = zealot_rl::ppo::PendingNorm::default();
 
@@ -1022,7 +1052,7 @@ fn main() {
             let roll_prof = std::env::var("BIPED_ROLL_PROF").is_ok();
             let (mut d_norm, mut d_fwd, mut d_samp, mut d_step, mut d_post) =
                 (0u128, 0u128, 0u128, 0u128, 0u128);
-            for _ in 0..T {
+            for step_i in 0..T {
                 let t_ph = Instant::now();
                 for e in 0..n {
                     if norm_freeze {
@@ -1036,7 +1066,7 @@ fn main() {
                     d_norm += t_ph.elapsed().as_micros();
                 }
                 let t_ph = Instant::now();
-                let (means, values) = gpu.forward(&bk, &ac, &gc, &gcc).await.unwrap();
+                let (means, values) = gpu.forward(&bk, &ac, &gc, &gcc, step_i).await.unwrap();
                 if roll_prof {
                     d_fwd += t_ph.elapsed().as_micros();
                 }
@@ -1181,64 +1211,104 @@ fn main() {
             let gae_s = t_gae.elapsed().as_secs_f64();
             // ---------------- GPU PPO UPDATE (persistent nets, advancing Adam) -------
             let t_upd = Instant::now();
-            if it == 0 {
-                // Cross-check the extracted tables against the real mirror on a
-                // random vector before anything depends on them.
-                let (po, so) = mirror_table(od, |x| mirror_obs(x));
-                let (pc, sc) = mirror_table(cd, |x| mirror_critic(x));
-                let mut r = Lcg::new(7);
-                let xo: Vec<f32> = (0..od).map(|_| (r.unit() * 6.0 - 3.0)).collect();
-                let xc: Vec<f32> = (0..cd).map(|_| (r.unit() * 6.0 - 3.0)).collect();
-                let ref_o = mirror_obs(&xo);
-                let ref_c = mirror_critic(&xc);
-                let max_o = (0..od)
-                    .map(|i| (so[i] * xo[po[i] as usize] - ref_o[i]).abs())
-                    .fold(0.0f32, f32::max);
-                let max_c = (0..cd)
-                    .map(|i| (sc[i] * xc[pc[i] as usize] - ref_c[i]).abs())
-                    .fold(0.0f32, f32::max);
-                assert!(max_o == 0.0 && max_c == 0.0, "mirror table mismatch: obs {max_o}, critic {max_c}");
-                println!("mirror table verified: obs {od} dims, critic {cd} dims (exact signed permutation)");
-            }
             let aff_o = ac.obs_norm.affine();
             let aff_c = ac.critic_norm.affine();
-            // Gather the per-sample vectors into contiguous arenas first.
-            //
-            // `batch` is ~400k Samples each owning its own heap `Vec`s (mirror
-            // augmentation clones every one), so a staging pass that walks
-            // `batch[c].obs` pays a cache miss per sample — and the row-blocked
-            // transpose repeats that walk once per block, ~8.7M misses across
-            // the three tensors. Touching each sample ONCE here and letting the
-            // transposes stream flat memory trades that for ~1.2M.
-            let mut obs_arena = vec![0f32; total * od];
-            let mut cobs_arena = vec![0f32; total * cd];
+            // ---- device-side batch build (obs + critic) ----
+            // The rollout already left the RAW observations on device
+            // (step-blocked), so the batch is assembled there: normalize +
+            // clamp + mirror augmentation in one dispatch per tensor. Nothing
+            // about obs is materialized on the host.
+            let half = if mirror_aug { total / 2 } else { 0 };
+            let stage_p = |dim: usize| PpoStageParams {
+                dim: dim as u32,
+                num_envs: n as u32,
+                horizon: T as u32,
+                total: total as u32,
+                mirror_half: half as u32,
+                clamp: 5.0,
+                pad0: 0,
+                pad1: 0,
+            };
+            // Only the normalizer affine changes per iteration (a few hundred
+            // floats); the mirror tables and the output tensors are persistent.
+            let up = |v: &[f32]| Tensor::vector(&bk, v, BufferUsages::STORAGE).unwrap();
+            let t_mo = up(&aff_o.0);
+            let t_io = up(&aff_o.1);
+            let t_mc = up(&aff_c.0);
+            let t_ic = up(&aff_c.1);
+            let po = Tensor::scalar(&bk, stage_p(od), BufferUsages::UNIFORM | BufferUsages::STORAGE)
+                .unwrap();
+            let pc = Tensor::scalar(&bk, stage_p(cd), BufferUsages::UNIFORM | BufferUsages::STORAGE)
+                .unwrap();
+            // Allocated ONCE (uninit — the kernel writes every element).
+            // Rebuilding these per iteration cost a host zero-fill plus a full
+            // upload of exactly the bytes this change exists to stop sending.
+            if stage_out.is_none() {
+                stage_out = Some((
+                    Tensor::matrix_uninit(&bk, od as u32, total as u32, st).unwrap(),
+                    Tensor::matrix_uninit(&bk, cd as u32, total as u32, st).unwrap(),
+                ));
+            }
+            let (f_obs, f_cobs) = stage_out.as_mut().unwrap();
+            {
+                let mut cur = EncCursor::new(&bk);
+                {
+                    let mut pass = cur.pass("ppo_stage_obs");
+                    ppo.stage_batch(
+                        &mut pass, &po, gpu.raw_obs(), &t_po, &t_so, &t_mo, &t_io, &mut *f_obs,
+                        (od * total) as u32,
+                    )
+                    .unwrap();
+                    ppo.stage_batch(
+                        &mut pass, &pc, gpu.raw_cobs(), &t_pc, &t_sc, &t_mc, &t_ic, &mut *f_cobs,
+                        (cd * total) as u32,
+                    )
+                    .unwrap();
+                }
+                cur.flush();
+            }
+            // Opt-in exactness check against the host staging path. A wrong
+            // column mapping here is SILENT — it trains on mismatched
+            // obs/action pairs and merely looks like worse learning — so this
+            // compares the device tensor element-for-element.
+            if std::env::var("BIPED_VERIFY_STAGE").is_ok() {
+                bk.synchronize().unwrap();
+                let dev: Vec<f32> = bk.slow_read_vec(f_obs.buffer()).await.unwrap();
+                let devc: Vec<f32> = bk.slow_read_vec(f_cobs.buffer()).await.unwrap();
+                let chk = |dim: usize,
+                           dev: &[f32],
+                           aff: &(Vec<f32>, Vec<f32>),
+                           get: &dyn Fn(usize) -> Vec<f32>| {
+                    let (mean, inv) = aff;
+                    let mut worst = 0.0f32;
+                    // Sample columns across both halves rather than all 400k.
+                    for c in (0..total).step_by((total / 4096).max(1)) {
+                        let src = get(c);
+                        for r in 0..dim {
+                            let want = ((src[r] - mean[r]) * inv[r]).clamp(-5.0, 5.0);
+                            let got = dev[r * total + c];
+                            worst = worst.max((want - got).abs());
+                        }
+                    }
+                    worst
+                };
+                let wo = chk(od, &dev, &aff_o, &|c| {
+                    if c < half { mirror_obs(&batch[c + half].obs) } else { batch[c].obs.clone() }
+                });
+                let wc = chk(cd, &devc, &aff_c, &|c| {
+                    if c < half {
+                        mirror_critic(&batch[c + half].critic_obs)
+                    } else {
+                        batch[c].critic_obs.clone()
+                    }
+                });
+                println!("[verify_stage] obs maxdiff={wo:.3e} critic maxdiff={wc:.3e}");
+            }
             let mut act_arena = vec![0f32; total * ad_];
-            rayon::scope(|s| {
-                s.spawn(|_| {
-                    obs_arena
-                        .par_chunks_mut(od)
-                        .zip(batch.par_iter())
-                        .for_each(|(dst, smp)| dst.copy_from_slice(&smp.obs));
-                });
-                s.spawn(|_| {
-                    cobs_arena
-                        .par_chunks_mut(cd)
-                        .zip(batch.par_iter())
-                        .for_each(|(dst, smp)| dst.copy_from_slice(&smp.critic_obs));
-                });
-                s.spawn(|_| {
-                    act_arena
-                        .par_chunks_mut(ad_)
-                        .zip(batch.par_iter())
-                        .for_each(|(dst, smp)| dst.copy_from_slice(&smp.action));
-                });
-            });
-            let f_obs = stage_rows(&bk, od, total, Some(&aff_o), st, |c| {
-                &obs_arena[c * od..(c + 1) * od]
-            });
-            let f_cobs = stage_rows(&bk, cd, total, Some(&aff_c), st, |c| {
-                &cobs_arena[c * cd..(c + 1) * cd]
-            });
+            act_arena
+                .par_chunks_mut(ad_)
+                .zip(batch.par_iter())
+                .for_each(|(dst, smp)| dst.copy_from_slice(&smp.action));
             // LOSS: normalized MIRRORED obs (normalize ∘ mirror — exact, not
             // mirror ∘ normalize), and refresh the stop-grad target net to the
             // current (iter-start) actor weights.

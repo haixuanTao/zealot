@@ -177,6 +177,14 @@ pub struct GpuPolicy {
     /// step allocates nothing.
     scratch_obs: Vec<f32>,
     scratch_cobs: Vec<f32>,
+    /// Same, holding the UNNORMALIZED values destined for the raw batch.
+    scratch_raw_obs: Vec<f32>,
+    scratch_raw_cobs: Vec<f32>,
+    /// Step-blocked `[T][dim][n]` raw rollout observations, retained on device
+    /// so the PPO update can build its batch there instead of on the host.
+    /// `None` until `init_raw_batch`.
+    raw_obs: Option<Tensor<f32>>,
+    raw_cobs: Option<Tensor<f32>>,
 }
 
 impl GpuPolicy {
@@ -186,6 +194,10 @@ impl GpuPolicy {
         Ok(Self {
             scratch_obs: vec![0.0; ac.actor.dims[0] * n],
             scratch_cobs: vec![0.0; ac.critic.dims[0] * n],
+            scratch_raw_obs: vec![0.0; ac.actor.dims[0] * n],
+            scratch_raw_cobs: vec![0.0; ac.critic.dims[0] * n],
+            raw_obs: None,
+            raw_cobs: None,
             actor: GpuNet::new(backend, &ac.actor, n),
             critic: GpuNet::new(backend, &ac.critic, n),
             ops: Ops {
@@ -220,6 +232,7 @@ impl GpuPolicy {
         ac: &ActorCritic,
         cur: &[Vec<f32>],
         cur_c: &[Vec<f32>],
+        step: usize,
     ) -> anyhow::Result<(Vec<[f32; NUM_JOINTS]>, Vec<f32>)> {
         let n = self.n;
         debug_assert_eq!(cur.len(), n);
@@ -232,16 +245,28 @@ impl GpuPolicy {
         // walked ~n·dim floats three times and allocated twice, every rollout
         // step. The normalizer is a per-feature affine, so hoisting (mean, 1/σ)
         // lets one parallel pass over ROWS write the buffer directly.
-        fn fill_rows(dst: &mut [f32], dim: usize, n: usize, aff: &(Vec<f32>, Vec<f32>), src: &[Vec<f32>]) {
+        fn fill_rows(
+            dst: &mut [f32],
+            raw_dst: &mut [f32],
+            dim: usize,
+            n: usize,
+            aff: &(Vec<f32>, Vec<f32>),
+            src: &[Vec<f32>],
+        ) {
             let (mean, inv_sd) = aff;
             dst[..dim * n]
                 .par_chunks_mut(n)
+                .zip(raw_dst[..dim * n].par_chunks_mut(n))
                 .enumerate()
-                .for_each(|(r, row)| {
+                .for_each(|(r, (row, raw_row))| {
                     let (m, s) = (mean[r], inv_sd[r]);
-                    for (e, d) in row.iter_mut().enumerate() {
+                    for (e, (d, rd)) in row.iter_mut().zip(raw_row.iter_mut()).enumerate() {
+                        let x = src[e][r];
+                        // The RAW value is what the batch keeps: the mirror is
+                        // defined on raw obs and the ±5 clamp below is lossy.
+                        *rd = x;
                         // Same ±5 clamp as `Normalizer::normalize`.
-                        *d = ((src[e][r] - m) * s).clamp(-5.0, 5.0);
+                        *d = ((x - m) * s).clamp(-5.0, 5.0);
                     }
                 });
         }
@@ -249,14 +274,28 @@ impl GpuPolicy {
         let aff_c = ac.critic_norm.affine();
         let mut so = std::mem::take(&mut self.scratch_obs);
         let mut sc = std::mem::take(&mut self.scratch_cobs);
+        let mut ro = std::mem::take(&mut self.scratch_raw_obs);
+        let mut rc = std::mem::take(&mut self.scratch_raw_cobs);
         so.resize(obs_dim * n, 0.0);
         sc.resize(crit_dim * n, 0.0);
-        fill_rows(&mut so, obs_dim, n, &aff_o, cur);
-        fill_rows(&mut sc, crit_dim, n, &aff_c, cur_c);
+        ro.resize(obs_dim * n, 0.0);
+        rc.resize(crit_dim * n, 0.0);
+        fill_rows(&mut so, &mut ro, obs_dim, n, &aff_o, cur);
+        fill_rows(&mut sc, &mut rc, crit_dim, n, &aff_c, cur_c);
         backend.write_buffer(self.actor.a[0].buffer_mut(), 0, &so[..obs_dim * n])?;
         backend.write_buffer(self.critic.a[0].buffer_mut(), 0, &sc[..crit_dim * n])?;
+        // Retain this step's raw block for the device-side batch build. The
+        // buffer is step-blocked, so this is ONE contiguous write per step.
+        if let Some(rb) = self.raw_obs.as_mut() {
+            backend.write_buffer(rb.buffer_mut(), (step * obs_dim * n) as u64, &ro[..obs_dim * n])?;
+        }
+        if let Some(rb) = self.raw_cobs.as_mut() {
+            backend.write_buffer(rb.buffer_mut(), (step * crit_dim * n) as u64, &rc[..crit_dim * n])?;
+        }
         self.scratch_obs = so;
         self.scratch_cobs = sc;
+        self.scratch_raw_obs = ro;
+        self.scratch_raw_cobs = rc;
 
         let mut cur = EncCursor::new(backend);
         self.actor
@@ -277,6 +316,26 @@ impl GpuPolicy {
         }
         let values: Vec<f32> = (0..n).map(|e| c_out[e]).collect();
         Ok((means, values))
+    }
+
+    /// Allocate the step-blocked raw-observation batch buffers (`[T][dim][n]`).
+    pub fn init_raw_batch(&mut self, backend: &GpuBackend, horizon: usize) -> anyhow::Result<()> {
+        let n = self.n;
+        let (od, cd) = (self.actor.dims[0], self.critic.dims[0]);
+        let u = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        self.raw_obs = Some(Tensor::vector_uninit(backend, (horizon * od * n) as u32, u)?);
+        self.raw_cobs = Some(Tensor::vector_uninit(backend, (horizon * cd * n) as u32, u)?);
+        Ok(())
+    }
+
+    /// The retained raw rollout observations (`[T][obs_dim][n]`).
+    pub fn raw_obs(&self) -> &Tensor<f32> {
+        self.raw_obs.as_ref().expect("init_raw_batch not called")
+    }
+
+    /// The retained raw critic observations (`[T][critic_dim][n]`).
+    pub fn raw_cobs(&self) -> &Tensor<f32> {
+        self.raw_cobs.as_ref().expect("init_raw_batch not called")
     }
 
     /// GPU-resident actor access: the input activation tensor (row-major
