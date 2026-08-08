@@ -17,6 +17,7 @@ use khal::BufferUsages;
 use khal::Shader;
 use khal::backend::{Backend, Encoder, GpuBackend};
 use nalgebra::DMatrix;
+use rayon::prelude::*;
 use vortx::linalg::{Activation, Gemm, OpAssign, OpAssignVariant};
 use vortx::shapes::TensorLayoutBuffers;
 use vortx::tensor::Tensor;
@@ -172,6 +173,10 @@ pub struct GpuPolicy {
     n: usize,
     /// cuTile tf32 fused-forward adapter (BIPED_CUTILE_GEMM=1); None = vortx.
     ct: Option<&'static CutileGemm>,
+    /// Reusable row-major staging for the per-step policy inputs, so a rollout
+    /// step allocates nothing.
+    scratch_obs: Vec<f32>,
+    scratch_cobs: Vec<f32>,
 }
 
 impl GpuPolicy {
@@ -179,6 +184,8 @@ impl GpuPolicy {
     /// sizing the activation buffers for `n` envs.
     pub fn new(backend: &GpuBackend, ac: &ActorCritic, n: usize) -> anyhow::Result<Self> {
         Ok(Self {
+            scratch_obs: vec![0.0; ac.actor.dims[0] * n],
+            scratch_cobs: vec![0.0; ac.critic.dims[0] * n],
             actor: GpuNet::new(backend, &ac.actor, n),
             critic: GpuNet::new(backend, &ac.critic, n),
             ops: Ops {
@@ -218,13 +225,38 @@ impl GpuPolicy {
         debug_assert_eq!(cur.len(), n);
         let (obs_dim, crit_dim) = (self.actor.dims[0], self.critic.dims[0]);
 
-        // Normalize on CPU (cheap, O(n·dim)) then pack column-major-by-env.
-        let obs_norm: Vec<Vec<f32>> = cur.iter().map(|o| ac.obs_norm.normalize(o)).collect();
-        let crit_norm: Vec<Vec<f32>> = cur_c.iter().map(|o| ac.critic_norm.normalize(o)).collect();
-        let obs_m = DMatrix::from_fn(obs_dim, n, |r, c| obs_norm[c][r]);
-        let crit_m = DMatrix::from_fn(crit_dim, n, |r, c| crit_norm[c][r]);
-        self.actor.set_input(backend, &obs_m);
-        self.critic.set_input(backend, &crit_m);
+        // Normalize straight into vortx's ROW-MAJOR input layout in one pass.
+        //
+        // The previous spelling — a `Vec` per env from `normalize`, then a
+        // column-major `DMatrix`, then `set_input`'s row-major re-flatten —
+        // walked ~n·dim floats three times and allocated twice, every rollout
+        // step. The normalizer is a per-feature affine, so hoisting (mean, 1/σ)
+        // lets one parallel pass over ROWS write the buffer directly.
+        fn fill_rows(dst: &mut [f32], dim: usize, n: usize, aff: &(Vec<f32>, Vec<f32>), src: &[Vec<f32>]) {
+            let (mean, inv_sd) = aff;
+            dst[..dim * n]
+                .par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(r, row)| {
+                    let (m, s) = (mean[r], inv_sd[r]);
+                    for (e, d) in row.iter_mut().enumerate() {
+                        // Same ±5 clamp as `Normalizer::normalize`.
+                        *d = ((src[e][r] - m) * s).clamp(-5.0, 5.0);
+                    }
+                });
+        }
+        let aff_o = ac.obs_norm.affine();
+        let aff_c = ac.critic_norm.affine();
+        let mut so = std::mem::take(&mut self.scratch_obs);
+        let mut sc = std::mem::take(&mut self.scratch_cobs);
+        so.resize(obs_dim * n, 0.0);
+        sc.resize(crit_dim * n, 0.0);
+        fill_rows(&mut so, obs_dim, n, &aff_o, cur);
+        fill_rows(&mut sc, crit_dim, n, &aff_c, cur_c);
+        backend.write_buffer(self.actor.a[0].buffer_mut(), 0, &so[..obs_dim * n])?;
+        backend.write_buffer(self.critic.a[0].buffer_mut(), 0, &sc[..crit_dim * n])?;
+        self.scratch_obs = so;
+        self.scratch_cobs = sc;
 
         let mut cur = EncCursor::new(backend);
         self.actor
