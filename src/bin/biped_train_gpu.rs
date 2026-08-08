@@ -74,6 +74,11 @@ const DESIRED_KL: f32 = 0.01;
 const LR_MIN: f32 = 1e-5;
 const LR_MAX: f32 = 1e-2;
 
+/// Count of normalized values that hit the +/-5 clamp (BIPED_CLAMP_PROBE=1).
+/// Decides whether the mirrored half of the PPO batch can be derived from the
+/// NORMALIZED obs by an exact affine, or needs the raw obs.
+static CLAMP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn mk(b: &GpuBackend, m: &DMatrix<f32>, u: BufferUsages) -> Tensor<f32> {
     Tensor::matrix_from_na(b, m, u).unwrap()
 }
@@ -112,13 +117,20 @@ fn stage_rows<'a>(
             match affine {
                 // Same clamp as `Normalizer::normalize` — keep them in lockstep.
                 Some((mean, inv_sd)) => {
+                    let mut hits = 0u64;
                     for c in 0..total {
                         let src = get(c);
                         for rr in 0..nr {
                             let r = r0 + rr;
-                            chunk[rr * total + c] =
-                                ((src[r] - mean[r]) * inv_sd[r]).clamp(-5.0, 5.0);
+                            let v = (src[r] - mean[r]) * inv_sd[r];
+                            if v > 5.0 || v < -5.0 {
+                                hits += 1;
+                            }
+                            chunk[rr * total + c] = v.clamp(-5.0, 5.0);
                         }
+                    }
+                    if hits > 0 && std::env::var("BIPED_CLAMP_PROBE").is_ok() {
+                        CLAMP_HITS.fetch_add(hits, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 None => {
@@ -1734,6 +1746,10 @@ fn main() {
                 // W&B sidecar (`wandb_logger.py` parses the `[rb]` prefix). Mean of
                 // each reward term over the window since the last drain, plus
                 // episode-termination counts split by cause.
+                if std::env::var("BIPED_CLAMP_PROBE").is_ok() {
+                    let h = CLAMP_HITS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    println!("[clamp] staged values hitting +/-5 since last: {h}");
+                }
                 if let Some(rl) = env.take_reward_log() {
                     let mut s = format!("[rb] iter {it}");
                     for (name, v) in REWARD_COMP_NAMES.iter().zip(rl.comps.iter()) {
