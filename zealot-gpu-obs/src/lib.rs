@@ -302,18 +302,25 @@ pub struct GpuFeetState {
     have_prev: Tensor<u32>,
     have_prev_force: Tensor<u32>,
     out: Tensor<f32>,
+    /// Reset path: shader + the resetting-env id list and its params.
+    reset_shader: FeetResetShader,
+    reset_ids: Tensor<u32>,
+    reset_params: Tensor<glamx::UVec4>,
     n: usize,
+}
+
+/// Host binding for the feet history reset.
+#[derive(Shader)]
+struct FeetResetShader {
+    reset: shaders::GpuFeetReset,
 }
 
 /// Per-step inputs for [`GpuFeetState::compute`].
 pub struct FeetInputs<'a> {
     pub sole_local: &'a [f32],
-    pub prev_foot_pos: &'a [f32],
+    pub prev_force: &'a [f32],
     pub ground_h: &'a [f32],
     pub sensed_force: &'a [f32],
-    pub prev_force: &'a [f32],
-    pub air_time: &'a [f32],
-    pub last_td: &'a [f32],
     pub have_prev: &'a [u32],
     pub have_prev_force: &'a [u32],
 }
@@ -343,13 +350,69 @@ impl GpuFeetState {
             ground_h: f(n_feet * n)?,
             sensed_force: f(n_feet * n)?,
             prev_force: f(n_feet * n)?,
-            air_time: f(n_feet * n)?,
-            last_td: f(n)?,
+            air_time: Tensor::vector(
+                backend,
+                &vec![0.0f32; n_feet * n],
+                st | BufferUsages::COPY_SRC,
+            )?,
+            last_td: Tensor::vector(backend, &vec![-1.0f32; n], st | BufferUsages::COPY_SRC)?,
             have_prev: Tensor::vector(backend, &vec![0u32; n], st)?,
             have_prev_force: Tensor::vector(backend, &vec![0u32; n], st)?,
             out: Tensor::vector_uninit(backend, (26 * n) as u32, st | BufferUsages::COPY_SRC)?,
+            reset_shader: FeetResetShader::from_backend(backend)?,
+            reset_ids: Tensor::vector(backend, &vec![0u32; n], st)?,
+            reset_params: Tensor::scalar(
+                backend,
+                glamx::UVec4::new(0, n as u32, n_feet as u32, 0),
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
             n,
         })
+    }
+
+    /// Clear the device-owned history for the envs that just reset.
+    pub async fn reset(
+        &mut self,
+        backend: &GpuBackend,
+        env_ids: &[u32],
+        seed_force: &[f32],
+    ) -> Result<(), GpuBackendError> {
+        if env_ids.is_empty() {
+            return Ok(());
+        }
+        backend.write_buffer(self.reset_ids.buffer_mut(), 0, env_ids)?;
+        backend.write_buffer(self.sensed_force.buffer_mut(), 0, seed_force)?;
+        backend.write_buffer(
+            self.reset_params.buffer_mut(),
+            0,
+            &[glamx::UVec4::new(env_ids.len() as u32, self.n as u32, 2, 0)],
+        )?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[reward] feet reset", None);
+            self.reset_shader.reset.call(
+                &mut pass,
+                env_ids.len() as u32,
+                &self.reset_params,
+                &self.reset_ids,
+                &self.sensed_force,
+                &mut self.air_time,
+                &mut self.last_td,
+            )?;
+        }
+        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Device-owned history, for the sync check: (air_time `[nf x n]`,
+    /// last_td `[n]`).
+    pub async fn read_history(
+        &self,
+        backend: &GpuBackend,
+    ) -> Result<(Vec<f32>, Vec<f32>), GpuBackendError> {
+        let a = backend.slow_read_vec(self.air_time.buffer()).await?;
+        let l = backend.slow_read_vec(self.last_td.buffer()).await?;
+        Ok((a, l))
     }
 
     /// Returns `[26 x n]`: per foot i at offset i*11 — contact, first_contact,
@@ -361,13 +424,13 @@ impl GpuFeetState {
         body_poses: &Tensor<glamx::Pose3>,
         inputs: FeetInputs<'_>,
     ) -> Result<Vec<f32>, GpuBackendError> {
+        // air_time / last_td / prev_force / prev_foot_pos are DEVICE-OWNED now:
+        // the kernel commits them at the end of each step and `reset` clears
+        // them, so they are never uploaded here.
         backend.write_buffer(self.sole_local.buffer_mut(), 0, inputs.sole_local)?;
-        backend.write_buffer(self.prev_foot_pos.buffer_mut(), 0, inputs.prev_foot_pos)?;
         backend.write_buffer(self.ground_h.buffer_mut(), 0, inputs.ground_h)?;
         backend.write_buffer(self.sensed_force.buffer_mut(), 0, inputs.sensed_force)?;
         backend.write_buffer(self.prev_force.buffer_mut(), 0, inputs.prev_force)?;
-        backend.write_buffer(self.air_time.buffer_mut(), 0, inputs.air_time)?;
-        backend.write_buffer(self.last_td.buffer_mut(), 0, inputs.last_td)?;
         backend.write_buffer(self.have_prev.buffer_mut(), 0, inputs.have_prev)?;
         backend.write_buffer(self.have_prev_force.buffer_mut(), 0, inputs.have_prev_force)?;
         let mut enc = backend.begin_encoding();
@@ -381,12 +444,12 @@ impl GpuFeetState {
                 &self.foot_links,
                 &self.foot_fwd,
                 &self.sole_local,
-                &self.prev_foot_pos,
+                &mut self.prev_foot_pos,
                 &self.ground_h,
                 &self.sensed_force,
-                &self.prev_force,
-                &self.air_time,
-                &self.last_td,
+                &mut self.prev_force,
+                &mut self.air_time,
+                &mut self.last_td,
                 &self.have_prev,
                 &self.have_prev_force,
                 &mut self.out,

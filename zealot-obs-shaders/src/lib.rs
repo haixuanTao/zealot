@@ -41,7 +41,7 @@
 
 #![cfg_attr(target_arch = "spirv", no_std)]
 
-use khal_std::glamx::{Pose3, UVec3, Vec4};
+use khal_std::glamx::{Pose3, UVec3, UVec4, Vec4};
 use khal_std::index::MaybeIndexUnchecked;
 use khal_std::macros::{spirv, spirv_bindgen};
 #[allow(unused_imports)]
@@ -968,12 +968,12 @@ pub fn gpu_feet_state(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] foot_links: &[u32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] foot_fwd_local: &[f32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] sole_local: &[f32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] prev_foot_pos: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] prev_foot_pos: &mut [f32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] ground_h: &[f32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] sensed_force: &[f32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 8)] prev_force: &[f32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 9)] air_time: &[f32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 10)] last_td_foot: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 9)] air_time: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 10)] last_td_foot: &mut [f32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 11)] have_prev: &[u32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 12)] have_prev_force: &[u32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 13)] out: &mut [f32],
@@ -1056,6 +1056,18 @@ pub fn gpu_feet_state(
             out.write((b + 10) * n + e, force_rate);
             out.write((22 + i) * n + e, if alt_step { 1.0 } else { 0.0 });
             out.write((24 + i) * n + e, new_air);
+
+            // Commit the per-env history the host used to own. `last_td_foot`
+            // takes the LAST foot to touch down this step, matching the host's
+            // serial commit (`if td_foot >= 0 { last_td_foot = td_foot }`,
+            // last-wins when both land).
+            air_time.write(i * n + e, new_air);
+            prev_foot_pos.write((i * 3) * n + e, px);
+            prev_foot_pos.write((i * 3 + 1) * n + e, py);
+            prev_foot_pos.write((i * 3 + 2) * n + e, pz);
+            if first_contact {
+                last_td_foot.write(e, i as f32);
+            }
         }
     }
 }
@@ -1426,5 +1438,36 @@ pub fn gpu_reward_misc_terms(
             2 * n + e,
             if fell.read(e) != 0 { params.w_termination } else { 0.0 },
         );
+    }
+}
+
+/// Clear the per-env feet history for the environments that just reset.
+///
+/// Mirrors the host reset: air time to zero, last-touchdown foot to −1 (so the
+/// first step after a reset counts as alternating), and the previous sensed
+/// force seeded from the current one. `env_ids` lists the resetting envs, so
+/// this is one dispatch per reset batch rather than per env.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_feet_reset(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &UVec4,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] env_ids: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] seed_force: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] air_time: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] last_td_foot: &mut [f32],
+) {
+    // params: x = count, y = n_envs, z = n_feet
+    let k = invocation_id.x as usize;
+    let count = params.x as usize;
+    let n = params.y as usize;
+    let nf = params.z as usize;
+    if k < count {
+        let e = env_ids.read(k) as usize;
+        last_td_foot.write(e, -1.0);
+        for i in 0..nf {
+            air_time.write(i * n + e, 0.0);
+        }
+        let _ = seed_force;
     }
 }

@@ -4639,24 +4639,16 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 );
             }
             let mut sole = vec![0.0f32; NUM_FEET * 3 * n];
-            let mut pfp = vec![0.0f32; NUM_FEET * 3 * n];
             let mut fgh = vec![0.0f32; NUM_FEET * n];
             let mut sfv = vec![0.0f32; NUM_FEET * n];
             let mut pfv = vec![0.0f32; NUM_FEET * n];
-            let mut atv = vec![0.0f32; NUM_FEET * n];
-            let mut ltd = vec![0.0f32; n];
             for e in 0..n {
-                ltd[e] = self.last_td_foot[e] as f32;
                 for i in 0..NUM_FEET {
                     let sl = self.foot_sole_local[e][i];
                     sole[(i * 3) * n + e] = sl.x;
                     sole[(i * 3 + 1) * n + e] = sl.y;
                     sole[(i * 3 + 2) * n + e] = sl.z;
                     let link = self.idx.foot_links[i] as usize;
-                    let pp = self.prev_body_poses[e * cpb + link].translation;
-                    pfp[(i * 3) * n + e] = pp.x;
-                    pfp[(i * 3 + 1) * n + e] = pp.y;
-                    pfp[(i * 3 + 2) * n + e] = pp.z;
                     let fpz = &poses[e * cpb + link].translation;
                     fgh[i * n + e] = self
                         .terrain
@@ -4664,7 +4656,6 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         .map_or(0.0, |ter| ter.strip_for(e).height(fpz.x, fpz.y));
                     sfv[i * n + e] = self.sensed_force[e][i];
                     pfv[i * n + e] = self.prev_sensed_force[e][i];
-                    atv[i * n + e] = self.air_time[e][i];
                 }
             }
             let hpf: Vec<u32> = (0..n).map(|e| self.has_prev_force[e] as u32).collect();
@@ -4678,12 +4669,9 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     poses_t3,
                     zealot_gpu_obs::FeetInputs {
                         sole_local: &sole,
-                        prev_foot_pos: &pfp,
+                        prev_force: &pfv,
                         ground_h: &fgh,
                         sensed_force: &sfv,
-                        prev_force: &pfv,
-                        air_time: &atv,
-                        last_td: &ltd,
                         have_prev: &hpp,
                         have_prev_force: &hpf,
                     },
@@ -4705,6 +4693,30 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     }
                 }
             }
+            // The history is device-owned now, so check it hasn't drifted from
+            // the host's copy — a divergence here corrupts every gait term
+            // downstream and would otherwise be invisible.
+            let (dev_air, dev_ltd) = self
+                .gpu_feet
+                .as_ref()
+                .unwrap()
+                .read_history(&self.gpu)
+                .await
+                .expect("read feet history");
+            let (mut wair, mut wltd) = (0.0f32, 0.0f32);
+            for e in 0..n {
+                let want_ltd = if computed[e].td_foot >= 0 {
+                    computed[e].td_foot as f32
+                } else {
+                    self.last_td_foot[e] as f32
+                };
+                wltd = wltd.max((dev_ltd[e] - want_ltd).abs());
+                for i in 0..NUM_FEET {
+                    wair = wair.max((dev_air[i * n + e] - computed[e].new_air[i]).abs());
+                }
+            }
+            eprintln!("[verify_feet_hist] air_time={wair:.2e} last_td={wltd:.2e}");
+
             let mut msg = String::from("[verify_feet]");
             for k in 0..11 {
                 msg.push_str(&format!(" {}={:.2e}", FEET_FIELDS[k], wf[k]));
@@ -5147,6 +5159,19 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 .collect();
             self.state.reset_envs_from_snapshots(&self.gpu, &specs);
             drop(specs);
+            // The feet history is device-owned, so a reset must clear it there
+            // too — otherwise air time keeps accumulating across the teleport
+            // and every gait term reads a stale swing.
+            if let Some(gf) = self.gpu_feet.as_mut() {
+                let ids: Vec<u32> = group.iter().map(|&e| e as u32).collect();
+                let mut seed = vec![0.0f32; NUM_FEET * self.n];
+                for e in 0..self.n {
+                    for i in 0..NUM_FEET {
+                        seed[i * self.n + e] = self.sensed_force[e][i];
+                    }
+                }
+                gf.reset(&self.gpu, &ids, &seed).await.expect("gpu feet reset");
+            }
             if prof {
                 t_scatter += t1.elapsed().as_micros();
             }
