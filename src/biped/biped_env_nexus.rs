@@ -1747,6 +1747,8 @@ pub struct BipedNexusBatchEnv {
     gpu_base_terms: Option<zealot_gpu_obs::GpuRewardBaseTerms>,
     /// Per-foot state.
     gpu_feet: Option<zealot_gpu_obs::GpuFeetState>,
+    /// Self-contained per-foot reward terms.
+    gpu_feet_terms: Option<zealot_gpu_obs::GpuRewardFeetTerms>,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2581,6 +2583,7 @@ impl BipedNexusBatchEnv {
             gpu_base: None,
             gpu_base_terms: None,
             gpu_feet: None,
+            gpu_feet_terms: None,
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -4681,6 +4684,57 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 msg.push_str(&format!(" {}={:.2e}", FEET_FIELDS[k], wf[k]));
             }
             eprintln!("{msg}");
+
+            // ---- self-contained per-foot reward terms ----
+            if self.gpu_feet_terms.is_none() {
+                self.gpu_feet_terms =
+                    Some(zealot_gpu_obs::GpuRewardFeetTerms::new(&self.gpu, n).expect("feet terms"));
+            }
+            let wq2 = &self.task.weights;
+            let fp = zealot_obs_shaders::RewardFeetParams {
+                n_envs: n as u32,
+                dt: dtc,
+                w_flight: wq2.flight,
+                w_foot_slip: wq2.foot_slip,
+                w_force_rate: wq2.force_rate,
+                force_rate_deadband: wq2.force_rate_deadband,
+                w_foot_orientation: wq2.foot_orientation,
+                w_feet_yaw_mean: wq2.feet_yaw_mean,
+                w_feet_yaw_diff: wq2.feet_yaw_diff,
+                w_feet_distance: wq2.feet_distance,
+                feet_distance_ref: wq2.feet_distance_ref,
+                w_touchdown_vz: wq2.touchdown_vz,
+                touchdown_vz_h: wq2.touchdown_vz_h,
+                touchdown_vz_ok: wq2.touchdown_vz_ok,
+                pad0: 0,
+                pad1: 0,
+            };
+            let ft = self
+                .gpu_feet_terms
+                .as_mut()
+                .unwrap()
+                .compute(&self.gpu, fp, &gf, &gb)
+                .await
+                .expect("gpu feet terms compute");
+            // comps order: flight 13, foot_slip 15, force_rate 28,
+            // foot_orientation 17, feet_yaw_mean 18, feet_yaw_diff 27,
+            // feet_distance 19, touchdown_vz 30.
+            const FEET_TERMS: [(usize, usize); 8] = [
+                (13, 0), (15, 1), (28, 2), (17, 3), (18, 4), (27, 5), (19, 6), (30, 7),
+            ];
+            let mut wft = [0.0f32; 8];
+            for (ti, (comp, row)) in FEET_TERMS.iter().enumerate() {
+                for e in 0..n {
+                    let d = (ft[row * n + e] - computed[e].comps[*comp]).abs();
+                    if d > wft[ti] {
+                        wft[ti] = d;
+                    }
+                }
+            }
+            eprintln!(
+                "[verify_feet_terms] flight={:.2e} slip={:.2e} dF={:.2e} orient={:.2e} yaw_mean={:.2e} yaw_diff={:.2e} dist={:.2e} td_vz={:.2e}",
+                wft[0], wft[1], wft[2], wft[3], wft[4], wft[5], wft[6], wft[7]
+            );
         }
 
         // (5) Serial commit: per-env mutable state + StepOut assembly.

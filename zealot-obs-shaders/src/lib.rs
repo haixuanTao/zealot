@@ -1073,3 +1073,120 @@ fn qrot(q: Vec4, v: [f32; 3]) -> [f32; 3] {
         v[2] + 2.0 * (ux * ty - uy * tx),
     ]
 }
+
+/// Scalar parameters for [`gpu_reward_feet_terms`] (uniform; 64 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct RewardFeetParams {
+    pub n_envs: u32,
+    pub dt: f32,
+    pub w_flight: f32,
+    pub w_foot_slip: f32,
+    pub w_force_rate: f32,
+    pub force_rate_deadband: f32,
+    pub w_foot_orientation: f32,
+    pub w_feet_yaw_mean: f32,
+    pub w_feet_yaw_diff: f32,
+    pub w_feet_distance: f32,
+    pub feet_distance_ref: f32,
+    pub w_touchdown_vz: f32,
+    pub touchdown_vz_h: f32,
+    pub touchdown_vz_ok: f32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
+/// The self-contained per-foot reward terms, one thread per environment.
+///
+/// Exact ports:
+///   flight           = w · dt                      when NO foot is in contact
+///   foot_slip        = w · Σ_contact planar²       · dt
+///   force_rate       = w · Σ max(|ΔF|−deadband,0)² · dt
+///   foot_orientation = w · Σ tilt²                 · dt
+///   feet_yaw_mean    = w · Σ yaw_rel_base²         · dt
+///   feet_yaw_diff    = w · wrap(yaw₁−yaw₀)²        · dt
+///   feet_distance    = w · | |lateral| − ref |     · dt   (L1, WBC default)
+///   touchdown_vz     = w · Σ max(−vz−ok,0)²        · dt   for airborne feet
+///                                                          below the gate height
+///
+/// `feet` is the `[26 x n]` block from [`gpu_feet_state`]; `base` is the
+/// `[13 x n]` block from [`gpu_base_state`] (only the quaternion is used, for
+/// the base-yaw projection of the stance width). `out` is `[8 x n]` in the
+/// order above.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_reward_feet_terms(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &RewardFeetParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] feet: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] base: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    if e < n {
+        let dt = params.dt;
+        let g = |row: usize| feet.read(row * n + e);
+
+        let mut n_contact = 0u32;
+        let mut slip = 0.0f32;
+        let mut frate = 0.0f32;
+        let mut tilt_sq = 0.0f32;
+        let mut yaw_sq = 0.0f32;
+        let mut slam = 0.0f32;
+        for i in 0..2usize {
+            let b = i * 11;
+            let contact = g(b) > 0.5;
+            if contact {
+                n_contact += 1;
+                let ps = g(b + 4);
+                slip += ps * ps;
+            }
+            let ex = g(b + 10) - params.force_rate_deadband;
+            let ex = if ex > 0.0 { ex } else { 0.0 };
+            frate += ex * ex;
+            let ti = g(b + 5);
+            tilt_sq += ti * ti;
+            let yw = g(b + 6);
+            yaw_sq += yw * yw;
+            if !contact && g(b + 3) < params.touchdown_vz_h {
+                let s = -g(b + 9) - params.touchdown_vz_ok;
+                let s = if s > 0.0 { s } else { 0.0 };
+                slam += s * s;
+            }
+        }
+
+        // Wrapped yaw difference between the feet (base yaw cancels).
+        let pi = 3.141_592_7f32;
+        let d = g(1 * 11 + 6) - g(6);
+        let two_pi = 2.0 * pi;
+        let mut wrapped = (d + pi) - two_pi * ((d + pi) / two_pi).floor();
+        wrapped -= pi;
+
+        // Lateral stance width: world foot-to-foot XY taken into the base frame
+        // using only the base YAW component.
+        let (qx, qy, qz, qw) =
+            (base.read(e), base.read(n + e), base.read(2 * n + e), base.read(3 * n + e));
+        let base_yaw =
+            (2.0 * (qw * qz + qx * qy)).atan2(1.0 - 2.0 * (qy * qy + qz * qz));
+        let dx = g(7) - g(1 * 11 + 7);
+        let dy = g(8) - g(1 * 11 + 8);
+        let lateral = -base_yaw.sin() * dx + base_yaw.cos() * dy;
+        let lat_abs = if lateral < 0.0 { -lateral } else { lateral };
+        let err = lat_abs - params.feet_distance_ref;
+        let err_abs = if err < 0.0 { -err } else { err };
+
+        out.write(e, if n_contact == 0 { params.w_flight * dt } else { 0.0 });
+        out.write(n + e, params.w_foot_slip * slip * dt);
+        out.write(2 * n + e, params.w_force_rate * frate * dt);
+        out.write(3 * n + e, params.w_foot_orientation * tilt_sq * dt);
+        out.write(4 * n + e, params.w_feet_yaw_mean * yaw_sq * dt);
+        out.write(5 * n + e, params.w_feet_yaw_diff * wrapped * wrapped * dt);
+        out.write(6 * n + e, params.w_feet_distance * err_abs * dt);
+        out.write(7 * n + e, params.w_touchdown_vz * slam * dt);
+    }
+}

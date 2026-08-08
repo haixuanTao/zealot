@@ -31,6 +31,86 @@ pub static SPIRV_DIR: Dir<'static> = include_dir!("$OUT_DIR/shaders-spirv");
 
 
 
+
+/// Host binding for the self-contained per-foot reward terms.
+#[derive(Shader)]
+struct RewardFeetShader {
+    terms: shaders::GpuRewardFeetTerms,
+}
+
+/// flight / foot_slip / force_rate / foot_orientation / feet_yaw_mean /
+/// feet_yaw_diff / feet_distance / touchdown_vz.
+pub struct GpuRewardFeetTerms {
+    shader: RewardFeetShader,
+    params: Tensor<shaders::RewardFeetParams>,
+    feet: Tensor<f32>,
+    base: Tensor<f32>,
+    out: Tensor<f32>,
+    n: usize,
+}
+
+impl GpuRewardFeetTerms {
+    pub fn new(backend: &GpuBackend, n: usize) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        Ok(Self {
+            shader: RewardFeetShader::from_backend(backend)?,
+            params: Tensor::scalar(
+                backend,
+                shaders::RewardFeetParams {
+                    n_envs: n as u32,
+                    dt: 0.0,
+                    w_flight: 0.0,
+                    w_foot_slip: 0.0,
+                    w_force_rate: 0.0,
+                    force_rate_deadband: 0.0,
+                    w_foot_orientation: 0.0,
+                    w_feet_yaw_mean: 0.0,
+                    w_feet_yaw_diff: 0.0,
+                    w_feet_distance: 0.0,
+                    feet_distance_ref: 0.0,
+                    w_touchdown_vz: 0.0,
+                    touchdown_vz_h: 0.0,
+                    touchdown_vz_ok: 0.0,
+                    pad0: 0,
+                    pad1: 0,
+                },
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            feet: Tensor::vector_uninit(backend, (26 * n) as u32, st)?,
+            base: Tensor::vector_uninit(backend, (13 * n) as u32, st)?,
+            out: Tensor::vector_uninit(backend, (8 * n) as u32, st | BufferUsages::COPY_SRC)?,
+            n,
+        })
+    }
+
+    /// Returns `[8 x n]`.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        params: shaders::RewardFeetParams,
+        feet: &[f32],
+        base: &[f32],
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
+        backend.write_buffer(self.feet.buffer_mut(), 0, feet)?;
+        backend.write_buffer(self.base.buffer_mut(), 0, base)?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[reward] feet terms", None);
+            self.shader.terms.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                &self.feet,
+                &self.base,
+                &mut self.out,
+            )?;
+        }
+        backend.submit(enc)?;
+        backend.slow_read_vec(self.out.buffer()).await
+    }
+}
+
 /// Host binding for the feet-state kernel.
 #[derive(Shader)]
 struct FeetStateShader {
