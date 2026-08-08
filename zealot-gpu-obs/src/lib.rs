@@ -33,6 +33,99 @@ pub static SPIRV_DIR: Dir<'static> = include_dir!("$OUT_DIR/shaders-spirv");
 
 
 
+
+/// Host binding for the remaining reward terms.
+#[derive(Shader)]
+struct RewardMiscShader {
+    terms: shaders::GpuRewardMiscTerms,
+}
+
+/// self_coll / chest_ang_vel / termination.
+pub struct GpuRewardMiscTerms {
+    shader: RewardMiscShader,
+    params: Tensor<shaders::RewardMiscParams>,
+    pair_a: Tensor<u32>,
+    pair_b: Tensor<u32>,
+    prev_chest: Tensor<f32>,
+    have_prev: Tensor<u32>,
+    fell: Tensor<u32>,
+    out: Tensor<f32>,
+    n: usize,
+}
+
+impl GpuRewardMiscTerms {
+    pub fn new(
+        backend: &GpuBackend,
+        n: usize,
+        pair_a: &[u32],
+        pair_b: &[u32],
+    ) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        Ok(Self {
+            shader: RewardMiscShader::from_backend(backend)?,
+            params: Tensor::scalar(
+                backend,
+                shaders::RewardMiscParams {
+                    n_envs: n as u32,
+                    colliders_per_env: 0,
+                    n_pairs: pair_a.len() as u32,
+                    dt: 0.0,
+                    sc_margin: 0.0,
+                    sc_weight: 0.0,
+                    chest_link: 0,
+                    chest_w: 0.0,
+                    w_termination: 0.0,
+                    pad0: 0,
+                    pad1: 0,
+                    pad2: 0,
+                },
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            pair_a: Tensor::vector(backend, if pair_a.is_empty() { &[0u32] } else { pair_a }, st)?,
+            pair_b: Tensor::vector(backend, if pair_b.is_empty() { &[0u32] } else { pair_b }, st)?,
+            prev_chest: Tensor::vector(backend, &vec![0.0f32; 4 * n], st)?,
+            have_prev: Tensor::vector(backend, &vec![0u32; n], st)?,
+            fell: Tensor::vector(backend, &vec![0u32; n], st)?,
+            out: Tensor::vector_uninit(backend, (3 * n) as u32, st | BufferUsages::COPY_SRC)?,
+            n,
+        })
+    }
+
+    /// `prev_chest` is the chest rotation from last step, `[4 x n]` xyzw.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        params: shaders::RewardMiscParams,
+        body_poses: &Tensor<glamx::Pose3>,
+        prev_chest: &[f32],
+        have_prev: &[u32],
+        fell: &[u32],
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
+        backend.write_buffer(self.prev_chest.buffer_mut(), 0, prev_chest)?;
+        backend.write_buffer(self.have_prev.buffer_mut(), 0, have_prev)?;
+        backend.write_buffer(self.fell.buffer_mut(), 0, fell)?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[reward] misc terms", None);
+            self.shader.terms.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                body_poses,
+                &self.pair_a,
+                &self.pair_b,
+                &self.prev_chest,
+                &self.have_prev,
+                &self.fell,
+                &mut self.out,
+            )?;
+        }
+        backend.submit(enc)?;
+        backend.slow_read_vec(self.out.buffer()).await
+    }
+}
+
 /// Host binding for the gated gait reward terms.
 #[derive(Shader)]
 struct RewardGaitShader {

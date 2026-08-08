@@ -1751,6 +1751,8 @@ pub struct BipedNexusBatchEnv {
     gpu_feet_terms: Option<zealot_gpu_obs::GpuRewardFeetTerms>,
     /// Gated gait reward terms.
     gpu_gait_terms: Option<zealot_gpu_obs::GpuRewardGaitTerms>,
+    /// self_coll / chest_ang_vel / termination.
+    gpu_misc_terms: Option<zealot_gpu_obs::GpuRewardMiscTerms>,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2587,6 +2589,7 @@ impl BipedNexusBatchEnv {
             gpu_feet: None,
             gpu_feet_terms: None,
             gpu_gait_terms: None,
+            gpu_misc_terms: None,
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -4826,6 +4829,65 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             eprintln!(
                 "[verify_gait_terms] air_time={:.2e} single_support={:.2e} stand_planted={:.2e} clearance={:.2e} gait_clock={:.2e}",
                 wgt[0], wgt[1], wgt[2], wgt[3], wgt[4]
+            );
+
+            // ---- self_coll / chest_ang_vel / termination ----
+            if self.gpu_misc_terms.is_none() {
+                let pa: Vec<u32> =
+                    self.idx.self_collision_pairs.iter().map(|&(a, _)| a as u32).collect();
+                let pb: Vec<u32> =
+                    self.idx.self_collision_pairs.iter().map(|&(_, b)| b as u32).collect();
+                self.gpu_misc_terms = Some(
+                    zealot_gpu_obs::GpuRewardMiscTerms::new(&self.gpu, n, &pa, &pb)
+                        .expect("misc terms"),
+                );
+            }
+            let chest_link = self.idx.chest_link as usize;
+            let mut pchest = vec![0.0f32; 4 * n];
+            let mut fellv = vec![0u32; n];
+            for e in 0..n {
+                let pq = self.prev_body_poses[e * cpb + chest_link].rotation;
+                pchest[e] = pq.x;
+                pchest[n + e] = pq.y;
+                pchest[2 * n + e] = pq.z;
+                pchest[3 * n + e] = pq.w;
+                fellv[e] = computed[e].fell as u32;
+            }
+            let mp = zealot_obs_shaders::RewardMiscParams {
+                n_envs: n as u32,
+                colliders_per_env: cpb as u32,
+                n_pairs: self.idx.self_collision_pairs.len() as u32,
+                dt: dtc,
+                sc_margin: self.knobs.sc_margin,
+                sc_weight: self.knobs.sc_weight,
+                chest_link: self.idx.chest_link,
+                chest_w: self.knobs.chest_w,
+                w_termination: self.task.weights.termination,
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
+            };
+            let poses_t4 = self.state.body_poses();
+            let mt = self
+                .gpu_misc_terms
+                .as_mut()
+                .unwrap()
+                .compute(&self.gpu, mp, poses_t4, &pchest, &hpp, &fellv)
+                .await
+                .expect("gpu misc terms compute");
+            const MISC_TERMS: [(usize, usize); 3] = [(22, 0), (31, 1), (23, 2)];
+            let mut wm = [0.0f32; 3];
+            for (ti, (comp, row)) in MISC_TERMS.iter().enumerate() {
+                for e in 0..n {
+                    let d = (mt[row * n + e] - computed[e].comps[*comp]).abs();
+                    if d > wm[ti] {
+                        wm[ti] = d;
+                    }
+                }
+            }
+            eprintln!(
+                "[verify_misc_terms] self_coll={:.2e} chest_ang_vel={:.2e} termination={:.2e}",
+                wm[0], wm[1], wm[2]
             );
         }
 

@@ -1337,3 +1337,94 @@ pub fn gpu_reward_gait_terms(
         );
     }
 }
+
+/// Scalar parameters for [`gpu_reward_misc_terms`] (uniform; 32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct RewardMiscParams {
+    pub n_envs: u32,
+    pub colliders_per_env: u32,
+    pub n_pairs: u32,
+    pub dt: f32,
+    pub sc_margin: f32,
+    pub sc_weight: f32,
+    pub chest_link: u32,
+    pub chest_w: f32,
+    pub w_termination: f32,
+    pub pad0: u32,
+    pub pad1: u32,
+    pub pad2: u32,
+}
+
+/// The three remaining reward terms, one thread per environment.
+///
+///   self_coll     = −(w · Σ_pairs max(margin − |pa − pb|, 0)) · dt
+///   chest_ang_vel = −(w · (ωx² + ωy²)) · dt, ω from the chest link's rotation
+///                   change with the same hemisphere correction as the base
+///   termination   = w_termination when the env fell this step
+///
+/// `fell` is supplied per env: the termination PREDICATE still lives on the
+/// host (it folds in joint faults, self-collision distance and time-outs), so
+/// only the reward contribution moves here.
+///
+/// `out` is `[3 x n]`: self_coll, chest_ang_vel, termination.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_reward_misc_terms(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &RewardMiscParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] body_poses: &[Pose3],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] pair_a: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] pair_b: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] prev_chest: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] have_prev: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] fell: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    if e < n {
+        let base = e * params.colliders_per_env as usize;
+        let dt = params.dt;
+
+        let mut intrusion = 0.0f32;
+        if params.sc_weight > 0.0 {
+            for k in 0..params.n_pairs as usize {
+                let pa = body_poses.read(base + pair_a.read(k) as usize).translation;
+                let pb = body_poses.read(base + pair_b.read(k) as usize).translation;
+                let dx = pa.x - pb.x;
+                let dy = pa.y - pb.y;
+                let dz = pa.z - pb.z;
+                let d = params.sc_margin - (dx * dx + dy * dy + dz * dz).sqrt();
+                intrusion += if d > 0.0 { d } else { 0.0 };
+            }
+        }
+
+        let mut chest_pen = 0.0f32;
+        if params.chest_w > 0.0 && have_prev.read(e) != 0 {
+            let c = body_poses.read(base + params.chest_link as usize).rotation;
+            let pq = Vec4::new(
+                -prev_chest.read(e),
+                -prev_chest.read(n + e),
+                -prev_chest.read(2 * n + e),
+                prev_chest.read(3 * n + e),
+            );
+            let dq = qmul(Vec4::new(c.x, c.y, c.z, c.w), pq);
+            let s = if dq.w >= 0.0 { 1.0 } else { -1.0 };
+            let wx = 2.0 * s * dq.x / dt;
+            let wy = 2.0 * s * dq.y / dt;
+            chest_pen = params.chest_w * (wx * wx + wy * wy) * dt;
+        }
+
+        out.write(e, -(params.sc_weight * intrusion * dt));
+        out.write(n + e, -chest_pen);
+        out.write(
+            2 * n + e,
+            if fell.read(e) != 0 { params.w_termination } else { 0.0 },
+        );
+    }
+}
