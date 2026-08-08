@@ -1130,8 +1130,43 @@ fn main() {
             let t_upd = Instant::now();
             let aff_o = ac.obs_norm.affine();
             let aff_c = ac.critic_norm.affine();
-            let f_obs = stage_rows(&bk, od, total, Some(&aff_o), st, |c| &batch[c].obs);
-            let f_cobs = stage_rows(&bk, cd, total, Some(&aff_c), st, |c| &batch[c].critic_obs);
+            // Gather the per-sample vectors into contiguous arenas first.
+            //
+            // `batch` is ~400k Samples each owning its own heap `Vec`s (mirror
+            // augmentation clones every one), so a staging pass that walks
+            // `batch[c].obs` pays a cache miss per sample — and the row-blocked
+            // transpose repeats that walk once per block, ~8.7M misses across
+            // the three tensors. Touching each sample ONCE here and letting the
+            // transposes stream flat memory trades that for ~1.2M.
+            let mut obs_arena = vec![0f32; total * od];
+            let mut cobs_arena = vec![0f32; total * cd];
+            let mut act_arena = vec![0f32; total * ad_];
+            rayon::scope(|s| {
+                s.spawn(|_| {
+                    obs_arena
+                        .par_chunks_mut(od)
+                        .zip(batch.par_iter())
+                        .for_each(|(dst, smp)| dst.copy_from_slice(&smp.obs));
+                });
+                s.spawn(|_| {
+                    cobs_arena
+                        .par_chunks_mut(cd)
+                        .zip(batch.par_iter())
+                        .for_each(|(dst, smp)| dst.copy_from_slice(&smp.critic_obs));
+                });
+                s.spawn(|_| {
+                    act_arena
+                        .par_chunks_mut(ad_)
+                        .zip(batch.par_iter())
+                        .for_each(|(dst, smp)| dst.copy_from_slice(&smp.action));
+                });
+            });
+            let f_obs = stage_rows(&bk, od, total, Some(&aff_o), st, |c| {
+                &obs_arena[c * od..(c + 1) * od]
+            });
+            let f_cobs = stage_rows(&bk, cd, total, Some(&aff_c), st, |c| {
+                &cobs_arena[c * cd..(c + 1) * cd]
+            });
             // LOSS: normalized MIRRORED obs (normalize ∘ mirror — exact, not
             // mirror ∘ normalize), and refresh the stop-grad target net to the
             // current (iter-start) actor weights.
@@ -1151,7 +1186,8 @@ fn main() {
                 ac.obs_norm.commit(&mut pn_obs);
                 ac.critic_norm.commit(&mut pn_cobs);
             }
-            let f_act = stage_rows(&bk, ad_, total, None, st, |c| &batch[c].action);
+            let f_act =
+                stage_rows(&bk, ad_, total, None, st, |c| &act_arena[c * ad_..(c + 1) * ad_]);
             let f_adv = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].adv), st);
             let f_lpo = mk(
                 &bk,
