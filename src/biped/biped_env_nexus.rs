@@ -1441,6 +1441,69 @@ struct ArmMotionCfg {
     scale: f32,
 }
 
+
+/// Per-step-constant reward / termination knobs, resolved ONCE.
+///
+/// These were re-read from the process environment on EVERY control step —
+/// ~500 `getenv` calls per training iteration, each a lock plus a linear scan
+/// of `environ`. They are also exactly the POD uniform a GPU reward kernel
+/// needs, so gathering them is the first step of that port.
+///
+/// Process env cannot change mid-run, so resolving once is behaviour-identical.
+#[derive(Clone, Copy, Debug)]
+pub struct StepKnobs {
+    pub illegal_z: f32,
+    pub sc_margin: f32,
+    pub sc_weight: f32,
+    pub sc_term: f32,
+    pub vel_term: f32,
+    pub power_term: f32,
+    pub env_term: f32,
+    pub dwell_max: u16,
+    pub slam_vel: f32,
+    pub joint_power_term: f32,
+    pub ankle_torque_w: f32,
+    pub w_knee_torques: f32,
+    pub power_w: f32,
+    pub chest_w: f32,
+    pub graph: bool,
+    pub substep_trace: bool,
+}
+
+impl StepKnobs {
+    fn from_env() -> Self {
+        fn f(name: &str, dflt: f32) -> f32 {
+            env_var(name).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(dflt)
+        }
+        Self {
+            illegal_z: f("BIPED_ILLEGAL_Z", 0.0),
+            sc_margin: f("BIPED_SELF_COLL_DIST", 0.08),
+            sc_weight: f("BIPED_SELF_COLL_W", 5.0),
+            sc_term: f("BIPED_SELF_COLL_TERM", 0.05),
+            vel_term: f("BIPED_DOF_VEL_TERM", 1.0),
+            power_term: f("BIPED_POWER_TERM", 3000.0),
+            env_term: f("BIPED_ENVELOPE_TERM", 0.0),
+            dwell_max: env_var("BIPED_LIMIT_DWELL_STEPS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(40u16),
+            slam_vel: f("BIPED_LIMIT_SLAM_VEL", 2.0),
+            joint_power_term: f("BIPED_JOINT_POWER_TERM", 1500.0),
+            ankle_torque_w: f("BIPED_ANKLE_TORQUE_W", 4.0),
+            w_knee_torques: f("BIPED_W_KNEE_TORQUES", 7e-5),
+            // MECH_POWER_W wins; POWER_W is the legacy alias.
+            power_w: env_var("BIPED_MECH_POWER_W")
+                .ok()
+                .or_else(|| env_var("BIPED_POWER_W").ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1e-4),
+            chest_w: f("BIPED_CHEST_ANGVEL_W", 0.0),
+            graph: env_var("BIPED_GRAPH").map(|v| v != "0").unwrap_or(true),
+            substep_trace: env_var("BIPED_SUBSTEP_TRACE").is_ok(),
+        }
+    }
+}
+
 pub struct BipedNexusBatchEnv {
     // Topology + indexing
     mjcf: Vec<MjBody>,
@@ -1663,6 +1726,8 @@ pub struct BipedNexusBatchEnv {
 
     /// Reusable row-major `[NUM_JOINTS × n]` motor-target staging, uploaded to
     /// `motor_targets_gpu` and scattered by a kernel each control step.
+    /// Reward / termination knobs, resolved once (see [`StepKnobs`]).
+    knobs: StepKnobs,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2489,6 +2554,7 @@ impl BipedNexusBatchEnv {
             template_foot_sole,
             template_spawn_obs: Vec::new(),
             template_spawn_critic_obs: Vec::new(),
+            knobs: StepKnobs::from_env(),
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -3481,7 +3547,7 @@ impl BipedNexusBatchEnv {
         let t = Instant::now();
         let mut ran_physics = false;
         #[cfg(feature = "cuda_backend")]
-        if env_var("BIPED_GRAPH").map(|v| v != "0").unwrap_or(true) {
+        if self.knobs.graph {
             if let Some(g) = self.physics_graph.as_ref() {
                 g.0.launch().expect("physics graph replay");
                 ran_physics = true;
@@ -3505,7 +3571,7 @@ impl BipedNexusBatchEnv {
             // BIPED_SOLVER_ITERS=1 each pipeline.step is one substep → per-substep
             // foot trajectory. Forces the non-graph path (this branch) implicitly
             // since the trace readback syncs per step.
-            let trace = env_var("BIPED_SUBSTEP_TRACE").is_ok();
+            let trace = self.knobs.substep_trace;
             for i in 0..self.task.decimation {
                 let _ = self.pipeline.step(&self.gpu, &mut self.state, None);
                 if trace {
@@ -3665,10 +3731,7 @@ impl BipedNexusBatchEnv {
         // (the −0.03 case) without over-terminating legitimate low stances —
         // 0.06 was too tight and killed the learning gradient. Set large-negative
         // to disable entirely.
-        let illegal_z = env_var("BIPED_ILLEGAL_Z")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(0.0);
+        let illegal_z = self.knobs.illegal_z;
         // WBC-AGILE-style self-collision avoidance, as a SOFT reward penalty
         // (not a hard termination). nexus can't do physical leg-leg collision
         // (inert leg colliders), and a hard distance-termination is the ONLY
@@ -3683,45 +3746,27 @@ impl BipedNexusBatchEnv {
         // workspace doesn't self-collide, so an explicit distance penalty is
         // redundant AND competes with learning. Kept as opt-in (`BIPED_SELF_COLL_W`)
         // for cases the limits don't cover (e.g. foot↔torso). margin 0.12 m.
-        let sc_margin = env_var("BIPED_SELF_COLL_DIST")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(0.08);
-        let sc_weight = env_var("BIPED_SELF_COLL_W")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(5.0);
+        let sc_margin = self.knobs.sc_margin;
+        let sc_weight = self.knobs.sc_weight;
         // Leg-interpenetration termination distance (BIPED_SELF_COLL_TERM,
         // 0 disables). 0.05 m between link centers ≈ colliders overlapping.
-        let sc_term = std::env::var("BIPED_SELF_COLL_TERM")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(0.05);
+        let sc_term = self.knobs.sc_term;
         // Joint-velocity fault (BIPED_DOF_VEL_TERM, multiplier on each
         // joint's hardware vel_limit; 0 disables). Real actuators fault past
         // rated speed — flail-speed swings end the episode like an e-stop.
-        let vel_term: f32 = std::env::var("BIPED_DOF_VEL_TERM")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(1.0);
+        let vel_term: f32 = self.knobs.vel_term;
         // Mechanical-power fault (BIPED_POWER_TERM, watts of Σ|τ·q̇| in one
         // control step; 0 disables). Calibration: walking ≈ 350 W, the
         // stand-tremor pathology ≈ 2000 W — sustained dither burns past the
         // threshold while honest locomotion never approaches it.
-        let power_term: f32 = std::env::var("BIPED_POWER_TERM")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(3000.0);
+        let power_term: f32 = self.knobs.power_term;
         // DC torque-speed envelope fault (BIPED_ENVELOPE_TERM, speed-axis
         // scale; 0 disables — and it DEFAULTS OFF: with 50 Hz finite-diff
         // joint velocities, contact aliasing throws single joints past rated
         // speed for one sample and even healthy gaits "violate" on 92% of
         // steps (measured). The correct form of this idea is kernel-level DC
         // torque-speed saturation in the actuator model, not a termination.
-        let env_term: f32 = std::env::var("BIPED_ENVELOPE_TERM")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(0.0);
+        let env_term: f32 = self.knobs.env_term;
         // Endstop-SLAM fault (BIPED_LIMIT_SLAM_VEL, rad/s; 0 disables). Resting
         // against a position limit is a static load the structure carries, but
         // ARRIVING at one carries ½Iω² into the gearbox — measured entries hit
@@ -3738,23 +3783,14 @@ impl BipedNexusBatchEnv {
         // is not an option either (54-66% of frames touch, in every gait).
         // Dwell separates them: standing leans ~19 steps at a stretch,
         // walking brushes ~9.
-        let dwell_max: u16 = std::env::var("BIPED_LIMIT_DWELL_STEPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(40);
-        let slam_vel: f32 = std::env::var("BIPED_LIMIT_SLAM_VEL")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(2.0);
+        let dwell_max: u16 = self.knobs.dwell_max;
+        let slam_vel: f32 = self.knobs.slam_vel;
         const SLAM_BAND: f32 = 0.05; // rad from the hard limit
         // Per-joint instantaneous power fault (BIPED_JOINT_POWER_TERM, watts;
         // 0 disables). Spikes are the failure mode averages cannot see, and
         // hardware limits are per actuator: healthy v17-style gait peaks at
         // ~700 W in the worst joint, the stand-tremor spikes to 20 kW.
-        let joint_power_term: f32 = std::env::var("BIPED_JOINT_POWER_TERM")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(1500.0);
+        let joint_power_term: f32 = self.knobs.joint_power_term;
         let sc_dt = self.task.control_dt();
         // Torque (effort) penalty: we're PD position-controlled and had NO cost
         // on joint torque, so the policy reward-hacks strained high-torque poses
@@ -3778,10 +3814,7 @@ impl BipedNexusBatchEnv {
         // Multiplier on the ankle extras. Default 1.0 = AGILE parity (the old
         // 4.0 was tuned against the lerobot-magnitude constants below and
         // would put the G1 ankles 4× over WBC).
-        let ankle_torque_w = env_var("BIPED_ANKLE_TORQUE_W")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(4.0);
+        let ankle_torque_w = self.knobs.ankle_torque_w;
         // AGILE-named torque regularizers, WBC-AGILE **G1** config verbatim
         // (`torques` -5e-5 on every controlled joint, `ankle_torques` an extra
         // -1e-4 on ankle joints, `ankle_roll_torques` an extra -1e-3 on
@@ -3815,10 +3848,7 @@ impl BipedNexusBatchEnv {
 // (measured: -4 deg through the whole swing, a locked compass gait). Size
 // this by the COST it should impose, not by another joint's weight. 7e-5
 // puts a walking peak at ~0.016/step, comparable to the ankle extra.
-let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(7e-5);
+let w_knee_torques: f32 = self.knobs.w_knee_torques;
         // Mechanical-power (energy) penalty weight. Penalizes Σ|τᵢ·q̇ᵢ| — the rate
         // of mechanical work, the principled cost-of-transport proxy. Unlike Στ²
         // (effort, penalized even when static), this only charges for work done in
@@ -3831,11 +3861,7 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         // zealot-only term — WBC-AGILE has NO power cost; its gait economy is
         // the torque family above). Default now 0 = AGILE parity; the legacy
         // name `BIPED_POWER_W` is still honored if set.
-        let power_w: f32 = env_var("BIPED_MECH_POWER_W")
-            .ok()
-            .or_else(|| env_var("BIPED_POWER_W").ok())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1e-4);
+        let power_w: f32 = self.knobs.power_w;
         // Chest angular-velocity penalty (BIPED_CHEST_ANGVEL_W, 0 = off).
         // Every other stability term reads the PELVIS (link 0); on the 29-DOF
         // body the chest above the waist joints is invisible to the reward, so
@@ -3844,10 +3870,7 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         // (finite-diff, same approximation as the base ang-vel obs) — yaw is
         // excluded so turning with the commanded heading isn't taxed. The
         // Isaac-Lab humanoid analogue is `ang_vel_xy_l2` on the torso link.
-        let chest_w: f32 = std::env::var("BIPED_CHEST_ANGVEL_W")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
+        let chest_w: f32 = self.knobs.chest_w;
         let chest_link = self.idx.chest_link as usize;
         let cpb_idx = self.idx.colliders_per_batch as usize;
         // Step-cue knobs, read once per step rather than per env.
