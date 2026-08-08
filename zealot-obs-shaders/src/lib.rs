@@ -41,7 +41,7 @@
 
 #![cfg_attr(target_arch = "spirv", no_std)]
 
-use khal_std::glamx::UVec3;
+use khal_std::glamx::{Pose3, UVec3, Vec4};
 use khal_std::index::MaybeIndexUnchecked;
 use khal_std::macros::{spirv, spirv_bindgen};
 #[allow(unused_imports)]
@@ -401,5 +401,90 @@ pub fn gpu_reward_action_terms(
         out.write(e, params.w_action_rate * da2 * dt);
         out.write(n + e, params.w_action_rate_hip * da2_hip * dt);
         out.write(2 * n + e, params.w_action_rate_rate * dda2 * dt);
+    }
+}
+
+/// Scalar parameters for [`gpu_joint_state`] (uniform; 16 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct JointStateParams {
+    pub n_envs: u32,
+    pub num_joints: u32,
+    /// Rigid bodies per env — `body_poses` is env-major (`env·bps + link`).
+    pub bodies_per_env: u32,
+    pub control_dt: f32,
+    pub pad0: u32,
+}
+
+/// Hamilton product of two xyzw quaternions.
+#[inline]
+fn qmul(a: Vec4, b: Vec4) -> Vec4 {
+    Vec4::new(
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+    )
+}
+
+/// Conjugate of an xyzw quaternion.
+#[inline]
+fn qconj(q: Vec4) -> Vec4 {
+    Vec4::new(-q.x, -q.y, -q.z, q.w)
+}
+
+/// Per-joint angle and finite-difference velocity, one thread per environment.
+///
+/// EXACT port of the trainer host's `read_state_from_poses`: the angle comes
+/// from the PARENT-CHILD relative rotation with the joint's rest quaternion
+/// removed,
+///   `rel = rest⁻¹ · qp⁻¹ · qc`,  `q = 2·atan2(rel.z, rel.w)`
+/// which is NOT what `gpu_assemble_obs` does (that reads the workspace
+/// joint-rotation quad directly). The reward must match the host, so this
+/// kernel deliberately mirrors the host formulation.
+///
+/// `body_poses` is the nexus buffer, env-major: pose of `link` in env `e` at
+/// `e·bodies_per_env + link`.
+/// `have_prev` is per-env (0 right after a reset, when the host also reports
+/// zero velocity). `prev_q` is updated in place for the next step.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_joint_state(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &JointStateParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] body_poses: &[Pose3],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] parent_ids: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] child_ids: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] rest_quats: &[Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] have_prev: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] prev_q: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] q_out: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 8)] qd_out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    let j = params.num_joints as usize;
+    let bps = params.bodies_per_env as usize;
+    if e < n {
+        let base = e * bps;
+        let fresh = have_prev.read(e);
+        let dt = params.control_dt;
+        for i in 0..j {
+            let rp = body_poses.read(base + parent_ids.read(i) as usize).rotation;
+            let rc = body_poses.read(base + child_ids.read(i) as usize).rotation;
+            let qp = Vec4::new(rp.x, rp.y, rp.z, rp.w);
+            let qc = Vec4::new(rc.x, rc.y, rc.z, rc.w);
+            let rel = qmul(qmul(qconj(rest_quats.read(i)), qconj(qp)), qc);
+            let q = 2.0 * rel.z.atan2(rel.w);
+            let idx = i * n + e;
+            let qd = if fresh != 0 { (q - prev_q.read(idx)) / dt } else { 0.0 };
+            q_out.write(idx, q);
+            qd_out.write(idx, qd);
+            prev_q.write(idx, q);
+        }
     }
 }

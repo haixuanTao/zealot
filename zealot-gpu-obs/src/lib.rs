@@ -23,7 +23,109 @@ use shaders::{
 };
 
 /// Embedded SPIR-V shader directory (resolved by `#[derive(Shader)]`).
+
+
 pub static SPIRV_DIR: Dir<'static> = include_dir!("$OUT_DIR/shaders-spirv");
+
+
+/// Host binding for the joint-state kernel.
+#[derive(Shader)]
+struct JointStateShader {
+    joints: shaders::GpuJointState,
+}
+
+/// GPU joint angles + finite-difference velocities.
+///
+/// Mirrors the TRAINER host's `read_state_from_poses` (parent-child relative
+/// rotation with the rest quat removed), not the demo obs kernel's workspace
+/// read — see `gpu_joint_state`.
+pub struct GpuJointState {
+    shader: JointStateShader,
+    params: vortx::tensor::Tensor<shaders::JointStateParams>,
+    parent_ids: vortx::tensor::Tensor<u32>,
+    child_ids: vortx::tensor::Tensor<u32>,
+    rest_quats: vortx::tensor::Tensor<glamx::Vec4>,
+    have_prev: vortx::tensor::Tensor<u32>,
+    prev_q: vortx::tensor::Tensor<f32>,
+    q: vortx::tensor::Tensor<f32>,
+    qd: vortx::tensor::Tensor<f32>,
+    n: usize,
+    j: usize,
+}
+
+impl GpuJointState {
+    /// `rest` is one xyzw quaternion per joint; `parents`/`children` are link
+    /// indices into the env-major `body_poses` buffer.
+    pub fn new(
+        backend: &GpuBackend,
+        n: usize,
+        j: usize,
+        parents: &[u32],
+        children: &[u32],
+        rest: &[glamx::Vec4],
+        bodies_per_env: u32,
+        control_dt: f32,
+    ) -> Result<Self, khal::backend::GpuBackendError> {
+        use khal::BufferUsages as U;
+        let st = U::STORAGE | U::COPY_DST;
+        Ok(Self {
+            shader: JointStateShader::from_backend(backend)?,
+            params: vortx::tensor::Tensor::scalar(
+                backend,
+                shaders::JointStateParams {
+                    n_envs: n as u32,
+                    num_joints: j as u32,
+                    bodies_per_env,
+                    control_dt,
+                    pad0: 0,
+                },
+                U::UNIFORM | U::STORAGE | U::COPY_DST,
+            )?,
+            parent_ids: vortx::tensor::Tensor::vector(backend, parents, st)?,
+            child_ids: vortx::tensor::Tensor::vector(backend, children, st)?,
+            rest_quats: vortx::tensor::Tensor::vector(backend, rest, st)?,
+            have_prev: vortx::tensor::Tensor::vector(backend, &vec![0u32; n], st)?,
+            prev_q: vortx::tensor::Tensor::vector(backend, &vec![0.0f32; j * n], st)?,
+            q: vortx::tensor::Tensor::vector_uninit(backend, (j * n) as u32, st | U::COPY_SRC)?,
+            qd: vortx::tensor::Tensor::vector_uninit(backend, (j * n) as u32, st | U::COPY_SRC)?,
+            n,
+            j,
+        })
+    }
+
+    /// Dispatch against the live `body_poses` buffer (bound as `Vec4`), then
+    /// read back `(q, qd)` — both row-major `[j x n]`.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        body_poses: &vortx::tensor::Tensor<glamx::Pose3>,
+        have_prev: &[u32],
+    ) -> Result<(Vec<f32>, Vec<f32>), khal::backend::GpuBackendError> {
+        use khal::backend::{Backend, Encoder};
+        backend.write_buffer(self.have_prev.buffer_mut(), 0, have_prev)?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[reward] joint state", None);
+            self.shader.joints.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                body_poses,
+                &self.parent_ids,
+                &self.child_ids,
+                &self.rest_quats,
+                &self.have_prev,
+                &mut self.prev_q,
+                &mut self.q,
+                &mut self.qd,
+            )?;
+        }
+        backend.submit(enc)?;
+        let q = backend.slow_read_vec(self.q.buffer()).await?;
+        let qd = backend.slow_read_vec(self.qd.buffer()).await?;
+        Ok((q, qd))
+    }
+}
 
 /// Host binding for the GPU reward terms.
 #[derive(Shader)]

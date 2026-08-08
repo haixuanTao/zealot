@@ -1735,6 +1735,8 @@ pub struct BipedNexusBatchEnv {
     /// GPU reward: the ported terms + their staging. `None` until first use.
     /// Verified against the host terms with `BIPED_VERIFY_REWARD=1`.
     gpu_reward: Option<zealot_gpu_obs::GpuRewardTerms>,
+    /// GPU joint state (q, qd), verified against `read_state_from_poses`.
+    gpu_joints: Option<zealot_gpu_obs::GpuJointState>,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2563,6 +2565,7 @@ impl BipedNexusBatchEnv {
             template_spawn_critic_obs: Vec::new(),
             knobs: StepKnobs::from_env(),
             gpu_reward: None,
+            gpu_joints: None,
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -3725,6 +3728,9 @@ impl BipedNexusBatchEnv {
             comps: [f32; NUM_REWARD_COMPS],
             new_air: [f32; NUM_FEET],
             new_joint_pos: [f32; NUM_JOINTS],
+            /// Host joint velocity, carried only so `BIPED_VERIFY_REWARD` can
+            /// check the GPU joint-state kernel against it.
+            joint_vel_dbg: [f32; NUM_JOINTS],
             // Foot index that touched down this step (-1 = none); committed to
             // `self.last_td_foot` in the serial pass to track gait alternation.
             td_foot: i8,
@@ -4170,6 +4176,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     }
                 }
                 PerEnv {
+                    joint_vel_dbg: state.joint_vel,
                     obs,
                     critic_obs,
                     reward,
@@ -4241,6 +4248,50 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 "[verify_reward] action_rate={:.3e} hipz_hipx={:.3e} action_rate_rate={:.3e}",
                 worst[0], worst[1], worst[2]
             );
+
+            // ---- joint state (q, qd) ----
+            let bps = (self.state.body_poses().len() as usize / n) as u32;
+            if self.gpu_joints.is_none() {
+                let rest: Vec<glamx::Vec4> = (0..NUM_JOINTS)
+                    .map(|k| {
+                        let r = self.idx.actuated_rest_quat[k];
+                        glamx::Vec4::new(r.x, r.y, r.z, r.w)
+                    })
+                    .collect();
+                let children: Vec<u32> =
+                    (0..NUM_JOINTS).map(|k| self.idx.actuated[k].0).collect();
+                self.gpu_joints = Some(
+                    zealot_gpu_obs::GpuJointState::new(
+                        &self.gpu,
+                        n,
+                        NUM_JOINTS,
+                        &self.idx.actuated_parent_links,
+                        &children,
+                        &rest,
+                        bps,
+                        self.task.control_dt(),
+                    )
+                    .expect("gpu joint state"),
+                );
+            }
+            let hp: Vec<u32> = (0..n).map(|e| self.has_prev_joint_pos[e] as u32).collect();
+            let poses_t = self.state.body_poses();
+            let (gq, gqd) = self
+                .gpu_joints
+                .as_mut()
+                .unwrap()
+                .compute(&self.gpu, poses_t, &hp)
+                .await
+                .expect("gpu joint state compute");
+            let (mut wq, mut wqd) = (0.0f32, 0.0f32);
+            for e in 0..n {
+                for k in 0..NUM_JOINTS {
+                    let i = k * n + e;
+                    wq = wq.max((gq[i] - computed[e].new_joint_pos[k]).abs());
+                    wqd = wqd.max((gqd[i] - computed[e].joint_vel_dbg[k]).abs());
+                }
+            }
+            eprintln!("[verify_joints] q={wq:.3e} qd={wqd:.3e}");
         }
 
         // (5) Serial commit: per-env mutable state + StepOut assembly.
