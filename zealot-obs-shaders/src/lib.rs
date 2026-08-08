@@ -781,3 +781,141 @@ pub fn gpu_base_state(
         prev_pose.write(6 * n + e, tz);
     }
 }
+
+/// Scalar parameters for [`gpu_reward_base_terms`] (uniform; 80 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct RewardBaseParams {
+    pub n_envs: u32,
+    pub dt: f32,
+    pub w_track_lin: f32,
+    pub w_forward_progress: f32,
+    pub w_track_ang: f32,
+    pub w_upright: f32,
+    pub w_base_height: f32,
+    pub w_body_ang_vel: f32,
+    pub w_lin_vel_z: f32,
+    pub std_lin: f32,
+    pub std_ang: f32,
+    pub std_base_h: f32,
+    pub std_upright: f32,
+    /// Widened stds used while stepping over a detected edge.
+    pub step_std_base_h: f32,
+    pub step_std_upright: f32,
+    pub step_relax_dist: f32,
+    /// Height target when standing (`cmd.speed() < 0.1`) and when walking.
+    pub h_target_stand: f32,
+    pub h_target_walk: f32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
+/// Rotate `v` by the INVERSE of xyzw quaternion `q` (world → body).
+#[inline]
+fn qrot_inv(q: Vec4, v: [f32; 3]) -> [f32; 3] {
+    // quat_rotate with u = -q.xyz, w = q.w
+    let (ux, uy, uz, w) = (-q.x, -q.y, -q.z, q.w);
+    let tx = uy * v[2] - uz * v[1] + w * v[0];
+    let ty = uz * v[0] - ux * v[2] + w * v[1];
+    let tz = ux * v[1] - uy * v[0] + w * v[2];
+    [
+        v[0] + 2.0 * (uy * tz - uz * ty),
+        v[1] + 2.0 * (uz * tx - ux * tz),
+        v[2] + 2.0 * (ux * ty - uy * tx),
+    ]
+}
+
+/// The base-state reward terms, one thread per environment.
+///
+/// Exact port of the host: velocities and gravity are taken into the BODY frame
+/// (`quat_rotate_inv`), tracking uses exp kernels, and `base_height`/`upright`
+/// widen their std while stepping over a detected edge — a condition that
+/// depends on the per-env step cue, so the cue is supplied rather than
+/// recomputed here.
+///
+/// `base` is `[13 x n]` from [`gpu_base_state`]; `cmd` is `[4 x n]`
+/// (vx, vy, yaw_rate, speed); `cue` is `[4 x n]` (valid, distance, edge_cos,
+/// edge_sin). `out` is `[6 x n]`: track_lin_vel, track_ang_vel, upright,
+/// base_height, body_ang_vel, lin_vel_z.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_reward_base_terms(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &RewardBaseParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] base: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] cmd: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] cue: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    if e < n {
+        let q = Vec4::new(base.read(e), base.read(n + e), base.read(2 * n + e), base.read(3 * n + e));
+        let lv = [base.read(4 * n + e), base.read(5 * n + e), base.read(6 * n + e)];
+        let av = [base.read(7 * n + e), base.read(8 * n + e), base.read(9 * n + e)];
+        let height = base.read(10 * n + e);
+
+        let v = qrot_inv(q, lv);
+        let w = qrot_inv(q, av);
+        let grav = qrot_inv(q, [0.0, 0.0, -1.0]);
+
+        let (cvx, cvy) = (cmd.read(e), cmd.read(n + e));
+        let cyaw = cmd.read(2 * n + e);
+        // NOTE two different "speeds": the tracking clamp uses the PLANAR
+        // command speed, while the height-target gate uses `cmd.speed()`, which
+        // also includes yaw_rate. Conflating them is a silent 3e-2 error.
+        let cspeed = cmd.read(3 * n + e);
+        let planar = (cvx * cvx + cvy * cvy).sqrt();
+        let dt = params.dt;
+
+        // Tracking: exp kernel plus a LINEAR forward-progress term, which keeps
+        // a gradient when the exp kernel has saturated flat.
+        let lin_err = (cvx - v[0]) * (cvx - v[0]) + (cvy - v[1]) * (cvy - v[1]);
+        let v_along = if planar > 1e-6 { (v[0] * cvx + v[1] * cvy) / planar } else { 0.0 };
+        let v_clamped = if v_along < 0.0 {
+            0.0
+        } else if v_along > planar {
+            planar
+        } else {
+            v_along
+        };
+        let track_lin = params.w_track_lin
+            * (-lin_err / (params.std_lin * params.std_lin)).exp()
+            * dt
+            + params.w_forward_progress * v_clamped * dt;
+
+        let ang_err = (cyaw - w[2]) * (cyaw - w[2]);
+        let track_ang =
+            params.w_track_ang * (-ang_err / (params.std_ang * params.std_ang)).exp() * dt;
+
+        // Stepping relaxes the height/upright stds — same predicate as the host.
+        let toward_step = v[0] * cue.read(2 * n + e) + v[1] * cue.read(3 * n + e);
+        let dist = cue.read(n + e);
+        let dist_abs = if dist < 0.0 { -dist } else { dist };
+        let stepping =
+            cue.read(e) > 0.5 && dist_abs < params.step_relax_dist && toward_step > 0.1;
+        let std_h = if stepping { params.step_std_base_h } else { params.std_base_h };
+        let std_up = if stepping { params.step_std_upright } else { params.std_upright };
+
+        let tilt_err = grav[0] * grav[0] + grav[1] * grav[1];
+        let upright = params.w_upright * (-tilt_err / (std_up * std_up)).exp() * dt;
+
+        let h_target = if cspeed < 0.1 { params.h_target_stand } else { params.h_target_walk };
+        let h_err = (height - h_target) * (height - h_target);
+        let base_h = params.w_base_height * (-h_err / (std_h * std_h)).exp() * dt;
+
+        let body_ang = params.w_body_ang_vel * (w[0] * w[0] + w[1] * w[1]) * dt;
+        let lin_z = params.w_lin_vel_z * v[2] * v[2] * dt;
+
+        out.write(e, track_lin);
+        out.write(n + e, track_ang);
+        out.write(2 * n + e, upright);
+        out.write(3 * n + e, base_h);
+        out.write(4 * n + e, body_ang);
+        out.write(5 * n + e, lin_z);
+    }
+}

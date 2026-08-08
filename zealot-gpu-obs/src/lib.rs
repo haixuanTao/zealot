@@ -29,6 +29,95 @@ pub static SPIRV_DIR: Dir<'static> = include_dir!("$OUT_DIR/shaders-spirv");
 
 
 
+
+/// Host binding for the base-state reward terms.
+#[derive(Shader)]
+struct RewardBaseShader {
+    terms: shaders::GpuRewardBaseTerms,
+}
+
+/// track_lin_vel / track_ang_vel / upright / base_height / body_ang_vel /
+/// lin_vel_z, from the GPU base state.
+pub struct GpuRewardBaseTerms {
+    shader: RewardBaseShader,
+    params: Tensor<shaders::RewardBaseParams>,
+    base: Tensor<f32>,
+    cmd: Tensor<f32>,
+    cue: Tensor<f32>,
+    out: Tensor<f32>,
+    n: usize,
+}
+
+impl GpuRewardBaseTerms {
+    pub fn new(backend: &GpuBackend, n: usize) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        Ok(Self {
+            shader: RewardBaseShader::from_backend(backend)?,
+            params: Tensor::scalar(
+                backend,
+                shaders::RewardBaseParams {
+                    n_envs: n as u32,
+                    dt: 0.0,
+                    w_track_lin: 0.0,
+                    w_forward_progress: 0.0,
+                    w_track_ang: 0.0,
+                    w_upright: 0.0,
+                    w_base_height: 0.0,
+                    w_body_ang_vel: 0.0,
+                    w_lin_vel_z: 0.0,
+                    std_lin: 1.0,
+                    std_ang: 1.0,
+                    std_base_h: 1.0,
+                    std_upright: 1.0,
+                    step_std_base_h: 1.0,
+                    step_std_upright: 1.0,
+                    step_relax_dist: 0.0,
+                    h_target_stand: 0.0,
+                    h_target_walk: 0.0,
+                    pad0: 0,
+                    pad1: 0,
+                },
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            base: Tensor::vector_uninit(backend, (13 * n) as u32, st)?,
+            cmd: Tensor::vector(backend, &vec![0.0f32; 4 * n], st)?,
+            cue: Tensor::vector(backend, &vec![0.0f32; 4 * n], st)?,
+            out: Tensor::vector_uninit(backend, (6 * n) as u32, st | BufferUsages::COPY_SRC)?,
+            n,
+        })
+    }
+
+    /// `base` is the `[13 x n]` block from `GpuBaseState`; returns `[6 x n]`.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        params: shaders::RewardBaseParams,
+        base: &[f32],
+        cmd: &[f32],
+        cue: &[f32],
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
+        backend.write_buffer(self.base.buffer_mut(), 0, base)?;
+        backend.write_buffer(self.cmd.buffer_mut(), 0, cmd)?;
+        backend.write_buffer(self.cue.buffer_mut(), 0, cue)?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[reward] base terms", None);
+            self.shader.terms.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                &self.base,
+                &self.cmd,
+                &self.cue,
+                &mut self.out,
+            )?;
+        }
+        backend.submit(enc)?;
+        backend.slow_read_vec(self.out.buffer()).await
+    }
+}
+
 /// Host binding for the base-state kernel.
 #[derive(Shader)]
 struct BaseStateShader {

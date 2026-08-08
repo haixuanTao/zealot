@@ -1743,6 +1743,8 @@ pub struct BipedNexusBatchEnv {
     gpu_torque_terms: Option<zealot_gpu_obs::GpuRewardTorqueTerms>,
     /// Base pose / velocities / height.
     gpu_base: Option<zealot_gpu_obs::GpuBaseState>,
+    /// Base-state reward terms.
+    gpu_base_terms: Option<zealot_gpu_obs::GpuRewardBaseTerms>,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2575,6 +2577,7 @@ impl BipedNexusBatchEnv {
             gpu_joint_terms: None,
             gpu_torque_terms: None,
             gpu_base: None,
+            gpu_base_terms: None,
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -3742,6 +3745,9 @@ impl BipedNexusBatchEnv {
             joint_vel_dbg: [f32; NUM_JOINTS],
             /// Host base state, same purpose: quat xyzw, lin vel, ang vel, height.
             base_dbg: [f32; 11],
+            /// The step cue AS THE HOST USED IT (noised/dropout-masked):
+            /// valid, distance, edge_cos, edge_sin.
+            cue_dbg: [f32; 4],
             // Foot index that touched down this step (-1 = none); committed to
             // `self.last_td_foot` in the serial pass to track gait alternation.
             td_foot: i8,
@@ -4188,6 +4194,12 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 }
                 PerEnv {
                     joint_vel_dbg: state.joint_vel,
+                    cue_dbg: [
+                        state.step_cue.valid,
+                        state.step_cue.distance,
+                        state.step_cue.edge_cos,
+                        state.step_cue.edge_sin,
+                    ],
                     base_dbg: [
                         state.base.orientation[0],
                         state.base.orientation[1],
@@ -4479,6 +4491,70 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             }
             eprintln!(
                 "[verify_base] quat={wquat:.3e} lin_vel={wlv:.3e} ang_vel={wav:.3e} height={wh:.3e}"
+            );
+
+            // ---- base-dependent reward terms ----
+            if self.gpu_base_terms.is_none() {
+                self.gpu_base_terms =
+                    Some(zealot_gpu_obs::GpuRewardBaseTerms::new(&self.gpu, n).expect("base terms"));
+            }
+            let tk = &self.task;
+            let bp = zealot_obs_shaders::RewardBaseParams {
+                n_envs: n as u32,
+                dt: dtc,
+                w_track_lin: tk.weights.track_lin_vel,
+                w_forward_progress: tk.weights.forward_progress,
+                w_track_ang: tk.weights.track_ang_vel,
+                w_upright: tk.weights.upright,
+                w_base_height: tk.weights.base_height,
+                w_body_ang_vel: tk.weights.body_ang_vel,
+                w_lin_vel_z: tk.weights.lin_vel_z,
+                std_lin: tk.stds.lin_vel,
+                std_ang: tk.stds.ang_vel,
+                std_base_h: tk.stds.base_height,
+                std_upright: tk.stds.upright,
+                step_std_base_h: tk.step_std_base_h,
+                step_std_upright: tk.step_std_upright,
+                step_relax_dist: tk.step_relax_dist,
+                h_target_stand: tk.weights.base_height_target_stand,
+                h_target_walk: tk.weights.base_height_target,
+                pad0: 0,
+                pad1: 0,
+            };
+            let mut cmdb = vec![0.0f32; 4 * n];
+            let mut cueb = vec![0.0f32; 4 * n];
+            for e in 0..n {
+                cmdb[e] = self.cmd[e].vx;
+                cmdb[n + e] = self.cmd[e].vy;
+                cmdb[2 * n + e] = self.cmd[e].yaw_rate;
+                cmdb[3 * n + e] = self.cmd[e].speed();
+                let c = computed[e].cue_dbg;
+                cueb[e] = c[0];
+                cueb[n + e] = c[1];
+                cueb[2 * n + e] = c[2];
+                cueb[3 * n + e] = c[3];
+            }
+            let bt = self
+                .gpu_base_terms
+                .as_mut()
+                .unwrap()
+                .compute(&self.gpu, bp, &gb, &cmdb, &cueb)
+                .await
+                .expect("gpu base terms compute");
+            const BASE_TERMS: [(usize, usize); 6] =
+                [(0, 0), (1, 1), (2, 2), (3, 3), (8, 4), (9, 5)];
+            let mut wbt = [0.0f32; 6];
+            for (ti, (comp, row)) in BASE_TERMS.iter().enumerate() {
+                for e in 0..n {
+                    let d = (bt[row * n + e] - computed[e].comps[*comp]).abs();
+                    if d > wbt[ti] {
+                        wbt[ti] = d;
+                    }
+                }
+            }
+            eprintln!(
+                "[verify_base_terms] track_lin={:.3e} track_ang={:.3e} upright={:.3e} base_h={:.3e} body_ang={:.3e} lin_vel_z={:.3e}",
+                wbt[0], wbt[1], wbt[2], wbt[3], wbt[4], wbt[5]
             );
         }
 
