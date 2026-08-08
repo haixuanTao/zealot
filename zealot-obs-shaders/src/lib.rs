@@ -327,3 +327,79 @@ pub fn gpu_commit_actions(
     let ep = state.read(sb(36));
     state.write(sb(36), ep + 1.0);
 }
+
+/// Scalar parameters for [`gpu_reward_action_terms`] (uniform; 32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct RewardActionParams {
+    /// Environments (columns of the row-major `[J x n]` action buffers).
+    pub n_envs: u32,
+    /// Actuated joints `J`.
+    pub num_joints: u32,
+    /// Control dt — every reward term is scaled by it.
+    pub dt: f32,
+    /// `weights.action_rate` (negative).
+    pub w_action_rate: f32,
+    /// `weights.action_rate_hipz_hipx` (negative).
+    pub w_action_rate_hip: f32,
+    /// `weights.action_rate_rate` (negative).
+    pub w_action_rate_rate: f32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
+/// The three action-smoothness reward terms, one thread per environment.
+///
+/// Exact port of `VelocityFlatTask::reward`'s action penalties:
+///   action_rate      = w   · Σ(a − a′)²      · dt
+///   action_rate_hip  = w_h · Σ_hip(a − a′)²  · dt
+///   action_rate_rate = w_r · Σ(a − 2a′ + a″)² · dt
+///
+/// These depend ONLY on the last three action vectors — no physics state — so
+/// they are the first terms that can move without the state-derivation kernel,
+/// and they exercise the whole path (params uniform, per-term output buffer,
+/// host comparison) end to end.
+///
+/// Action buffers are row-major `[num_joints x n_envs]`: joint `i` of env `e`
+/// at `i·n_envs + e`. `hip_mask` is `num_joints` long, 1.0 on the hip yaw/roll
+/// joints the hip-specific term sums over. `out` is `[3 x n_envs]`, rows in the
+/// order above.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_reward_action_terms(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &RewardActionParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] last: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] prev: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] prev2: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] hip_mask: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    let j = params.num_joints as usize;
+    if e < n {
+        let mut da2 = 0.0f32;
+        let mut da2_hip = 0.0f32;
+        let mut dda2 = 0.0f32;
+        for i in 0..j {
+            let idx = i * n + e;
+            let a = last.read(idx);
+            let ap = prev.read(idx);
+            let app = prev2.read(idx);
+            let d = a - ap;
+            da2 += d * d;
+            da2_hip += hip_mask.read(i) * d * d;
+            let dd = a - 2.0 * ap + app;
+            dda2 += dd * dd;
+        }
+        let dt = params.dt;
+        out.write(e, params.w_action_rate * da2 * dt);
+        out.write(n + e, params.w_action_rate_hip * da2_hip * dt);
+        out.write(2 * n + e, params.w_action_rate_rate * dda2 * dt);
+    }
+}

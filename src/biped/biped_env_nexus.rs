@@ -1504,6 +1504,10 @@ impl StepKnobs {
     }
 }
 
+/// Reward-component indices the GPU kernel currently owns, paired with the
+/// kernel output row that carries each. See [`zealot_gpu_obs::GpuRewardTerms`].
+const GPU_REWARD_TERMS: [(usize, usize); 3] = [(6, 0), (7, 1), (29, 2)];
+
 pub struct BipedNexusBatchEnv {
     // Topology + indexing
     mjcf: Vec<MjBody>,
@@ -1728,6 +1732,9 @@ pub struct BipedNexusBatchEnv {
     /// `motor_targets_gpu` and scattered by a kernel each control step.
     /// Reward / termination knobs, resolved once (see [`StepKnobs`]).
     knobs: StepKnobs,
+    /// GPU reward: the ported terms + their staging. `None` until first use.
+    /// Verified against the host terms with `BIPED_VERIFY_REWARD=1`.
+    gpu_reward: Option<zealot_gpu_obs::GpuRewardTerms>,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2555,6 +2562,7 @@ impl BipedNexusBatchEnv {
             template_spawn_obs: Vec::new(),
             template_spawn_critic_obs: Vec::new(),
             knobs: StepKnobs::from_env(),
+            gpu_reward: None,
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -4175,6 +4183,65 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             })
             .collect();
         self.timings.par_compute_ns += t.elapsed().as_nanos() as u64;
+
+        // ---- GPU reward terms (partial port) ----
+        // Verified against the host values with BIPED_VERIFY_REWARD=1. Until a
+        // term is confirmed it stays host-owned, so totals are unaffected.
+        if env_var("BIPED_VERIFY_REWARD").is_ok() {
+            let n = self.n;
+            let jn = NUM_JOINTS * n;
+            if self.gpu_reward.is_none() {
+                self.gpu_reward = Some(
+                    zealot_gpu_obs::GpuRewardTerms::new(
+                        &self.gpu,
+                        n,
+                        NUM_JOINTS,
+                        &self.task.hip_yawroll_idx(),
+                    )
+                    .expect("gpu reward terms"),
+                );
+            }
+            let mut la = vec![0.0f32; jn];
+            let mut pa = vec![0.0f32; jn];
+            let mut p2a = vec![0.0f32; jn];
+            for e in 0..n {
+                for k in 0..NUM_JOINTS {
+                    la[k * n + e] = self.last_action[e][k];
+                    pa[k * n + e] = self.prev_action[e][k];
+                    p2a[k * n + e] = self.prev2_action[e][k];
+                }
+            }
+            let w = &self.task.weights;
+            let got = self
+                .gpu_reward
+                .as_mut()
+                .unwrap()
+                .compute(
+                    &self.gpu,
+                    &la,
+                    &pa,
+                    &p2a,
+                    self.task.control_dt(),
+                    w.action_rate,
+                    w.action_rate_hipz_hipx,
+                    w.action_rate_rate,
+                )
+                .await
+                .expect("gpu reward compute");
+            let mut worst = [0.0f32; GPU_REWARD_TERMS.len()];
+            for (t_i, (comp, row)) in GPU_REWARD_TERMS.iter().enumerate() {
+                for e in 0..n {
+                    let d = (got[row * n + e] - computed[e].comps[*comp]).abs();
+                    if d > worst[t_i] {
+                        worst[t_i] = d;
+                    }
+                }
+            }
+            eprintln!(
+                "[verify_reward] action_rate={:.3e} hipz_hipx={:.3e} action_rate_rate={:.3e}",
+                worst[0], worst[1], worst[2]
+            );
+        }
 
         // (5) Serial commit: per-env mutable state + StepOut assembly.
         let t = Instant::now();

@@ -958,6 +958,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda-device"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=62472763#624727636e99b5eb5a1613df2331051be7ab7e4e"
+dependencies = [
+ "cuda-macros",
+]
+
+[[package]]
+name = "cuda-macros"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=62472763#624727636e99b5eb5a1613df2331051be7ab7e4e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "reserved-oxide-symbols",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "cuda_std"
 version = "0.2.2"
 source = "git+https://github.com/sebcrozet/Rust-CUDA.git?branch=glam-up#039c38d945875b48a50363c05a5ddece392865eb"
@@ -2304,9 +2323,11 @@ dependencies = [
 name = "khal-std"
 version = "0.2.1"
 dependencies = [
+ "cuda-device",
  "cuda_std",
  "glamx",
  "khal-derive",
+ "num-traits",
  "spirv-std",
  "spirv-std-macros",
 ]
@@ -4064,6 +4085,11 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+
+[[package]]
+name = "reserved-oxide-symbols"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=62472763#624727636e99b5eb5a1613df2331051be7ab7e4e"
 
 [[package]]
 name = "rfd"
@@ -5914,6 +5940,7 @@ dependencies = [
  "wgpu",
  "zealot-env",
  "zealot-gpu-obs",
+ "zealot-obs-shaders",
  "zealot-rl",
 ]
 

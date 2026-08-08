@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 zealot-env = { path = "zealot-env" }
 zealot-rl = { path = "zealot-rl" }
+zealot-obs-shaders = { path = "zealot-obs-shaders" }
 zealot-gpu-obs = { path = "zealot-gpu-obs" }
 
 # The workspace root is also a package: it hosts the runnable examples that
@@ -38,7 +39,7 @@ gpu = ["dep:vortx", "dep:khal"]
 # biped_gpu — biped on nexus GPU physics, MJCF model. Pulls zealot-rl so the
 # nexus trainer can build (the smoke example doesn't need it, but it's a
 # negligible link-time addition).
-biped_gpu = ["dep:nexus3d", "dep:rapier3d", "dep:pollster", "dep:khal", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "dep:rayon", "dep:nalgebra", "dep:async-std", "dep:anyhow"]
+biped_gpu = ["dep:nexus3d", "dep:rapier3d", "dep:pollster", "dep:khal", "dep:roxmltree", "dep:zealot-env", "dep:zealot-rl", "dep:zealot-obs-shaders", "dep:zealot-gpu-obs", "dep:rayon", "dep:nalgebra", "dep:async-std", "dep:anyhow"]
 # cuda_backend — additively enables the native-CUDA (cuda-oxide) khal backend on
 # the vortx + nexus3d stack, alongside WebGPU. Selected at runtime via BIPED_CUDA=1.
 # Used for the all-native end-to-end benchmark (iter_e2e_bench). The cubins are
@@ -81,6 +82,7 @@ rayon = { version = "1", optional = true }
 pollster = { version = "0.4", optional = true }
 zealot-env = { workspace = true, optional = true }
 zealot-rl = { workspace = true, optional = true }
+zealot-obs-shaders = { workspace = true, optional = true }
 # Renderer for the website demos — same crate the nexus demos website uses, so
 # the wasm/WebGPU path is known-good. glamx 0.3 is kiss3d's math crate (the
 # nexus stack uses its own glamx internally; poses are converted by hand).

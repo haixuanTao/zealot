@@ -25,6 +25,121 @@ use shaders::{
 /// Embedded SPIR-V shader directory (resolved by `#[derive(Shader)]`).
 pub static SPIRV_DIR: Dir<'static> = include_dir!("$OUT_DIR/shaders-spirv");
 
+/// Host binding for the GPU reward terms.
+#[derive(Shader)]
+struct RewardShader {
+    terms: shaders::GpuRewardActionTerms,
+}
+
+/// GPU reward terms + persistent staging.
+///
+/// PARTIAL PORT BY DESIGN: the kernel owns only the action-smoothness terms so
+/// far; the caller still computes the rest on host and the totals are
+/// unaffected. A term moves across only once `BIPED_VERIFY_REWARD=1` shows it
+/// matching the host value.
+pub struct GpuRewardTerms {
+    shader: RewardShader,
+    params: vortx::tensor::Tensor<shaders::RewardActionParams>,
+    last: vortx::tensor::Tensor<f32>,
+    prev: vortx::tensor::Tensor<f32>,
+    prev2: vortx::tensor::Tensor<f32>,
+    hip_mask: vortx::tensor::Tensor<f32>,
+    out: vortx::tensor::Tensor<f32>,
+    n: usize,
+    j: usize,
+}
+
+
+impl GpuRewardTerms {
+    /// Allocate for `n` envs and `j` actuated joints. `hip` are the joint
+    /// indices `action_rate_hipz_hipx` sums over.
+    pub fn new(
+        backend: &GpuBackend,
+        n: usize,
+        j: usize,
+        hip: &[usize],
+    ) -> Result<Self, khal::backend::GpuBackendError> {
+        use khal::BufferUsages as U;
+        let st = U::STORAGE | U::COPY_DST;
+        let mut mask = vec![0.0f32; j];
+        for &i in hip {
+            if i < j {
+                mask[i] = 1.0;
+            }
+        }
+        Ok(Self {
+            shader: RewardShader::from_backend(backend)?,
+            params: vortx::tensor::Tensor::scalar(
+                backend,
+                shaders::RewardActionParams {
+                    n_envs: n as u32,
+                    num_joints: j as u32,
+                    dt: 0.0,
+                    w_action_rate: 0.0,
+                    w_action_rate_hip: 0.0,
+                    w_action_rate_rate: 0.0,
+                    pad0: 0,
+                    pad1: 0,
+                },
+                U::UNIFORM | U::STORAGE | U::COPY_DST,
+            )?,
+            last: vortx::tensor::Tensor::vector_uninit(backend, (j * n) as u32, st)?,
+            prev: vortx::tensor::Tensor::vector_uninit(backend, (j * n) as u32, st)?,
+            prev2: vortx::tensor::Tensor::vector_uninit(backend, (j * n) as u32, st)?,
+            hip_mask: vortx::tensor::Tensor::vector(backend, &mask, st)?,
+            out: vortx::tensor::Tensor::vector_uninit(backend, (3 * n) as u32, st | U::COPY_SRC)?,
+            n,
+            j,
+        })
+    }
+
+    /// Upload the three action vectors (each row-major `[j x n]`), dispatch,
+    /// and read back the `[3 x n]` term values.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        last: &[f32],
+        prev: &[f32],
+        prev2: &[f32],
+        dt: f32,
+        w_rate: f32,
+        w_hip: f32,
+        w_rate_rate: f32,
+    ) -> Result<Vec<f32>, khal::backend::GpuBackendError> {
+        use khal::backend::{Backend, Encoder};
+        backend.write_buffer(self.params.buffer_mut(), 0, &[shaders::RewardActionParams {
+            n_envs: self.n as u32,
+            num_joints: self.j as u32,
+            dt,
+            w_action_rate: w_rate,
+            w_action_rate_hip: w_hip,
+            w_action_rate_rate: w_rate_rate,
+            pad0: 0,
+            pad1: 0,
+        }])?;
+        backend.write_buffer(self.last.buffer_mut(), 0, last)?;
+        backend.write_buffer(self.prev.buffer_mut(), 0, prev)?;
+        backend.write_buffer(self.prev2.buffer_mut(), 0, prev2)?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[reward] action terms", None);
+            self.shader.terms.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                &self.last,
+                &self.prev,
+                &self.prev2,
+                &self.hip_mask,
+                &mut self.out,
+            )?;
+        }
+        backend.submit(enc)?;
+        backend.slow_read_vec(self.out.buffer()).await
+    }
+}
+
 #[derive(Shader)]
 struct ObsBundle {
     assemble: shaders::GpuAssembleObs,
