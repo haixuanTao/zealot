@@ -1737,6 +1737,8 @@ pub struct BipedNexusBatchEnv {
     gpu_reward: Option<zealot_gpu_obs::GpuRewardTerms>,
     /// GPU joint state (q, qd), verified against `read_state_from_poses`.
     gpu_joints: Option<zealot_gpu_obs::GpuJointState>,
+    /// Joint-only reward terms (pose / dof_pos_limits / dof_vel).
+    gpu_joint_terms: Option<zealot_gpu_obs::GpuRewardJointTerms>,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2566,6 +2568,7 @@ impl BipedNexusBatchEnv {
             knobs: StepKnobs::from_env(),
             gpu_reward: None,
             gpu_joints: None,
+            gpu_joint_terms: None,
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -4292,6 +4295,55 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 }
             }
             eprintln!("[verify_joints] q={wq:.3e} qd={wqd:.3e}");
+
+            // ---- joint-only reward terms ----
+            if self.gpu_joint_terms.is_none() {
+                let dpos: Vec<f32> =
+                    (0..NUM_JOINTS).map(|k| self.robot.joints[k].default_pos).collect();
+                // The host applies the 0.9 soft band before comparing, so bake
+                // it in here rather than in the kernel.
+                let lo: Vec<f32> =
+                    (0..NUM_JOINTS).map(|k| self.robot.joints[k].pos_limit.0 * 0.9).collect();
+                let hi: Vec<f32> =
+                    (0..NUM_JOINTS).map(|k| self.robot.joints[k].pos_limit.1 * 0.9).collect();
+                self.gpu_joint_terms = Some(
+                    zealot_gpu_obs::GpuRewardJointTerms::new(
+                        &self.gpu,
+                        n,
+                        NUM_JOINTS,
+                        &dpos,
+                        &lo,
+                        &hi,
+                        &self.task.hip_yawroll_idx(),
+                    )
+                    .expect("gpu joint terms"),
+                );
+            }
+            let w = &self.task.weights;
+            let (wp, wl, wv) = (w.pose, w.dof_pos_limits, w.dof_vel);
+            let dtc = self.task.control_dt();
+            let joints_ref = self.gpu_joints.as_ref().unwrap();
+            let jt = self
+                .gpu_joint_terms
+                .as_mut()
+                .unwrap()
+                .compute(&self.gpu, joints_ref, dtc, wp, wl, wv)
+                .await
+                .expect("gpu joint terms compute");
+            const JOINT_TERMS: [(usize, usize); 3] = [(4, 0), (10, 1), (11, 2)];
+            let mut wj = [0.0f32; 3];
+            for (ti, (comp, row)) in JOINT_TERMS.iter().enumerate() {
+                for e in 0..n {
+                    let d = (jt[row * n + e] - computed[e].comps[*comp]).abs();
+                    if d > wj[ti] {
+                        wj[ti] = d;
+                    }
+                }
+            }
+            eprintln!(
+                "[verify_joint_terms] pose={:.3e} dof_pos_limits={:.3e} dof_vel={:.3e}",
+                wj[0], wj[1], wj[2]
+            );
         }
 
         // (5) Serial commit: per-env mutable state + StepOut assembly.

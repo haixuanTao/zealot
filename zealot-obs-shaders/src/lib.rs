@@ -488,3 +488,75 @@ pub fn gpu_joint_state(
         }
     }
 }
+
+/// Scalar parameters for [`gpu_reward_joint_terms`] (uniform; 32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct RewardJointParams {
+    pub n_envs: u32,
+    pub num_joints: u32,
+    pub dt: f32,
+    /// `weights.pose` — hip yaw/roll deviation from the default pose.
+    pub w_pose: f32,
+    /// `weights.dof_pos_limits` — soft band at 90% of each hard limit.
+    pub w_dof_limits: f32,
+    /// `weights.dof_vel` — joint-velocity L2.
+    pub w_dof_vel: f32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
+/// The joint-only reward terms, one thread per environment.
+///
+/// Exact port of `VelocityFlatTask::reward`:
+///   pose           = w   · Σ_hip (q − default)²                    · dt
+///   dof_pos_limits = w_l · Σ_i  [max(q−hi,0) + max(lo−q,0)]        · dt
+///   dof_vel        = w_v · Σ_i  q̇²                                 · dt
+///
+/// `lo`/`hi` are the SOFT limits — the host applies the 0.9 band factor, so it
+/// is applied host-side when these are uploaded, not here.
+///
+/// `q`/`qd` are row-major `[num_joints x n_envs]` as produced by
+/// [`gpu_joint_state`]; `out` is `[3 x n_envs]` in the order above.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_reward_joint_terms(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &RewardJointParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] q: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] qd: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] default_pos: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] soft_lo: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] soft_hi: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] hip_mask: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    let j = params.num_joints as usize;
+    if e < n {
+        let mut hip_dev2 = 0.0f32;
+        let mut lim_pen = 0.0f32;
+        let mut jv2 = 0.0f32;
+        for i in 0..j {
+            let idx = i * n + e;
+            let qi = q.read(idx);
+            let vi = qd.read(idx);
+            let d = qi - default_pos.read(i);
+            hip_dev2 += hip_mask.read(i) * d * d;
+            let over = qi - soft_hi.read(i);
+            let under = soft_lo.read(i) - qi;
+            lim_pen += if over > 0.0 { over } else { 0.0 };
+            lim_pen += if under > 0.0 { under } else { 0.0 };
+            jv2 += vi * vi;
+        }
+        let dt = params.dt;
+        out.write(e, params.w_pose * hip_dev2 * dt);
+        out.write(n + e, params.w_dof_limits * lim_pen * dt);
+        out.write(2 * n + e, params.w_dof_vel * jv2 * dt);
+    }
+}

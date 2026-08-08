@@ -93,7 +93,17 @@ impl GpuJointState {
         })
     }
 
-    /// Dispatch against the live `body_poses` buffer (bound as `Vec4`), then
+    /// The device-resident joint angles, row-major `[j x n]`.
+    pub fn q_buffer(&self) -> &Tensor<f32> {
+        &self.q
+    }
+
+    /// The device-resident joint velocities, row-major `[j x n]`.
+    pub fn qd_buffer(&self) -> &Tensor<f32> {
+        &self.qd
+    }
+
+    /// Dispatch against the live `body_poses` buffer, then
     /// read back `(q, qd)` — both row-major `[j x n]`.
     pub async fn compute(
         &mut self,
@@ -124,6 +134,111 @@ impl GpuJointState {
         let q = backend.slow_read_vec(self.q.buffer()).await?;
         let qd = backend.slow_read_vec(self.qd.buffer()).await?;
         Ok((q, qd))
+    }
+}
+
+
+/// Host binding for the joint-only reward terms.
+#[derive(Shader)]
+struct RewardJointShader {
+    terms: shaders::GpuRewardJointTerms,
+}
+
+/// pose / dof_pos_limits / dof_vel, computed from the GPU joint state.
+pub struct GpuRewardJointTerms {
+    shader: RewardJointShader,
+    params: Tensor<shaders::RewardJointParams>,
+    default_pos: Tensor<f32>,
+    soft_lo: Tensor<f32>,
+    soft_hi: Tensor<f32>,
+    hip_mask: Tensor<f32>,
+    out: Tensor<f32>,
+    n: usize,
+    j: usize,
+}
+
+impl GpuRewardJointTerms {
+    /// `soft_lo`/`soft_hi` must already carry the host's 0.9 band factor.
+    pub fn new(
+        backend: &GpuBackend,
+        n: usize,
+        j: usize,
+        default_pos: &[f32],
+        soft_lo: &[f32],
+        soft_hi: &[f32],
+        hip: &[usize],
+    ) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        let mut mask = vec![0.0f32; j];
+        for &i in hip {
+            if i < j {
+                mask[i] = 1.0;
+            }
+        }
+        Ok(Self {
+            shader: RewardJointShader::from_backend(backend)?,
+            params: Tensor::scalar(
+                backend,
+                shaders::RewardJointParams {
+                    n_envs: n as u32,
+                    num_joints: j as u32,
+                    dt: 0.0,
+                    w_pose: 0.0,
+                    w_dof_limits: 0.0,
+                    w_dof_vel: 0.0,
+                    pad0: 0,
+                    pad1: 0,
+                },
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            default_pos: Tensor::vector(backend, default_pos, st)?,
+            soft_lo: Tensor::vector(backend, soft_lo, st)?,
+            soft_hi: Tensor::vector(backend, soft_hi, st)?,
+            hip_mask: Tensor::vector(backend, &mask, st)?,
+            out: Tensor::vector_uninit(backend, (3 * n) as u32, st | BufferUsages::COPY_SRC)?,
+            n,
+            j,
+        })
+    }
+
+    /// Dispatch against the GPU joint state; returns `[3 x n]`.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        joints: &GpuJointState,
+        dt: f32,
+        w_pose: f32,
+        w_dof_limits: f32,
+        w_dof_vel: f32,
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        backend.write_buffer(self.params.buffer_mut(), 0, &[shaders::RewardJointParams {
+            n_envs: self.n as u32,
+            num_joints: self.j as u32,
+            dt,
+            w_pose,
+            w_dof_limits,
+            w_dof_vel,
+            pad0: 0,
+            pad1: 0,
+        }])?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[reward] joint terms", None);
+            self.shader.terms.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                joints.q_buffer(),
+                joints.qd_buffer(),
+                &self.default_pos,
+                &self.soft_lo,
+                &self.soft_hi,
+                &self.hip_mask,
+                &mut self.out,
+            )?;
+        }
+        backend.submit(enc)?;
+        backend.slow_read_vec(self.out.buffer()).await
     }
 }
 
