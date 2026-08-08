@@ -1749,6 +1749,8 @@ pub struct BipedNexusBatchEnv {
     gpu_feet: Option<zealot_gpu_obs::GpuFeetState>,
     /// Self-contained per-foot reward terms.
     gpu_feet_terms: Option<zealot_gpu_obs::GpuRewardFeetTerms>,
+    /// Gated gait reward terms.
+    gpu_gait_terms: Option<zealot_gpu_obs::GpuRewardGaitTerms>,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2584,6 +2586,7 @@ impl BipedNexusBatchEnv {
             gpu_base_terms: None,
             gpu_feet: None,
             gpu_feet_terms: None,
+            gpu_gait_terms: None,
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -3757,6 +3760,10 @@ impl BipedNexusBatchEnv {
             /// Host per-foot state for the GPU feet check: per foot, 11 fields
             /// in the kernel's order.
             feet_dbg: [f32; 22],
+            /// The host's `stepping` predicate and cue height, which gate the
+            /// clearance target.
+            stepping_dbg: f32,
+            cue_h_dbg: f32,
             // Foot index that touched down this step (-1 = none); committed to
             // `self.last_td_foot` in the serial pass to track gait alternation.
             td_foot: i8,
@@ -4203,6 +4210,22 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 }
                 PerEnv {
                     joint_vel_dbg: state.joint_vel,
+                    // The host's `stepping` predicate, recomputed here from the
+                    // same state the reward uses, so the GPU gate is checked
+                    // against the identical condition.
+                    stepping_dbg: {
+                        let vb = zealot_env::math::quat_rotate_inv(
+                            state.base.orientation,
+                            state.base.lin_vel_world,
+                        );
+                        let toward = vb[0] * state.step_cue.edge_cos
+                            + vb[1] * state.step_cue.edge_sin;
+                        let st = state.step_cue.valid > 0.5
+                            && state.step_cue.distance.abs() < self.task.step_relax_dist
+                            && toward > 0.1;
+                        if st { 1.0 } else { 0.0 }
+                    },
+                    cue_h_dbg: state.step_cue.height,
                     feet_dbg: {
                         let mut f = [0.0f32; 22];
                         for (i, fo) in state.feet.iter().enumerate() {
@@ -4734,6 +4757,75 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             eprintln!(
                 "[verify_feet_terms] flight={:.2e} slip={:.2e} dF={:.2e} orient={:.2e} yaw_mean={:.2e} yaw_diff={:.2e} dist={:.2e} td_vz={:.2e}",
                 wft[0], wft[1], wft[2], wft[3], wft[4], wft[5], wft[6], wft[7]
+            );
+
+            // ---- gated gait terms ----
+            if self.gpu_gait_terms.is_none() {
+                self.gpu_gait_terms =
+                    Some(zealot_gpu_obs::GpuRewardGaitTerms::new(&self.gpu, n).expect("gait terms"));
+            }
+            let wq3 = &self.task.weights;
+            let gp = zealot_obs_shaders::RewardGaitParams {
+                n_envs: n as u32,
+                dt: dtc,
+                w_air_time: wq3.air_time,
+                w_single_support: wq3.single_support,
+                w_stand_planted: wq3.stand_planted,
+                w_foot_clearance: wq3.foot_clearance,
+                foot_clearance_target: wq3.foot_clearance_target,
+                w_gait_clock: wq3.gait_clock,
+                gait_swing_ratio: wq3.gait_swing_ratio,
+                max_swing_s: 0.45,
+                foot_rest_h: 0.035,
+                step_clear_margin: 0.05,
+                step_relax_dist: self.task.step_relax_dist,
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
+            };
+            // aux: phase, progress, cmd_speed_full, cue_height, stepping — the
+            // per-env scalars the gates read.
+            let mut aux = vec![0.0f32; 5 * n];
+            for e in 0..n {
+                let c = &self.cmd[e];
+                let sp2 = c.vx * c.vx + c.vy * c.vy;
+                let bq = &computed[e].base_dbg;
+                // body-frame planar velocity, as the host's `progress` uses.
+                let vb = zealot_env::math::quat_rotate_inv(
+                    [bq[0], bq[1], bq[2], bq[3]],
+                    [bq[4], bq[5], bq[6]],
+                );
+                aux[e] = self.gait_phase[e];
+                aux[n + e] = if sp2 > 1e-6 {
+                    ((vb[0] * c.vx + vb[1] * c.vy) / sp2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                aux[2 * n + e] = c.speed();
+                aux[3 * n + e] = computed[e].cue_h_dbg;
+                aux[4 * n + e] = computed[e].stepping_dbg;
+            }
+            let gt = self
+                .gpu_gait_terms
+                .as_mut()
+                .unwrap()
+                .compute(&self.gpu, gp, &gf, &aux)
+                .await
+                .expect("gpu gait terms compute");
+            const GAIT_TERMS: [(usize, usize); 5] =
+                [(12, 0), (14, 1), (26, 2), (16, 3), (25, 4)];
+            let mut wgt = [0.0f32; 5];
+            for (ti, (comp, row)) in GAIT_TERMS.iter().enumerate() {
+                for e in 0..n {
+                    let d = (gt[row * n + e] - computed[e].comps[*comp]).abs();
+                    if d > wgt[ti] {
+                        wgt[ti] = d;
+                    }
+                }
+            }
+            eprintln!(
+                "[verify_gait_terms] air_time={:.2e} single_support={:.2e} stand_planted={:.2e} clearance={:.2e} gait_clock={:.2e}",
+                wgt[0], wgt[1], wgt[2], wgt[3], wgt[4]
             );
         }
 

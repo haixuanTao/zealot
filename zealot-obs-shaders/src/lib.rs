@@ -1190,3 +1190,150 @@ pub fn gpu_reward_feet_terms(
         out.write(7 * n + e, params.w_touchdown_vz * slam * dt);
     }
 }
+
+/// Scalar parameters for [`gpu_reward_gait_terms`] (uniform; 64 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct RewardGaitParams {
+    pub n_envs: u32,
+    pub dt: f32,
+    pub w_air_time: f32,
+    pub w_single_support: f32,
+    pub w_stand_planted: f32,
+    pub w_foot_clearance: f32,
+    pub foot_clearance_target: f32,
+    pub w_gait_clock: f32,
+    pub gait_swing_ratio: f32,
+    /// Longest airborne time still counted as an ACTIVE swing.
+    pub max_swing_s: f32,
+    /// Foot resting height, subtracted before the clearance ratio.
+    pub foot_rest_h: f32,
+    /// Extra clearance demanded above a detected step edge.
+    pub step_clear_margin: f32,
+    pub step_relax_dist: f32,
+    pub pad0: u32,
+    pub pad1: u32,
+    pub pad2: u32,
+}
+
+/// The GATED gait reward terms, one thread per environment.
+///
+/// These are the terms whose whole character is in their guards, so the guards
+/// are ported verbatim:
+///   air_time       — paid only at an ALTERNATING touchdown, capped at 0.4 s,
+///                    moving-gated and multiplied by `progress`
+///   single_support — moving: penalise permanent double-support, and
+///                    single-support only when the airborne foot is a HELD
+///                    statue (air_time > max_swing); standing: the inverse,
+///                    reward both planted and penalise stepping
+///   stand_planted  — per airborne foot, standing only
+///   foot_clearance — active swings only (air_time < max_swing), moving-gated,
+///                    capped at 1 per foot, target raised over a detected edge
+///   gait_clock     — Siekmann ±1 per foot for contact matching its phase
+///                    window, moving-gated and progress-multiplied
+///
+/// `moving`/`standing` is `cmd.speed() >= 0.1` (the FULL speed, including
+/// yaw_rate), while `progress` uses the PLANAR command — the same distinction
+/// that bit the tracking term.
+///
+/// `feet` is `[26 x n]` from `gpu_feet_state`; `aux` is `[5 x n]`: phase,
+/// progress, cmd_speed_full, cue_height, stepping. `out` is `[5 x n]`:
+/// air_time, single_support, stand_planted, foot_clearance, gait_clock.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_reward_gait_terms(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &RewardGaitParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] feet: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] aux: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    if e < n {
+        let dt = params.dt;
+        let g = |row: usize| feet.read(row * n + e);
+        let phase = aux.read(e);
+        let progress = aux.read(n + e);
+        let speed_full = aux.read(2 * n + e);
+        let cue_h = aux.read(3 * n + e);
+        let stepping = aux.read(4 * n + e) > 0.5;
+        let moving = speed_full >= 0.1;
+
+        let mut contacts = 0u32;
+        let mut held = false;
+        let mut air = 0.0f32;
+        let mut airborne = 0.0f32;
+        let mut foot_h = 0.0f32;
+        let mut gc = 0.0f32;
+
+        let clear_target = if stepping && cue_h > 0.0 {
+            let t = cue_h + params.step_clear_margin;
+            if t > params.foot_clearance_target { t } else { params.foot_clearance_target }
+        } else {
+            params.foot_clearance_target
+        };
+
+        for i in 0..2usize {
+            let b = i * 11;
+            let contact = g(b) > 0.5;
+            let at = g(b + 2);
+            let alt = g(22 + i) > 0.5;
+            if contact {
+                contacts += 1;
+            } else {
+                airborne += 1.0;
+                if at > params.max_swing_s {
+                    held = true;
+                }
+                if at < params.max_swing_s {
+                    let lift = g(b + 3) - params.foot_rest_h;
+                    let lift = if lift > 0.0 { lift } else { 0.0 } / clear_target;
+                    foot_h += if lift > 1.0 { 1.0 } else { lift };
+                }
+            }
+            if alt {
+                air += if at > 0.4 { 0.4 } else { at };
+            }
+            // Siekmann gait clock: +1 when contact matches the phase window.
+            let ph = phase + 0.5 * i as f32;
+            let ph = ph - ph.floor();
+            let want_swing = ph < params.gait_swing_ratio;
+            let matched = if want_swing { !contact } else { contact };
+            gc += if matched { 1.0 } else { -1.0 };
+        }
+
+        let ss = if moving {
+            if contacts == 2 || (contacts == 1 && held) {
+                -params.w_single_support * dt
+            } else {
+                0.0
+            }
+        } else if contacts == 2 {
+            params.w_single_support * dt
+        } else if contacts == 1 {
+            -params.w_single_support * dt
+        } else {
+            0.0
+        };
+
+        out.write(e, if moving { params.w_air_time * air * dt * progress } else { 0.0 });
+        out.write(n + e, ss);
+        out.write(
+            2 * n + e,
+            if moving { 0.0 } else { params.w_stand_planted * airborne * dt },
+        );
+        out.write(
+            3 * n + e,
+            if moving { params.w_foot_clearance * foot_h * dt } else { 0.0 },
+        );
+        out.write(
+            4 * n + e,
+            if moving { params.w_gait_clock * gc * dt * progress } else { 0.0 },
+        );
+    }
+}
