@@ -48,9 +48,12 @@ gen () { # $1 ws, $2 pkg, $3 features, $4 ll name, $5 srcdir
 echo "=== STAGE 2: regen .ll (host-target interception) ==="
 gen $WORK/nexus nexus_rbd_shaders3d "cuda-oxide dim3 unsafe_remove_boundchecks" nexus_rbd_shaders3d $WORK/nexus/src_rbd_shaders
 gen $WORK/vortx-unified vortx-shaders "cuda-oxide" vortx_shaders $WORK/vortx-unified/vortx-shaders/src
+# zealot-side kernels (obs assembly, reward terms) — the SPIR-V build of
+# this crate feeds only the browser demo; the trainer needs a cubin.
+gen $WORK/zealot zealot-obs-shaders "cuda-oxide" zealot_obs_shaders $WORK/zealot/zealot-obs-shaders/src
 
 echo "=== STAGE 3: full-O3 lowering ==="
-for name in nexus_rbd_shaders3d vortx_shaders; do
+for name in nexus_rbd_shaders3d vortx_shaders zealot_obs_shaders; do
   LL=$CUDA_OXIDE_PTX_DIR/$name.ll
   $TOOL/llvm-as $LL -o /tmp/u.bc
   $TOOL/llvm-link /tmp/u.bc $LIBDEV -o /tmp/u_linked.bc
@@ -64,6 +67,6 @@ echo "=== STAGE 4: rebuild trainer (forced re-embed) ==="
 # Cubin paths + toolkit come from .cargo/config.toml [env] (repo) and
 # ~/.cargo/config.toml [env] (machine) — see docs/development.md.
 cd $WORK/zealot
-cargo clean -p nexus_rbd_shaders3d -p vortx-shaders 2>/dev/null || true
+cargo clean -p nexus_rbd_shaders3d -p vortx-shaders -p zealot-obs-shaders 2>/dev/null || true
 cargo build --release --bin biped_train_gpu --features "gpu biped_gpu cutile" 2>&1 | tail -1
 echo CHAIN_DONE
