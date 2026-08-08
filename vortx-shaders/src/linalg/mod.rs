@@ -29,6 +29,6 @@ pub use reduce::*;
 #[cfg(not(target_arch_is_gpu))]
 pub use optim::GpuAdam;
 #[cfg(not(target_arch_is_gpu))]
-pub use ppo::{GpuPpoActorGrad, GpuPpoValueGrad};
+pub use ppo::{GpuPpoActorGrad, GpuPpoStageBatch, GpuPpoValueGrad};
 #[cfg(not(target_arch_is_gpu))]
 pub use repeat::Repeat;

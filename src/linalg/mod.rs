@@ -14,7 +14,7 @@ pub use contiguous::Contiguous;
 pub use gemm::{Gemm, MatrixMode, N, T};
 pub use op_assign::{BinOpOffsets, OpAssign, OpAssignVariant};
 pub use optim::{Adam, AdamParams};
-pub use ppo::{Ppo, PpoActorParams, PpoValueParams};
+pub use ppo::{Ppo, PpoActorParams, PpoStageParams, PpoValueParams};
 pub use reduce::{Reduce, ReduceVariant};
 pub use repeat::Repeat;
 

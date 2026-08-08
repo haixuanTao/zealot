@@ -165,3 +165,89 @@ pub fn gpu_ppo_value_grad(
         *g_v.at_mut(m) = params.value_coef * dv * scale;
     }
 }
+
+/// Scalar parameters for the batch-staging kernel (uniform buffer; 32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct PpoStageParams {
+    /// Feature rows of the staged tensor.
+    pub dim: u32,
+    /// Environments per rollout step (`n`).
+    pub num_envs: u32,
+    /// Rollout horizon (`T`).
+    pub horizon: u32,
+    /// Total batch columns: `T·n`, doubled when mirror-augmented.
+    pub total: u32,
+    /// Leading columns holding the MIRRORED half (`0` = no augmentation).
+    pub mirror_half: u32,
+    /// Symmetric clamp applied after normalization (matches the host
+    /// `Normalizer::normalize`).
+    pub clamp: f32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
+/// Build the PPO batch tensor `[dim × total]` (row-major) directly on device.
+///
+/// Replaces the host pipeline that normalized every sample into its own `Vec`,
+/// transposed into a column-major matrix, transposed again on upload, and
+/// materialized the mirrored half as a full second copy of the batch.
+///
+/// `raw` holds the UNNORMALIZED rollout observations, step-blocked as
+/// `[T][dim][n]` so each rollout step uploads one contiguous run. Normalization
+/// happens here, which is what makes the augmentation exact: the mirror is
+/// defined on RAW obs (`normalize ∘ mirror`), and the ±5 clamp is lossy, so a
+/// mirror derived from already-normalized values would be wrong for every
+/// saturated feature.
+///
+/// Column layout matches the host batch: the mirrored half comes FIRST, and
+/// within each half columns are env-major (`c = e·T + t`).
+#[spirv_bindgen]
+#[spirv(compute(threads(256, 1, 1)))]
+pub fn gpu_ppo_stage_batch(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &PpoStageParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] raw: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] perm: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] sign: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] mean: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] inv_sd: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] out: &mut [f32],
+) {
+    let dim = params.dim as usize;
+    let n = params.num_envs as usize;
+    let horizon = params.horizon as usize;
+    let total = params.total as usize;
+    let half = params.mirror_half as usize;
+    let clamp = params.clamp;
+    let count = dim * total;
+
+    for i in (invocation_id.x as usize..count).step_by(MAX_NUM_THREADS as usize) {
+        let r = i / total;
+        let c = i - r * total;
+
+        // Mirrored columns lead; within a half the order is env-major.
+        let mirrored = c < half;
+        let cc = if mirrored { c } else { c - half };
+        let src_r = if mirrored { perm.read(r) as usize } else { r };
+        let sgn = if mirrored { sign.read(r) } else { 1.0 };
+
+        let e = cc / horizon;
+        let t = cc - e * horizon;
+
+        let v = sgn * raw.read(t * dim * n + src_r * n + e);
+        let z = (v - mean.read(r)) * inv_sd.read(r);
+        let z = if z > clamp {
+            clamp
+        } else if z < -clamp {
+            -clamp
+        } else {
+            z
+        };
+        out.write(r * total + c, z);
+    }
+}
