@@ -165,6 +165,20 @@ struct Ops {
 }
 
 /// GPU-resident actor + critic, batched over a fixed number of envs.
+/// Constant-per-iteration buffers the staging kernel binds: the normalizer's
+/// per-feature affine and the mirror signed-permutation tables.
+pub struct NormBufs {
+    pub mean_o: Tensor<f32>,
+    pub inv_o: Tensor<f32>,
+    pub mean_c: Tensor<f32>,
+    pub inv_c: Tensor<f32>,
+    pub perm_o: Tensor<u32>,
+    pub sign_o: Tensor<f32>,
+    pub perm_c: Tensor<u32>,
+    pub sign_c: Tensor<f32>,
+}
+
+
 pub struct GpuPolicy {
     actor: GpuNet,
     critic: GpuNet,
@@ -180,6 +194,13 @@ pub struct GpuPolicy {
     /// Same, holding the UNNORMALIZED values destined for the raw batch.
     scratch_raw_obs: Vec<f32>,
     scratch_raw_cobs: Vec<f32>,
+    /// Staging kernel + per-step params, used to derive the normalized policy
+    /// inputs from the raw batch on device (so obs upload once, not twice).
+    stage: vortx::linalg::Ppo,
+    stage_p_obs: Option<Tensor<vortx::linalg::PpoStageParams>>,
+    stage_p_cobs: Option<Tensor<vortx::linalg::PpoStageParams>>,
+    /// Normalizer affine + (unused here) mirror tables, refreshed per iteration.
+    norm: Option<NormBufs>,
     /// Step-blocked `[T][dim][n]` raw rollout observations, retained on device
     /// so the PPO update can build its batch there instead of on the host.
     /// `None` until `init_raw_batch`.
@@ -196,6 +217,10 @@ impl GpuPolicy {
             scratch_cobs: vec![0.0; ac.critic.dims[0] * n],
             scratch_raw_obs: vec![0.0; ac.actor.dims[0] * n],
             scratch_raw_cobs: vec![0.0; ac.critic.dims[0] * n],
+            stage: vortx::linalg::Ppo::from_backend(backend)?,
+            stage_p_obs: None,
+            stage_p_cobs: None,
+            norm: None,
             raw_obs: None,
             raw_cobs: None,
             actor: GpuNet::new(backend, &ac.actor, n),
@@ -245,59 +270,85 @@ impl GpuPolicy {
         // walked ~n·dim floats three times and allocated twice, every rollout
         // step. The normalizer is a per-feature affine, so hoisting (mean, 1/σ)
         // lets one parallel pass over ROWS write the buffer directly.
-        fn fill_rows(
-            dst: &mut [f32],
-            raw_dst: &mut [f32],
-            dim: usize,
-            n: usize,
-            aff: &(Vec<f32>, Vec<f32>),
-            src: &[Vec<f32>],
-        ) {
-            let (mean, inv_sd) = aff;
+        // Transpose the RAW observations into row-major and upload ONCE. The
+        // normalized policy input is then derived on device by the same staging
+        // kernel that builds the PPO batch — uploading both forms cost 258 MB
+        // per iteration at N=8192 to send the same numbers twice.
+        fn fill_raw(dst: &mut [f32], dim: usize, n: usize, src: &[Vec<f32>]) {
             dst[..dim * n]
                 .par_chunks_mut(n)
-                .zip(raw_dst[..dim * n].par_chunks_mut(n))
                 .enumerate()
-                .for_each(|(r, (row, raw_row))| {
-                    let (m, s) = (mean[r], inv_sd[r]);
-                    for (e, (d, rd)) in row.iter_mut().zip(raw_row.iter_mut()).enumerate() {
-                        let x = src[e][r];
-                        // The RAW value is what the batch keeps: the mirror is
-                        // defined on raw obs and the ±5 clamp below is lossy.
-                        *rd = x;
-                        // Same ±5 clamp as `Normalizer::normalize`.
-                        *d = ((x - m) * s).clamp(-5.0, 5.0);
+                .for_each(|(r, row)| {
+                    for (e, d) in row.iter_mut().enumerate() {
+                        *d = src[e][r];
                     }
                 });
         }
-        let aff_o = ac.obs_norm.affine();
-        let aff_c = ac.critic_norm.affine();
-        let mut so = std::mem::take(&mut self.scratch_obs);
-        let mut sc = std::mem::take(&mut self.scratch_cobs);
         let mut ro = std::mem::take(&mut self.scratch_raw_obs);
         let mut rc = std::mem::take(&mut self.scratch_raw_cobs);
-        so.resize(obs_dim * n, 0.0);
-        sc.resize(crit_dim * n, 0.0);
         ro.resize(obs_dim * n, 0.0);
         rc.resize(crit_dim * n, 0.0);
-        fill_rows(&mut so, &mut ro, obs_dim, n, &aff_o, cur);
-        fill_rows(&mut sc, &mut rc, crit_dim, n, &aff_c, cur_c);
-        backend.write_buffer(self.actor.a[0].buffer_mut(), 0, &so[..obs_dim * n])?;
-        backend.write_buffer(self.critic.a[0].buffer_mut(), 0, &sc[..crit_dim * n])?;
-        // Retain this step's raw block for the device-side batch build. The
-        // buffer is step-blocked, so this is ONE contiguous write per step.
+        fill_raw(&mut ro, obs_dim, n, cur);
+        fill_raw(&mut rc, crit_dim, n, cur_c);
+        // Step-blocked buffer, so this is ONE contiguous write per step.
         if let Some(rb) = self.raw_obs.as_mut() {
             backend.write_buffer(rb.buffer_mut(), (step * obs_dim * n) as u64, &ro[..obs_dim * n])?;
         }
         if let Some(rb) = self.raw_cobs.as_mut() {
             backend.write_buffer(rb.buffer_mut(), (step * crit_dim * n) as u64, &rc[..crit_dim * n])?;
         }
-        self.scratch_obs = so;
-        self.scratch_cobs = sc;
         self.scratch_raw_obs = ro;
         self.scratch_raw_cobs = rc;
 
+        // Params for the "one step, no mirror" form of the staging kernel.
+        let mk_p = |dim: usize, off: usize| vortx::linalg::PpoStageParams {
+            dim: dim as u32,
+            num_envs: n as u32,
+            horizon: 1,
+            total: n as u32,
+            mirror_half: 0,
+            clamp: 5.0,
+            raw_offset: off as u32,
+            pad1: 0,
+        };
+        let pu = BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        if self.stage_p_obs.is_none() {
+            self.stage_p_obs = Some(Tensor::scalar(backend, mk_p(obs_dim, 0), pu)?);
+            self.stage_p_cobs = Some(Tensor::scalar(backend, mk_p(crit_dim, 0), pu)?);
+        }
+        backend.write_buffer(
+            self.stage_p_obs.as_mut().unwrap().buffer_mut(),
+            0,
+            &[mk_p(obs_dim, step * obs_dim * n)],
+        )?;
+        backend.write_buffer(
+            self.stage_p_cobs.as_mut().unwrap().buffer_mut(),
+            0,
+            &[mk_p(crit_dim, step * crit_dim * n)],
+        )?;
+
         let mut cur = EncCursor::new(backend);
+        {
+            let nb = self.norm.as_ref().expect("GpuPolicy::set_norm not called");
+            let (stage, po, pc) = (
+                &self.stage,
+                self.stage_p_obs.as_ref().unwrap(),
+                self.stage_p_cobs.as_ref().unwrap(),
+            );
+            let (raw_o, raw_c) = (
+                self.raw_obs.as_ref().expect("init_raw_batch"),
+                self.raw_cobs.as_ref().expect("init_raw_batch"),
+            );
+            let mut pass = cur.pass("policy_input_normalize");
+            stage.stage_batch(
+                &mut pass, po, raw_o, &nb.perm_o, &nb.sign_o, &nb.mean_o, &nb.inv_o,
+                &mut self.actor.a[0], (obs_dim * n) as u32,
+            )?;
+            stage.stage_batch(
+                &mut pass, pc, raw_c, &nb.perm_c, &nb.sign_c, &nb.mean_c, &nb.inv_c,
+                &mut self.critic.a[0], (crit_dim * n) as u32,
+            )?;
+        }
         self.actor
             .encode(backend, &self.ops, &mut self.shapes, &mut cur, self.ct)?;
         self.critic
@@ -316,6 +367,17 @@ impl GpuPolicy {
         }
         let values: Vec<f32> = (0..n).map(|e| c_out[e]).collect();
         Ok((means, values))
+    }
+
+    /// The per-iteration normalizer/mirror buffers, for the batch build.
+    pub fn norm_bufs(&self) -> &NormBufs {
+        self.norm.as_ref().expect("set_norm not called")
+    }
+
+    /// Per-iteration normalizer affine + mirror tables shared by the policy
+    /// input normalize and the PPO batch build.
+    pub fn set_norm(&mut self, bufs: NormBufs) {
+        self.norm = Some(bufs);
     }
 
     /// Allocate the step-blocked raw-observation batch buffers (`[T][dim][n]`).

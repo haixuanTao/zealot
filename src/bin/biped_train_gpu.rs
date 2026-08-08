@@ -1047,6 +1047,25 @@ fn main() {
             let t_roll = Instant::now();
             let mut reset_dur = std::time::Duration::ZERO;
             // Envs terminating on the current step, reset as one batch.
+            // Normalizer affine for THIS iteration. With BIPED_NORM_FREEZE (the
+            // default) the transform is frozen across the rollout and the
+            // update, so the rollout's policy-input normalize and the batch
+            // build share exactly these buffers.
+            let aff_o = ac.obs_norm.affine();
+            let aff_c = ac.critic_norm.affine();
+            {
+                let up = |v: &[f32]| Tensor::vector(&bk, v, BufferUsages::STORAGE).unwrap();
+                gpu.set_norm(gpu_policy::NormBufs {
+                    mean_o: up(&aff_o.0),
+                    inv_o: up(&aff_o.1),
+                    mean_c: up(&aff_c.0),
+                    inv_c: up(&aff_c.1),
+                    perm_o: Tensor::vector(&bk, &mirror_perm_obs, BufferUsages::STORAGE).unwrap(),
+                    sign_o: Tensor::vector(&bk, &mirror_sign_obs, BufferUsages::STORAGE).unwrap(),
+                    perm_c: Tensor::vector(&bk, &mirror_perm_cobs, BufferUsages::STORAGE).unwrap(),
+                    sign_c: Tensor::vector(&bk, &mirror_sign_cobs, BufferUsages::STORAGE).unwrap(),
+                });
+            }
             let mut to_reset: Vec<usize> = Vec::with_capacity(n);
             // Non-physics rollout phase split (BIPED_ROLL_PROF=1).
             let roll_prof = std::env::var("BIPED_ROLL_PROF").is_ok();
@@ -1211,8 +1230,6 @@ fn main() {
             let gae_s = t_gae.elapsed().as_secs_f64();
             // ---------------- GPU PPO UPDATE (persistent nets, advancing Adam) -------
             let t_upd = Instant::now();
-            let aff_o = ac.obs_norm.affine();
-            let aff_c = ac.critic_norm.affine();
             // ---- device-side batch build (obs + critic) ----
             // The rollout already left the RAW observations on device
             // (step-blocked), so the batch is assembled there: normalize +
@@ -1226,16 +1243,10 @@ fn main() {
                 total: total as u32,
                 mirror_half: half as u32,
                 clamp: 5.0,
-                pad0: 0,
+                raw_offset: 0,
                 pad1: 0,
             };
-            // Only the normalizer affine changes per iteration (a few hundred
-            // floats); the mirror tables and the output tensors are persistent.
-            let up = |v: &[f32]| Tensor::vector(&bk, v, BufferUsages::STORAGE).unwrap();
-            let t_mo = up(&aff_o.0);
-            let t_io = up(&aff_o.1);
-            let t_mc = up(&aff_c.0);
-            let t_ic = up(&aff_c.1);
+            // Reuse the very buffers the rollout normalized against.
             let po = Tensor::scalar(&bk, stage_p(od), BufferUsages::UNIFORM | BufferUsages::STORAGE)
                 .unwrap();
             let pc = Tensor::scalar(&bk, stage_p(cd), BufferUsages::UNIFORM | BufferUsages::STORAGE)
@@ -1251,16 +1262,17 @@ fn main() {
             }
             let (f_obs, f_cobs) = stage_out.as_mut().unwrap();
             {
+                let nb = gpu.norm_bufs();
                 let mut cur = EncCursor::new(&bk);
                 {
                     let mut pass = cur.pass("ppo_stage_obs");
                     ppo.stage_batch(
-                        &mut pass, &po, gpu.raw_obs(), &t_po, &t_so, &t_mo, &t_io, &mut *f_obs,
+                        &mut pass, &po, gpu.raw_obs(), &nb.perm_o, &nb.sign_o, &nb.mean_o, &nb.inv_o, &mut *f_obs,
                         (od * total) as u32,
                     )
                     .unwrap();
                     ppo.stage_batch(
-                        &mut pass, &pc, gpu.raw_cobs(), &t_pc, &t_sc, &t_mc, &t_ic, &mut *f_cobs,
+                        &mut pass, &pc, gpu.raw_cobs(), &nb.perm_c, &nb.sign_c, &nb.mean_c, &nb.inv_c, &mut *f_cobs,
                         (cd * total) as u32,
                     )
                     .unwrap();
