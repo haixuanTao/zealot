@@ -15,6 +15,10 @@ rust.unexpected_cfgs = { level = "warn", check-cfg = [
 [features]
 default = []
 unsafe_remove_boundchecks = ["khal-std/unsafe_remove_boundchecks"]
+# cuda-oxide: PTX device backend, forwarded from khal-std — the route these
+# kernels need to reach the TRAINER's native-CUDA path (the SPIR-V build feeds
+# only the WebGPU/browser demo).
+cuda-oxide = ["khal-std/cuda-oxide"]
 
 [dependencies]
 khal-std = { version = "0.2" }
