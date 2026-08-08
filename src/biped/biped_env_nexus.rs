@@ -1745,6 +1745,8 @@ pub struct BipedNexusBatchEnv {
     gpu_base: Option<zealot_gpu_obs::GpuBaseState>,
     /// Base-state reward terms.
     gpu_base_terms: Option<zealot_gpu_obs::GpuRewardBaseTerms>,
+    /// Per-foot state.
+    gpu_feet: Option<zealot_gpu_obs::GpuFeetState>,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2578,6 +2580,7 @@ impl BipedNexusBatchEnv {
             gpu_torque_terms: None,
             gpu_base: None,
             gpu_base_terms: None,
+            gpu_feet: None,
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -3748,6 +3751,9 @@ impl BipedNexusBatchEnv {
             /// The step cue AS THE HOST USED IT (noised/dropout-masked):
             /// valid, distance, edge_cos, edge_sin.
             cue_dbg: [f32; 4],
+            /// Host per-foot state for the GPU feet check: per foot, 11 fields
+            /// in the kernel's order.
+            feet_dbg: [f32; 22],
             // Foot index that touched down this step (-1 = none); committed to
             // `self.last_td_foot` in the serial pass to track gait alternation.
             td_foot: i8,
@@ -4194,6 +4200,24 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 }
                 PerEnv {
                     joint_vel_dbg: state.joint_vel,
+                    feet_dbg: {
+                        let mut f = [0.0f32; 22];
+                        for (i, fo) in state.feet.iter().enumerate() {
+                            let b = i * 11;
+                            f[b] = fo.contact as u8 as f32;
+                            f[b + 1] = fo.first_contact as u8 as f32;
+                            f[b + 2] = fo.air_time;
+                            f[b + 3] = fo.height;
+                            f[b + 4] = fo.planar_speed;
+                            f[b + 5] = fo.tilt;
+                            f[b + 6] = fo.yaw_rel_base;
+                            f[b + 7] = fo.pos_xy[0];
+                            f[b + 8] = fo.pos_xy[1];
+                            f[b + 9] = fo.vz;
+                            f[b + 10] = fo.force_rate;
+                        }
+                        f
+                    },
                     cue_dbg: [
                         state.step_cue.valid,
                         state.step_cue.distance,
@@ -4556,6 +4580,107 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 "[verify_base_terms] track_lin={:.3e} track_ang={:.3e} upright={:.3e} base_h={:.3e} body_ang={:.3e} lin_vel_z={:.3e}",
                 wbt[0], wbt[1], wbt[2], wbt[3], wbt[4], wbt[5]
             );
+
+            // ---- per-foot state ----
+            let cpb = self.idx.colliders_per_batch as usize;
+            if self.gpu_feet.is_none() {
+                let ff = self.robot.foot_forward_local;
+                self.gpu_feet = Some(
+                    zealot_gpu_obs::GpuFeetState::new(
+                        &self.gpu,
+                        n,
+                        NUM_FEET,
+                        &(0..NUM_FEET).map(|i| self.idx.foot_links[i]).collect::<Vec<_>>(),
+                        &[ff[0], ff[1], ff[2]],
+                        zealot_obs_shaders::FeetStateParams {
+                            n_envs: n as u32,
+                            colliders_per_env: cpb as u32,
+                            torso_link: self.idx.torso_link,
+                            control_dt: dtc,
+                            contact_z: env_var("BIPED_CONTACT_Z")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.05),
+                            contact_force_n: self.contact_force_n,
+                            contact_sense: self.contact_sense as u32,
+                            body_weight: self.robot.total_mass * 9.81,
+                        },
+                    )
+                    .expect("gpu feet"),
+                );
+            }
+            let mut sole = vec![0.0f32; NUM_FEET * 3 * n];
+            let mut pfp = vec![0.0f32; NUM_FEET * 3 * n];
+            let mut fgh = vec![0.0f32; NUM_FEET * n];
+            let mut sfv = vec![0.0f32; NUM_FEET * n];
+            let mut pfv = vec![0.0f32; NUM_FEET * n];
+            let mut atv = vec![0.0f32; NUM_FEET * n];
+            let mut ltd = vec![0.0f32; n];
+            for e in 0..n {
+                ltd[e] = self.last_td_foot[e] as f32;
+                for i in 0..NUM_FEET {
+                    let sl = self.foot_sole_local[e][i];
+                    sole[(i * 3) * n + e] = sl.x;
+                    sole[(i * 3 + 1) * n + e] = sl.y;
+                    sole[(i * 3 + 2) * n + e] = sl.z;
+                    let link = self.idx.foot_links[i] as usize;
+                    let pp = self.prev_body_poses[e * cpb + link].translation;
+                    pfp[(i * 3) * n + e] = pp.x;
+                    pfp[(i * 3 + 1) * n + e] = pp.y;
+                    pfp[(i * 3 + 2) * n + e] = pp.z;
+                    let fpz = &poses[e * cpb + link].translation;
+                    fgh[i * n + e] = self
+                        .terrain
+                        .as_ref()
+                        .map_or(0.0, |ter| ter.strip_for(e).height(fpz.x, fpz.y));
+                    sfv[i * n + e] = self.sensed_force[e][i];
+                    pfv[i * n + e] = self.prev_sensed_force[e][i];
+                    atv[i * n + e] = self.air_time[e][i];
+                }
+            }
+            let hpf: Vec<u32> = (0..n).map(|e| self.has_prev_force[e] as u32).collect();
+            let poses_t3 = self.state.body_poses();
+            let gf = self
+                .gpu_feet
+                .as_mut()
+                .unwrap()
+                .compute(
+                    &self.gpu,
+                    poses_t3,
+                    zealot_gpu_obs::FeetInputs {
+                        sole_local: &sole,
+                        prev_foot_pos: &pfp,
+                        ground_h: &fgh,
+                        sensed_force: &sfv,
+                        prev_force: &pfv,
+                        air_time: &atv,
+                        last_td: &ltd,
+                        have_prev: &hpp,
+                        have_prev_force: &hpf,
+                    },
+                )
+                .await
+                .expect("gpu feet compute");
+            const FEET_FIELDS: [&str; 11] = [
+                "contact", "first", "air", "height", "planar", "tilt", "yaw", "x", "y", "vz",
+                "dF",
+            ];
+            let mut wf = [0.0f32; 11];
+            for e in 0..n {
+                for i in 0..NUM_FEET {
+                    for k in 0..11 {
+                        let d = (gf[(i * 11 + k) * n + e] - computed[e].feet_dbg[i * 11 + k]).abs();
+                        if d > wf[k] {
+                            wf[k] = d;
+                        }
+                    }
+                }
+            }
+            let mut msg = String::from("[verify_feet]");
+            for k in 0..11 {
+                msg.push_str(&format!(" {}={:.2e}", FEET_FIELDS[k], wf[k]));
+            }
+            eprintln!("{msg}");
         }
 
         // (5) Serial commit: per-env mutable state + StepOut assembly.

@@ -919,3 +919,157 @@ pub fn gpu_reward_base_terms(
         out.write(5 * n + e, lin_z);
     }
 }
+
+/// Scalar parameters for [`gpu_feet_state`] (uniform; 32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct FeetStateParams {
+    pub n_envs: u32,
+    /// Colliders per env — the pose buffer stride the host uses for feet.
+    pub colliders_per_env: u32,
+    pub torso_link: u32,
+    pub control_dt: f32,
+    /// Geometric contact threshold on the foot LINK-ORIGIN height.
+    pub contact_z: f32,
+    /// Force threshold (N) when force-based contact sensing is on.
+    pub contact_force_n: f32,
+    /// 1 = use sensed force for contact, 0 = geometric height proxy.
+    pub contact_sense: u32,
+    /// Body weight (mass·g), the force_rate normalizer.
+    pub body_weight: f32,
+}
+
+/// Per-foot state, one thread per environment.
+///
+/// Exact port of the host's `compute_feet_from_poses`. The host-maintained
+/// per-env history (air time, last touchdown foot, previous sensed force,
+/// previous foot poses) is supplied as inputs for now so the MATHS can be
+/// verified independently; migrating that state onto the device is a separate
+/// step with reset semantics to match.
+///
+/// Layouts, all row-major with env-major inner index. Per-foot arrays are
+/// `[NUM_FEET x n]`; `foot_links` is `[NUM_FEET]`; `sole_local` and
+/// `prev_foot_pos` are `[NUM_FEET*3 x n]`.
+///
+/// `out` is `[22 x n]`, per foot i (offset i*11): contact, first_contact,
+/// air_time, height, planar_speed, tilt, yaw_rel_base, pos_x, pos_y, vz,
+/// force_rate — plus alt_step folded into first_contact's sign convention is
+/// NOT done; alt_step is emitted in row 11*NUM_FEET + i.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_feet_state(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &FeetStateParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] body_poses: &[Pose3],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] foot_links: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] foot_fwd_local: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] sole_local: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] prev_foot_pos: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] ground_h: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] sensed_force: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 8)] prev_force: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 9)] air_time: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 10)] last_td_foot: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 11)] have_prev: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 12)] have_prev_force: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 13)] out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    let nf = 2usize; // NUM_FEET
+    if e < n {
+        let cpb = params.colliders_per_env as usize;
+        let env_base = e * cpb;
+        let dt = params.control_dt;
+        let bq = body_poses.read(env_base + params.torso_link as usize).rotation;
+        let base_inv = Vec4::new(-bq.x, -bq.y, -bq.z, bq.w);
+        let hp = have_prev.read(e);
+        let hpf = have_prev_force.read(e);
+
+        for i in 0..nf {
+            let fp = body_poses.read(env_base + foot_links.read(i) as usize);
+            let (px, py, pz) = (fp.translation.x, fp.translation.y, fp.translation.z);
+            let fq = Vec4::new(fp.rotation.x, fp.rotation.y, fp.rotation.z, fp.rotation.w);
+
+            let mut planar_speed = 0.0f32;
+            let mut vz = 0.0f32;
+            if hp != 0 {
+                let ox = prev_foot_pos.read((i * 3) * n + e);
+                let oy = prev_foot_pos.read((i * 3 + 1) * n + e);
+                let oz = prev_foot_pos.read((i * 3 + 2) * n + e);
+                let dx = (px - ox) / dt;
+                let dy = (py - oy) / dt;
+                planar_speed = (dx * dx + dy * dy).sqrt();
+                vz = (pz - oz) / dt;
+            }
+
+            // Sole normal into the world frame; tilt from horizontal.
+            let sl = [
+                sole_local.read((i * 3) * n + e),
+                sole_local.read((i * 3 + 1) * n + e),
+                sole_local.read((i * 3 + 2) * n + e),
+            ];
+            let wn = qrot(fq, sl);
+            let wnz = if wn[2] < 0.0 { -wn[2] } else { wn[2] };
+            let wnz = if wnz > 1.0 { 1.0 } else { wnz };
+            let tilt = wnz.acos();
+
+            // Foot forward, expressed in the BASE frame → yaw relative to base.
+            let fwd = [foot_fwd_local.read(0), foot_fwd_local.read(1), foot_fwd_local.read(2)];
+            let f_world = qrot(fq, fwd);
+            let f_base = qrot(base_inv, f_world);
+            let yaw_rel = f_base[1].atan2(f_base[0]);
+
+            let gh = ground_h.read(i * n + e);
+            let sf = sensed_force.read(i * n + e);
+            let contact = if params.contact_sense != 0 {
+                sf >= params.contact_force_n
+            } else {
+                (pz - gh) < params.contact_z
+            };
+            let prev_air = air_time.read(i * n + e);
+            let first_contact = contact && prev_air > 0.0;
+            let alt_step = first_contact && last_td_foot.read(e) != i as f32;
+            let new_air = if contact { 0.0 } else { prev_air + dt };
+            let force_rate = if params.contact_sense != 0 && hpf != 0 {
+                let d = sf - prev_force.read(i * n + e);
+                (if d < 0.0 { -d } else { d }) / params.body_weight
+            } else {
+                0.0
+            };
+
+            let b = i * 11;
+            out.write(b * n + e, if contact { 1.0 } else { 0.0 });
+            out.write((b + 1) * n + e, if first_contact { 1.0 } else { 0.0 });
+            out.write((b + 2) * n + e, if contact { prev_air } else { new_air });
+            out.write((b + 3) * n + e, pz - gh);
+            out.write((b + 4) * n + e, planar_speed);
+            out.write((b + 5) * n + e, tilt);
+            out.write((b + 6) * n + e, yaw_rel);
+            out.write((b + 7) * n + e, px);
+            out.write((b + 8) * n + e, py);
+            out.write((b + 9) * n + e, vz);
+            out.write((b + 10) * n + e, force_rate);
+            out.write((22 + i) * n + e, if alt_step { 1.0 } else { 0.0 });
+            out.write((24 + i) * n + e, new_air);
+        }
+    }
+}
+
+/// Rotate `v` by xyzw quaternion `q`.
+#[inline]
+fn qrot(q: Vec4, v: [f32; 3]) -> [f32; 3] {
+    let (ux, uy, uz, w) = (q.x, q.y, q.z, q.w);
+    let tx = uy * v[2] - uz * v[1] + w * v[0];
+    let ty = uz * v[0] - ux * v[2] + w * v[1];
+    let tz = ux * v[1] - uy * v[0] + w * v[2];
+    [
+        v[0] + 2.0 * (uy * tz - uz * ty),
+        v[1] + 2.0 * (uz * tx - ux * tz),
+        v[2] + 2.0 * (ux * ty - uy * tx),
+    ]
+}

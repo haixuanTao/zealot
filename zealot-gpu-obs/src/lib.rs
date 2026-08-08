@@ -30,6 +30,126 @@ pub static SPIRV_DIR: Dir<'static> = include_dir!("$OUT_DIR/shaders-spirv");
 
 
 
+
+/// Host binding for the feet-state kernel.
+#[derive(Shader)]
+struct FeetStateShader {
+    feet: shaders::GpuFeetState,
+}
+
+/// Per-foot state on device. The per-env history it depends on (air time, last
+/// touchdown foot, previous force, previous foot poses) is still supplied by
+/// the caller — porting the maths first, the state migration after.
+pub struct GpuFeetState {
+    shader: FeetStateShader,
+    params: Tensor<shaders::FeetStateParams>,
+    foot_links: Tensor<u32>,
+    foot_fwd: Tensor<f32>,
+    sole_local: Tensor<f32>,
+    prev_foot_pos: Tensor<f32>,
+    ground_h: Tensor<f32>,
+    sensed_force: Tensor<f32>,
+    prev_force: Tensor<f32>,
+    air_time: Tensor<f32>,
+    last_td: Tensor<f32>,
+    have_prev: Tensor<u32>,
+    have_prev_force: Tensor<u32>,
+    out: Tensor<f32>,
+    n: usize,
+}
+
+/// Per-step inputs for [`GpuFeetState::compute`].
+pub struct FeetInputs<'a> {
+    pub sole_local: &'a [f32],
+    pub prev_foot_pos: &'a [f32],
+    pub ground_h: &'a [f32],
+    pub sensed_force: &'a [f32],
+    pub prev_force: &'a [f32],
+    pub air_time: &'a [f32],
+    pub last_td: &'a [f32],
+    pub have_prev: &'a [u32],
+    pub have_prev_force: &'a [u32],
+}
+
+impl GpuFeetState {
+    pub fn new(
+        backend: &GpuBackend,
+        n: usize,
+        n_feet: usize,
+        foot_links: &[u32],
+        foot_fwd: &[f32],
+        params: shaders::FeetStateParams,
+    ) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        let f = |len: usize| Tensor::vector(backend, &vec![0.0f32; len], st);
+        Ok(Self {
+            shader: FeetStateShader::from_backend(backend)?,
+            params: Tensor::scalar(
+                backend,
+                params,
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            foot_links: Tensor::vector(backend, foot_links, st)?,
+            foot_fwd: Tensor::vector(backend, foot_fwd, st)?,
+            sole_local: f(n_feet * 3 * n)?,
+            prev_foot_pos: f(n_feet * 3 * n)?,
+            ground_h: f(n_feet * n)?,
+            sensed_force: f(n_feet * n)?,
+            prev_force: f(n_feet * n)?,
+            air_time: f(n_feet * n)?,
+            last_td: f(n)?,
+            have_prev: Tensor::vector(backend, &vec![0u32; n], st)?,
+            have_prev_force: Tensor::vector(backend, &vec![0u32; n], st)?,
+            out: Tensor::vector_uninit(backend, (26 * n) as u32, st | BufferUsages::COPY_SRC)?,
+            n,
+        })
+    }
+
+    /// Returns `[26 x n]`: per foot i at offset i*11 — contact, first_contact,
+    /// air_time, height, planar_speed, tilt, yaw_rel_base, x, y, vz,
+    /// force_rate; then alt_step at 22+i and the new air time at 24+i.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        body_poses: &Tensor<glamx::Pose3>,
+        inputs: FeetInputs<'_>,
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        backend.write_buffer(self.sole_local.buffer_mut(), 0, inputs.sole_local)?;
+        backend.write_buffer(self.prev_foot_pos.buffer_mut(), 0, inputs.prev_foot_pos)?;
+        backend.write_buffer(self.ground_h.buffer_mut(), 0, inputs.ground_h)?;
+        backend.write_buffer(self.sensed_force.buffer_mut(), 0, inputs.sensed_force)?;
+        backend.write_buffer(self.prev_force.buffer_mut(), 0, inputs.prev_force)?;
+        backend.write_buffer(self.air_time.buffer_mut(), 0, inputs.air_time)?;
+        backend.write_buffer(self.last_td.buffer_mut(), 0, inputs.last_td)?;
+        backend.write_buffer(self.have_prev.buffer_mut(), 0, inputs.have_prev)?;
+        backend.write_buffer(self.have_prev_force.buffer_mut(), 0, inputs.have_prev_force)?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[reward] feet state", None);
+            self.shader.feet.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                body_poses,
+                &self.foot_links,
+                &self.foot_fwd,
+                &self.sole_local,
+                &self.prev_foot_pos,
+                &self.ground_h,
+                &self.sensed_force,
+                &self.prev_force,
+                &self.air_time,
+                &self.last_td,
+                &self.have_prev,
+                &self.have_prev_force,
+                &mut self.out,
+            )?;
+        }
+        backend.submit(enc)?;
+        backend.slow_read_vec(self.out.buffer()).await
+    }
+}
+
 /// Host binding for the base-state reward terms.
 #[derive(Shader)]
 struct RewardBaseShader {
