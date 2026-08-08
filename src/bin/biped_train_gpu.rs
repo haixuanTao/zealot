@@ -233,6 +233,47 @@ fn mirror_critic(c: &[f32]) -> Vec<f32> {
     m
 }
 const OBS_FRAME: usize = zealot_env::tasks::velocity_flat::OBS_DIM;
+
+/// Extract the mirror as an explicit signed permutation: `out[r] = sign[r] *
+/// x[perm[r]]`.
+///
+/// The mirror is linear (an L/R swap with sign flips), so probing it with basis
+/// vectors recovers the table exactly — which lets a GPU kernel apply it without
+/// re-implementing `mirror_frame`'s hand-written index maths, and keeps the two
+/// from drifting apart. Panics if `f` turns out not to be a signed permutation,
+/// so a future non-linear mirror term fails loudly here instead of silently
+/// producing a wrong augmented batch.
+fn mirror_table(dim: usize, f: impl Fn(&[f32]) -> Vec<f32>) -> (Vec<u32>, Vec<f32>) {
+    let zero = f(&vec![0.0f32; dim]);
+    assert!(
+        zero.iter().all(|v| *v == 0.0),
+        "mirror is not linear (f(0) != 0) — cannot express as a signed permutation"
+    );
+    let mut perm = vec![u32::MAX; dim];
+    let mut sign = vec![0.0f32; dim];
+    for j in 0..dim {
+        let mut e = vec![0.0f32; dim];
+        e[j] = 1.0;
+        let out = f(&e);
+        for (r, v) in out.iter().enumerate() {
+            if *v == 0.0 {
+                continue;
+            }
+            assert!(
+                *v == 1.0 || *v == -1.0,
+                "mirror entry ({r},{j}) = {v}, expected ±1 (not a signed permutation)"
+            );
+            assert!(perm[r] == u32::MAX, "mirror maps two inputs onto output {r}");
+            perm[r] = j as u32;
+            sign[r] = *v;
+        }
+    }
+    assert!(
+        perm.iter().all(|p| *p != u32::MAX),
+        "mirror leaves some output unmapped"
+    );
+    (perm, sign)
+}
 fn mirror_sample(s: &Sample) -> Sample {
     Sample {
         obs: mirror_obs(&s.obs),
@@ -1140,6 +1181,25 @@ fn main() {
             let gae_s = t_gae.elapsed().as_secs_f64();
             // ---------------- GPU PPO UPDATE (persistent nets, advancing Adam) -------
             let t_upd = Instant::now();
+            if it == 0 {
+                // Cross-check the extracted tables against the real mirror on a
+                // random vector before anything depends on them.
+                let (po, so) = mirror_table(od, |x| mirror_obs(x));
+                let (pc, sc) = mirror_table(cd, |x| mirror_critic(x));
+                let mut r = Lcg::new(7);
+                let xo: Vec<f32> = (0..od).map(|_| (r.unit() * 6.0 - 3.0)).collect();
+                let xc: Vec<f32> = (0..cd).map(|_| (r.unit() * 6.0 - 3.0)).collect();
+                let ref_o = mirror_obs(&xo);
+                let ref_c = mirror_critic(&xc);
+                let max_o = (0..od)
+                    .map(|i| (so[i] * xo[po[i] as usize] - ref_o[i]).abs())
+                    .fold(0.0f32, f32::max);
+                let max_c = (0..cd)
+                    .map(|i| (sc[i] * xc[pc[i] as usize] - ref_c[i]).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(max_o == 0.0 && max_c == 0.0, "mirror table mismatch: obs {max_o}, critic {max_c}");
+                println!("mirror table verified: obs {od} dims, critic {cd} dims (exact signed permutation)");
+            }
             let aff_o = ac.obs_norm.affine();
             let aff_c = ac.critic_norm.affine();
             // Gather the per-sample vectors into contiguous arenas first.
