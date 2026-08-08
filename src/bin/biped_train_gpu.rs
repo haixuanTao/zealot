@@ -77,6 +77,44 @@ const LR_MAX: f32 = 1e-2;
 fn mk(b: &GpuBackend, m: &DMatrix<f32>, u: BufferUsages) -> Tensor<f32> {
     Tensor::matrix_from_na(b, m, u).unwrap()
 }
+
+/// Stage a `[dim × total]` batch tensor straight into vortx's ROW-MAJOR layout,
+/// normalizing inline.
+///
+/// The obvious spelling — `batch.par_iter().map(|s| norm.normalize(&s.obs))`
+/// then `DMatrix::from_fn` then `Tensor::matrix_from_na` — costs THREE
+/// full-size allocations and three passes over ~200 MB (a `Vec` per sample, the
+/// column-major DMatrix, and the `transpose()` inside `matrix_from_na`). The
+/// normalizer is a per-feature affine, so hoisting `(mean, 1/σ)` out lets one
+/// parallel pass over ROWS write the final buffer directly, with sequential
+/// stores and the scale constants held in registers.
+fn stage_rows<'a>(
+    b: &GpuBackend,
+    dim: usize,
+    total: usize,
+    affine: Option<&(Vec<f32>, Vec<f32>)>,
+    u: BufferUsages,
+    get: impl Fn(usize) -> &'a [f32] + Sync,
+) -> Tensor<f32> {
+    let mut flat = vec![0f32; dim * total];
+    flat.par_chunks_mut(total).enumerate().for_each(|(r, row)| {
+        match affine {
+            // Same clamp as `Normalizer::normalize` — keep them in lockstep.
+            Some((mean, inv_sd)) => {
+                let (m, s) = (mean[r], inv_sd[r]);
+                for (c, dst) in row.iter_mut().enumerate() {
+                    *dst = ((get(c)[r] - m) * s).clamp(-5.0, 5.0);
+                }
+            }
+            None => {
+                for (c, dst) in row.iter_mut().enumerate() {
+                    *dst = get(c)[r];
+                }
+            }
+        }
+    });
+    Tensor::matrix(b, dim as u32, total as u32, &flat, u).unwrap()
+}
 fn wmat(w: &[f32], out: usize, inp: usize) -> DMatrix<f32> {
     DMatrix::from_fn(out, inp, |r, c| w[r * inp + c])
 }
@@ -900,7 +938,12 @@ fn main() {
             let mut reset_dur = std::time::Duration::ZERO;
             // Envs terminating on the current step, reset as one batch.
             let mut to_reset: Vec<usize> = Vec::with_capacity(n);
+            // Non-physics rollout phase split (BIPED_ROLL_PROF=1).
+            let roll_prof = std::env::var("BIPED_ROLL_PROF").is_ok();
+            let (mut d_norm, mut d_fwd, mut d_samp, mut d_step, mut d_post) =
+                (0u128, 0u128, 0u128, 0u128, 0u128);
             for _ in 0..T {
+                let t_ph = Instant::now();
                 for e in 0..n {
                     if norm_freeze {
                         pn_obs.push(&gc[e]);
@@ -909,7 +952,15 @@ fn main() {
                         ac.record_obs(&gc[e], &gcc[e]);
                     }
                 }
+                if roll_prof {
+                    d_norm += t_ph.elapsed().as_micros();
+                }
+                let t_ph = Instant::now();
                 let (means, values) = gpu.forward(&bk, &ac, &gc, &gcc).await.unwrap();
+                if roll_prof {
+                    d_fwd += t_ph.elapsed().as_micros();
+                }
+                let t_ph = Instant::now();
                 let mut acts = Vec::with_capacity(n);
                 for e in 0..n {
                     let mean = means[e];
@@ -931,7 +982,15 @@ fn main() {
                     });
                     vs[e].push(values[e]);
                 }
+                if roll_prof {
+                    d_samp += t_ph.elapsed().as_micros();
+                }
+                let t_ph = Instant::now();
                 let outs = env.step(&acts).await;
+                if roll_prof {
+                    d_step += t_ph.elapsed().as_micros();
+                }
+                let t_ph = Instant::now();
                 for e in 0..n {
                     total_reward += outs[e].reward;
                     if outs[e].fell {
@@ -975,6 +1034,19 @@ fn main() {
                     }
                     to_reset.clear();
                 }
+                if roll_prof {
+                    d_post += t_ph.elapsed().as_micros();
+                }
+            }
+            if roll_prof {
+                println!(
+                    "[prof-roll] norm={:.2}s forward={:.2}s sample={:.2}s step={:.2}s post={:.2}s",
+                    d_norm as f64 / 1e6,
+                    d_fwd as f64 / 1e6,
+                    d_samp as f64 / 1e6,
+                    d_step as f64 / 1e6,
+                    d_post as f64 / 1e6,
+                );
             }
 
             let roll_s = t_roll.elapsed().as_secs_f64();
@@ -1029,28 +1101,19 @@ fn main() {
             let gae_s = t_gae.elapsed().as_secs_f64();
             // ---------------- GPU PPO UPDATE (persistent nets, advancing Adam) -------
             let t_upd = Instant::now();
-            let on: Vec<Vec<f32>> = batch
-                .par_iter()
-                .map(|s| ac.obs_norm.normalize(&s.obs))
-                .collect();
-            let cn: Vec<Vec<f32>> = batch
-                .par_iter()
-                .map(|s| ac.critic_norm.normalize(&s.critic_obs))
-                .collect();
-            let f_obs = mk(&bk, &DMatrix::from_fn(od, total, |r, c| on[c][r]), st);
-            let f_cobs = mk(&bk, &DMatrix::from_fn(cd, total, |r, c| cn[c][r]), st);
+            let aff_o = ac.obs_norm.affine();
+            let aff_c = ac.critic_norm.affine();
+            let f_obs = stage_rows(&bk, od, total, Some(&aff_o), st, |c| &batch[c].obs);
+            let f_cobs = stage_rows(&bk, cd, total, Some(&aff_c), st, |c| &batch[c].critic_obs);
             // LOSS: normalized MIRRORED obs (normalize ∘ mirror — exact, not
             // mirror ∘ normalize), and refresh the stop-grad target net to the
             // current (iter-start) actor weights.
             let f_obs_mir = if mirror_loss > 0.0 {
-                let onm: Vec<Vec<f32>> = batch
-                    .par_iter()
-                    .map(|s| ac.obs_norm.normalize(&mirror_obs(&s.obs)))
-                    .collect();
+                let onm: Vec<Vec<f32>> = batch.par_iter().map(|s| mirror_obs(&s.obs)).collect();
                 if let Some(sn) = s_net.as_mut() {
                     sn.write_w(&bk, &ac.actor);
                 }
-                Some(mk(&bk, &DMatrix::from_fn(od, total, |r, c| onm[c][r]), st))
+                Some(stage_rows(&bk, od, total, Some(&aff_o), st, |c| &onm[c]))
             } else {
                 None
             };
@@ -1061,11 +1124,7 @@ fn main() {
                 ac.obs_norm.commit(&mut pn_obs);
                 ac.critic_norm.commit(&mut pn_cobs);
             }
-            let f_act = mk(
-                &bk,
-                &DMatrix::from_fn(ad_, total, |r, c| batch[c].action[r]),
-                st,
-            );
+            let f_act = stage_rows(&bk, ad_, total, None, st, |c| &batch[c].action);
             let f_adv = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].adv), st);
             let f_lpo = mk(
                 &bk,

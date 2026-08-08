@@ -1661,6 +1661,18 @@ pub struct BipedNexusBatchEnv {
     template_spawn_obs: Vec<Vec<f32>>,
     template_spawn_critic_obs: Vec<Vec<f32>>,
 
+    /// Reusable row-major `[NUM_JOINTS × n]` motor-target staging, uploaded to
+    /// `motor_targets_gpu` and scattered by a kernel each control step.
+    targets_row: Vec<f32>,
+    /// Device copy of `targets_row`; persistent so the per-step upload is one
+    /// small `write_buffer` instead of a fresh allocation.
+    motor_targets_gpu: Option<vortx::tensor::Tensor<f32>>,
+    /// Set when `stage_arm_motion` changed HELD-joint entries of the mirror.
+    /// Those live in `links_static` alongside the actuated ones, and the motor
+    /// scatter only rewrites the actuated entries — so a full mirror upload is
+    /// still required on exactly those steps.
+    held_dirty: bool,
+
     /// Counter for the periodic `pipeline.auto_resize_buffers` call (see
     /// `AUTO_RESIZE_PERIOD`). Resets to 0 after each resize.
     tick_since_resize: u32,
@@ -2477,6 +2489,9 @@ impl BipedNexusBatchEnv {
             template_foot_sole,
             template_spawn_obs: Vec::new(),
             template_spawn_critic_obs: Vec::new(),
+            targets_row: vec![0.0; NUM_JOINTS * num_envs],
+            motor_targets_gpu: None,
+            held_dirty: false,
             tick_since_resize: 0,
             #[cfg(feature = "cuda_backend")]
             physics_graph: None,
@@ -3223,6 +3238,10 @@ impl BipedNexusBatchEnv {
         if self.arm_motion.is_none() && self.live_arm.is_none() && self.live_fadeout == 0 {
             return;
         }
+        // Held-joint entries of the mirror are about to change; the motor
+        // scatter only rewrites ACTUATED entries, so this step needs the full
+        // links_static upload as well.
+        self.held_dirty = true;
         if self.live_arm.is_none() && self.live_fadeout > 0 {
             self.live_fadeout -= 1;
         }
@@ -3351,7 +3370,8 @@ impl BipedNexusBatchEnv {
         // delay-state upload below); staging is identical to the no-delay path.
         let t = Instant::now();
         if self.motor_delay.is_none() {
-            for e in 0..self.n {
+            let n = self.n;
+            for e in 0..n {
                 let targets = self.task.joint_targets(&actions[e]);
                 for k in 0..NUM_JOINTS {
                     let link = self.idx.actuated[k].0;
@@ -3361,15 +3381,19 @@ impl BipedNexusBatchEnv {
                         JointAxis::AngZ,
                         targets[k],
                     );
+                    self.targets_row[k * n + e] = targets[k];
                 }
             }
             self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
 
             let t = Instant::now();
-            self.state
-                .multibodies_mut()
-                .flush_links_static(&self.gpu)
-                .expect("flush motor targets");
+            self.flush_motor_targets();
+            if std::mem::take(&mut self.held_dirty) {
+                self.state
+                    .multibodies_mut()
+                    .flush_links_static(&self.gpu)
+                    .expect("flush held targets");
+            }
             self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
         } else {
             // GPU-side delay: stage the CURRENT targets for every env (exactly
@@ -3379,18 +3403,25 @@ impl BipedNexusBatchEnv {
             // per-step tick < k — ZERO mid-decimation host writes (the old
             // per-substep restage stalled the stream on a pageable H2D copy,
             // ~70 ms/step at 4096 envs).
-            for e in 0..self.n {
+            let n = self.n;
+            for e in 0..n {
                 self.delay_now[e] = self.task.joint_targets(&actions[e]);
                 let tg = self.delay_now[e];
                 self.stage_env_targets(e, &tg);
+                for k in 0..NUM_JOINTS {
+                    self.targets_row[k * n + e] = tg[k];
+                }
             }
             self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
 
             let t = Instant::now();
-            self.state
-                .multibodies_mut()
-                .flush_links_static(&self.gpu)
-                .expect("flush motor targets");
+            self.flush_motor_targets();
+            if std::mem::take(&mut self.held_dirty) {
+                self.state
+                    .multibodies_mut()
+                    .flush_links_static(&self.gpu)
+                    .expect("flush held targets");
+            }
             let stride = self.state.multibodies_mut().motor_delay_stride() as usize;
             if self.delay_state_buf.len() != stride * self.n {
                 self.delay_state_buf = vec![0.0; stride * self.n];
@@ -4790,6 +4821,37 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
                 JointAxis::AngZ as u32,
             )
             .expect("encode_scatter_motor_targets");
+    }
+
+    /// Upload this step's actuated targets and scatter them into the motor
+    /// constraints with a kernel.
+    ///
+    /// Replaces the per-step `flush_links_static`, which re-uploaded the ENTIRE
+    /// `links_static` mirror (`links_per_batch × n` structs, each carrying a
+    /// full `GenericJoint` + mass properties — tens of MB) just to change
+    /// `NUM_JOINTS` floats per env. This uploads exactly those floats.
+    fn flush_motor_targets(&mut self) {
+        let n = self.n;
+        if self.motor_targets_gpu.is_none() {
+            self.motor_targets_gpu = Some(
+                vortx::tensor::Tensor::matrix(
+                    &self.gpu,
+                    NUM_JOINTS as u32,
+                    n as u32,
+                    &self.targets_row,
+                    khal::BufferUsages::STORAGE | khal::BufferUsages::COPY_DST,
+                )
+                .expect("motor target buffer"),
+            );
+        } else {
+            let buf = self.motor_targets_gpu.as_mut().unwrap();
+            self.gpu
+                .write_buffer(buf.buffer_mut(), 0, &self.targets_row)
+                .expect("motor target upload");
+        }
+        let targets = self.motor_targets_gpu.take().expect("motor targets");
+        self.scatter_targets_gpu(&targets);
+        self.motor_targets_gpu = Some(targets);
     }
 
     /// Advance physics one control step (`decimation` substeps) WITHOUT any
