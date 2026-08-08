@@ -152,6 +152,9 @@ pub struct GpuRewardJointTerms {
     soft_lo: Tensor<f32>,
     soft_hi: Tensor<f32>,
     hip_mask: Tensor<f32>,
+    mirror_idx: Tensor<u32>,
+    mirror_sign: Tensor<f32>,
+    cmd_yaw: Tensor<f32>,
     out: Tensor<f32>,
     n: usize,
     j: usize,
@@ -167,6 +170,8 @@ impl GpuRewardJointTerms {
         soft_lo: &[f32],
         soft_hi: &[f32],
         hip: &[usize],
+        mirror_idx: &[u32],
+        mirror_sign: &[f32],
     ) -> Result<Self, GpuBackendError> {
         let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
         let mut mask = vec![0.0f32; j];
@@ -186,8 +191,8 @@ impl GpuRewardJointTerms {
                     w_pose: 0.0,
                     w_dof_limits: 0.0,
                     w_dof_vel: 0.0,
-                    pad0: 0,
-                    pad1: 0,
+                    w_bilateral: 0.0,
+                    sym_yaw_gate: 0.0,
                 },
                 BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
             )?,
@@ -195,7 +200,10 @@ impl GpuRewardJointTerms {
             soft_lo: Tensor::vector(backend, soft_lo, st)?,
             soft_hi: Tensor::vector(backend, soft_hi, st)?,
             hip_mask: Tensor::vector(backend, &mask, st)?,
-            out: Tensor::vector_uninit(backend, (3 * n) as u32, st | BufferUsages::COPY_SRC)?,
+            mirror_idx: Tensor::vector(backend, mirror_idx, st)?,
+            mirror_sign: Tensor::vector(backend, mirror_sign, st)?,
+            cmd_yaw: Tensor::vector(backend, &vec![0.0f32; n], st)?,
+            out: Tensor::vector_uninit(backend, (4 * n) as u32, st | BufferUsages::COPY_SRC)?,
             n,
             j,
         })
@@ -210,6 +218,9 @@ impl GpuRewardJointTerms {
         w_pose: f32,
         w_dof_limits: f32,
         w_dof_vel: f32,
+        w_bilateral: f32,
+        sym_yaw_gate: f32,
+        cmd_yaw: &[f32],
     ) -> Result<Vec<f32>, GpuBackendError> {
         backend.write_buffer(self.params.buffer_mut(), 0, &[shaders::RewardJointParams {
             n_envs: self.n as u32,
@@ -218,9 +229,10 @@ impl GpuRewardJointTerms {
             w_pose,
             w_dof_limits,
             w_dof_vel,
-            pad0: 0,
-            pad1: 0,
+            w_bilateral,
+            sym_yaw_gate,
         }])?;
+        backend.write_buffer(self.cmd_yaw.buffer_mut(), 0, cmd_yaw)?;
         let mut enc = backend.begin_encoding();
         {
             let mut pass = enc.begin_pass("[reward] joint terms", None);
@@ -234,6 +246,9 @@ impl GpuRewardJointTerms {
                 &self.soft_lo,
                 &self.soft_hi,
                 &self.hip_mask,
+                &self.mirror_idx,
+                &self.mirror_sign,
+                &self.cmd_yaw,
                 &mut self.out,
             )?;
         }

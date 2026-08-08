@@ -4315,23 +4315,32 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         &lo,
                         &hi,
                         &self.task.hip_yawroll_idx(),
+                        &(0..NUM_JOINTS)
+                            .map(|k| self.robot.mirror[k] as u32)
+                            .collect::<Vec<_>>(),
+                        &(0..NUM_JOINTS)
+                            .map(|k| self.robot.mirror_sign[k])
+                            .collect::<Vec<_>>(),
                     )
                     .expect("gpu joint terms"),
                 );
             }
             let w = &self.task.weights;
             let (wp, wl, wv) = (w.pose, w.dof_pos_limits, w.dof_vel);
+            let wb = w.bilateral_symmetry;
+            let gate = self.task.sym_yaw_gate;
             let dtc = self.task.control_dt();
+            let yaws: Vec<f32> = (0..n).map(|e| self.cmd[e].yaw_rate).collect();
             let joints_ref = self.gpu_joints.as_ref().unwrap();
             let jt = self
                 .gpu_joint_terms
                 .as_mut()
                 .unwrap()
-                .compute(&self.gpu, joints_ref, dtc, wp, wl, wv)
+                .compute(&self.gpu, joints_ref, dtc, wp, wl, wv, wb, gate, &yaws)
                 .await
                 .expect("gpu joint terms compute");
-            const JOINT_TERMS: [(usize, usize); 3] = [(4, 0), (10, 1), (11, 2)];
-            let mut wj = [0.0f32; 3];
+            const JOINT_TERMS: [(usize, usize); 4] = [(4, 0), (10, 1), (11, 2), (5, 3)];
+            let mut wj = [0.0f32; 4];
             for (ti, (comp, row)) in JOINT_TERMS.iter().enumerate() {
                 for e in 0..n {
                     let d = (jt[row * n + e] - computed[e].comps[*comp]).abs();
@@ -4341,8 +4350,8 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 }
             }
             eprintln!(
-                "[verify_joint_terms] pose={:.3e} dof_pos_limits={:.3e} dof_vel={:.3e}",
-                wj[0], wj[1], wj[2]
+                "[verify_joint_terms] pose={:.3e} dof_pos_limits={:.3e} dof_vel={:.3e} bilateral={:.3e}",
+                wj[0], wj[1], wj[2], wj[3]
             );
         }
 

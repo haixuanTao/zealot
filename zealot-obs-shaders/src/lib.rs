@@ -506,8 +506,11 @@ pub struct RewardJointParams {
     pub w_dof_limits: f32,
     /// `weights.dof_vel` — joint-velocity L2.
     pub w_dof_vel: f32,
-    pub pad0: u32,
-    pub pad1: u32,
+    /// `weights.bilateral_symmetry` — exp(-symmetry error).
+    pub w_bilateral: f32,
+    /// Yaw gate releasing the LATERAL half of the symmetry term as the turn
+    /// command grows; 0 = never release (lateral always at full weight).
+    pub sym_yaw_gate: f32,
 }
 
 /// The joint-only reward terms, one thread per environment.
@@ -533,7 +536,10 @@ pub fn gpu_reward_joint_terms(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] soft_lo: &[f32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] soft_hi: &[f32],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] hip_mask: &[f32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] out: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] mirror_idx: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 8)] mirror_sign: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 9)] cmd_yaw: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 10)] out: &mut [f32],
 ) {
     let e = invocation_id.x as usize;
     let n = params.n_envs as usize;
@@ -554,9 +560,36 @@ pub fn gpu_reward_joint_terms(
             lim_pen += if under > 0.0 { under } else { 0.0 };
             jv2 += vi * vi;
         }
+        // Bilateral symmetry: each L/R pair counted once (partner index > i).
+        // Lateral pairs (negative mirror sign) are scaled by the yaw gate.
+        let gate = params.sym_yaw_gate;
+        let lateral_scale = if gate > 0.0 {
+            let s = 1.0 - (cmd_yaw.read(e).abs() / gate);
+            if s < 0.0 {
+                0.0
+            } else if s > 1.0 {
+                1.0
+            } else {
+                s
+            }
+        } else {
+            1.0
+        };
+        let mut sym_err = 0.0f32;
+        for i in 0..j {
+            let jr = mirror_idx.read(i) as usize;
+            if jr > i {
+                let sgn = mirror_sign.read(i);
+                let d = q.read(i * n + e) - sgn * q.read(jr * n + e);
+                let sq = d * d;
+                sym_err += if sgn < 0.0 { lateral_scale * sq } else { sq };
+            }
+        }
+
         let dt = params.dt;
         out.write(e, params.w_pose * hip_dev2 * dt);
         out.write(n + e, params.w_dof_limits * lim_pen * dt);
         out.write(2 * n + e, params.w_dof_vel * jv2 * dt);
+        out.write(3 * n + e, params.w_bilateral * (-sym_err).exp() * dt);
     }
 }
