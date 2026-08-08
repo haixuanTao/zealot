@@ -138,6 +138,121 @@ impl GpuJointState {
 }
 
 
+
+/// Host binding for the torque / power reward terms.
+#[derive(Shader)]
+struct RewardTorqueShader {
+    terms: shaders::GpuRewardTorqueTerms,
+}
+
+/// torque_leg / torque_ankle / power from the GPU joint state + PD targets.
+pub struct GpuRewardTorqueTerms {
+    shader: RewardTorqueShader,
+    params: Tensor<shaders::RewardTorqueParams>,
+    q_target: Tensor<f32>,
+    kp: Tensor<f32>,
+    kd: Tensor<f32>,
+    effort: Tensor<f32>,
+    w_leg: Tensor<f32>,
+    w_ankle: Tensor<f32>,
+    w_knee: Tensor<f32>,
+    out: Tensor<f32>,
+    n: usize,
+    j: usize,
+}
+
+impl GpuRewardTorqueTerms {
+    /// `w_leg`/`w_ankle`/`w_knee` are per-joint, with the host's joint-name
+    /// classification already resolved into them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        backend: &GpuBackend,
+        n: usize,
+        j: usize,
+        kp: &[f32],
+        kd: &[f32],
+        effort: &[f32],
+        w_leg: &[f32],
+        w_ankle: &[f32],
+        w_knee: &[f32],
+    ) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        Ok(Self {
+            shader: RewardTorqueShader::from_backend(backend)?,
+            params: Tensor::scalar(
+                backend,
+                shaders::RewardTorqueParams {
+                    n_envs: n as u32,
+                    num_joints: j as u32,
+                    dt: 0.0,
+                    torque_w: 0.0,
+                    ankle_torque_w: 0.0,
+                    power_w: 0.0,
+                    pad0: 0,
+                    pad1: 0,
+                },
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            q_target: Tensor::vector_uninit(backend, (j * n) as u32, st)?,
+            kp: Tensor::vector(backend, kp, st)?,
+            kd: Tensor::vector(backend, kd, st)?,
+            effort: Tensor::vector(backend, effort, st)?,
+            w_leg: Tensor::vector(backend, w_leg, st)?,
+            w_ankle: Tensor::vector(backend, w_ankle, st)?,
+            w_knee: Tensor::vector(backend, w_knee, st)?,
+            out: Tensor::vector_uninit(backend, (3 * n) as u32, st | BufferUsages::COPY_SRC)?,
+            n,
+            j,
+        })
+    }
+
+    /// `q_target` is the row-major `[j x n]` PD target the env already stages.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        joints: &GpuJointState,
+        q_target: &[f32],
+        dt: f32,
+        torque_w: f32,
+        ankle_torque_w: f32,
+        power_w: f32,
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        backend.write_buffer(self.params.buffer_mut(), 0, &[shaders::RewardTorqueParams {
+            n_envs: self.n as u32,
+            num_joints: self.j as u32,
+            dt,
+            torque_w,
+            ankle_torque_w,
+            power_w,
+            pad0: 0,
+            pad1: 0,
+        }])?;
+        backend.write_buffer(self.q_target.buffer_mut(), 0, q_target)?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[reward] torque terms", None);
+            self.shader.terms.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                joints.q_buffer(),
+                joints.qd_buffer(),
+                &self.q_target,
+                &self.kp,
+                &self.kd,
+                &self.effort,
+                &self.w_leg,
+                &self.w_ankle,
+                &self.w_knee,
+                &mut self.out,
+            )?;
+        }
+        backend.submit(enc)?;
+        backend.slow_read_vec(self.out.buffer()).await
+    }
+}
+
 /// Host binding for the joint-only reward terms.
 #[derive(Shader)]
 struct RewardJointShader {

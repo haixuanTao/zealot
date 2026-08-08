@@ -593,3 +593,93 @@ pub fn gpu_reward_joint_terms(
         out.write(3 * n + e, params.w_bilateral * (-sym_err).exp() * dt);
     }
 }
+
+/// Scalar parameters for [`gpu_reward_torque_terms`] (uniform; 32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct RewardTorqueParams {
+    pub n_envs: u32,
+    pub num_joints: u32,
+    pub dt: f32,
+    /// Curriculum-ramped leg-torque gain (the env's `torque_scale`).
+    pub torque_w: f32,
+    /// Ankle-torque gain — full strength at all times, NOT ramped.
+    pub ankle_torque_w: f32,
+    /// Mechanical-power gain.
+    pub power_w: f32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
+/// Torque / power reward terms, one thread per environment.
+///
+/// Reconstructs the applied PD torque exactly as the host does:
+///   `tau = clamp(kp·(q_target − q) − kd·q̇, ±effort)`
+/// then
+///   torque_leg   = −(torque_w · Σ w_leg·tau² + Σ w_knee·tau²) · dt
+///   torque_ankle = −(ankle_torque_w · Σ w_ankle·tau²)         · dt
+///   power        = −(power_w · Σ|tau·q̇|)                      · dt
+///
+/// The per-joint weights arrive as `[num_joints]` arrays so the kernel never
+/// does the host's joint-NAME matching (`contains("ankle")`, `"knee"`, the two
+/// roll naming schemes) — that classification is resolved once on the host and
+/// baked into `w_leg` / `w_ankle` / `w_knee`.
+///
+/// Note the knee extra is deliberately OUTSIDE the ramped `torque_w`, matching
+/// the host: it is full-strength from iteration 0 like the ankle extras.
+///
+/// `q`, `qd` and `q_target` are row-major `[num_joints x n_envs]`; `out` is
+/// `[3 x n_envs]`: torque_leg, torque_ankle, power.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_reward_torque_terms(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &RewardTorqueParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] q: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] qd: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] q_target: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] kp: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] kd: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] effort: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] w_leg: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 8)] w_ankle: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 9)] w_knee: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 10)] out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    let j = params.num_joints as usize;
+    if e < n {
+        let mut leg_pen = 0.0f32;
+        let mut ankle_pen = 0.0f32;
+        let mut knee_pen = 0.0f32;
+        let mut power = 0.0f32;
+        for i in 0..j {
+            let idx = i * n + e;
+            let v = qd.read(idx);
+            let lim = effort.read(i);
+            let raw = kp.read(i) * (q_target.read(idx) - q.read(idx)) - kd.read(i) * v;
+            let tau = if raw > lim {
+                lim
+            } else if raw < -lim {
+                -lim
+            } else {
+                raw
+            };
+            let t2 = tau * tau;
+            let p = tau * v;
+            power += if p < 0.0 { -p } else { p };
+            leg_pen += w_leg.read(i) * t2;
+            ankle_pen += w_ankle.read(i) * t2;
+            knee_pen += w_knee.read(i) * t2;
+        }
+        let dt = params.dt;
+        out.write(e, -(params.torque_w * leg_pen + knee_pen) * dt);
+        out.write(n + e, -(params.ankle_torque_w * ankle_pen) * dt);
+        out.write(2 * n + e, -(params.power_w * power) * dt);
+    }
+}

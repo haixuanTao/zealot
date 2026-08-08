@@ -1739,6 +1739,8 @@ pub struct BipedNexusBatchEnv {
     gpu_joints: Option<zealot_gpu_obs::GpuJointState>,
     /// Joint-only reward terms (pose / dof_pos_limits / dof_vel).
     gpu_joint_terms: Option<zealot_gpu_obs::GpuRewardJointTerms>,
+    /// Torque / power reward terms.
+    gpu_torque_terms: Option<zealot_gpu_obs::GpuRewardTorqueTerms>,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2569,6 +2571,7 @@ impl BipedNexusBatchEnv {
             gpu_reward: None,
             gpu_joints: None,
             gpu_joint_terms: None,
+            gpu_torque_terms: None,
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -4352,6 +4355,65 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             eprintln!(
                 "[verify_joint_terms] pose={:.3e} dof_pos_limits={:.3e} dof_vel={:.3e} bilateral={:.3e}",
                 wj[0], wj[1], wj[2], wj[3]
+            );
+
+            // ---- torque / power terms ----
+            if self.gpu_torque_terms.is_none() {
+                // Resolve the host's joint-NAME classification once, into
+                // per-joint weights the kernel just multiplies by.
+                let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(1e-4);
+                let w_ankle_t = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1.5e-3);
+                let w_ankle_roll = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(0.0);
+                let w_knee = self.knobs.w_knee_torques;
+                let js = &self.task.robot.joints;
+                let kp: Vec<f32> = (0..NUM_JOINTS).map(|k| js[k].kp).collect();
+                let kd: Vec<f32> = (0..NUM_JOINTS).map(|k| js[k].kd).collect();
+                let eff: Vec<f32> = (0..NUM_JOINTS).map(|k| js[k].effort_limit).collect();
+                let wl = vec![w_torques; NUM_JOINTS];
+                let wa: Vec<f32> = (0..NUM_JOINTS)
+                    .map(|k| {
+                        let nm = &js[k].name;
+                        if nm.contains("ankle") {
+                            let roll = nm.contains("ankle_roll") || nm.contains("anklex");
+                            w_ankle_t + if roll { w_ankle_roll } else { 0.0 }
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let wk: Vec<f32> = (0..NUM_JOINTS)
+                    .map(|k| if js[k].name.contains("knee") { w_knee } else { 0.0 })
+                    .collect();
+                self.gpu_torque_terms = Some(
+                    zealot_gpu_obs::GpuRewardTorqueTerms::new(
+                        &self.gpu, n, NUM_JOINTS, &kp, &kd, &eff, &wl, &wa, &wk,
+                    )
+                    .expect("gpu torque terms"),
+                );
+            }
+            let (tw, atw, pw) = (self.torque_scale, self.knobs.ankle_torque_w, self.knobs.power_w);
+            let tr = self.targets_row.clone();
+            let joints_ref2 = self.gpu_joints.as_ref().unwrap();
+            let tt = self
+                .gpu_torque_terms
+                .as_mut()
+                .unwrap()
+                .compute(&self.gpu, joints_ref2, &tr, dtc, tw, atw, pw)
+                .await
+                .expect("gpu torque terms compute");
+            const TORQUE_TERMS: [(usize, usize); 3] = [(20, 0), (21, 1), (24, 2)];
+            let mut wt = [0.0f32; 3];
+            for (ti, (comp, row)) in TORQUE_TERMS.iter().enumerate() {
+                for e in 0..n {
+                    let d = (tt[row * n + e] - computed[e].comps[*comp]).abs();
+                    if d > wt[ti] {
+                        wt[ti] = d;
+                    }
+                }
+            }
+            eprintln!(
+                "[verify_torque_terms] torque_leg={:.3e} torque_ankle={:.3e} power={:.3e}",
+                wt[0], wt[1], wt[2]
             );
         }
 
