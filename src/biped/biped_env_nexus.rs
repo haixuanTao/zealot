@@ -3374,26 +3374,23 @@ impl BipedNexusBatchEnv {
             for e in 0..n {
                 let targets = self.task.joint_targets(&actions[e]);
                 for k in 0..NUM_JOINTS {
-                    let link = self.idx.actuated[k].0;
-                    self.state.multibodies_mut().stage_motor_position(
-                        e as u32,
-                        link,
-                        JointAxis::AngZ,
-                        targets[k],
-                    );
                     self.targets_row[k * n + e] = targets[k];
                 }
             }
             self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
 
             let t = Instant::now();
-            self.flush_motor_targets();
+            // ORDER MATTERS: the held flush uploads the WHOLE mirror, whose
+            // actuated entries are deliberately stale (we stopped staging them
+            // per env — the scatter is the only writer). So flush first, then
+            // scatter the fresh targets over the top, before any substep runs.
             if std::mem::take(&mut self.held_dirty) {
                 self.state
                     .multibodies_mut()
                     .flush_links_static(&self.gpu)
                     .expect("flush held targets");
             }
+            self.flush_motor_targets();
             self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
         } else {
             // GPU-side delay: stage the CURRENT targets for every env (exactly
@@ -3407,7 +3404,6 @@ impl BipedNexusBatchEnv {
             for e in 0..n {
                 self.delay_now[e] = self.task.joint_targets(&actions[e]);
                 let tg = self.delay_now[e];
-                self.stage_env_targets(e, &tg);
                 for k in 0..NUM_JOINTS {
                     self.targets_row[k * n + e] = tg[k];
                 }
@@ -3415,13 +3411,14 @@ impl BipedNexusBatchEnv {
             self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
 
             let t = Instant::now();
-            self.flush_motor_targets();
+            // Flush BEFORE the scatter — see the no-delay branch.
             if std::mem::take(&mut self.held_dirty) {
                 self.state
                     .multibodies_mut()
                     .flush_links_static(&self.gpu)
                     .expect("flush held targets");
             }
+            self.flush_motor_targets();
             let stride = self.state.multibodies_mut().motor_delay_stride() as usize;
             if self.delay_state_buf.len() != stride * self.n {
                 self.delay_state_buf = vec![0.0; stride * self.n];
