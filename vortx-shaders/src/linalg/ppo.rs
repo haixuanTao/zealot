@@ -187,7 +187,11 @@ pub struct PpoStageParams {
     /// Symmetric clamp applied after normalization (matches the host
     /// `Normalizer::normalize`).
     pub clamp: f32,
-    pub pad0: u32,
+    /// Element offset added to every `raw` index. Lets one kernel serve both
+    /// the whole batch (`0`) and a single rollout step's policy input
+    /// (`step·dim·n`, with `horizon = 1`, `total = n`, `mirror_half = 0`), so
+    /// the observations are uploaded ONCE per step instead of twice.
+    pub raw_offset: u32,
     pub pad1: u32,
 }
 
@@ -239,7 +243,7 @@ pub fn gpu_ppo_stage_batch(
         let e = cc / horizon;
         let t = cc - e * horizon;
 
-        let v = sgn * raw.read(t * dim * n + src_r * n + e);
+        let v = sgn * raw.read(params.raw_offset as usize + t * dim * n + src_r * n + e);
         let z = (v - mean.read(r)) * inv_sd.read(r);
         let z = if z > clamp {
             clamp
