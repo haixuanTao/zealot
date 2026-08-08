@@ -96,24 +96,51 @@ fn stage_rows<'a>(
     u: BufferUsages,
     get: impl Fn(usize) -> &'a [f32] + Sync,
 ) -> Tensor<f32> {
+    // Fill BLOCKS of rows per pass over the samples. One row at a time would
+    // re-walk all `total` samples `dim` times — with ~200 MB of per-sample obs
+    // that streams the whole working set through cache once per row (~3 GB of
+    // traffic for the actor obs). A block of `RB` rows amortizes each pass over
+    // RB outputs and reads `src[r0..r0+RB]` contiguously inside each sample.
+    const RB: usize = 16;
+    let t_fill = std::time::Instant::now();
     let mut flat = vec![0f32; dim * total];
-    flat.par_chunks_mut(total).enumerate().for_each(|(r, row)| {
-        match affine {
-            // Same clamp as `Normalizer::normalize` — keep them in lockstep.
-            Some((mean, inv_sd)) => {
-                let (m, s) = (mean[r], inv_sd[r]);
-                for (c, dst) in row.iter_mut().enumerate() {
-                    *dst = ((get(c)[r] - m) * s).clamp(-5.0, 5.0);
+    flat.par_chunks_mut(total * RB)
+        .enumerate()
+        .for_each(|(blk, chunk)| {
+            let r0 = blk * RB;
+            let nr = (dim - r0).min(RB);
+            match affine {
+                // Same clamp as `Normalizer::normalize` — keep them in lockstep.
+                Some((mean, inv_sd)) => {
+                    for c in 0..total {
+                        let src = get(c);
+                        for rr in 0..nr {
+                            let r = r0 + rr;
+                            chunk[rr * total + c] =
+                                ((src[r] - mean[r]) * inv_sd[r]).clamp(-5.0, 5.0);
+                        }
+                    }
+                }
+                None => {
+                    for c in 0..total {
+                        let src = get(c);
+                        for rr in 0..nr {
+                            chunk[rr * total + c] = src[r0 + rr];
+                        }
+                    }
                 }
             }
-            None => {
-                for (c, dst) in row.iter_mut().enumerate() {
-                    *dst = get(c)[r];
-                }
-            }
-        }
-    });
-    Tensor::matrix(b, dim as u32, total as u32, &flat, u).unwrap()
+        });
+    let t_up = std::time::Instant::now();
+    let out = Tensor::matrix(b, dim as u32, total as u32, &flat, u).unwrap();
+    if std::env::var("BIPED_STAGE_PROF").is_ok() {
+        eprintln!(
+            "[prof-stage] dim={dim} total={total} fill={:.1}ms upload={:.1}ms",
+            (t_up - t_fill).as_secs_f64() * 1e3,
+            t_up.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    out
 }
 fn wmat(w: &[f32], out: usize, inp: usize) -> DMatrix<f32> {
     DMatrix::from_fn(out, inp, |r, c| w[r * inp + c])
