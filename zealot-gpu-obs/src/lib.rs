@@ -566,6 +566,11 @@ pub struct GpuBaseState {
 }
 
 impl GpuBaseState {
+    /// Device-resident `[13 x n]` base-state block.
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
     pub fn new(
         backend: &GpuBackend,
         n: usize,
@@ -644,6 +649,17 @@ pub struct GpuJointState {
 }
 
 impl GpuJointState {
+    /// Device-resident `[num_joints x n]` joint angles, for consumers that
+    /// chain off this kernel instead of reading back.
+    pub fn q_tensor(&self) -> &vortx::tensor::Tensor<f32> {
+        &self.q
+    }
+
+    /// Device-resident `[num_joints x n]` joint velocities.
+    pub fn qd_tensor(&self) -> &vortx::tensor::Tensor<f32> {
+        &self.qd
+    }
+
     /// `rest` is one xyzw quaternion per joint; `parents`/`children` are link
     /// indices into the env-major `body_poses` buffer.
     pub fn new(
@@ -1249,5 +1265,165 @@ impl GpuObs {
             &self.u_scale,
         )?;
         Ok(())
+    }
+}
+
+/// Host binding for the observation-assembly kernel.
+#[derive(Shader)]
+struct ObserveShader {
+    observe: shaders::GpuObserve,
+}
+
+/// GPU assembly of the actor + critic observation frames.
+///
+/// Exact port of `VelocityFlatTask::observe` / `observe_critic`. Writes RAW
+/// frames directly into the caller's step-blocked `raw_obs` / `raw_cobs`
+/// tensors, replacing the host `fill_raw` transpose and its two `write_buffer`s.
+///
+/// `cue` is UPLOADED, not derived: the step cue needs the host terrain patch
+/// structure and the per-env RNG stream, and a device RNG that did not
+/// reproduce that stream bit-exactly would silently change the domain
+/// randomization the policy trains against. So the host still probes; only the
+/// assembly moved.
+pub struct GpuObserve {
+    shader: ObserveShader,
+    params: Tensor<shaders::ObserveParams>,
+    last_action: Tensor<f32>,
+    cmd: Tensor<f32>,
+    default_pos: Tensor<f32>,
+    phase: Tensor<f32>,
+    cue: Tensor<f32>,
+    out_obs: Tensor<f32>,
+    out_cobs: Tensor<f32>,
+    n: usize,
+    num_joints: u32,
+    obs_dim: usize,
+    crit_dim: usize,
+}
+
+impl GpuObserve {
+    pub fn new(
+        backend: &GpuBackend,
+        n: usize,
+        num_joints: u32,
+        obs_dim: usize,
+        crit_dim: usize,
+        default_pos: &[f32],
+    ) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        Ok(Self {
+            shader: ObserveShader::from_backend(backend)?,
+            params: Tensor::scalar(
+                backend,
+                shaders::ObserveParams {
+                    n_envs: n as u32,
+                    num_joints,
+                    obs_dim: obs_dim as u32,
+                    crit_dim: crit_dim as u32,
+                    step: 0,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                },
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            last_action: Tensor::vector(backend, &vec![0.0f32; num_joints as usize * n], st)?,
+            cmd: Tensor::vector(backend, &vec![0.0f32; 4 * n], st)?,
+            default_pos: Tensor::vector(backend, default_pos, st)?,
+            phase: Tensor::vector(backend, &vec![0.0f32; n], st)?,
+            cue: Tensor::vector(backend, &vec![0.0f32; 10 * n], st)?,
+            out_obs: Tensor::vector_uninit(
+                backend,
+                (obs_dim * n) as u32,
+                st | BufferUsages::COPY_SRC,
+            )?,
+            out_cobs: Tensor::vector_uninit(
+                backend,
+                (crit_dim * n) as u32,
+                st | BufferUsages::COPY_SRC,
+            )?,
+            n,
+            num_joints,
+            obs_dim,
+            crit_dim,
+        })
+    }
+
+    /// Device-resident raw actor frame, `[obs_dim x n]`.
+    pub fn obs_tensor(&self) -> &Tensor<f32> {
+        &self.out_obs
+    }
+
+    /// Device-resident raw critic frame, `[crit_dim x n]`.
+    pub fn cobs_tensor(&self) -> &Tensor<f32> {
+        &self.out_cobs
+    }
+
+    /// `last_action` is `[J x n]`, `cmd` `[4 x n]`, `phase` `[n]`, `cue`
+    /// `[10 x n]` (noisy 5 then clean 5). `q`/`qd` come from [`GpuJointState`],
+    /// `base` from [`GpuBaseState`] — both borrowed on-device, no round trip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode(
+        &mut self,
+        backend: &GpuBackend,
+        step: u32,
+        last_action: &[f32],
+        cmd: &[f32],
+        phase: &[f32],
+        cue: &[f32],
+        q: &Tensor<f32>,
+        qd: &Tensor<f32>,
+        base: &Tensor<f32>,
+    ) -> Result<(), GpuBackendError> {
+        backend.write_buffer(
+            self.params.buffer_mut(),
+            0,
+            &[shaders::ObserveParams {
+                n_envs: self.n as u32,
+                num_joints: self.num_joints,
+                obs_dim: self.obs_dim as u32,
+                crit_dim: self.crit_dim as u32,
+                step,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }],
+        )?;
+        backend.write_buffer(self.last_action.buffer_mut(), 0, last_action)?;
+        backend.write_buffer(self.cmd.buffer_mut(), 0, cmd)?;
+        backend.write_buffer(self.phase.buffer_mut(), 0, phase)?;
+        backend.write_buffer(self.cue.buffer_mut(), 0, cue)?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[obs] assemble", None);
+            self.shader.observe.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                &self.last_action,
+                &self.cmd,
+                q,
+                qd,
+                &self.default_pos,
+                base,
+                &self.phase,
+                &self.cue,
+                &mut self.out_obs,
+                &mut self.out_cobs,
+            )?;
+        }
+        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Read both frames back. Verification only — the whole point of the port
+    /// is that the steady-state path never does this.
+    pub async fn read_back(
+        &self,
+        backend: &GpuBackend,
+    ) -> Result<(Vec<f32>, Vec<f32>), GpuBackendError> {
+        let o = backend.slow_read_vec(self.out_obs.buffer()).await?;
+        let c = backend.slow_read_vec(self.out_cobs.buffer()).await?;
+        Ok((o, c))
     }
 }

@@ -1471,3 +1471,189 @@ pub fn gpu_feet_reset(
         let _ = seed_force;
     }
 }
+
+/// `f32::clamp` is not available in the shader targets; spelled out to match
+/// the host's `.clamp(lo, hi)` exactly (NaN handling is irrelevant here — both
+/// inputs are terrain-probe outputs).
+#[inline]
+fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+/// Scalar parameters for [`gpu_observe`] (uniform).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct ObserveParams {
+    pub n_envs: u32,
+    pub num_joints: u32,
+    /// Actor obs width (`OBS_DIM`).
+    pub obs_dim: u32,
+    /// Critic obs width (`CRITIC_OBS_DIM`).
+    pub crit_dim: u32,
+    /// Rollout step, used only to offset into the step-blocked output buffers.
+    pub step: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// Exact port of `VelocityFlatTask::observe` + `observe_critic`, one thread per
+/// environment.
+///
+/// Writes the RAW (un-normalized) single frame straight into the step-blocked
+/// `raw_obs` / `raw_cobs` device buffers at `step · dim · n`, in the same
+/// row-major `[dim x n_envs]` layout the host's `fill_raw` produced — so the
+/// existing `gpu_ppo_stage_batch` consumes it unchanged. This replaces a host
+/// `par_chunks_mut` transpose over the whole batch plus two `write_buffer`s
+/// per step.
+///
+/// Actor layout (53 wide): last_action(12), cmd(4), q−default(12), qd(12),
+/// projected_gravity(3), gait clock as (sin, cos)(2), base ang vel body(3),
+/// step cue(5). Critic appends base lin vel body(3), ang vel body(3) and the
+/// CLEAN cue(5).
+///
+/// THE CUE IS AN INPUT, NOT DERIVED HERE. Both cues arrive in `cue` as
+/// `[10 x n]` (noisy 5 then clean 5) because deriving them needs the host's
+/// terrain patch structure AND the per-env RNG stream, and reproducing that
+/// stream anywhere but the host would change the domain-randomization noise the
+/// policy trains against. Clamping still happens here to keep the clamp
+/// co-located with the layout it protects.
+///
+/// `q`/`qd` are `[num_joints x n]` from [`gpu_joint_state`]; `base` is the
+/// `[13 x n]` block from [`gpu_base_state`] (quat 0-3, lin vel world 4-6, ang
+/// vel world 7-9, height 10, xy 11-12).
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_observe(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &ObserveParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] last_action: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] cmd: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] q: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] qd: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] default_pos: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] base: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 7)] phase: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 8)] cue: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 9)] out_obs: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 10)] out_cobs: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    let j = params.num_joints as usize;
+    if e < n {
+        let od = params.obs_dim as usize;
+        let cd = params.crit_dim as usize;
+        let ob = params.step as usize * od * n;
+        let cb = params.step as usize * cd * n;
+
+        let quat = Vec4::new(
+            base.read(e),
+            base.read(n + e),
+            base.read(2 * n + e),
+            base.read(3 * n + e),
+        );
+
+        let mut o = 0usize;
+        for i in 0..j {
+            out_obs.write(ob + o * n + e, last_action.read(i * n + e));
+            o += 1;
+        }
+        // `VelocityCommand::obs()` — the 4th channel is reserved 0.0.
+        for c in 0..4 {
+            out_obs.write(ob + o * n + e, cmd.read(c * n + e));
+            o += 1;
+        }
+        for i in 0..j {
+            out_obs.write(ob + o * n + e, q.read(i * n + e) - default_pos.read(i));
+            o += 1;
+        }
+        for i in 0..j {
+            out_obs.write(ob + o * n + e, qd.read(i * n + e));
+            o += 1;
+        }
+        // projected_gravity: world down rotated into the body frame (UP = 2).
+        let g = qrot_inv(quat, [0.0, 0.0, -1.0]);
+        for k in 0..3 {
+            out_obs.write(ob + o * n + e, g[k]);
+            o += 1;
+        }
+        let ph = phase.read(e) * core::f32::consts::TAU;
+        out_obs.write(ob + o * n + e, ph.sin());
+        o += 1;
+        out_obs.write(ob + o * n + e, ph.cos());
+        o += 1;
+        let avw = [
+            base.read(7 * n + e),
+            base.read(8 * n + e),
+            base.read(9 * n + e),
+        ];
+        let avb = qrot_inv(quat, avw);
+        for k in 0..3 {
+            out_obs.write(ob + o * n + e, avb[k]);
+            o += 1;
+        }
+        // Step cue. `valid == 0` forces the other four to zero so "no step" is
+        // a single unambiguous pattern rather than stale numbers.
+        let live = cue.read(4 * n + e) > 0.5;
+        let (cdist, chgt, csin, ccos) = if live {
+            (
+                clampf(cue.read(e), -0.5, 1.5),
+                clampf(cue.read(n + e), -0.4, 0.4),
+                cue.read(2 * n + e),
+                cue.read(3 * n + e),
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        out_obs.write(ob + o * n + e, cdist);
+        out_obs.write(ob + (o + 1) * n + e, chgt);
+        out_obs.write(ob + (o + 2) * n + e, csin);
+        out_obs.write(ob + (o + 3) * n + e, ccos);
+        out_obs.write(ob + (o + 4) * n + e, if live { 1.0 } else { 0.0 });
+
+        // Critic: the actor frame verbatim, then the privileged tail.
+        for r in 0..od {
+            out_cobs.write(cb + r * n + e, out_obs.read(ob + r * n + e));
+        }
+        let lvw = [
+            base.read(4 * n + e),
+            base.read(5 * n + e),
+            base.read(6 * n + e),
+        ];
+        let lvb = qrot_inv(quat, lvw);
+        for k in 0..3 {
+            out_cobs.write(cb + (od + k) * n + e, lvb[k]);
+            out_cobs.write(cb + (od + 3 + k) * n + e, avb[k]);
+        }
+        // Clean cue: the un-noised, never-dropped oracle (asymmetric critic).
+        // "Clean" refers to the SOURCE — it is still gated and clamped exactly
+        // like the actor's copy, just from `step_cue_clean`.
+        let clive = cue.read(9 * n + e) > 0.5;
+        let (dd, hh, ss, cc2) = if clive {
+            (
+                clampf(cue.read(5 * n + e), -0.5, 1.5),
+                clampf(cue.read(6 * n + e), -0.4, 0.4),
+                cue.read(7 * n + e),
+                cue.read(8 * n + e),
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        out_cobs.write(cb + (od + 6) * n + e, dd);
+        out_cobs.write(cb + (od + 7) * n + e, hh);
+        out_cobs.write(cb + (od + 8) * n + e, ss);
+        out_cobs.write(cb + (od + 9) * n + e, cc2);
+        out_cobs.write(cb + (od + 10) * n + e, if clive { 1.0 } else { 0.0 });
+    }
+}

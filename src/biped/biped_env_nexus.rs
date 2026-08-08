@@ -1747,6 +1747,13 @@ pub struct BipedNexusBatchEnv {
     gpu_base_terms: Option<zealot_gpu_obs::GpuRewardBaseTerms>,
     /// Per-foot state.
     gpu_feet: Option<zealot_gpu_obs::GpuFeetState>,
+    /// GPU assembly of the actor + critic observation frames. Verified with
+    /// `BIPED_VERIFY_REWARD=1` against the host `observe`/`observe_critic`.
+    gpu_observe: Option<zealot_gpu_obs::GpuObserve>,
+    /// `BIPED_VERIFY_CUE`: feed a synthetic step cue so the obs harness
+    /// exercises the cue gate + clamp, which a flat-curriculum run never hits.
+    /// TEST FIXTURE ONLY — it overwrites the real cue.
+    verify_cue: bool,
     /// Self-contained per-foot reward terms.
     gpu_feet_terms: Option<zealot_gpu_obs::GpuRewardFeetTerms>,
     /// Gated gait reward terms.
@@ -2587,6 +2594,8 @@ impl BipedNexusBatchEnv {
             gpu_base: None,
             gpu_base_terms: None,
             gpu_feet: None,
+            gpu_observe: None,
+            verify_cue: std::env::var("BIPED_VERIFY_CUE").is_ok(),
             gpu_feet_terms: None,
             gpu_gait_terms: None,
             gpu_misc_terms: None,
@@ -3760,6 +3769,10 @@ impl BipedNexusBatchEnv {
             /// The step cue AS THE HOST USED IT (noised/dropout-masked):
             /// valid, distance, edge_cos, edge_sin.
             cue_dbg: [f32; 4],
+            /// Both cues in the OBS kernel's upload order — noisy 5 then clean
+            /// 5, each (distance, height, edge_sin, edge_cos, valid). RAW: the
+            /// gating and clamping happen in the kernel, matching `observe`.
+            cue_obs: [f32; 10],
             /// Host per-foot state for the GPU feet check: per foot, 11 fields
             /// in the kernel's order.
             feet_dbg: [f32; 22],
@@ -3983,6 +3996,30 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         }
                         state.step_cue = cue;
                     }
+                }
+                // BIPED_VERIFY_CUE: deterministic synthetic cue for the obs
+                // harness. The terrain curriculum starts flat, so a short run
+                // never produces a live cue and the kernel's gate + clamp
+                // branches would be compared as zeros against zeros. Values are
+                // chosen to straddle BOTH clamp bounds and to differ between
+                // the actor and clean copies, so a swapped source is caught.
+                if self.verify_cue {
+                    let f = |k: usize, m: usize, lo: f32, st: f32| lo + ((e + k) % m) as f32 * st;
+                    let ang = (e % 13) as f32 * 0.5;
+                    state.step_cue = zealot_env::tasks::velocity_flat::StepCue {
+                        valid: if e % 3 == 0 { 0.0 } else { 1.0 },
+                        distance: f(0, 17, -1.0, 0.25),
+                        height: f(3, 11, -0.8, 0.16),
+                        edge_sin: ang.sin(),
+                        edge_cos: ang.cos(),
+                    };
+                    state.step_cue_clean = zealot_env::tasks::velocity_flat::StepCue {
+                        valid: if e % 4 == 0 { 0.0 } else { 1.0 },
+                        distance: f(5, 17, -1.0, 0.25),
+                        height: f(7, 11, -0.8, 0.16),
+                        edge_sin: (ang + 0.3).sin(),
+                        edge_cos: (ang + 0.3).cos(),
+                    };
                 }
                 let env_base = e * cpb_idx;
                 let illegal = self.idx.illegal_ground_links.iter().any(|&l| {
@@ -4252,6 +4289,18 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         state.step_cue.distance,
                         state.step_cue.edge_cos,
                         state.step_cue.edge_sin,
+                    ],
+                    cue_obs: [
+                        state.step_cue.distance,
+                        state.step_cue.height,
+                        state.step_cue.edge_sin,
+                        state.step_cue.edge_cos,
+                        state.step_cue.valid,
+                        state.step_cue_clean.distance,
+                        state.step_cue_clean.height,
+                        state.step_cue_clean.edge_sin,
+                        state.step_cue_clean.edge_cos,
+                        state.step_cue_clean.valid,
                     ],
                     base_dbg: [
                         state.base.orientation[0],
@@ -4722,6 +4771,83 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 msg.push_str(&format!(" {}={:.2e}", FEET_FIELDS[k], wf[k]));
             }
             eprintln!("{msg}");
+
+            // ---- observation assembly (actor + critic) ----
+            // The last host-side consumer of `state`. The step cue is NOT
+            // derived here: it needs the terrain patch structure and the
+            // per-env RNG stream, so the host still probes and the kernel takes
+            // both cues as input.
+            if self.gpu_observe.is_none() {
+                let defaults: Vec<f32> =
+                    (0..NUM_JOINTS).map(|k| self.robot.joints[k].default_pos).collect();
+                self.gpu_observe = Some(
+                    zealot_gpu_obs::GpuObserve::new(
+                        &self.gpu,
+                        n,
+                        NUM_JOINTS as u32,
+                        OBS_DIM,
+                        CRITIC_OBS_DIM,
+                        &defaults,
+                    )
+                    .expect("gpu observe"),
+                );
+            }
+            let mut cmd_b = vec![0.0f32; 4 * n];
+            let mut ph_b = vec![0.0f32; n];
+            let mut cue_b = vec![0.0f32; 10 * n];
+            for e in 0..n {
+                cmd_b[e] = self.cmd[e].vx;
+                cmd_b[n + e] = self.cmd[e].vy;
+                cmd_b[2 * n + e] = self.cmd[e].yaw_rate;
+                ph_b[e] = self.gait_phase[e];
+                for k in 0..10 {
+                    cue_b[k * n + e] = computed[e].cue_obs[k];
+                }
+            }
+            let (qt, qdt) = {
+                let j = self.gpu_joints.as_ref().unwrap();
+                (j.q_tensor(), j.qd_tensor())
+            };
+            let bt = self.gpu_base.as_ref().unwrap().out_tensor();
+            self.gpu_observe
+                .as_mut()
+                .unwrap()
+                .encode(&self.gpu, 0, &la, &cmd_b, &ph_b, &cue_b, qt, qdt, bt)
+                .expect("gpu observe encode");
+            let (gobs, gcobs) = self
+                .gpu_observe
+                .as_ref()
+                .unwrap()
+                .read_back(&self.gpu)
+                .await
+                .expect("gpu observe readback");
+            let (mut wo, mut wc) = (0.0f32, 0.0f32);
+            let (mut wo_i, mut wc_i) = (0usize, 0usize);
+            for e in 0..n {
+                for r in 0..OBS_DIM {
+                    let d = (gobs[r * n + e] - computed[e].obs[r]).abs();
+                    if d > wo {
+                        wo = d;
+                        wo_i = r;
+                    }
+                }
+                for r in 0..CRITIC_OBS_DIM {
+                    let d = (gcobs[r * n + e] - computed[e].critic_obs[r]).abs();
+                    if d > wc {
+                        wc = d;
+                        wc_i = r;
+                    }
+                }
+            }
+            // Occupancy guard: slots 48-52 (actor cue) and the critic's clean
+            // cue are zero whenever no env sees a step edge, and a comparison
+            // of zeros proves nothing. Report how many envs actually carry a
+            // live cue so a clean diff can be trusted.
+            let live_n = (0..n).filter(|&e| computed[e].cue_obs[4] > 0.5).count();
+            let live_c = (0..n).filter(|&e| computed[e].cue_obs[9] > 0.5).count();
+            eprintln!(
+                "[verify_obs] actor={wo:.2e} (slot {wo_i}) critic={wc:.2e} (slot {wc_i}) cue_live={live_n}/{n} clean_live={live_c}/{n}"
+            );
 
             // ---- self-contained per-foot reward terms ----
             if self.gpu_feet_terms.is_none() {
