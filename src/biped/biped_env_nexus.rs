@@ -1741,6 +1741,8 @@ pub struct BipedNexusBatchEnv {
     gpu_joint_terms: Option<zealot_gpu_obs::GpuRewardJointTerms>,
     /// Torque / power reward terms.
     gpu_torque_terms: Option<zealot_gpu_obs::GpuRewardTorqueTerms>,
+    /// Base pose / velocities / height.
+    gpu_base: Option<zealot_gpu_obs::GpuBaseState>,
     targets_row: Vec<f32>,
     /// Device copy of `targets_row`; persistent so the per-step upload is one
     /// small `write_buffer` instead of a fresh allocation.
@@ -2572,6 +2574,7 @@ impl BipedNexusBatchEnv {
             gpu_joints: None,
             gpu_joint_terms: None,
             gpu_torque_terms: None,
+            gpu_base: None,
             targets_row: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             held_dirty: false,
@@ -3737,6 +3740,8 @@ impl BipedNexusBatchEnv {
             /// Host joint velocity, carried only so `BIPED_VERIFY_REWARD` can
             /// check the GPU joint-state kernel against it.
             joint_vel_dbg: [f32; NUM_JOINTS],
+            /// Host base state, same purpose: quat xyzw, lin vel, ang vel, height.
+            base_dbg: [f32; 11],
             // Foot index that touched down this step (-1 = none); committed to
             // `self.last_td_foot` in the serial pass to track gait alternation.
             td_foot: i8,
@@ -4183,6 +4188,19 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 }
                 PerEnv {
                     joint_vel_dbg: state.joint_vel,
+                    base_dbg: [
+                        state.base.orientation[0],
+                        state.base.orientation[1],
+                        state.base.orientation[2],
+                        state.base.orientation[3],
+                        state.base.lin_vel_world[0],
+                        state.base.lin_vel_world[1],
+                        state.base.lin_vel_world[2],
+                        state.base.ang_vel_world[0],
+                        state.base.ang_vel_world[1],
+                        state.base.ang_vel_world[2],
+                        state.base.height,
+                    ],
                     obs,
                     critic_obs,
                     reward,
@@ -4414,6 +4432,53 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             eprintln!(
                 "[verify_torque_terms] torque_leg={:.3e} torque_ankle={:.3e} power={:.3e}",
                 wt[0], wt[1], wt[2]
+            );
+
+            // ---- base state ----
+            if self.gpu_base.is_none() {
+                self.gpu_base = Some(
+                    zealot_gpu_obs::GpuBaseState::new(
+                        &self.gpu,
+                        n,
+                        bps,
+                        self.idx.torso_link,
+                        dtc,
+                    )
+                    .expect("gpu base state"),
+                );
+            }
+            // The terrain lookup stays host-side, so heights stay relative to
+            // the LOCAL surface exactly as the host computes them.
+            let gh: Vec<f32> = (0..n)
+                .map(|e| {
+                    let tp = &poses[e * bps as usize + self.idx.torso_link as usize];
+                    self.terrain
+                        .as_ref()
+                        .map_or(0.0, |ter| ter.strip_for(e).height(tp.translation.x, tp.translation.y))
+                })
+                .collect();
+            let hpp: Vec<u32> = (0..n).map(|e| self.has_prev_pose[e] as u32).collect();
+            let poses_t2 = self.state.body_poses();
+            let gb = self
+                .gpu_base
+                .as_mut()
+                .unwrap()
+                .compute(&self.gpu, poses_t2, &hpp, &gh)
+                .await
+                .expect("gpu base compute");
+            let (mut wquat, mut wlv, mut wav, mut wh) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for e in 0..n {
+                for k in 0..4 {
+                    wquat = wquat.max((gb[k * n + e] - computed[e].base_dbg[k]).abs());
+                }
+                for k in 0..3 {
+                    wlv = wlv.max((gb[(4 + k) * n + e] - computed[e].base_dbg[4 + k]).abs());
+                    wav = wav.max((gb[(7 + k) * n + e] - computed[e].base_dbg[7 + k]).abs());
+                }
+                wh = wh.max((gb[10 * n + e] - computed[e].base_dbg[10]).abs());
+            }
+            eprintln!(
+                "[verify_base] quat={wquat:.3e} lin_vel={wlv:.3e} ang_vel={wav:.3e} height={wh:.3e}"
             );
         }
 

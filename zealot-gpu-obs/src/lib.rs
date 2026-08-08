@@ -28,6 +28,77 @@ use shaders::{
 pub static SPIRV_DIR: Dir<'static> = include_dir!("$OUT_DIR/shaders-spirv");
 
 
+
+/// Host binding for the base-state kernel.
+#[derive(Shader)]
+struct BaseStateShader {
+    base: shaders::GpuBaseState,
+}
+
+/// Base pose, world velocities and terrain-relative height on device.
+pub struct GpuBaseState {
+    shader: BaseStateShader,
+    params: Tensor<shaders::BaseStateParams>,
+    have_prev: Tensor<u32>,
+    ground_h: Tensor<f32>,
+    prev_pose: Tensor<f32>,
+    out: Tensor<f32>,
+    n: usize,
+}
+
+impl GpuBaseState {
+    pub fn new(
+        backend: &GpuBackend,
+        n: usize,
+        bodies_per_env: u32,
+        torso_link: u32,
+        control_dt: f32,
+    ) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        Ok(Self {
+            shader: BaseStateShader::from_backend(backend)?,
+            params: Tensor::scalar(
+                backend,
+                shaders::BaseStateParams { n_envs: n as u32, bodies_per_env, torso_link, control_dt },
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            have_prev: Tensor::vector(backend, &vec![0u32; n], st)?,
+            ground_h: Tensor::vector(backend, &vec![0.0f32; n], st)?,
+            prev_pose: Tensor::vector(backend, &vec![0.0f32; 7 * n], st)?,
+            out: Tensor::vector_uninit(backend, (13 * n) as u32, st | BufferUsages::COPY_SRC)?,
+            n,
+        })
+    }
+
+    /// Returns `[13 x n]`: quat xyzw, lin vel, ang vel, height, xy.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        body_poses: &Tensor<glamx::Pose3>,
+        have_prev: &[u32],
+        ground_h: &[f32],
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        backend.write_buffer(self.have_prev.buffer_mut(), 0, have_prev)?;
+        backend.write_buffer(self.ground_h.buffer_mut(), 0, ground_h)?;
+        let mut enc = backend.begin_encoding();
+        {
+            let mut pass = enc.begin_pass("[reward] base state", None);
+            self.shader.base.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                body_poses,
+                &self.have_prev,
+                &self.ground_h,
+                &mut self.prev_pose,
+                &mut self.out,
+            )?;
+        }
+        backend.submit(enc)?;
+        backend.slow_read_vec(self.out.buffer()).await
+    }
+}
+
 /// Host binding for the joint-state kernel.
 #[derive(Shader)]
 struct JointStateShader {

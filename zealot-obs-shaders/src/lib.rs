@@ -683,3 +683,101 @@ pub fn gpu_reward_torque_terms(
         out.write(2 * n + e, -(params.power_w * power) * dt);
     }
 }
+
+/// Scalar parameters for [`gpu_base_state`] (uniform; 16 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct BaseStateParams {
+    pub n_envs: u32,
+    /// Rigid bodies per env (`body_poses` is env-major).
+    pub bodies_per_env: u32,
+    /// Index of the torso/base link within an env.
+    pub torso_link: u32,
+    pub control_dt: f32,
+}
+
+/// Base pose, world velocities and terrain-relative height, one thread per env.
+///
+/// Exact port of the host's `read_state_from_poses` base block: linear velocity
+/// is a finite difference of the torso translation, and angular velocity uses
+/// the small-rotation approximation `ω ≈ 2·Δq.xyz/dt` from
+/// `dq = r · prev⁻¹`, with the hemisphere correction (`sign(dq.w)`) so
+/// antipodal quaternions don't blow it up. Both are ZERO on the first step
+/// after a reset, matching `has_prev_pose`.
+///
+/// `ground_h` is supplied per env: the terrain lookup stays on the host, so
+/// heights remain relative to the LOCAL ground surface exactly as the host
+/// computes them.
+///
+/// `out` is `[13 x n_envs]` row-major: rows 0..4 base quat xyzw, 4..7 linear
+/// velocity, 7..10 angular velocity, 10 height, 11..13 base xy.
+/// `prev_pose` holds the previous torso (quat xyzw, translation xyz) per env
+/// as `[7 x n_envs]`, updated in place.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_base_state(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &BaseStateParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] body_poses: &[Pose3],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] have_prev: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] ground_h: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] prev_pose: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    if e < n {
+        let p = body_poses.read(e * params.bodies_per_env as usize + params.torso_link as usize);
+        let (rx, ry, rz, rw) = (p.rotation.x, p.rotation.y, p.rotation.z, p.rotation.w);
+        let (tx, ty, tz) = (p.translation.x, p.translation.y, p.translation.z);
+        let dt = params.control_dt;
+
+        let mut lv = [0.0f32; 3];
+        let mut av = [0.0f32; 3];
+        if have_prev.read(e) != 0 {
+            let (px, py, pz, pw) = (
+                prev_pose.read(e),
+                prev_pose.read(n + e),
+                prev_pose.read(2 * n + e),
+                prev_pose.read(3 * n + e),
+            );
+            let (ptx, pty, ptz) = (
+                prev_pose.read(4 * n + e),
+                prev_pose.read(5 * n + e),
+                prev_pose.read(6 * n + e),
+            );
+            lv = [(tx - ptx) / dt, (ty - pty) / dt, (tz - ptz) / dt];
+            // dq = r · prev⁻¹
+            let pc = Vec4::new(-px, -py, -pz, pw);
+            let dq = qmul(Vec4::new(rx, ry, rz, rw), pc);
+            let s = if dq.w >= 0.0 { 1.0 } else { -1.0 };
+            av = [2.0 * s * dq.x / dt, 2.0 * s * dq.y / dt, 2.0 * s * dq.z / dt];
+        }
+
+        out.write(e, rx);
+        out.write(n + e, ry);
+        out.write(2 * n + e, rz);
+        out.write(3 * n + e, rw);
+        out.write(4 * n + e, lv[0]);
+        out.write(5 * n + e, lv[1]);
+        out.write(6 * n + e, lv[2]);
+        out.write(7 * n + e, av[0]);
+        out.write(8 * n + e, av[1]);
+        out.write(9 * n + e, av[2]);
+        out.write(10 * n + e, tz - ground_h.read(e));
+        out.write(11 * n + e, tx);
+        out.write(12 * n + e, ty);
+
+        prev_pose.write(e, rx);
+        prev_pose.write(n + e, ry);
+        prev_pose.write(2 * n + e, rz);
+        prev_pose.write(3 * n + e, rw);
+        prev_pose.write(4 * n + e, tx);
+        prev_pose.write(5 * n + e, ty);
+        prev_pose.write(6 * n + e, tz);
+    }
+}
