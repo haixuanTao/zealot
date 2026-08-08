@@ -276,8 +276,15 @@ fn mirror_table(dim: usize, f: impl Fn(&[f32]) -> Vec<f32>) -> (Vec<u32>, Vec<f3
 }
 fn mirror_sample(s: &Sample) -> Sample {
     Sample {
-        obs: mirror_obs(&s.obs),
-        critic_obs: mirror_critic(&s.critic_obs),
+        // Empty unless a consumer still needs host obs — see `keep_obs`. The
+        // batch (both halves) and the mirror-loss target are built on device
+        // from the raw observations, so nothing reads these by default.
+        obs: if s.obs.is_empty() { Vec::new() } else { mirror_obs(&s.obs) },
+        critic_obs: if s.critic_obs.is_empty() {
+            Vec::new()
+        } else {
+            mirror_critic(&s.critic_obs)
+        },
         action: jmirror(&s.action),
         mean_old: jmirror(&s.mean_old),
         logp_old: s.logp_old,
@@ -760,9 +767,14 @@ fn main() {
         // sample → symmetric policy. To keep the minibatch SIZE `mb` (and the
         // pre-sized GPU buffers) unchanged, we double the minibatch COUNT instead
         // (n_mb below), so a doubled batch just runs 2× minibatches at the same mb.
+        // DEFAULT, matching WBC-AGILE: its G1 and T1 configs both set
+        // `use_data_augmentation=True, use_mirror_loss=False`, and every zealot
+        // policy to date trained this way. The LOSS method below is the cheaper
+        // alternative (no batch doubling) but has never been trained — flip
+        // only with a policy-quality comparison, not a benchmark.
         let mirror_aug = std::env::var("BIPED_MIRROR_AUG").map_or(true, |v| v != "0");
         if mirror_aug {
-            println!("mirror augmentation ENABLED (symmetric policy)");
+            println!("mirror augmentation ENABLED (symmetric policy, batch doubled)");
         }
         // Print the obs geometry so a config-echo comparison catches any
         // trainer/env disagreement (the v29 single-frame bug hid because
@@ -779,12 +791,26 @@ fn main() {
         // is a target), so it needs only ONE extra actor forward per minibatch
         // and no second backward — and, unlike DUP, doesn't touch the batch size
         // or the KL signal, so it warm-starts cleanly.
+        // Opt-in (`BIPED_MIRROR_LOSS=1.0` is the intended starting weight): one
+        // extra stop-grad actor forward per minibatch, batch size and KL signal
+        // untouched — unlike augmentation, which doubles the batch and forces
+        // the mirrored-copies-first ordering that keeps the adaptive-KL
+        // controller from reading policy asymmetry as update drift.
         let mirror_loss: f32 = std::env::var("BIPED_MIRROR_LOSS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
         if mirror_loss > 0.0 {
             println!("mirror LOSS ENABLED (auxiliary symmetry penalty, weight={mirror_loss})");
+        }
+        // Per-sample host obs are now read by exactly ONE thing: the
+        // BIPED_VERIFY_STAGE audit. The PPO batch and the mirror-loss target
+        // are both built on device from the retained raw observations, so
+        // storing them otherwise clones several hundred MB per iteration that
+        // nothing reads (and `mirror_sample` clones them a second time).
+        let keep_obs = std::env::var("BIPED_VERIFY_STAGE").is_ok();
+        if !keep_obs {
+            println!("per-sample host obs NOT stored (device batch build)");
         }
         let g = Gemm::from_backend(&bk).unwrap();
         let op = OpAssign::from_backend(&bk).unwrap();
@@ -944,7 +970,7 @@ fn main() {
             println!("obs-normalizer FREEZE enabled: per-iteration stats snapshot (exact PPO ratios)");
         }
         // Persistent device-side PPO batch tensors (obs, critic).
-        let mut stage_out: Option<(Tensor<f32>, Tensor<f32>)> = None;
+        let mut stage_out: Option<(Tensor<f32>, Tensor<f32>, Option<Tensor<f32>>)> = None;
         let mut pn_obs = zealot_rl::ppo::PendingNorm::default();
         let mut pn_cobs = zealot_rl::ppo::PendingNorm::default();
 
@@ -1100,8 +1126,8 @@ fn main() {
                     let lp = ac.logp(&a, &mean[..]);
                     acts.push(to_action(&a));
                     samp[e].push(Sample {
-                        obs: gc[e].clone(),
-                        critic_obs: gcc[e].clone(),
+                        obs: if keep_obs { gc[e].clone() } else { Vec::new() },
+                        critic_obs: if keep_obs { gcc[e].clone() } else { Vec::new() },
                         action: a,
                         mean_old: mean.to_vec(),
                         logp_old: lp,
@@ -1249,6 +1275,12 @@ fn main() {
             // Reuse the very buffers the rollout normalized against.
             let po = Tensor::scalar(&bk, stage_p(od), BufferUsages::UNIFORM | BufferUsages::STORAGE)
                 .unwrap();
+            let po_mir = Tensor::scalar(
+                &bk,
+                PpoStageParams { mirror_half: total as u32, ..stage_p(od) },
+                BufferUsages::UNIFORM | BufferUsages::STORAGE,
+            )
+            .unwrap();
             let pc = Tensor::scalar(&bk, stage_p(cd), BufferUsages::UNIFORM | BufferUsages::STORAGE)
                 .unwrap();
             // Allocated ONCE (uninit — the kernel writes every element).
@@ -1258,9 +1290,17 @@ fn main() {
                 stage_out = Some((
                     Tensor::matrix_uninit(&bk, od as u32, total as u32, st).unwrap(),
                     Tensor::matrix_uninit(&bk, cd as u32, total as u32, st).unwrap(),
+                    // Mirror-loss target: the same kernel with EVERY column
+                    // mirrored (`mirror_half = total`). Only allocated when the
+                    // loss is on — it is another full batch of VRAM.
+                    if mirror_loss > 0.0 {
+                        Some(Tensor::matrix_uninit(&bk, od as u32, total as u32, st).unwrap())
+                    } else {
+                        None
+                    },
                 ));
             }
-            let (f_obs, f_cobs) = stage_out.as_mut().unwrap();
+            let (f_obs, f_cobs, f_obs_mir_buf) = stage_out.as_mut().unwrap();
             {
                 let nb = gpu.norm_bufs();
                 let mut cur = EncCursor::new(&bk);
@@ -1276,6 +1316,13 @@ fn main() {
                         (cd * total) as u32,
                     )
                     .unwrap();
+                    if let Some(mir) = f_obs_mir_buf.as_mut() {
+                        ppo.stage_batch(
+                            &mut pass, &po_mir, gpu.raw_obs(), &nb.perm_o, &nb.sign_o, &nb.mean_o,
+                            &nb.inv_o, mir, (od * total) as u32,
+                        )
+                        .unwrap();
+                    }
                 }
                 cur.flush();
             }
@@ -1284,6 +1331,10 @@ fn main() {
             // obs/action pairs and merely looks like worse learning — so this
             // compares the device tensor element-for-element.
             if std::env::var("BIPED_VERIFY_STAGE").is_ok() {
+                assert!(
+                    keep_obs && !batch[0].obs.is_empty(),
+                    "BIPED_VERIFY_STAGE needs host obs — `keep_obs` must gate on it"
+                );
                 bk.synchronize().unwrap();
                 let dev: Vec<f32> = bk.slow_read_vec(f_obs.buffer()).await.unwrap();
                 let devc: Vec<f32> = bk.slow_read_vec(f_cobs.buffer()).await.unwrap();
@@ -1325,11 +1376,11 @@ fn main() {
             // mirror ∘ normalize), and refresh the stop-grad target net to the
             // current (iter-start) actor weights.
             let f_obs_mir = if mirror_loss > 0.0 {
-                let onm: Vec<Vec<f32>> = batch.par_iter().map(|s| mirror_obs(&s.obs)).collect();
+                // Built on device above — the host never sees mirrored obs.
                 if let Some(sn) = s_net.as_mut() {
                     sn.write_w(&bk, &ac.actor);
                 }
-                Some(stage_rows(&bk, od, total, Some(&aff_o), st, |c| &onm[c]))
+                f_obs_mir_buf.as_ref()
             } else {
                 None
             };
