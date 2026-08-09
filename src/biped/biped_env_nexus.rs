@@ -4809,11 +4809,13 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 (j.q_tensor(), j.qd_tensor())
             };
             let bt = self.gpu_base.as_ref().unwrap().out_tensor();
+            let mut obs_enc = self.gpu.begin_encoding();
             self.gpu_observe
                 .as_mut()
                 .unwrap()
-                .encode(&self.gpu, 0, &la, &cmd_b, &ph_b, &cue_b, qt, qdt, bt)
+                                .encode(&self.gpu, &mut obs_enc, 0, &la, &cmd_b, &ph_b, &cue_b, qt, qdt, bt)
                 .expect("gpu observe encode");
+            self.gpu.submit(obs_enc).expect("gpu observe submit");
             let (gobs, gcobs) = self
                 .gpu_observe
                 .as_ref()

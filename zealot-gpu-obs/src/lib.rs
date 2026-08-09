@@ -16,6 +16,10 @@ use khal::backend::{Backend, Encoder, GpuBackend, GpuBackendError};
 use khal::{BufferUsages, Shader};
 use vortx::tensor::Tensor;
 
+/// The backend encoder type, so bindings can record into a caller-owned
+/// encoder instead of each opening and submitting its own.
+pub type Enc = <GpuBackend as Backend>::Encoder;
+
 use shaders::{
     C_DEFAULT, C_HI, C_LEN, C_LINK, C_LO, C_MEAN, C_STD, FRAME, FRAME_GYRO, FRAME_NO_GYRO, HIST,
     N_ACT,
@@ -92,20 +96,25 @@ impl GpuRewardMiscTerms {
     }
 
     /// `prev_chest` is the chest rotation from last step, `[4 x n]` xyzw.
-    pub async fn compute(
+    /// Record this kernel into a SHARED encoder. Every kernel in this module is
+    /// elementwise over envs with no cross-env dependency, so the whole set
+    /// belongs in ONE submit; a sync point per kernel is pure overhead.
+    pub fn encode(
         &mut self,
         backend: &GpuBackend,
+        enc: &mut Enc,
         params: shaders::RewardMiscParams,
         body_poses: &Tensor<glamx::Pose3>,
         prev_chest: &[f32],
         have_prev: &[u32],
         fell: &[u32],
-    ) -> Result<Vec<f32>, GpuBackendError> {
+    ) -> Result<(), GpuBackendError> {
+
         backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
         backend.write_buffer(self.prev_chest.buffer_mut(), 0, prev_chest)?;
         backend.write_buffer(self.have_prev.buffer_mut(), 0, have_prev)?;
         backend.write_buffer(self.fell.buffer_mut(), 0, fell)?;
-        let mut enc = backend.begin_encoding();
+
         {
             let mut pass = enc.begin_pass("[reward] misc terms", None);
             self.shader.terms.call(
@@ -121,9 +130,40 @@ impl GpuRewardMiscTerms {
                 &mut self.out,
             )?;
         }
-        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Read this kernel's output. Valid only once the encoder it was recorded
+    /// into has been submitted.
+    pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
+
+    /// Standalone encode + submit + read. For the verification harness only —
+    /// in the hot loop this costs one sync point per kernel.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        params: shaders::RewardMiscParams,
+        body_poses: &Tensor<glamx::Pose3>,
+        prev_chest: &[f32],
+        have_prev: &[u32],
+        fell: &[u32],
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        let mut enc = backend.begin_encoding();
+        self.encode(
+            backend,
+            &mut enc,
+            params,
+            body_poses,
+            prev_chest,
+            have_prev,
+            fell,
+        )?;
+        backend.submit(enc)?;
+        self.read(backend).await
+    }
+
 }
 
 /// Host binding for the gated gait reward terms.
@@ -177,6 +217,39 @@ impl GpuRewardGaitTerms {
     }
 
     /// `aux` is `[5 x n]`: phase, progress, cmd_speed_full, cue_height, stepping.
+    /// Record this kernel into a SHARED encoder. Every kernel in this module is
+    /// elementwise over envs with no cross-env dependency, so the whole set
+    /// belongs in ONE submit; a sync point per kernel is pure overhead.
+    pub fn encode(
+        &mut self,
+        backend: &GpuBackend,
+        enc: &mut Enc,
+        params: shaders::RewardGaitParams,
+        feet: &[f32],
+        aux: &[f32],
+    ) -> Result<(), GpuBackendError> {
+
+        backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
+        backend.write_buffer(self.feet.buffer_mut(), 0, feet)?;
+        backend.write_buffer(self.aux.buffer_mut(), 0, aux)?;
+
+        {
+            let mut pass = enc.begin_pass("[reward] gait terms", None);
+            self.shader.terms.call(
+                &mut pass, self.n as u32, &self.params, &self.feet, &self.aux, &mut self.out,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Read this kernel's output. Valid only once the encoder it was recorded
+    /// into has been submitted.
+    pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
+        backend.slow_read_vec(self.out.buffer()).await
+    }
+
+    /// Standalone encode + submit + read. For the verification harness only —
+    /// in the hot loop this costs one sync point per kernel.
     pub async fn compute(
         &mut self,
         backend: &GpuBackend,
@@ -184,19 +257,18 @@ impl GpuRewardGaitTerms {
         feet: &[f32],
         aux: &[f32],
     ) -> Result<Vec<f32>, GpuBackendError> {
-        backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
-        backend.write_buffer(self.feet.buffer_mut(), 0, feet)?;
-        backend.write_buffer(self.aux.buffer_mut(), 0, aux)?;
         let mut enc = backend.begin_encoding();
-        {
-            let mut pass = enc.begin_pass("[reward] gait terms", None);
-            self.shader.terms.call(
-                &mut pass, self.n as u32, &self.params, &self.feet, &self.aux, &mut self.out,
-            )?;
-        }
+        self.encode(
+            backend,
+            &mut enc,
+            params,
+            feet,
+            aux,
+        )?;
         backend.submit(enc)?;
-        backend.slow_read_vec(self.out.buffer()).await
+        self.read(backend).await
     }
+
 }
 
 /// Host binding for the self-contained per-foot reward terms.
@@ -251,17 +323,22 @@ impl GpuRewardFeetTerms {
     }
 
     /// Returns `[8 x n]`.
-    pub async fn compute(
+    /// Record this kernel into a SHARED encoder. Every kernel in this module is
+    /// elementwise over envs with no cross-env dependency, so the whole set
+    /// belongs in ONE submit; a sync point per kernel is pure overhead.
+    pub fn encode(
         &mut self,
         backend: &GpuBackend,
+        enc: &mut Enc,
         params: shaders::RewardFeetParams,
         feet: &[f32],
         base: &[f32],
-    ) -> Result<Vec<f32>, GpuBackendError> {
+    ) -> Result<(), GpuBackendError> {
+
         backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
         backend.write_buffer(self.feet.buffer_mut(), 0, feet)?;
         backend.write_buffer(self.base.buffer_mut(), 0, base)?;
-        let mut enc = backend.begin_encoding();
+
         {
             let mut pass = enc.begin_pass("[reward] feet terms", None);
             self.shader.terms.call(
@@ -273,9 +350,36 @@ impl GpuRewardFeetTerms {
                 &mut self.out,
             )?;
         }
-        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Read this kernel's output. Valid only once the encoder it was recorded
+    /// into has been submitted.
+    pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
+
+    /// Standalone encode + submit + read. For the verification harness only —
+    /// in the hot loop this costs one sync point per kernel.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        params: shaders::RewardFeetParams,
+        feet: &[f32],
+        base: &[f32],
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        let mut enc = backend.begin_encoding();
+        self.encode(
+            backend,
+            &mut enc,
+            params,
+            feet,
+            base,
+        )?;
+        backend.submit(enc)?;
+        self.read(backend).await
+    }
+
 }
 
 /// Host binding for the feet-state kernel.
@@ -418,12 +522,17 @@ impl GpuFeetState {
     /// Returns `[26 x n]`: per foot i at offset i*11 — contact, first_contact,
     /// air_time, height, planar_speed, tilt, yaw_rel_base, x, y, vz,
     /// force_rate; then alt_step at 22+i and the new air time at 24+i.
-    pub async fn compute(
+    /// Record this kernel into a SHARED encoder. Every kernel in this module is
+    /// elementwise over envs with no cross-env dependency, so the whole set
+    /// belongs in ONE submit; a sync point per kernel is pure overhead.
+    pub fn encode(
         &mut self,
         backend: &GpuBackend,
+        enc: &mut Enc,
         body_poses: &Tensor<glamx::Pose3>,
         inputs: FeetInputs<'_>,
-    ) -> Result<Vec<f32>, GpuBackendError> {
+    ) -> Result<(), GpuBackendError> {
+
         // air_time / last_td / prev_force / prev_foot_pos are DEVICE-OWNED now:
         // the kernel commits them at the end of each step and `reset` clears
         // them, so they are never uploaded here.
@@ -433,7 +542,7 @@ impl GpuFeetState {
         backend.write_buffer(self.prev_force.buffer_mut(), 0, inputs.prev_force)?;
         backend.write_buffer(self.have_prev.buffer_mut(), 0, inputs.have_prev)?;
         backend.write_buffer(self.have_prev_force.buffer_mut(), 0, inputs.have_prev_force)?;
-        let mut enc = backend.begin_encoding();
+
         {
             let mut pass = enc.begin_pass("[reward] feet state", None);
             self.shader.feet.call(
@@ -455,9 +564,34 @@ impl GpuFeetState {
                 &mut self.out,
             )?;
         }
-        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Read this kernel's output. Valid only once the encoder it was recorded
+    /// into has been submitted.
+    pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
+
+    /// Standalone encode + submit + read. For the verification harness only —
+    /// in the hot loop this costs one sync point per kernel.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        body_poses: &Tensor<glamx::Pose3>,
+        inputs: FeetInputs<'_>,
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        let mut enc = backend.begin_encoding();
+        self.encode(
+            backend,
+            &mut enc,
+            body_poses,
+            inputs,
+        )?;
+        backend.submit(enc)?;
+        self.read(backend).await
+    }
+
 }
 
 /// Host binding for the base-state reward terms.
@@ -518,19 +652,24 @@ impl GpuRewardBaseTerms {
     }
 
     /// `base` is the `[13 x n]` block from `GpuBaseState`; returns `[6 x n]`.
-    pub async fn compute(
+    /// Record this kernel into a SHARED encoder. Every kernel in this module is
+    /// elementwise over envs with no cross-env dependency, so the whole set
+    /// belongs in ONE submit; a sync point per kernel is pure overhead.
+    pub fn encode(
         &mut self,
         backend: &GpuBackend,
+        enc: &mut Enc,
         params: shaders::RewardBaseParams,
         base: &[f32],
         cmd: &[f32],
         cue: &[f32],
-    ) -> Result<Vec<f32>, GpuBackendError> {
+    ) -> Result<(), GpuBackendError> {
+
         backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
         backend.write_buffer(self.base.buffer_mut(), 0, base)?;
         backend.write_buffer(self.cmd.buffer_mut(), 0, cmd)?;
         backend.write_buffer(self.cue.buffer_mut(), 0, cue)?;
-        let mut enc = backend.begin_encoding();
+
         {
             let mut pass = enc.begin_pass("[reward] base terms", None);
             self.shader.terms.call(
@@ -543,9 +682,38 @@ impl GpuRewardBaseTerms {
                 &mut self.out,
             )?;
         }
-        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Read this kernel's output. Valid only once the encoder it was recorded
+    /// into has been submitted.
+    pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
+
+    /// Standalone encode + submit + read. For the verification harness only —
+    /// in the hot loop this costs one sync point per kernel.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        params: shaders::RewardBaseParams,
+        base: &[f32],
+        cmd: &[f32],
+        cue: &[f32],
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        let mut enc = backend.begin_encoding();
+        self.encode(
+            backend,
+            &mut enc,
+            params,
+            base,
+            cmd,
+            cue,
+        )?;
+        backend.submit(enc)?;
+        self.read(backend).await
+    }
+
 }
 
 /// Host binding for the base-state kernel.
@@ -595,16 +763,21 @@ impl GpuBaseState {
     }
 
     /// Returns `[13 x n]`: quat xyzw, lin vel, ang vel, height, xy.
-    pub async fn compute(
+    /// Record this kernel into a SHARED encoder. Every kernel in this module is
+    /// elementwise over envs with no cross-env dependency, so the whole set
+    /// belongs in ONE submit; a sync point per kernel is pure overhead.
+    pub fn encode(
         &mut self,
         backend: &GpuBackend,
+        enc: &mut Enc,
         body_poses: &Tensor<glamx::Pose3>,
         have_prev: &[u32],
         ground_h: &[f32],
-    ) -> Result<Vec<f32>, GpuBackendError> {
+    ) -> Result<(), GpuBackendError> {
+
         backend.write_buffer(self.have_prev.buffer_mut(), 0, have_prev)?;
         backend.write_buffer(self.ground_h.buffer_mut(), 0, ground_h)?;
-        let mut enc = backend.begin_encoding();
+
         {
             let mut pass = enc.begin_pass("[reward] base state", None);
             self.shader.base.call(
@@ -618,9 +791,36 @@ impl GpuBaseState {
                 &mut self.out,
             )?;
         }
-        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Read this kernel's output. Valid only once the encoder it was recorded
+    /// into has been submitted.
+    pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
+
+    /// Standalone encode + submit + read. For the verification harness only —
+    /// in the hot loop this costs one sync point per kernel.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        body_poses: &Tensor<glamx::Pose3>,
+        have_prev: &[u32],
+        ground_h: &[f32],
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        let mut enc = backend.begin_encoding();
+        self.encode(
+            backend,
+            &mut enc,
+            body_poses,
+            have_prev,
+            ground_h,
+        )?;
+        backend.submit(enc)?;
+        self.read(backend).await
+    }
+
 }
 
 /// Host binding for the joint-state kernel.
@@ -711,15 +911,20 @@ impl GpuJointState {
 
     /// Dispatch against the live `body_poses` buffer, then
     /// read back `(q, qd)` — both row-major `[j x n]`.
-    pub async fn compute(
+    /// Record this kernel into a SHARED encoder. Every kernel in this module is
+    /// elementwise over envs with no cross-env dependency, so the whole set
+    /// belongs in ONE submit; a sync point per kernel is pure overhead.
+    pub fn encode(
         &mut self,
         backend: &GpuBackend,
+        enc: &mut Enc,
         body_poses: &vortx::tensor::Tensor<glamx::Pose3>,
         have_prev: &[u32],
-    ) -> Result<(Vec<f32>, Vec<f32>), khal::backend::GpuBackendError> {
+    ) -> Result<(), GpuBackendError> {
+
         use khal::backend::{Backend, Encoder};
         backend.write_buffer(self.have_prev.buffer_mut(), 0, have_prev)?;
-        let mut enc = backend.begin_encoding();
+
         {
             let mut pass = enc.begin_pass("[reward] joint state", None);
             self.shader.joints.call(
@@ -736,11 +941,36 @@ impl GpuJointState {
                 &mut self.qd,
             )?;
         }
-        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Read this kernel's output. Valid only once the encoder it was recorded
+    /// into has been submitted.
+    pub async fn read(&self, backend: &GpuBackend) -> Result<(Vec<f32>, Vec<f32>), khal::backend::GpuBackendError> {
         let q = backend.slow_read_vec(self.q.buffer()).await?;
         let qd = backend.slow_read_vec(self.qd.buffer()).await?;
         Ok((q, qd))
     }
+
+    /// Standalone encode + submit + read. For the verification harness only —
+    /// in the hot loop this costs one sync point per kernel.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        body_poses: &vortx::tensor::Tensor<glamx::Pose3>,
+        have_prev: &[u32],
+    ) -> Result<(Vec<f32>, Vec<f32>), khal::backend::GpuBackendError> {
+        let mut enc = backend.begin_encoding();
+        self.encode(
+            backend,
+            &mut enc,
+            body_poses,
+            have_prev,
+        )?;
+        backend.submit(enc)?;
+        self.read(backend).await
+    }
+
 }
 
 
@@ -814,16 +1044,21 @@ impl GpuRewardTorqueTerms {
 
     /// `q_target` is the row-major `[j x n]` PD target the env already stages.
     #[allow(clippy::too_many_arguments)]
-    pub async fn compute(
+    /// Record this kernel into a SHARED encoder. Every kernel in this module is
+    /// elementwise over envs with no cross-env dependency, so the whole set
+    /// belongs in ONE submit; a sync point per kernel is pure overhead.
+    pub fn encode(
         &mut self,
         backend: &GpuBackend,
+        enc: &mut Enc,
         joints: &GpuJointState,
         q_target: &[f32],
         dt: f32,
         torque_w: f32,
         ankle_torque_w: f32,
         power_w: f32,
-    ) -> Result<Vec<f32>, GpuBackendError> {
+    ) -> Result<(), GpuBackendError> {
+
         backend.write_buffer(self.params.buffer_mut(), 0, &[shaders::RewardTorqueParams {
             n_envs: self.n as u32,
             num_joints: self.j as u32,
@@ -835,7 +1070,7 @@ impl GpuRewardTorqueTerms {
             pad1: 0,
         }])?;
         backend.write_buffer(self.q_target.buffer_mut(), 0, q_target)?;
-        let mut enc = backend.begin_encoding();
+
         {
             let mut pass = enc.begin_pass("[reward] torque terms", None);
             self.shader.terms.call(
@@ -854,9 +1089,42 @@ impl GpuRewardTorqueTerms {
                 &mut self.out,
             )?;
         }
-        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Read this kernel's output. Valid only once the encoder it was recorded
+    /// into has been submitted.
+    pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
+
+    /// Standalone encode + submit + read. For the verification harness only —
+    /// in the hot loop this costs one sync point per kernel.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        joints: &GpuJointState,
+        q_target: &[f32],
+        dt: f32,
+        torque_w: f32,
+        ankle_torque_w: f32,
+        power_w: f32,
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        let mut enc = backend.begin_encoding();
+        self.encode(
+            backend,
+            &mut enc,
+            joints,
+            q_target,
+            dt,
+            torque_w,
+            ankle_torque_w,
+            power_w,
+        )?;
+        backend.submit(enc)?;
+        self.read(backend).await
+    }
+
 }
 
 /// Host binding for the joint-only reward terms.
@@ -931,9 +1199,13 @@ impl GpuRewardJointTerms {
     }
 
     /// Dispatch against the GPU joint state; returns `[3 x n]`.
-    pub async fn compute(
+    /// Record this kernel into a SHARED encoder. Every kernel in this module is
+    /// elementwise over envs with no cross-env dependency, so the whole set
+    /// belongs in ONE submit; a sync point per kernel is pure overhead.
+    pub fn encode(
         &mut self,
         backend: &GpuBackend,
+        enc: &mut Enc,
         joints: &GpuJointState,
         dt: f32,
         w_pose: f32,
@@ -942,7 +1214,8 @@ impl GpuRewardJointTerms {
         w_bilateral: f32,
         sym_yaw_gate: f32,
         cmd_yaw: &[f32],
-    ) -> Result<Vec<f32>, GpuBackendError> {
+    ) -> Result<(), GpuBackendError> {
+
         backend.write_buffer(self.params.buffer_mut(), 0, &[shaders::RewardJointParams {
             n_envs: self.n as u32,
             num_joints: self.j as u32,
@@ -954,7 +1227,7 @@ impl GpuRewardJointTerms {
             sym_yaw_gate,
         }])?;
         backend.write_buffer(self.cmd_yaw.buffer_mut(), 0, cmd_yaw)?;
-        let mut enc = backend.begin_encoding();
+
         {
             let mut pass = enc.begin_pass("[reward] joint terms", None);
             self.shader.terms.call(
@@ -973,9 +1246,46 @@ impl GpuRewardJointTerms {
                 &mut self.out,
             )?;
         }
-        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Read this kernel's output. Valid only once the encoder it was recorded
+    /// into has been submitted.
+    pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
+
+    /// Standalone encode + submit + read. For the verification harness only —
+    /// in the hot loop this costs one sync point per kernel.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        joints: &GpuJointState,
+        dt: f32,
+        w_pose: f32,
+        w_dof_limits: f32,
+        w_dof_vel: f32,
+        w_bilateral: f32,
+        sym_yaw_gate: f32,
+        cmd_yaw: &[f32],
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        let mut enc = backend.begin_encoding();
+        self.encode(
+            backend,
+            &mut enc,
+            joints,
+            dt,
+            w_pose,
+            w_dof_limits,
+            w_dof_vel,
+            w_bilateral,
+            sym_yaw_gate,
+            cmd_yaw,
+        )?;
+        backend.submit(enc)?;
+        self.read(backend).await
+    }
+
 }
 
 /// Host binding for the GPU reward terms.
@@ -1049,9 +1359,13 @@ impl GpuRewardTerms {
     /// Upload the three action vectors (each row-major `[j x n]`), dispatch,
     /// and read back the `[3 x n]` term values.
     #[allow(clippy::too_many_arguments)]
-    pub async fn compute(
+    /// Record this kernel into a SHARED encoder. Every kernel in this module is
+    /// elementwise over envs with no cross-env dependency, so the whole set
+    /// belongs in ONE submit; a sync point per kernel is pure overhead.
+    pub fn encode(
         &mut self,
         backend: &GpuBackend,
+        enc: &mut Enc,
         last: &[f32],
         prev: &[f32],
         prev2: &[f32],
@@ -1059,7 +1373,8 @@ impl GpuRewardTerms {
         w_rate: f32,
         w_hip: f32,
         w_rate_rate: f32,
-    ) -> Result<Vec<f32>, khal::backend::GpuBackendError> {
+    ) -> Result<(), GpuBackendError> {
+
         use khal::backend::{Backend, Encoder};
         backend.write_buffer(self.params.buffer_mut(), 0, &[shaders::RewardActionParams {
             n_envs: self.n as u32,
@@ -1074,7 +1389,7 @@ impl GpuRewardTerms {
         backend.write_buffer(self.last.buffer_mut(), 0, last)?;
         backend.write_buffer(self.prev.buffer_mut(), 0, prev)?;
         backend.write_buffer(self.prev2.buffer_mut(), 0, prev2)?;
-        let mut enc = backend.begin_encoding();
+
         {
             let mut pass = enc.begin_pass("[reward] action terms", None);
             self.shader.terms.call(
@@ -1088,9 +1403,44 @@ impl GpuRewardTerms {
                 &mut self.out,
             )?;
         }
-        backend.submit(enc)?;
+        Ok(())
+    }
+
+    /// Read this kernel's output. Valid only once the encoder it was recorded
+    /// into has been submitted.
+    pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, khal::backend::GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
+
+    /// Standalone encode + submit + read. For the verification harness only —
+    /// in the hot loop this costs one sync point per kernel.
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        last: &[f32],
+        prev: &[f32],
+        prev2: &[f32],
+        dt: f32,
+        w_rate: f32,
+        w_hip: f32,
+        w_rate_rate: f32,
+    ) -> Result<Vec<f32>, khal::backend::GpuBackendError> {
+        let mut enc = backend.begin_encoding();
+        self.encode(
+            backend,
+            &mut enc,
+            last,
+            prev,
+            prev2,
+            dt,
+            w_rate,
+            w_hip,
+            w_rate_rate,
+        )?;
+        backend.submit(enc)?;
+        self.read(backend).await
+    }
+
 }
 
 #[derive(Shader)]
@@ -1366,6 +1716,7 @@ impl GpuObserve {
     pub fn encode(
         &mut self,
         backend: &GpuBackend,
+        enc: &mut Enc,
         step: u32,
         last_action: &[f32],
         cmd: &[f32],
@@ -1393,7 +1744,6 @@ impl GpuObserve {
         backend.write_buffer(self.cmd.buffer_mut(), 0, cmd)?;
         backend.write_buffer(self.phase.buffer_mut(), 0, phase)?;
         backend.write_buffer(self.cue.buffer_mut(), 0, cue)?;
-        let mut enc = backend.begin_encoding();
         {
             let mut pass = enc.begin_pass("[obs] assemble", None);
             self.shader.observe.call(
@@ -1412,7 +1762,6 @@ impl GpuObserve {
                 &mut self.out_cobs,
             )?;
         }
-        backend.submit(enc)?;
         Ok(())
     }
 
