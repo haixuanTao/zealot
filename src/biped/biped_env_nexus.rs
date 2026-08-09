@@ -1754,6 +1754,9 @@ pub struct BipedNexusBatchEnv {
     /// exercises the cue gate + clamp, which a flat-curriculum run never hits.
     /// TEST FIXTURE ONLY — it overwrites the real cue.
     verify_cue: bool,
+    /// `BIPED_SKIP_REWARD`: skip the host reward evaluation to price it. Gives
+    /// WRONG training; measurement only.
+    skip_reward: bool,
     /// Self-contained per-foot reward terms.
     gpu_feet_terms: Option<zealot_gpu_obs::GpuRewardFeetTerms>,
     /// Gated gait reward terms.
@@ -2596,6 +2599,7 @@ impl BipedNexusBatchEnv {
             gpu_feet: None,
             gpu_observe: None,
             verify_cue: std::env::var("BIPED_VERIFY_CUE").is_ok(),
+            skip_reward: std::env::var("BIPED_SKIP_REWARD").is_ok(),
             gpu_feet_terms: None,
             gpu_gait_terms: None,
             gpu_misc_terms: None,
@@ -4123,7 +4127,15 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     || envelope_fault
                     || self.task.fell_over(&state.base)
                     || !state.base.height.is_finite();
-                let rb = self.task.reward(&state, &self.cmd[e]);
+                // BIPED_SKIP_REWARD: A/B lever isolating the cost of the host
+                // reward evaluation from the rest of the per-env block, so the
+                // GPU port's ~0.55 ms/step can be priced against what it would
+                // actually replace. Produces WRONG training — measurement only.
+                let rb = if self.skip_reward {
+                    Default::default()
+                } else {
+                    self.task.reward(&state, &self.cmd[e])
+                };
                 let mut reward = rb.total();
                 let mut comps = [0.0f32; NUM_REWARD_COMPS];
                 comps[0] = rb.track_lin_vel;
