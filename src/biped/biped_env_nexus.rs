@@ -4768,11 +4768,66 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     let _ = self.gpu_base.as_ref().unwrap().read(&self.gpu).await;
                 }
                 let d_f = t_f.elapsed().as_secs_f64() / reps as f64;
+
+                // Third shape: fused encode, one submit, and only ONE readback.
+                // The delta against `fused` (two readbacks) isolates the cost of
+                // a readback from the cost of a dispatch, which decides whether
+                // consolidating outputs into one buffer is worth building.
+                let t_1r = std::time::Instant::now();
+                for _ in 0..reps {
+                    let mut e = self.gpu.begin_encoding();
+                    {
+                        let pt = self.state.body_poses();
+                        self.gpu_joints
+                            .as_mut()
+                            .unwrap()
+                            .encode(&self.gpu, &mut e, pt, &hp)
+                            .expect("enc joints");
+                    }
+                    {
+                        let pt = self.state.body_poses();
+                        self.gpu_base
+                            .as_mut()
+                            .unwrap()
+                            .encode(&self.gpu, &mut e, pt, &hpp, &gh)
+                            .expect("enc base");
+                    }
+                    self.gpu.submit(e).expect("submit fused");
+                    let _ = self.gpu_base.as_ref().unwrap().read(&self.gpu).await;
+                }
+                let d_1r = t_1r.elapsed().as_secs_f64() / reps as f64;
+
+                // And the dispatch floor: encode + submit, NO readback at all.
+                let t_0r = std::time::Instant::now();
+                for _ in 0..reps {
+                    let mut e = self.gpu.begin_encoding();
+                    {
+                        let pt = self.state.body_poses();
+                        self.gpu_joints
+                            .as_mut()
+                            .unwrap()
+                            .encode(&self.gpu, &mut e, pt, &hp)
+                            .expect("enc joints");
+                    }
+                    {
+                        let pt = self.state.body_poses();
+                        self.gpu_base
+                            .as_mut()
+                            .unwrap()
+                            .encode(&self.gpu, &mut e, pt, &hpp, &gh)
+                            .expect("enc base");
+                    }
+                    self.gpu.submit(e).expect("submit fused");
+                }
+                self.gpu.synchronize().expect("sync");
+                let d_0r = t_0r.elapsed().as_secs_f64() / reps as f64;
+
                 eprintln!(
-                    "[fuse_bench] 2 kernels: unfused={:.3}ms fused={:.3}ms saved={:.3}ms/sync",
+                    "[fuse_bench] 2 kernels: unfused={:.3} fused2r={:.3} fused1r={:.3} dispatch_only={:.3} ms",
                     d_un * 1e3,
                     d_f * 1e3,
-                    (d_un - d_f) * 1e3,
+                    d_1r * 1e3,
+                    d_0r * 1e3,
                 );
             }
 
