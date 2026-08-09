@@ -242,6 +242,28 @@ impl GpuRewardGaitTerms {
         Ok(())
     }
 
+    /// As `encode`, but `feet` stays ON DEVICE — the state kernel's output
+    /// tensor is fed straight in. `aux` remains a host upload: phase, progress,
+    /// commanded speed, cue height and the stepping gate are all host-derived.
+    pub fn encode_dev(
+        &mut self,
+        backend: &GpuBackend,
+        enc: &mut Enc,
+        params: shaders::RewardGaitParams,
+        feet: &Tensor<f32>,
+        aux: &[f32],
+    ) -> Result<(), GpuBackendError> {
+        backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
+        backend.write_buffer(self.aux.buffer_mut(), 0, aux)?;
+        {
+            let mut pass = enc.begin_pass("[reward] gait terms", None);
+            self.shader.terms.call(
+                &mut pass, self.n as u32, &self.params, feet, &self.aux, &mut self.out,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Read this kernel's output. Valid only once the encoder it was recorded
     /// into has been submitted.
     pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
@@ -353,6 +375,31 @@ impl GpuRewardFeetTerms {
         Ok(())
     }
 
+    /// As `encode`, but both inputs stay ON DEVICE: the feet-state and
+    /// base-state kernels' output tensors feed straight in.
+    pub fn encode_dev(
+        &mut self,
+        backend: &GpuBackend,
+        enc: &mut Enc,
+        params: shaders::RewardFeetParams,
+        feet: &Tensor<f32>,
+        base: &Tensor<f32>,
+    ) -> Result<(), GpuBackendError> {
+        backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
+        {
+            let mut pass = enc.begin_pass("[reward] feet terms", None);
+            self.shader.terms.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                feet,
+                base,
+                &mut self.out,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Read this kernel's output. Valid only once the encoder it was recorded
     /// into has been submitted.
     pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
@@ -430,6 +477,12 @@ pub struct FeetInputs<'a> {
 }
 
 impl GpuFeetState {
+    /// Device-resident `[26 x n]` per-foot state block, so the reward-term
+    /// kernels can consume it without a host round trip.
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
     pub fn new(
         backend: &GpuBackend,
         n: usize,
@@ -677,6 +730,36 @@ impl GpuRewardBaseTerms {
                 self.n as u32,
                 &self.params,
                 &self.base,
+                &self.cmd,
+                &self.cue,
+                &mut self.out,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// As `encode`, but `base` stays ON DEVICE — the base-state kernel's output
+    /// tensor feeds straight in. `cmd`/`cue` remain host uploads: the command is
+    /// host-sampled and the cue needs the terrain probe + per-env RNG.
+    pub fn encode_dev(
+        &mut self,
+        backend: &GpuBackend,
+        enc: &mut Enc,
+        params: shaders::RewardBaseParams,
+        base: &Tensor<f32>,
+        cmd: &[f32],
+        cue: &[f32],
+    ) -> Result<(), GpuBackendError> {
+        backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
+        backend.write_buffer(self.cmd.buffer_mut(), 0, cmd)?;
+        backend.write_buffer(self.cue.buffer_mut(), 0, cue)?;
+        {
+            let mut pass = enc.begin_pass("[reward] base terms", None);
+            self.shader.terms.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                base,
                 &self.cmd,
                 &self.cue,
                 &mut self.out,

@@ -4727,6 +4727,55 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 )
                 .await
                 .expect("gpu feet compute");
+            // BIPED_FUSE_BENCH: measure the dispatch shape directly instead of
+            // projecting it. Same three state kernels, same inputs, timed as
+            // (a) one submit + one readback each -- the shape every binding was
+            // built with -- versus (b) one shared encoder, one submit, then the
+            // readbacks. The delta is the per-sync-point cost, which is the
+            // whole question of whether the GPU step can beat the host block.
+            if env_var("BIPED_FUSE_BENCH").is_ok() {
+                let reps = 20u32;
+                let t_un = std::time::Instant::now();
+                for _ in 0..reps {
+                    let pt = self.state.body_poses();
+                    let _ = self.gpu_joints.as_mut().unwrap().compute(&self.gpu, pt, &hp).await;
+                    let pt = self.state.body_poses();
+                    let _ = self.gpu_base.as_mut().unwrap().compute(&self.gpu, pt, &hpp, &gh).await;
+                }
+                let d_un = t_un.elapsed().as_secs_f64() / reps as f64;
+
+                let t_f = std::time::Instant::now();
+                for _ in 0..reps {
+                    let mut e = self.gpu.begin_encoding();
+                    {
+                        let pt = self.state.body_poses();
+                        self.gpu_joints
+                            .as_mut()
+                            .unwrap()
+                            .encode(&self.gpu, &mut e, pt, &hp)
+                            .expect("enc joints");
+                    }
+                    {
+                        let pt = self.state.body_poses();
+                        self.gpu_base
+                            .as_mut()
+                            .unwrap()
+                            .encode(&self.gpu, &mut e, pt, &hpp, &gh)
+                            .expect("enc base");
+                    }
+                    self.gpu.submit(e).expect("submit fused");
+                    let _ = self.gpu_joints.as_ref().unwrap().read(&self.gpu).await;
+                    let _ = self.gpu_base.as_ref().unwrap().read(&self.gpu).await;
+                }
+                let d_f = t_f.elapsed().as_secs_f64() / reps as f64;
+                eprintln!(
+                    "[fuse_bench] 2 kernels: unfused={:.3}ms fused={:.3}ms saved={:.3}ms/sync",
+                    d_un * 1e3,
+                    d_f * 1e3,
+                    (d_un - d_f) * 1e3,
+                );
+            }
+
             const FEET_FIELDS: [&str; 11] = [
                 "contact", "first", "air", "height", "planar", "tilt", "yaw", "x", "y", "vz",
                 "dF",
