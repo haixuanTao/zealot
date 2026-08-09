@@ -1757,6 +1757,9 @@ pub struct BipedNexusBatchEnv {
     /// `BIPED_SKIP_REWARD`: skip the host reward evaluation to price it. Gives
     /// WRONG training; measurement only.
     skip_reward: bool,
+    /// `BIPED_SKIP_OBS`: skip the host obs assembly to price it. Wrong
+    /// training; measurement only.
+    skip_obs: bool,
     /// Self-contained per-foot reward terms.
     gpu_feet_terms: Option<zealot_gpu_obs::GpuRewardFeetTerms>,
     /// Gated gait reward terms.
@@ -2600,6 +2603,7 @@ impl BipedNexusBatchEnv {
             gpu_observe: None,
             verify_cue: std::env::var("BIPED_VERIFY_CUE").is_ok(),
             skip_reward: std::env::var("BIPED_SKIP_REWARD").is_ok(),
+            skip_obs: std::env::var("BIPED_SKIP_OBS").is_ok(),
             gpu_feet_terms: None,
             gpu_gait_terms: None,
             gpu_misc_terms: None,
@@ -4247,11 +4251,18 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     comps[31] = -pen;
                     reward -= pen;
                 }
+                // BIPED_SKIP_OBS: A/B lever pricing the HOST obs assembly, the
+                // thing the device-resident path removes. Wrong training;
+                // measurement only. Vectors keep their length so every
+                // downstream consumer (gc/gcc, fill_raw, the bootstrap) still
+                // does its normal work — this isolates assembly, not transfer.
                 let mut obs = vec![0.0; OBS_DIM];
-                self.task.observe(&state, &self.cmd[e], &mut obs);
                 let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
-                self.task
-                    .observe_critic(&state, &self.cmd[e], &mut critic_obs);
+                if !self.skip_obs {
+                    self.task.observe(&state, &self.cmd[e], &mut obs);
+                    self.task
+                        .observe_critic(&state, &self.cmd[e], &mut critic_obs);
+                }
                 // Which foot touched down this step (last wins if both did) — used
                 // to advance the gait-alternation tracker in the serial pass.
                 let mut td_foot: i8 = -1;
