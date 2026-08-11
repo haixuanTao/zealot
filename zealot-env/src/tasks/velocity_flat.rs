@@ -321,7 +321,7 @@ impl Default for CommandSampler {
             // regime where tracking reward is uniformly tiny → it gives up.
             // Override per-axis with BIPED_VX / BIPED_VY / BIPED_YAW ("lo,hi").
             lin_vel_x: range_env("BIPED_VX", (-0.8, 0.8)),
-            lin_vel_y: range_env("BIPED_VY", (-0.3, 0.3)),
+            lin_vel_y: range_env("BIPED_VY", (-0.5, 0.5)),
             // Yaw was ±0.2 through v21 — 5× narrower than WBC-AGILE T1's ±1.0,
             // and too narrow to learn from: at |yaw| ≤ 0.2 the exp tracking
             // kernel is nearly satisfied by NOT turning, so `track_ang_vel`
@@ -333,7 +333,7 @@ impl Default for CommandSampler {
             // staying inside what the 12-DOF platform can turn.
             // NOTE evaluations: ±0.5 was OUTSIDE the old training range, so
             // every pre-v22 yaw probe at 0.5 was measuring extrapolation.
-            ang_vel_z: range_env("BIPED_YAW", (-0.6, 0.6)),
+            ang_vel_z: range_env("BIPED_YAW", (-1.0, 1.0)),
             // Fraction of command resamples that are a pure STAND (zero). Raising
             // it (BIPED_STAND_PROB) makes the robot stop more often → trains
             // explicit walk→stand→walk (go-stop-go) transitions and gives frequent
@@ -354,7 +354,7 @@ impl Default for CommandSampler {
                         None
                     }
                 })
-                .unwrap_or((3.0, 8.0)),
+                .unwrap_or((8.0, 12.0)),
         }
     }
 }
