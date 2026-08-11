@@ -781,10 +781,10 @@ fn main() {
         // from `mirror_obs`/`mirror_critic`. Verify any change with
         // BIPED_VERIFY_STAGE=1 (element-wise device-vs-host compare).
         let total_cols = if mirror_aug { 2 * T * n } else { T * n };
-        let mut raw_obs_dev =
-            Tensor::<f32>::vector_uninit(&bk, ((T + 1) * od * n) as u32, rw).unwrap();
-        let mut raw_cobs_dev =
-            Tensor::<f32>::vector_uninit(&bk, ((T + 1) * cd * n) as u32, rw).unwrap();
+        env.raw_obs_t =
+            Some(Tensor::<f32>::vector_uninit(&bk, ((T + 1) * od * n) as u32, rw).unwrap());
+        env.raw_cobs_t =
+            Some(Tensor::<f32>::vector_uninit(&bk, ((T + 1) * cd * n) as u32, rw).unwrap());
         let mut f_obs_dev =
             Tensor::<f32>::matrix_uninit(&bk, od as u32, total_cols as u32, rw).unwrap();
         let mut f_cobs_dev =
@@ -951,8 +951,33 @@ fn main() {
         }
         let mut pn_obs = zealot_rl::ppo::PendingNorm::default();
         let mut pn_cobs = zealot_rl::ppo::PendingNorm::default();
+        // BIPED_GPU_OBS: obs live on device end-to-end — no host mirrors (gc/
+        // gcc frozen at initial values, unused), no per-step slot uploads, no
+        // host welford. Requires the frozen-normalizer schedule.
+        let gpu_obs = env.gpu_obs_on();
+        let gpu_obs_verify = gpu_obs && std::env::var("BIPED_GPU_OBS_VERIFY").is_ok();
+        // Debug bisect: device obs pipeline still runs, but the forward reads
+        // HOST-uploaded slots (the known-good path). Requires verify (live gc).
+        let gpu_obs_hostfeed = gpu_obs_verify && std::env::var("BIPED_GPU_OBS_HOSTFEED").is_ok();
+        let verify_stage = verify_stage && !gpu_obs;
+        if gpu_obs {
+            assert!(norm_freeze, "BIPED_GPU_OBS requires BIPED_NORM_FREEZE");
+        }
 
         let (mut gc, mut gcc) = env.initial_obs().await;
+        if gpu_obs {
+            // One-time seed: arena slot 0 = the initial obs (host-assembled).
+            // Every later slot is device-written; iteration boundaries reuse
+            // slot T via `copy_bootstrap_to_slot0`.
+            let mut tmp = vec![0.0f32; od.max(cd) * n];
+            stage_transpose(&mut tmp[..od * n], &gc, od, n);
+            bk.write_buffer(env.raw_obs_t.as_mut().unwrap().buffer_mut(), 0, &tmp[..od * n])
+                .unwrap();
+            env.seed_initial_stack(&tmp[..od * n]);
+            stage_transpose(&mut tmp[..cd * n], &gcc, cd, n);
+            bk.write_buffer(env.raw_cobs_t.as_mut().unwrap().buffer_mut(), 0, &tmp[..cd * n])
+                .unwrap();
+        }
         // Velocity-command curriculum: STAND-BEFORE-WALK. Hold the command at 0
         // (cscale=0 → all commands standing) for the first `stand_frac` of training
         // so the policy first learns to BALANCE, then ramp the command 0→1 over
@@ -1011,6 +1036,12 @@ fn main() {
             );
         }
         for it in 0..iters {
+            // BIPED_GPU_OBS: slot 0 of this rollout = last iteration's final
+            // state (slot T). Deferred to HERE — after the update — because
+            // the update's t=0 batch columns still read the OLD slot 0.
+            if gpu_obs && it > 0 {
+                env.copy_bootstrap_to_slot0();
+            }
             let t_iter = Instant::now();
             let frac = it as f32 / iters as f32;
             let cscale = if terrain_on {
@@ -1064,31 +1095,51 @@ fn main() {
                 (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
             for t_step in 0..T {
                 let tp = Instant::now();
-                for e in 0..n {
-                    if norm_freeze {
-                        pn_obs.push(&gc[e]);
-                        pn_cobs.push(&gcc[e]);
-                    } else {
-                        ac.record_obs(&gc[e], &gcc[e]);
-                    }
+                if gpu_obs_hostfeed {
+                    stage_transpose(&mut raw_stage[..od * n], &gc, od, n);
+                    bk.write_buffer(
+                        env.raw_obs_t.as_mut().unwrap().buffer_mut(),
+                        (t_step * od * n) as u64,
+                        &raw_stage[..od * n],
+                    )
+                    .unwrap();
+                    stage_transpose(&mut raw_stage[..cd * n], &gcc, cd, n);
+                    bk.write_buffer(
+                        env.raw_cobs_t.as_mut().unwrap().buffer_mut(),
+                        (t_step * cd * n) as u64,
+                        &raw_stage[..cd * n],
+                    )
+                    .unwrap();
                 }
-                // Stage this step's RAW obs into the device rollout arenas
-                // (step-blocked [T][dim][n]) — the update's staging kernel
-                // reads them in place; the batch never re-crosses PCIe.
-                stage_transpose(&mut raw_stage[..od * n], &gc, od, n);
-                bk.write_buffer(
-                    raw_obs_dev.buffer_mut(),
-                    (t_step * od * n) as u64,
-                    &raw_stage[..od * n],
-                )
-                .unwrap();
-                stage_transpose(&mut raw_stage[..cd * n], &gcc, cd, n);
-                bk.write_buffer(
-                    raw_cobs_dev.buffer_mut(),
-                    (t_step * cd * n) as u64,
-                    &raw_stage[..cd * n],
-                )
-                .unwrap();
+                if !gpu_obs {
+                    for e in 0..n {
+                        if norm_freeze {
+                            pn_obs.push(&gc[e]);
+                            pn_cobs.push(&gcc[e]);
+                        } else {
+                            ac.record_obs(&gc[e], &gcc[e]);
+                        }
+                    }
+                    // Stage this step's RAW obs into the device rollout arenas
+                    // (step-blocked [T][dim][n]) — the update's staging kernel
+                    // reads them in place; the batch never re-crosses PCIe.
+                    // (BIPED_GPU_OBS: the env already wrote this slot at the
+                    // previous step's finalize; welford runs there too.)
+                    stage_transpose(&mut raw_stage[..od * n], &gc, od, n);
+                    bk.write_buffer(
+                        env.raw_obs_t.as_mut().unwrap().buffer_mut(),
+                        (t_step * od * n) as u64,
+                        &raw_stage[..od * n],
+                    )
+                    .unwrap();
+                    stage_transpose(&mut raw_stage[..cd * n], &gcc, cd, n);
+                    bk.write_buffer(
+                        env.raw_cobs_t.as_mut().unwrap().buffer_mut(),
+                        (t_step * cd * n) as u64,
+                        &raw_stage[..cd * n],
+                    )
+                    .unwrap();
+                }
                 pr_norm += tp.elapsed().as_secs_f64();
                 let tp = Instant::now();
                 // Device-normalized forward: stage this step's raw-arena slice
@@ -1102,8 +1153,8 @@ fn main() {
                     let mut cur = EncCursor::new(&bk);
                     {
                         let mut pass = cur.pass("policy_stage");
-                        ppo.stage_batch(&mut pass, &prm_roll_o[t_step], &raw_obs_dev, &roll_mean_o, &roll_inv_o, &perm_id_o, &sign_id_o, gpu.actor_input_mut(), n as u32, od as u32).unwrap();
-                        ppo.stage_batch(&mut pass, &prm_roll_c[t_step], &raw_cobs_dev, &roll_mean_c, &roll_inv_c, &perm_id_c, &sign_id_c, gpu.critic_input_mut(), n as u32, cd as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &prm_roll_o[t_step], env.raw_obs_t.as_ref().unwrap(), &roll_mean_o, &roll_inv_o, &perm_id_o, &sign_id_o, gpu.actor_input_mut(), n as u32, od as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &prm_roll_c[t_step], env.raw_cobs_t.as_ref().unwrap(), &roll_mean_c, &roll_inv_c, &perm_id_c, &sign_id_c, gpu.critic_input_mut(), n as u32, cd as u32).unwrap();
                     }
                     gpu.encode_actor(&bk, &mut cur).unwrap();
                     gpu.encode_critic(&bk, &mut cur).unwrap();
@@ -1185,7 +1236,7 @@ fn main() {
                     };
                     rs[e].push(r);
                     ds[e].push(outs[e].done);
-                    if !outs[e].done {
+                    if (!gpu_obs || gpu_obs_verify) && !outs[e].done {
                         // MOVE, don't clone — `outs` is dropped at the end
                         // of the step, and the bootstrap read of
                         // `outs[e].critic_obs` already happened above.
@@ -1200,11 +1251,58 @@ fn main() {
                 if !to_reset.is_empty() {
                     let tr = Instant::now();
                     let fresh = env.reset_envs(&to_reset).await;
-                    for (&e, (o, c)) in to_reset.iter().zip(fresh) {
-                        gc[e] = o;
-                        gcc[e] = c;
+                    if !gpu_obs || gpu_obs_verify {
+                        for (&e, (o, c)) in to_reset.iter().zip(fresh) {
+                            gc[e] = o;
+                            gcc[e] = c;
+                        }
                     }
                     reset_dur += tr.elapsed();
+                }
+                // BIPED_GPU_OBS: finish this step's obs into arena slot t+1
+                // AFTER resets so the template-frame column scatter lands
+                // before stacking (slot T at t=T-1 doubles as the bootstrap).
+                if gpu_obs {
+                    env.finalize_obs_slot(t_step + 1);
+                }
+                if gpu_obs_verify {
+                    let (dobs, dcobs) = env.debug_read_obs().await;
+                    let (mut wo, mut wc) = (0.0f32, 0.0f32);
+                    let (mut wo_d, mut wc_d, mut wo_e) = (0usize, 0usize, 0usize);
+                    for e in 0..n {
+                        for d in 0..od {
+                            let x = (dobs[d * n + e] - gc[e][d]).abs();
+                            if x > wo {
+                                wo = x;
+                                wo_d = d;
+                                wo_e = e;
+                            }
+                        }
+                        for d in 0..cd {
+                            let x = (dcobs[d * n + e] - gcc[e][d]).abs();
+                            if x > wc {
+                                wc = x;
+                                wc_d = d;
+                            }
+                        }
+                    }
+                    // Per-history-frame breakdown for the worst env + values.
+                    let f = od / 5;
+                    let mut per_frame = [0.0f32; 5];
+                    for d in 0..od {
+                        let x = (dobs[d * n + wo_e] - gc[wo_e][d]).abs();
+                        let fi = d / f;
+                        per_frame[fi] = per_frame[fi].max(x);
+                    }
+                    eprintln!(
+                        "[verify_gpu_obs] t={t_step} obs={wo:.2e} (d{wo_d}={}|{} e{wo_e} slot{} frames {:.1e}/{:.1e}/{:.1e}/{:.1e}/{:.1e}) cobs={wc:.2e} (d{wc_d}) resets={} was_reset={}",
+                        gc[wo_e][wo_d],
+                        dobs[wo_d * n + wo_e],
+                        wo_d % f,
+                        per_frame[0], per_frame[1], per_frame[2], per_frame[3], per_frame[4],
+                        to_reset.len(),
+                        to_reset.contains(&wo_e),
+                    );
                 }
                 pr_post += tp.elapsed().as_secs_f64();
             }
@@ -1224,17 +1322,20 @@ fn main() {
             // and is MORE consistent, since every other value in the GAE
             // stream (`vs`) already came from this same GPU path.
             let boot_vals: Vec<f32> = if norm_freeze {
-                stage_transpose(&mut raw_stage[..od * n], &gc, od, n);
-                bk.write_buffer(raw_obs_dev.buffer_mut(), (T * od * n) as u64, &raw_stage[..od * n])
-                    .unwrap();
-                stage_transpose(&mut raw_stage[..cd * n], &gcc, cd, n);
-                bk.write_buffer(raw_cobs_dev.buffer_mut(), (T * cd * n) as u64, &raw_stage[..cd * n])
-                    .unwrap();
+                if !gpu_obs {
+                    // (BIPED_GPU_OBS: slot T was device-written at t=T-1.)
+                    stage_transpose(&mut raw_stage[..od * n], &gc, od, n);
+                    bk.write_buffer(env.raw_obs_t.as_mut().unwrap().buffer_mut(), (T * od * n) as u64, &raw_stage[..od * n])
+                        .unwrap();
+                    stage_transpose(&mut raw_stage[..cd * n], &gcc, cd, n);
+                    bk.write_buffer(env.raw_cobs_t.as_mut().unwrap().buffer_mut(), (T * cd * n) as u64, &raw_stage[..cd * n])
+                        .unwrap();
+                }
                 let mut cur = EncCursor::new(&bk);
                 {
                     let mut pass = cur.pass("bootstrap_stage");
-                    ppo.stage_batch(&mut pass, &prm_roll_o[T], &raw_obs_dev, &roll_mean_o, &roll_inv_o, &perm_id_o, &sign_id_o, gpu.actor_input_mut(), n as u32, od as u32).unwrap();
-                    ppo.stage_batch(&mut pass, &prm_roll_c[T], &raw_cobs_dev, &roll_mean_c, &roll_inv_c, &perm_id_c, &sign_id_c, gpu.critic_input_mut(), n as u32, cd as u32).unwrap();
+                    ppo.stage_batch(&mut pass, &prm_roll_o[T], env.raw_obs_t.as_ref().unwrap(), &roll_mean_o, &roll_inv_o, &perm_id_o, &sign_id_o, gpu.actor_input_mut(), n as u32, od as u32).unwrap();
+                    ppo.stage_batch(&mut pass, &prm_roll_c[T], env.raw_cobs_t.as_ref().unwrap(), &roll_mean_c, &roll_inv_c, &perm_id_c, &sign_id_c, gpu.critic_input_mut(), n as u32, cd as u32).unwrap();
                 }
                 gpu.encode_actor(&bk, &mut cur).unwrap();
                 gpu.encode_critic(&bk, &mut cur).unwrap();
@@ -1330,20 +1431,20 @@ fn main() {
                 {
                     let mut pass = enc.begin_pass("ppo_stage_batch", None);
                     if mirror_aug {
-                        ppo.stage_batch(&mut pass, &prm(od, 0), &raw_obs_dev, &mean_o, &inv_o, &perm_mir_o, &sign_mir_o, &mut f_obs_dev, half, od as u32).unwrap();
-                        ppo.stage_batch(&mut pass, &prm(od, half), &raw_obs_dev, &mean_o, &inv_o, &perm_id_o, &sign_id_o, &mut f_obs_dev, half, od as u32).unwrap();
-                        ppo.stage_batch(&mut pass, &prm(cd, 0), &raw_cobs_dev, &mean_c, &inv_c, &perm_mir_c, &sign_mir_c, &mut f_cobs_dev, half, cd as u32).unwrap();
-                        ppo.stage_batch(&mut pass, &prm(cd, half), &raw_cobs_dev, &mean_c, &inv_c, &perm_id_c, &sign_id_c, &mut f_cobs_dev, half, cd as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &prm(od, 0), env.raw_obs_t.as_ref().unwrap(), &mean_o, &inv_o, &perm_mir_o, &sign_mir_o, &mut f_obs_dev, half, od as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &prm(od, half), env.raw_obs_t.as_ref().unwrap(), &mean_o, &inv_o, &perm_id_o, &sign_id_o, &mut f_obs_dev, half, od as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &prm(cd, 0), env.raw_cobs_t.as_ref().unwrap(), &mean_c, &inv_c, &perm_mir_c, &sign_mir_c, &mut f_cobs_dev, half, cd as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &prm(cd, half), env.raw_cobs_t.as_ref().unwrap(), &mean_c, &inv_c, &perm_id_c, &sign_id_c, &mut f_cobs_dev, half, cd as u32).unwrap();
                     } else {
-                        ppo.stage_batch(&mut pass, &prm(od, 0), &raw_obs_dev, &mean_o, &inv_o, &perm_id_o, &sign_id_o, &mut f_obs_dev, half, od as u32).unwrap();
-                        ppo.stage_batch(&mut pass, &prm(cd, 0), &raw_cobs_dev, &mean_c, &inv_c, &perm_id_c, &sign_id_c, &mut f_cobs_dev, half, cd as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &prm(od, 0), env.raw_obs_t.as_ref().unwrap(), &mean_o, &inv_o, &perm_id_o, &sign_id_o, &mut f_obs_dev, half, od as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &prm(cd, 0), env.raw_cobs_t.as_ref().unwrap(), &mean_c, &inv_c, &perm_id_c, &sign_id_c, &mut f_cobs_dev, half, cd as u32).unwrap();
                     }
                     if let Some(fom) = f_obs_mir_dev.as_mut() {
                         if mirror_aug {
-                            ppo.stage_batch(&mut pass, &prm(od, 0), &raw_obs_dev, &mean_o, &inv_o, &perm_id_o, &sign_id_o, &mut *fom, half, od as u32).unwrap();
-                            ppo.stage_batch(&mut pass, &prm(od, half), &raw_obs_dev, &mean_o, &inv_o, &perm_mir_o, &sign_mir_o, &mut *fom, half, od as u32).unwrap();
+                            ppo.stage_batch(&mut pass, &prm(od, 0), env.raw_obs_t.as_ref().unwrap(), &mean_o, &inv_o, &perm_id_o, &sign_id_o, &mut *fom, half, od as u32).unwrap();
+                            ppo.stage_batch(&mut pass, &prm(od, half), env.raw_obs_t.as_ref().unwrap(), &mean_o, &inv_o, &perm_mir_o, &sign_mir_o, &mut *fom, half, od as u32).unwrap();
                         } else {
-                            ppo.stage_batch(&mut pass, &prm(od, 0), &raw_obs_dev, &mean_o, &inv_o, &perm_mir_o, &sign_mir_o, &mut *fom, half, od as u32).unwrap();
+                            ppo.stage_batch(&mut pass, &prm(od, 0), env.raw_obs_t.as_ref().unwrap(), &mean_o, &inv_o, &perm_mir_o, &sign_mir_o, &mut *fom, half, od as u32).unwrap();
                         }
                     }
                 }
@@ -1379,8 +1480,19 @@ fn main() {
             // this iteration (rollout forwards, GAE, staged obs, mirror map)
             // has now run — merge the iteration's pending stats for the next.
             if norm_freeze {
-                ac.obs_norm.commit(&mut pn_obs);
-                ac.critic_norm.commit(&mut pn_cobs);
+                if gpu_obs {
+                    // Device Welford accumulated slots 1..T during finalize
+                    // (host pushed 0..T-1 — a one-slot shift, statistically
+                    // immaterial under the frozen-affine schedule).
+                    let ((co, mo, m2o), (cc, mc, m2c)) = env.take_norm_moments().await;
+                    let mut po = zealot_rl::ppo::PendingNorm::from_moments(co, mo, m2o);
+                    let mut pc = zealot_rl::ppo::PendingNorm::from_moments(cc, mc, m2c);
+                    ac.obs_norm.commit(&mut po);
+                    ac.critic_norm.commit(&mut pc);
+                } else {
+                    ac.obs_norm.commit(&mut pn_obs);
+                    ac.critic_norm.commit(&mut pn_cobs);
+                }
             }
             let f_act = mk(
                 &bk,

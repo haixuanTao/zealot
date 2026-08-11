@@ -1765,3 +1765,52 @@ pub fn gpu_gather_link_pos(
     out.write(((l * 3 + 1) * n + e) as usize, p.y);
     out.write(((l * 3 + 2) * n + e) as usize, p.z);
 }
+
+/// Scatter compact per-env frame columns into a `[D × n]` tensor — the
+/// post-reset obs fix-up: reset envs' freshly-assembled frames are replaced
+/// by their (host-cached) template spawn frames before stacking. One thread
+/// per (row, reset-env).
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_scatter_frame_cols(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] frames: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] env_ids: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] out: &mut [f32],
+    // x = rows D, y = num resets R, z = n_envs.
+    #[spirv(uniform, descriptor_set = 0, binding = 3)] params: &UVec4,
+) {
+    let d = invocation_id.x;
+    let r = invocation_id.y;
+    if d >= params.x || r >= params.y {
+        return;
+    }
+    let e = env_ids.read(r as usize);
+    out.write(
+        (d * params.z + e) as usize,
+        frames.read((d * params.y + r) as usize),
+    );
+}
+
+/// Additive actor-obs sensor noise: compact rows map to frame slots 16..43
+/// (joint_pos_rel, joint_vel, projected_gravity — contiguous) then 45..48
+/// (gyro). Values are HOST-drawn from the per-env RNG streams (bit-identical
+/// order to the host path) and simply added here.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_obs_noise(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] noise: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] out: &mut [f32],
+    // x = rows (30), y = n_envs.
+    #[spirv(uniform, descriptor_set = 0, binding = 2)] params: &UVec4,
+) {
+    let r = invocation_id.x;
+    let e = invocation_id.y;
+    if r >= params.x || e >= params.y {
+        return;
+    }
+    let slot = if r < 27 { 16 + r } else { 45 + (r - 27) };
+    let i = (slot * params.y + e) as usize;
+    out.write(i, out.read(i) + noise.read((r * params.y + e) as usize));
+}

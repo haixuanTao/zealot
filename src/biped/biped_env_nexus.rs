@@ -1805,6 +1805,43 @@ pub struct BipedNexusBatchEnv {
     /// One consolidated device buffer all GPU-state outputs are copied into
     /// (same submit), so ONE slow_read replaces five per-tensor syncs.
     gs_all: Option<vortx::tensor::Tensor<f32>>,
+    /// Step-blocked raw obs arenas `[(T+1)][dim][n]` (slot t = policy input
+    /// at step t; slot T = the GAE-bootstrap final state). Owned here so the
+    /// device obs path (BIPED_GPU_OBS) can write slots directly; the trainer
+    /// reads them for its policy/update staging via the accessors.
+    pub raw_obs_t: Option<vortx::tensor::Tensor<f32>>,
+    pub raw_cobs_t: Option<vortx::tensor::Tensor<f32>>,
+    /// BIPED_GPU_OBS=1: full device-resident obs. `step()` only captures the
+    /// host staging (last_action/cmd/phase/cue as of par-block time — the
+    /// exact values host `observe` reads); `finalize_obs_slot` (called by the
+    /// trainer AFTER resets) runs ONE submit: frame assembly -> reset-column
+    /// scatter -> history stack -> arena-slot copies -> welford. No readback.
+    gpu_obs_prod: bool,
+    gpu_stack: Option<zealot_gpu_obs::GpuObsStack>,
+    gpu_welford_o: Option<zealot_gpu_obs::GpuWelford>,
+    gpu_welford_c: Option<zealot_gpu_obs::GpuWelford>,
+    gpu_scatter_o: Option<zealot_gpu_obs::GpuFrameScatter>,
+    gpu_scatter_c: Option<zealot_gpu_obs::GpuFrameScatter>,
+    /// Ping-pong stacked-obs pair `[od x n]` (prev feeds the stack kernel,
+    /// out receives; swapped after each finalize).
+    stack_prev: Option<vortx::tensor::Tensor<f32>>,
+    stack_out: Option<vortx::tensor::Tensor<f32>>,
+    /// Per-env "reset since last finalize" flags (1 -> stack replicates the
+    /// frame). Starts all-1: the first finalize has no valid prev.
+    fresh_pending: Vec<u32>,
+    pend_la: Vec<f32>,
+    pend_cmd: Vec<f32>,
+    pend_ph: Vec<f32>,
+    pend_cue: Vec<f32>,
+    /// Reset fix-up staging: per reset env the template spawn FRAME (cmd
+    /// patched), row-major by env; transposed compact at finalize.
+    pend_scatter_o: Vec<f32>,
+    pend_scatter_c: Vec<f32>,
+    pend_scatter_ids: Vec<u32>,
+    /// Host-drawn actor sensor noise `[30 x n]` (same RNG draws as the host
+    /// path), device-added to the frame before scatter/stack.
+    pend_noise: Vec<f32>,
+    gpu_noise: Option<zealot_gpu_obs::GpuObsNoise>,
     /// Set when `stage_arm_motion` changed HELD-joint entries of the mirror.
     /// Those live in `links_static` alongside the actuated ones, and the motor
     /// scatter only rewrites the actuated entries — so a full mirror upload is
@@ -2603,13 +2640,34 @@ impl BipedNexusBatchEnv {
             motor_targets_host: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             motor_targets_alt: None,
-            gpu_state: env_var("BIPED_GPU_STATE").as_deref() == Ok("1"),
+            gpu_state: env_var("BIPED_GPU_STATE").as_deref() == Ok("1")
+                || env_var("BIPED_GPU_OBS").as_deref() == Ok("1"),
             gs_base: vec![0.0; 13 * num_envs],
             gs_feet: vec![0.0; 26 * num_envs],
             gpu_link_gather: None,
             gs_links: Vec::new(),
             gather_slot: std::collections::HashMap::new(),
             gs_all: None,
+            raw_obs_t: None,
+            raw_cobs_t: None,
+            gpu_obs_prod: env_var("BIPED_GPU_OBS").as_deref() == Ok("1"),
+            gpu_stack: None,
+            gpu_welford_o: None,
+            gpu_welford_c: None,
+            gpu_scatter_o: None,
+            gpu_scatter_c: None,
+            stack_prev: None,
+            stack_out: None,
+            fresh_pending: vec![1u32; num_envs],
+            pend_la: Vec::new(),
+            pend_cmd: Vec::new(),
+            pend_ph: Vec::new(),
+            pend_cue: Vec::new(),
+            pend_scatter_o: Vec::new(),
+            pend_scatter_c: Vec::new(),
+            pend_scatter_ids: Vec::new(),
+            pend_noise: Vec::new(),
+            gpu_noise: None,
             delay_keff_host: vec![0.0; num_envs],
             delay_keff_gpu: None,
             limit_dwell,
@@ -2650,7 +2708,9 @@ impl BipedNexusBatchEnv {
             gpu_observe: None,
             verify_cue: std::env::var("BIPED_VERIFY_CUE").is_ok(),
             skip_reward: std::env::var("BIPED_SKIP_REWARD").is_ok(),
-            skip_obs: std::env::var("BIPED_SKIP_OBS").is_ok(),
+            skip_obs: std::env::var("BIPED_SKIP_OBS").is_ok()
+                || (env_var("BIPED_GPU_OBS").as_deref() == Ok("1")
+                    && env_var("BIPED_GPU_OBS_VERIFY").is_err()),
             gpu_feet_terms: None,
             gpu_gait_terms: None,
             gpu_misc_terms: None,
@@ -4758,6 +4818,17 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     self.task.observe(&state, &self.cmd[e], &mut obs);
                     self.task
                         .observe_critic(&state, &self.cmd[e], &mut critic_obs);
+                } else if self.gpu_obs_prod
+                    && !fell
+                    && self.step_count[e] >= self.task.max_steps()
+                {
+                    // Timeout truncation: the trainer bootstraps r + gamma*V(s_final)
+                    // through a HOST critic forward on the final pre-reset state —
+                    // the one host obs the device path still owes. (step_count was
+                    // already incremented this step, so this predicate is bit-equal
+                    // to the commit loop's `timeout`.)
+                    self.task
+                        .observe_critic(&state, &self.cmd[e], &mut critic_obs);
                 }
                 // Which foot touched down this step (last wins if both did) — used
                 // to advance the gait-alternation tracker in the serial pass.
@@ -5667,20 +5738,60 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
         let mut outs = Vec::with_capacity(self.n);
+        // BIPED_GPU_OBS: capture the frame-assembly inputs EXACTLY as host
+        // `observe` would read them here (pre-commit last_action, pre-advance
+        // gait phase, this step's cue) — the GPU work itself is deferred to
+        // `finalize_obs_slot` so post-reset column fix-ups land first.
+        if self.gpu_obs_prod {
+            let n = self.n;
+            self.pend_la.resize(NUM_JOINTS * n, 0.0);
+            self.pend_cmd.resize(4 * n, 0.0);
+            self.pend_ph.resize(n, 0.0);
+            self.pend_cue.resize(10 * n, 0.0);
+            for e in 0..n {
+                for k in 0..NUM_JOINTS {
+                    self.pend_la[k * n + e] = self.last_action[e][k];
+                }
+                self.pend_cmd[e] = self.cmd[e].vx;
+                self.pend_cmd[n + e] = self.cmd[e].vy;
+                self.pend_cmd[2 * n + e] = self.cmd[e].yaw_rate;
+                self.pend_cmd[3 * n + e] = 0.0;
+                self.pend_ph[e] = self.gait_phase[e];
+                for k in 0..10 {
+                    self.pend_cue[k * n + e] = computed[e].cue_obs[k];
+                }
+            }
+        }
+        if self.gpu_obs_prod {
+            self.pend_noise.resize(30 * self.n, 0.0);
+        }
         for (e, mut c) in computed.into_iter().enumerate() {
             if obs_noise > 0.0 {
+                let n = self.n;
                 let rng = &mut self.rng[e];
                 // joint_pos_rel [16..28]: ±0.01 rad
-                for v in &mut c.obs[NUM_JOINTS + 4..2 * NUM_JOINTS + 4] {
-                    *v += rng.range(-0.01, 0.01) * obs_noise;
+                for (k, v) in c.obs[NUM_JOINTS + 4..2 * NUM_JOINTS + 4].iter_mut().enumerate() {
+                    let r = rng.range(-0.01, 0.01) * obs_noise;
+                    *v += r;
+                    if self.gpu_obs_prod {
+                        self.pend_noise[k * n + e] = r;
+                    }
                 }
                 // joint_vel [28..40]: ±1.5 rad/s
-                for v in &mut c.obs[2 * NUM_JOINTS + 4..3 * NUM_JOINTS + 4] {
-                    *v += rng.range(-1.5, 1.5) * obs_noise;
+                for (k, v) in c.obs[2 * NUM_JOINTS + 4..3 * NUM_JOINTS + 4].iter_mut().enumerate() {
+                    let r = rng.range(-1.5, 1.5) * obs_noise;
+                    *v += r;
+                    if self.gpu_obs_prod {
+                        self.pend_noise[(12 + k) * n + e] = r;
+                    }
                 }
                 // projected_gravity [40..43]: ±0.05
-                for v in &mut c.obs[3 * NUM_JOINTS + 4..3 * NUM_JOINTS + 7] {
-                    *v += rng.range(-0.05, 0.05) * obs_noise;
+                for (k, v) in c.obs[3 * NUM_JOINTS + 4..3 * NUM_JOINTS + 7].iter_mut().enumerate() {
+                    let r = rng.range(-0.05, 0.05) * obs_noise;
+                    *v += r;
+                    if self.gpu_obs_prod {
+                        self.pend_noise[(24 + k) * n + e] = r;
+                    }
                 }
                 // base_ang_vel / gyro [45..48]: ±0.2 rad/s. This block predates
                 // the gyro (added with the 48-dim frame in v22) and stopped at
@@ -5693,9 +5804,17 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 // above are taken from (joint_pos 0.01 / joint_vel 1.5 /
                 // ang_vel 0.2 / gravity 0.05).
                 if OBS_DIM >= 48 {
-                    for v in &mut c.obs[45..48] {
-                        *v += rng.range(-0.2, 0.2) * obs_noise;
+                    for (k, v) in c.obs[45..48].iter_mut().enumerate() {
+                        let r = rng.range(-0.2, 0.2) * obs_noise;
+                        *v += r;
+                        if self.gpu_obs_prod {
+                            self.pend_noise[(27 + k) * n + e] = r;
+                        }
                     }
+                }
+            } else if self.gpu_obs_prod && !self.pend_noise.is_empty() {
+                for k in 0..30 {
+                    self.pend_noise[k * self.n + e] = 0.0;
                 }
             }
             // (obs history is stacked in one parallel pass after this loop —
@@ -5871,6 +5990,275 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
     /// rates). RNG draw order per env matches the old sequential
     /// `reset_env` exactly: template pick → terrain offset → reset
     /// velocities → command.
+    pub fn gpu_obs_on(&self) -> bool {
+        self.gpu_obs_prod
+    }
+
+    /// BIPED_GPU_OBS: one submit finishing this step's obs into arena `slot`:
+    /// frame assembly (captured staging) -> reset-column scatter -> history
+    /// stack -> copies into `raw_obs_t`/`raw_cobs_t[slot]` -> welford. Call
+    /// AFTER `reset_envs` for the step. No readback, no synchronize.
+    pub fn finalize_obs_slot(&mut self, slot: usize) {
+        use khal::backend::Encoder as _;
+        let n = self.n;
+        let od = self.obs_dim();
+        let cd = CRITIC_OBS_DIM;
+        let st = khal::BufferUsages::STORAGE
+            | khal::BufferUsages::COPY_DST
+            | khal::BufferUsages::COPY_SRC;
+        if self.gpu_observe.is_none() {
+            let defaults: Vec<f32> =
+                (0..NUM_JOINTS).map(|k| self.robot.joints[k].default_pos).collect();
+            self.gpu_observe = Some(
+                zealot_gpu_obs::GpuObserve::new(
+                    &self.gpu,
+                    n,
+                    NUM_JOINTS as u32,
+                    OBS_DIM,
+                    CRITIC_OBS_DIM,
+                    &defaults,
+                )
+                .expect("gpu observe"),
+            );
+        }
+        if self.gpu_stack.is_none() {
+            let h = self.obs_hist.as_ref().map_or(1, |x| x.h());
+            self.gpu_stack = Some(
+                zealot_gpu_obs::GpuObsStack::new(&self.gpu, n, OBS_DIM as u32, h as u32)
+                    .expect("gpu stack"),
+            );
+            self.gpu_welford_o =
+                Some(zealot_gpu_obs::GpuWelford::new(&self.gpu, od, n).expect("welford o"));
+            self.gpu_welford_c =
+                Some(zealot_gpu_obs::GpuWelford::new(&self.gpu, cd, n).expect("welford c"));
+            self.gpu_scatter_o = Some(
+                zealot_gpu_obs::GpuFrameScatter::new(&self.gpu, n, OBS_DIM as u32)
+                    .expect("scatter o"),
+            );
+            self.gpu_scatter_c = Some(
+                zealot_gpu_obs::GpuFrameScatter::new(&self.gpu, n, cd as u32)
+                    .expect("scatter c"),
+            );
+            // (seed_initial_stack may already have created + seeded these.)
+            if self.stack_prev.is_none() {
+                self.stack_prev = Some(
+                    vortx::tensor::Tensor::<f32>::vector_uninit(&self.gpu, (od * n) as u32, st)
+                        .expect("stack prev"),
+                );
+                self.stack_out = Some(
+                    vortx::tensor::Tensor::<f32>::vector_uninit(&self.gpu, (od * n) as u32, st)
+                        .expect("stack out"),
+                );
+            }
+        }
+        let mut enc = self.gpu.begin_encoding();
+        {
+            let (qt, qdt) = {
+                let j = self.gpu_joints.as_ref().unwrap();
+                (j.q_tensor(), j.qd_tensor())
+            };
+            let bt = self.gpu_base.as_ref().unwrap().out_tensor();
+            self.gpu_observe
+                .as_mut()
+                .unwrap()
+                .encode(
+                    &self.gpu,
+                    &mut enc,
+                    0,
+                    &self.pend_la,
+                    &self.pend_cmd,
+                    &self.pend_ph,
+                    &self.pend_cue,
+                    qt,
+                    qdt,
+                    bt,
+                )
+                .expect("obs frame encode");
+        }
+        // Actor sensor noise (host-drawn, device-added) — BEFORE the reset
+        // scatter, so reset envs end clean-template exactly like the host.
+        if !self.pend_noise.is_empty() {
+            if self.gpu_noise.is_none() {
+                self.gpu_noise =
+                    Some(zealot_gpu_obs::GpuObsNoise::new(&self.gpu, n).expect("obs noise"));
+            }
+            let noise = std::mem::take(&mut self.pend_noise);
+            let ob = self.gpu_observe.as_mut().unwrap();
+            self.gpu_noise
+                .as_mut()
+                .unwrap()
+                .encode(&self.gpu, &mut enc, &noise, ob.out_obs_mut())
+                .expect("noise encode");
+            self.pend_noise = noise;
+            self.pend_noise.clear();
+        }
+        // Post-reset fix-up: overwrite reset envs' frame columns with their
+        // template spawn frames (transpose row-major staging -> [D x R]).
+        let rn = self.pend_scatter_ids.len();
+        if rn > 0 {
+            let mut fo = vec![0.0f32; OBS_DIM * rn];
+            let mut fc = vec![0.0f32; cd * rn];
+            for r in 0..rn {
+                for d in 0..OBS_DIM {
+                    fo[d * rn + r] = self.pend_scatter_o[r * OBS_DIM + d];
+                }
+                for d in 0..cd {
+                    fc[d * rn + r] = self.pend_scatter_c[r * cd + d];
+                }
+            }
+            let ids = std::mem::take(&mut self.pend_scatter_ids);
+            let ob = self.gpu_observe.as_mut().unwrap();
+            self.gpu_scatter_o
+                .as_mut()
+                .unwrap()
+                .encode(&self.gpu, &mut enc, &fo, &ids, ob.out_obs_mut())
+                .expect("scatter o");
+            self.gpu_scatter_c
+                .as_mut()
+                .unwrap()
+                .encode(&self.gpu, &mut enc, &fc, &ids, ob.out_cobs_mut())
+                .expect("scatter c");
+            self.pend_scatter_o.clear();
+            self.pend_scatter_c.clear();
+        }
+        // History stack -> arena slot copies -> welford, all in this encoder.
+        let stack = self.gpu_stack.as_mut().unwrap();
+        stack
+            .set_fresh(&self.gpu, &self.fresh_pending)
+            .expect("fresh upload");
+        self.fresh_pending.fill(0);
+        let prev = self.stack_prev.take().unwrap();
+        let mut out = self.stack_out.take().unwrap();
+        stack
+            .encode(&mut enc, self.gpu_observe.as_ref().unwrap().out_obs(), &prev, &mut out)
+            .expect("stack encode");
+        enc.copy_buffer_to_buffer(
+            out.buffer(),
+            0,
+            self.raw_obs_t.as_mut().unwrap().buffer_mut(),
+            slot * od * n,
+            od * n,
+        )
+        .expect("obs slot copy");
+        enc.copy_buffer_to_buffer(
+            self.gpu_observe.as_ref().unwrap().out_cobs().buffer(),
+            0,
+            self.raw_cobs_t.as_mut().unwrap().buffer_mut(),
+            slot * cd * n,
+            cd * n,
+        )
+        .expect("cobs slot copy");
+        self.gpu_welford_o
+            .as_mut()
+            .unwrap()
+            .encode(&mut enc, &out)
+            .expect("welford o");
+        self.gpu_welford_c
+            .as_mut()
+            .unwrap()
+            .encode(&mut enc, self.gpu_observe.as_ref().unwrap().out_cobs())
+            .expect("welford c");
+        self.gpu.submit(enc).expect("obs finalize submit");
+        // out becomes prev for the next step.
+        self.stack_prev = Some(out);
+        self.stack_out = Some(prev);
+    }
+
+    /// BIPED_GPU_OBS: seed the device history with the initial stacked obs
+    /// (`[od x n]`, already transposed) so the first finalize shift-appends
+    /// against the true init frames instead of replicating (host semantics).
+    pub fn seed_initial_stack(&mut self, stacked: &[f32]) {
+        let n = self.n;
+        let od = self.obs_dim();
+        assert_eq!(stacked.len(), od * n);
+        let st = khal::BufferUsages::STORAGE
+            | khal::BufferUsages::COPY_DST
+            | khal::BufferUsages::COPY_SRC;
+        if self.stack_prev.is_none() {
+            self.stack_prev = Some(
+                vortx::tensor::Tensor::<f32>::vector_uninit(&self.gpu, (od * n) as u32, st)
+                    .expect("stack prev"),
+            );
+            self.stack_out = Some(
+                vortx::tensor::Tensor::<f32>::vector_uninit(&self.gpu, (od * n) as u32, st)
+                    .expect("stack out"),
+            );
+        }
+        self.gpu
+            .write_buffer(self.stack_prev.as_mut().unwrap().buffer_mut(), 0, stacked)
+            .expect("stack seed");
+        self.fresh_pending.fill(0);
+    }
+
+    /// BIPED_GPU_OBS iteration boundary: next iteration's step-0 policy input
+    /// (arena slot 0) is this iteration's final state (slot T) — whose stacked
+    /// obs is exactly `stack_prev` and whose critic frame is `out_cobs` (both
+    /// post-reset-patched at the last finalize). Intra-buffer slot T -> 0 would
+    /// alias mutably; these copies are the same bytes without the alias.
+    pub fn copy_bootstrap_to_slot0(&mut self) {
+        use khal::backend::Encoder as _;
+        let n = self.n;
+        let od = self.obs_dim();
+        let cd = CRITIC_OBS_DIM;
+        let mut enc = self.gpu.begin_encoding();
+        enc.copy_buffer_to_buffer(
+            self.stack_prev.as_ref().unwrap().buffer(),
+            0,
+            self.raw_obs_t.as_mut().unwrap().buffer_mut(),
+            0,
+            od * n,
+        )
+        .expect("slot0 obs copy");
+        enc.copy_buffer_to_buffer(
+            self.gpu_observe.as_ref().unwrap().out_cobs().buffer(),
+            0,
+            self.raw_cobs_t.as_mut().unwrap().buffer_mut(),
+            0,
+            cd * n,
+        )
+        .expect("slot0 cobs copy");
+        self.gpu.submit(enc).expect("slot0 submit");
+    }
+
+    /// Debug (BIPED_GPU_OBS_VERIFY): read back this step's device obs — the
+    /// stacked actor obs (`stack_prev`, post-finalize) and critic frame.
+    pub async fn debug_read_obs(&mut self) -> (Vec<f32>, Vec<f32>) {
+        self.gpu.synchronize().unwrap();
+        let o: Vec<f32> = self
+            .gpu
+            .slow_read_vec(self.stack_prev.as_ref().unwrap().buffer())
+            .await
+            .unwrap();
+        let c: Vec<f32> = self
+            .gpu
+            .slow_read_vec(self.gpu_observe.as_ref().unwrap().out_cobs().buffer())
+            .await
+            .unwrap();
+        (o, c)
+    }
+
+    /// Drain the device Welford accumulators: `((count, mean, m2)_obs,
+    /// (count, mean, m2)_critic)`. Zeroes the device state (per-iteration).
+    pub async fn take_norm_moments(
+        &mut self,
+    ) -> ((f32, Vec<f32>, Vec<f32>), (f32, Vec<f32>, Vec<f32>)) {
+        let o = self
+            .gpu_welford_o
+            .as_mut()
+            .unwrap()
+            .take_moments(&self.gpu)
+            .await
+            .expect("moments o");
+        let c = self
+            .gpu_welford_c
+            .as_mut()
+            .unwrap()
+            .take_moments(&self.gpu)
+            .await
+            .expect("moments c");
+        (o, c)
+    }
+
     pub async fn reset_envs(&mut self, envs: &[usize]) -> Vec<(Vec<f32>, Vec<f32>)> {
         let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
         let mut meta = Vec::with_capacity(envs.len());
@@ -5912,6 +6300,26 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
         }
         self.state
             .reset_envs_from_templates(&self.gpu, &meta, &offs, &dof_vels);
+        // BIPED_GPU_OBS: the device q/qd/base tensors are pre-reset (the state
+        // kernels can't rerun without double-advancing their finite-diff
+        // history), so stage the template spawn FRAMES (cmd patched — the only
+        // varying slot, exactly as `reset_obs` serves them) for a column
+        // scatter over the assembled frames at finalize. fresh=1 makes the
+        // stack kernel replicate the patched frame into all history slots.
+        if self.gpu_obs_prod && !self.template_spawn_obs.is_empty() {
+            for (i, &env) in envs.iter().enumerate() {
+                let t = tpls[i];
+                let mut fo = self.template_spawn_obs[t].clone();
+                let mut fc = self.template_spawn_critic_obs[t].clone();
+                let c = self.cmd[env].obs();
+                fo[NUM_JOINTS..NUM_JOINTS + 4].copy_from_slice(&c);
+                fc[NUM_JOINTS..NUM_JOINTS + 4].copy_from_slice(&c);
+                self.pend_scatter_o.extend_from_slice(&fo);
+                self.pend_scatter_c.extend_from_slice(&fc);
+                self.pend_scatter_ids.push(env as u32);
+                self.fresh_pending[env] = 1;
+            }
+        }
         let mut out = Vec::with_capacity(envs.len());
         for (i, &env) in envs.iter().enumerate() {
             out.push(self.reset_obs(env, tpls[i]).await);

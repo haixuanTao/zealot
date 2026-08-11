@@ -1856,6 +1856,22 @@ impl GpuObserve {
 
     /// Read both frames back. Verification only — the whole point of the port
     /// is that the steady-state path never does this.
+    pub fn out_obs(&self) -> &Tensor<f32> {
+        &self.out_obs
+    }
+
+    pub fn out_cobs(&self) -> &Tensor<f32> {
+        &self.out_cobs
+    }
+
+    pub fn out_obs_mut(&mut self) -> &mut Tensor<f32> {
+        &mut self.out_obs
+    }
+
+    pub fn out_cobs_mut(&mut self) -> &mut Tensor<f32> {
+        &mut self.out_cobs
+    }
+
     pub async fn read_back(
         &self,
         backend: &GpuBackend,
@@ -2075,5 +2091,131 @@ impl GpuGatherLinkPos {
         self.encode(&mut enc, body_poses)?;
         backend.submit(enc)?;
         self.read(backend).await
+    }
+}
+
+/// `#[derive(Shader)]` supplies `from_backend` for the column scatter.
+#[derive(Shader)]
+struct FrameScatterShader {
+    kernel: shaders::GpuScatterFrameCols,
+}
+
+/// Post-reset frame fix-up (see `gpu_scatter_frame_cols`).
+pub struct GpuFrameScatter {
+    shader: FrameScatterShader,
+    frames: Tensor<f32>,
+    ids: Tensor<u32>,
+    params: Tensor<glamx::UVec4>,
+    cap: usize,
+    rows: u32,
+    n: usize,
+}
+
+impl GpuFrameScatter {
+    pub fn new(backend: &GpuBackend, n: usize, rows: u32) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        let cap = n.max(1);
+        Ok(Self {
+            shader: FrameScatterShader::from_backend(backend)?,
+            frames: Tensor::vector_uninit(backend, rows * cap as u32, st)?,
+            ids: Tensor::vector(backend, &vec![0u32; cap], st)?,
+            params: Tensor::scalar(
+                backend,
+                glamx::UVec4::ZERO,
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            cap,
+            rows,
+            n,
+        })
+    }
+
+    /// Upload `[rows × R]` compact frames + ids, encode the scatter into `out`.
+    pub fn encode(
+        &mut self,
+        backend: &GpuBackend,
+        enc: &mut Enc,
+        frames: &[f32],
+        env_ids: &[u32],
+        out: &mut Tensor<f32>,
+    ) -> Result<(), GpuBackendError> {
+        let r = env_ids.len();
+        debug_assert!(r <= self.cap && frames.len() == self.rows as usize * r);
+        if r == 0 {
+            return Ok(());
+        }
+        backend.write_buffer(self.frames.buffer_mut(), 0, frames)?;
+        backend.write_buffer(self.ids.buffer_mut(), 0, env_ids)?;
+        backend.write_buffer(
+            self.params.buffer_mut(),
+            0,
+            &[glamx::UVec4::new(self.rows, r as u32, self.n as u32, 0)],
+        )?;
+        let mut pass = enc.begin_pass("frame_scatter", None);
+        self.shader.kernel.call(
+            &mut pass,
+            [self.rows, r as u32, 1],
+            &self.frames,
+            &self.ids,
+            out,
+            &self.params,
+        )
+    }
+}
+
+/// `#[derive(Shader)]` supplies `from_backend` for the noise add.
+#[derive(Shader)]
+struct ObsNoiseShader {
+    kernel: shaders::GpuObsNoise,
+}
+
+/// Host-drawn actor-obs noise, device-applied (see `gpu_obs_noise`).
+pub struct GpuObsNoise {
+    shader: ObsNoiseShader,
+    noise: Tensor<f32>,
+    params: Tensor<glamx::UVec4>,
+    rows: u32,
+    n: usize,
+}
+
+impl GpuObsNoise {
+    pub const ROWS: u32 = 30;
+
+    pub fn new(backend: &GpuBackend, n: usize) -> Result<Self, GpuBackendError> {
+        Ok(Self {
+            shader: ObsNoiseShader::from_backend(backend)?,
+            noise: Tensor::vector_uninit(
+                backend,
+                Self::ROWS * n as u32,
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            params: Tensor::scalar(
+                backend,
+                glamx::UVec4::new(Self::ROWS, n as u32, 0, 0),
+                BufferUsages::UNIFORM | BufferUsages::STORAGE,
+            )?,
+            rows: Self::ROWS,
+            n,
+        })
+    }
+
+    /// Upload `[ROWS × n]` noise values and encode the add into `out`.
+    pub fn encode(
+        &mut self,
+        backend: &GpuBackend,
+        enc: &mut Enc,
+        noise: &[f32],
+        out: &mut Tensor<f32>,
+    ) -> Result<(), GpuBackendError> {
+        debug_assert_eq!(noise.len(), self.rows as usize * self.n);
+        backend.write_buffer(self.noise.buffer_mut(), 0, noise)?;
+        let mut pass = enc.begin_pass("obs_noise", None);
+        self.shader.kernel.call(
+            &mut pass,
+            [self.rows, self.n as u32, 1],
+            &self.noise,
+            out,
+            &self.params,
+        )
     }
 }
