@@ -122,6 +122,19 @@ pub struct PendingNorm {
 }
 
 impl PendingNorm {
+    /// Rebuild pending statistics from externally-accumulated Welford moments
+    /// (e.g. the GPU `gpu_welford` kernel, whose per-dim arithmetic sequence
+    /// matches `push` exactly). Merged into the live stats by `commit`.
+    pub fn from_moments(count: f32, mean: Vec<f32>, m2: Vec<f32>) -> Self {
+        Self { mean, m2, count }
+    }
+
+    /// The accumulated `(count, mean, m2)` — for parity checks against
+    /// externally-accumulated moments.
+    pub fn moments(&self) -> (f32, &[f32], &[f32]) {
+        (self.count, &self.mean, &self.m2)
+    }
+
     /// Fold one observation into the pending statistics (Welford).
     pub fn push(&mut self, x: &[f32]) {
         self.count += 1.0;

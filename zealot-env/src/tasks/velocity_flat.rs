@@ -912,6 +912,12 @@ impl Default for VelocityFlatTask {
 }
 
 impl VelocityFlatTask {
+    /// The four hip yaw/roll joint indices (canonical order) — consumed by
+    /// the GPU action-rate reward term.
+    pub fn hip_yawroll_idx(&self) -> [usize; 4] {
+        self.hip_yawroll_idx
+    }
+
     /// Build the task with the deployed policy's settings, for the robot
     /// selected by `BIPED_ROBOT` (see [`RobotSpec::from_env`]).
     pub fn new() -> Self {
