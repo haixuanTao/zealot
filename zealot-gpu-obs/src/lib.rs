@@ -527,6 +527,12 @@ impl GpuFeetState {
         })
     }
 
+    /// Device-owned history tensors (air_time `[F × n]`, last_td `[n]`) —
+    /// for consolidated readbacks.
+    pub fn history_tensors(&self) -> (&Tensor<f32>, &Tensor<f32>) {
+        (&self.air_time, &self.last_td)
+    }
+
     /// Clear the device-owned history for the envs that just reset.
     pub async fn reset(
         &mut self,
@@ -1986,5 +1992,88 @@ impl GpuWelford {
         let mean = all[self.dim..2 * self.dim].to_vec();
         let m2 = all[2 * self.dim..].to_vec();
         Ok((count, mean, m2))
+    }
+}
+
+/// `#[derive(Shader)]` supplies `from_backend` for the gather entry.
+#[derive(Shader)]
+struct GatherLinkShader {
+    kernel: shaders::GpuGatherLinkPos,
+}
+
+/// Compact link-position gather (see `gpu_gather_link_pos`) — feeds the
+/// host-side illegal-ground termination predicate without the full pose slurp.
+pub struct GpuGatherLinkPos {
+    shader: GatherLinkShader,
+    links: Tensor<u32>,
+    out: Tensor<f32>,
+    params: Tensor<glamx::UVec4>,
+    nl: u32,
+    n: usize,
+}
+
+impl GpuGatherLinkPos {
+    pub fn new(
+        backend: &GpuBackend,
+        n: usize,
+        links: &[u32],
+        colliders_per_env: u32,
+    ) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        Ok(Self {
+            shader: GatherLinkShader::from_backend(backend)?,
+            links: Tensor::vector(backend, links, st)?,
+            out: Tensor::vector_uninit(
+                backend,
+                (3 * links.len() * n) as u32,
+                st | BufferUsages::COPY_SRC,
+            )?,
+            params: Tensor::scalar(
+                backend,
+                glamx::UVec4::new(links.len() as u32, n as u32, colliders_per_env, 0),
+                BufferUsages::UNIFORM | BufferUsages::STORAGE,
+            )?,
+            nl: links.len() as u32,
+            n,
+        })
+    }
+
+    /// Record the gather into a shared encoder.
+    pub fn encode(
+        &mut self,
+        enc: &mut Enc,
+        body_poses: &Tensor<glamx::Pose3>,
+    ) -> Result<(), GpuBackendError> {
+        let mut pass = enc.begin_pass("gather_link_pos", None);
+        self.shader.kernel.call(
+            &mut pass,
+            [self.nl, self.n as u32, 1],
+            body_poses,
+            &self.links,
+            &mut self.out,
+            &self.params,
+        )
+    }
+
+    /// Read back `[3·L × n]` (x/y/z rows per link, env-major inner).
+    pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
+        backend.slow_read_vec(self.out.buffer()).await
+    }
+
+    /// The device-resident output block, for consolidated readbacks.
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
+    /// One submit: [`Self::encode`] + [`Self::read`].
+    pub async fn compute(
+        &mut self,
+        backend: &GpuBackend,
+        body_poses: &Tensor<glamx::Pose3>,
+    ) -> Result<Vec<f32>, GpuBackendError> {
+        let mut enc = backend.begin_encoding();
+        self.encode(&mut enc, body_poses)?;
+        backend.submit(enc)?;
+        self.read(backend).await
     }
 }

@@ -1735,3 +1735,33 @@ pub fn gpu_welford(
     state.write((dim + d) as usize, mean);
     state.write((2 * dim + d) as usize, m2);
 }
+
+/// Gather selected links' world positions from `body_poses` into a compact
+/// `[3·L × n]` block (x rows, then y, then z per link) — the host-side
+/// termination predicate (illegal-ground contact) needs a handful of link
+/// positions, not the whole pose buffer. One thread per (link, env).
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_gather_link_pos(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] body_poses: &[Pose3],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] links: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] out: &mut [f32],
+    // x = num links L, y = n_envs, z = colliders per env.
+    #[spirv(uniform, descriptor_set = 0, binding = 3)] params: &UVec4,
+) {
+    let l = invocation_id.x;
+    let e = invocation_id.y;
+    let nl = params.x;
+    let n = params.y;
+    let cpe = params.z;
+    if l >= nl || e >= n {
+        return;
+    }
+    let p = body_poses
+        .read((e * cpe + links.read(l as usize)) as usize)
+        .translation;
+    out.write(((l * 3) * n + e) as usize, p.x);
+    out.write(((l * 3 + 1) * n + e) as usize, p.y);
+    out.write(((l * 3 + 2) * n + e) as usize, p.z);
+}

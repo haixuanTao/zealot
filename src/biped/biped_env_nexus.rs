@@ -1786,6 +1786,25 @@ pub struct BipedNexusBatchEnv {
     gpu_gait_terms: Option<zealot_gpu_obs::GpuRewardGaitTerms>,
     /// self_coll / chest_ang_vel / termination.
     gpu_misc_terms: Option<zealot_gpu_obs::GpuRewardMiscTerms>,
+    /// BIPED_GPU_STATE=1: derive joint/base/feet state ON DEVICE (the
+    /// rescued, verified kernels) and read back ~0.9 MB of compact state
+    /// instead of the ~4 MB pose slurp + host derivation. Ground heights are
+    /// probed host-side at the PREVIOUS step's positions (one-step stale —
+    /// same design class as the host-probed step cue).
+    gpu_state: bool,
+    /// Last GPU state readback (base [13n] / feet [26n]) — next step's
+    /// ground-probe positions come from here; xy lanes seeded on reset.
+    gs_base: Vec<f32>,
+    gs_feet: Vec<f32>,
+    /// Compact link-position readback ([3·L × n]) for the host predicates
+    /// (illegal-ground + self-collision pairs) + the gather kernel + the
+    /// link→row map.
+    gpu_link_gather: Option<zealot_gpu_obs::GpuGatherLinkPos>,
+    gs_links: Vec<f32>,
+    gather_slot: std::collections::HashMap<u32, usize>,
+    /// One consolidated device buffer all GPU-state outputs are copied into
+    /// (same submit), so ONE slow_read replaces five per-tensor syncs.
+    gs_all: Option<vortx::tensor::Tensor<f32>>,
     /// Set when `stage_arm_motion` changed HELD-joint entries of the mirror.
     /// Those live in `links_static` alongside the actuated ones, and the motor
     /// scatter only rewrites the actuated entries — so a full mirror upload is
@@ -2584,6 +2603,13 @@ impl BipedNexusBatchEnv {
             motor_targets_host: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
             motor_targets_alt: None,
+            gpu_state: env_var("BIPED_GPU_STATE").as_deref() == Ok("1"),
+            gs_base: vec![0.0; 13 * num_envs],
+            gs_feet: vec![0.0; 26 * num_envs],
+            gpu_link_gather: None,
+            gs_links: Vec::new(),
+            gather_slot: std::collections::HashMap::new(),
+            gs_all: None,
             delay_keff_host: vec![0.0; num_envs],
             delay_keff_gpu: None,
             limit_dwell,
@@ -3036,6 +3062,304 @@ impl BipedNexusBatchEnv {
     /// finite-diffed at the control rate (20 ms) against the cached previous
     /// poses — first step gets zero velocity (mirrors the existing
     /// `has_prev_joint_pos` semantics).
+    /// BIPED_GPU_STATE: run the verified device state-derivation chain
+    /// (joints / base / feet + device-owned feet history) and read back the
+    /// compact blocks. Ground heights are probed at the PREVIOUS step's
+    /// positions from `gs_base`/`gs_feet` (xy lanes seeded on reset).
+    async fn compute_gpu_state(&mut self) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let n = self.n;
+        let bps = self.idx.colliders_per_batch;
+        let dtc = self.task.control_dt();
+        // ---- lazy inits (identical to the BIPED_VERIFY_REWARD wiring) ----
+        if self.gpu_joints.is_none() {
+            let children: Vec<u32> = (0..NUM_JOINTS).map(|k| self.idx.actuated[k].0).collect();
+            let rest: Vec<glamx::Vec4> = (0..NUM_JOINTS)
+                .map(|k| {
+                    let q = self.idx.actuated_rest_quat[k];
+                    glamx::Vec4::new(q.x, q.y, q.z, q.w)
+                })
+                .collect();
+            self.gpu_joints = Some(
+                zealot_gpu_obs::GpuJointState::new(
+                    &self.gpu,
+                    n,
+                    NUM_JOINTS,
+                    &self.idx.actuated_parent_links,
+                    &children,
+                    &rest,
+                    bps,
+                    dtc,
+                )
+                .expect("gpu joint state"),
+            );
+        }
+        if self.gpu_base.is_none() {
+            self.gpu_base = Some(
+                zealot_gpu_obs::GpuBaseState::new(&self.gpu, n, bps, self.idx.torso_link, dtc)
+                    .expect("gpu base state"),
+            );
+        }
+        if self.gpu_feet.is_none() {
+            let ff = self.robot.foot_forward_local;
+            self.gpu_feet = Some(
+                zealot_gpu_obs::GpuFeetState::new(
+                    &self.gpu,
+                    n,
+                    NUM_FEET,
+                    &(0..NUM_FEET).map(|i| self.idx.foot_links[i]).collect::<Vec<_>>(),
+                    &[ff[0], ff[1], ff[2]],
+                    zealot_obs_shaders::FeetStateParams {
+                        n_envs: n as u32,
+                        colliders_per_env: bps,
+                        torso_link: self.idx.torso_link,
+                        control_dt: dtc,
+                        contact_z: env_var("BIPED_CONTACT_Z")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0.05),
+                        contact_force_n: self.contact_force_n,
+                        contact_sense: self.contact_sense as u32,
+                        body_weight: self.robot.total_mass * 9.81,
+                    },
+                )
+                .expect("gpu feet"),
+            );
+        }
+        // ---- per-step inputs (ground from LAST step's readback) ----
+        let hp: Vec<u32> = (0..n).map(|e| self.has_prev_joint_pos[e] as u32).collect();
+        let hpp: Vec<u32> = (0..n).map(|e| self.has_prev_pose[e] as u32).collect();
+        let gh: Vec<f32> = (0..n)
+            .into_par_iter()
+            .map(|e| {
+                let (x, y) = (self.gs_base[11 * n + e], self.gs_base[12 * n + e]);
+                self.terrain.as_ref().map_or(0.0, |ter| ter.strip_for(e).height(x, y))
+            })
+            .collect();
+        let mut sole = vec![0.0f32; NUM_FEET * 3 * n];
+        let mut fgh = vec![0.0f32; NUM_FEET * n];
+        let mut sfv = vec![0.0f32; NUM_FEET * n];
+        let mut pfv = vec![0.0f32; NUM_FEET * n];
+        {
+            // Disjoint per-row rayon fill (probes dominate; rows are [F x n]).
+            let fgh_rows: Vec<f32> = (0..NUM_FEET * n)
+                .into_par_iter()
+                .map(|j| {
+                    let (i, e) = (j / n, j % n);
+                    let (fx, fy) = (
+                        self.gs_feet[(i * 11 + 7) * n + e],
+                        self.gs_feet[(i * 11 + 8) * n + e],
+                    );
+                    self.terrain
+                        .as_ref()
+                        .map_or(0.0, |ter| ter.strip_for(e).height(fx, fy))
+                })
+                .collect();
+            fgh.copy_from_slice(&fgh_rows);
+            for e in 0..n {
+                for i in 0..NUM_FEET {
+                    let sl = self.foot_sole_local[e][i];
+                    sole[(i * 3) * n + e] = sl.x;
+                    sole[(i * 3 + 1) * n + e] = sl.y;
+                    sole[(i * 3 + 2) * n + e] = sl.z;
+                    sfv[i * n + e] = self.sensed_force[e][i];
+                    pfv[i * n + e] = self.prev_sensed_force[e][i];
+                }
+            }
+        }
+        let hpf: Vec<u32> = (0..n).map(|e| self.has_prev_force[e] as u32).collect();
+        // ---- ONE submit for the whole chain (a sync point per kernel is
+        // pure overhead — every kernel is elementwise over envs), then the
+        // readbacks share a single drain. ----
+        let gpu: *const KhalGpuBackend = &self.gpu;
+        let gpu = unsafe { &*gpu };
+        let poses_t = self.state.body_poses();
+        let mut enc = gpu.begin_encoding();
+        self.gpu_joints
+            .as_mut()
+            .unwrap()
+            .encode(gpu, &mut enc, poses_t, &hp)
+            .expect("encode joints");
+        self.gpu_base
+            .as_mut()
+            .unwrap()
+            .encode(gpu, &mut enc, poses_t, &hpp, &gh)
+            .expect("encode base");
+        self.gpu_feet
+            .as_mut()
+            .unwrap()
+            .encode(
+                gpu,
+                &mut enc,
+                poses_t,
+                zealot_gpu_obs::FeetInputs {
+                    sole_local: &sole,
+                    prev_force: &pfv,
+                    ground_h: &fgh,
+                    sensed_force: &sfv,
+                    have_prev: &hpp,
+                    have_prev_force: &hpf,
+                },
+            )
+            .expect("encode feet");
+        if self.gpu_link_gather.is_none() {
+            let mut links: Vec<u32> = self.idx.illegal_ground_links.clone();
+            for &(a, b) in &self.idx.self_collision_pairs {
+                links.push(a);
+                links.push(b);
+            }
+            links.sort_unstable();
+            links.dedup();
+            self.gather_slot = links.iter().enumerate().map(|(i, &l)| (l, i)).collect();
+            self.gpu_link_gather = Some(
+                zealot_gpu_obs::GpuGatherLinkPos::new(gpu, n, &links, bps)
+                    .expect("link gather"),
+            );
+        }
+        self.gpu_link_gather
+            .as_mut()
+            .unwrap()
+            .encode(&mut enc, poses_t)
+            .expect("encode gather");
+        // Consolidate every output into ONE buffer inside the SAME submit,
+        // then a single slow_read replaces five per-tensor syncs (their
+        // memory note's "output consolidation" prerequisite, learned the
+        // hard way: five reads cost more than the pose slurp they replaced).
+        let jn = NUM_JOINTS * n;
+        let nl3 = 3 * self.gather_slot.len();
+        let total = 2 * jn + 13 * n + 26 * n + NUM_FEET * n + n + nl3 * n;
+        if self.gs_all.is_none() {
+            self.gs_all = Some(
+                vortx::tensor::Tensor::vector_uninit(
+                    gpu,
+                    total as u32,
+                    BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+                )
+                .expect("gs_all"),
+            );
+        }
+        {
+            use khal::backend::Encoder as _;
+            let mut all = self.gs_all.take().unwrap();
+            let jt = self.gpu_joints.as_ref().unwrap();
+            let (air_t, ltd_t) = self.gpu_feet.as_ref().unwrap().history_tensors();
+            let mut off = 0usize;
+            for (src, len) in [
+                (jt.q_tensor(), jn),
+                (jt.qd_tensor(), jn),
+                (self.gpu_base.as_ref().unwrap().out_tensor(), 13 * n),
+                (self.gpu_feet.as_ref().unwrap().out_tensor(), 26 * n),
+                (air_t, NUM_FEET * n),
+                (ltd_t, n),
+                (self.gpu_link_gather.as_ref().unwrap().out_tensor(), nl3 * n),
+            ] {
+                enc.copy_buffer_to_buffer(src.buffer(), 0, all.buffer_mut(), off, len)
+                    .expect("consolidate copy");
+                off += len;
+            }
+            self.gs_all = Some(all);
+        }
+        gpu.submit(enc).expect("gpu-state submit");
+        let all: Vec<f32> = gpu
+            .slow_read_vec(self.gs_all.as_ref().unwrap().buffer())
+            .await
+            .expect("gs_all read");
+        let mut off = 0usize;
+        let gq = all[off..off + jn].to_vec();
+        off += jn;
+        let gqd = all[off..off + jn].to_vec();
+        off += jn;
+        let gb = all[off..off + 13 * n].to_vec();
+        off += 13 * n;
+        let gf = all[off..off + 26 * n].to_vec();
+        off += 26 * n;
+        let gair = all[off..off + NUM_FEET * n].to_vec();
+        off += NUM_FEET * n;
+        let gltd = all[off..off + n].to_vec();
+        off += n;
+        self.gs_links = all[off..off + nl3 * n].to_vec();
+        // cache for next step's ground probes
+        self.gs_base.copy_from_slice(&gb);
+        self.gs_feet.copy_from_slice(&gf);
+        (gq, gqd, gb, gf, gair, gltd)
+    }
+
+    /// A gathered link's world position for env `e` (see `gpu_link_gather`).
+    fn gathered_pos(&self, link: u32, e: usize) -> Vec3 {
+        let l = self.gather_slot[&link];
+        Vec3::new(
+            self.gs_links[(l * 3) * self.n + e],
+            self.gs_links[(l * 3 + 1) * self.n + e],
+            self.gs_links[(l * 3 + 2) * self.n + e],
+        )
+    }
+
+    /// Rebuild one env's `RobotState` + feet from the GPU readback blocks —
+    /// the array-unpack mirror of `read_state_from_poses` +
+    /// `compute_feet_from_poses` (verified equal by the BIPED_VERIFY_REWARD
+    /// harnesses).
+    #[allow(clippy::type_complexity)]
+    fn state_from_gpu(
+        &self,
+        e: usize,
+        gq: &[f32],
+        gqd: &[f32],
+        gb: &[f32],
+        gf: &[f32],
+        gair: &[f32],
+    ) -> ([FootObs; NUM_FEET], [f32; NUM_FEET], RobotState, [f32; NUM_JOINTS]) {
+        let n = self.n;
+        let mut joint_pos = [0.0f32; NUM_JOINTS];
+        let mut joint_vel = [0.0f32; NUM_JOINTS];
+        for k in 0..NUM_JOINTS {
+            joint_pos[k] = gq[k * n + e];
+            joint_vel[k] = gqd[k * n + e];
+        }
+        let base = BaseState {
+            orientation: [gb[e], gb[n + e], gb[2 * n + e], gb[3 * n + e]],
+            lin_vel_world: [gb[4 * n + e], gb[5 * n + e], gb[6 * n + e]],
+            ang_vel_world: [gb[7 * n + e], gb[8 * n + e], gb[9 * n + e]],
+            height: gb[10 * n + e],
+            pos_xy: [gb[11 * n + e], gb[12 * n + e]],
+        };
+        let mut feet = [FootObs::default(); NUM_FEET];
+        let mut new_air = [0.0f32; NUM_FEET];
+        for i in 0..NUM_FEET {
+            let b = i * 11;
+            let first_contact = gf[(b + 1) * n + e] > 0.5;
+            feet[i] = FootObs {
+                contact: gf[b * n + e] > 0.5,
+                first_contact,
+                alt_step: first_contact && self.last_td_foot[e] != i as i8,
+                air_time: gf[(b + 2) * n + e],
+                height: gf[(b + 3) * n + e],
+                planar_speed: gf[(b + 4) * n + e],
+                tilt: gf[(b + 5) * n + e],
+                yaw_rel_base: gf[(b + 6) * n + e],
+                pos_xy: [gf[(b + 7) * n + e], gf[(b + 8) * n + e]],
+                vz: gf[(b + 9) * n + e],
+                force_rate: gf[(b + 10) * n + e],
+            };
+            new_air[i] = gair[i * n + e];
+        }
+        (
+            feet,
+            new_air,
+            RobotState {
+                base,
+                joint_pos,
+                joint_vel,
+                last_action: self.last_action[e],
+                prev_action: self.prev_action[e],
+                prev2_action: self.prev2_action[e],
+                feet: [FootObs::default(); NUM_FEET],
+                phase: 0.0,
+                step_cue: Default::default(),
+                step_cue_clean: Default::default(),
+            },
+            joint_pos,
+        )
+    }
+
     fn read_state_from_poses(
         &self,
         env: usize,
@@ -3804,7 +4128,14 @@ impl BipedNexusBatchEnv {
         // close to its real cost, not the GPU compute that piggybacks on the
         // implicit drain.
         let t = Instant::now();
-        let poses = self.slurp_poses().await;
+        // BIPED_GPU_STATE: no pose slurp — the state kernels read poses on
+        // device and only compact blocks come back (below, after the contact
+        // readback they consume).
+        let poses = if self.gpu_state {
+            Vec::new()
+        } else {
+            self.slurp_poses().await
+        };
         // Force-sensed contact (BIPED_CONTACT_SENSE=1): pull the per-foot
         // normal-impulse sums the MB solver folded out during the last physics
         // step of this control tick. Tiny buffer (4 f32 per env) — piggybacks
@@ -3850,6 +4181,11 @@ impl BipedNexusBatchEnv {
                 }
             }
         }
+        let gs = if self.gpu_state {
+            Some(self.compute_gpu_state().await)
+        } else {
+            None
+        };
         self.timings.readback_ns += t.elapsed().as_nanos() as u64;
 
         // (4) Serial pre-pass: step_count + command resample. Cheap; can't
@@ -3861,12 +4197,17 @@ impl BipedNexusBatchEnv {
                 // BIPED_TERRAIN travel metric (AGILE's): accumulate the
                 // straight-line chord from the last resample point.
                 if let Some(ter) = &mut self.terrain {
-                    let p = poses[e * self.idx.colliders_per_batch as usize
-                        + self.idx.torso_link as usize]
-                        .translation;
+                    let (px, py) = if self.gpu_state {
+                        (self.gs_base[11 * self.n + e], self.gs_base[12 * self.n + e])
+                    } else {
+                        let p = poses[e * self.idx.colliders_per_batch as usize
+                            + self.idx.torso_link as usize]
+                            .translation;
+                        (p.x, p.y)
+                    };
                     let [lx, ly] = ter.last_xy[e];
-                    ter.travel[e] += ((p.x - lx).powi(2) + (p.y - ly).powi(2)).sqrt();
-                    ter.last_xy[e] = [p.x, p.y];
+                    ter.travel[e] += ((px - lx).powi(2) + (py - ly).powi(2)).sqrt();
+                    ter.last_xy[e] = [px, py];
                 }
                 self.cmd[e] = eval_cmd_override().unwrap_or_else(|| self.sampler.sample(&mut self.rng[e]));
                 self.resample_at[e] = self.step_count[e]
@@ -4095,8 +4436,14 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             .into_par_iter()
             .with_min_len(64)
             .map(|e| {
-                let (feet, new_air) = self.compute_feet_from_poses(e, &poses);
-                let (mut state, new_joint_pos) = self.read_state_from_poses(e, &poses);
+                let (feet, new_air, mut state, new_joint_pos) =
+                    if let Some((gq, gqd, gb, gf, gair, _)) = gs.as_ref() {
+                        self.state_from_gpu(e, gq, gqd, gb, gf, gair)
+                    } else {
+                        let (feet, new_air) = self.compute_feet_from_poses(e, &poses);
+                        let (state, njp) = self.read_state_from_poses(e, &poses);
+                        (feet, new_air, state, njp)
+                    };
                 state.feet = feet;
                 state.phase = self.gait_phase[e];
                 // Step cue from the foot-probe oracle, with PROBE-shaped error.
@@ -4155,7 +4502,19 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     };
                 }
                 let env_base = e * cpb_idx;
-                let illegal = self.idx.illegal_ground_links.iter().any(|&l| {
+                let illegal = if gs.is_some() {
+                    self.idx.illegal_ground_links.iter().any(|&link| {
+                        let l = self.gather_slot[&link];
+                        let x = self.gs_links[(l * 3) * self.n + e];
+                        let y = self.gs_links[(l * 3 + 1) * self.n + e];
+                        let z = self.gs_links[(l * 3 + 2) * self.n + e];
+                        let gh = self
+                            .terrain
+                            .as_ref()
+                            .map_or(0.0, |ter| ter.strip_for(e).height(x, y));
+                        z - gh < illegal_z
+                    })
+                } else { self.idx.illegal_ground_links.iter().any(|&l| {
                     let p = poses[env_base + l as usize].translation;
                     // BIPED_TERRAIN: threshold vs the LOCAL ground height.
                     let gh = self
@@ -4163,7 +4522,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         .as_ref()
                         .map_or(0.0, |ter| ter.strip_for(e).height(p.x, p.y));
                     p.z - gh < illegal_z
-                });
+                }) };
                 // E-stop termination: legs truly interpenetrating (any L/R pair
                 // inside `sc_term`). Neither engine has leg-leg collision, so on
                 // hardware this state is an operator emergency stop — train the
@@ -4171,8 +4530,14 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 // rare after the first few hundred iters.
                 let crossed = sc_term > 0.0
                     && self.idx.self_collision_pairs.iter().any(|&(a, b)| {
-                        let pa = poses[env_base + a as usize].translation;
-                        let pb = poses[env_base + b as usize].translation;
+                        let (pa, pb) = if gs.is_some() {
+                            (self.gathered_pos(a, e), self.gathered_pos(b, e))
+                        } else {
+                            (
+                                poses[env_base + a as usize].translation,
+                                poses[env_base + b as usize].translation,
+                            )
+                        };
                         (pa - pb).length_squared() < sc_term * sc_term
                     });
                 let vel_fault = vel_term > 0.0
@@ -4309,8 +4674,14 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         .self_collision_pairs
                         .iter()
                         .map(|&(a, b)| {
-                            let pa = poses[env_base + a as usize].translation;
-                            let pb = poses[env_base + b as usize].translation;
+                            let (pa, pb) = if gs.is_some() {
+                                (self.gathered_pos(a, e), self.gathered_pos(b, e))
+                            } else {
+                                (
+                                    poses[env_base + a as usize].translation,
+                                    poses[env_base + b as usize].translation,
+                                )
+                            };
                             (sc_margin - (pa - pb).length()).max(0.0)
                         })
                         .sum();
@@ -5332,7 +5703,10 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             // are disjoint, so batching after the serial mutations is
             // bit-identical to pushing here. Serial it cost ~12 ms/step.)
             self.air_time[e] = c.new_air;
-            if c.td_foot >= 0 {
+            if let Some((_, _, _, _, _, gltd)) = gs.as_ref() {
+                // Device-owned feet history is authoritative.
+                self.last_td_foot[e] = gltd[e] as i8;
+            } else if c.td_foot >= 0 {
                 self.last_td_foot[e] = c.td_foot;
             }
             // Gait clock: fully derived from the command, matching the
@@ -5363,10 +5737,13 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             self.prev_joint_pos[e] = c.new_joint_pos;
             self.has_prev_joint_pos[e] = true;
             // Snapshot poses for this env into prev_body_poses for the next
-            // step's finite-diff base / foot velocities.
+            // step's finite-diff base / foot velocities (host path only —
+            // the device kernels advance their own prev buffers).
             let env_base = e * cpb;
-            self.prev_body_poses[env_base..env_base + cpb]
-                .copy_from_slice(&poses[env_base..env_base + cpb]);
+            if !poses.is_empty() {
+                self.prev_body_poses[env_base..env_base + cpb]
+                    .copy_from_slice(&poses[env_base..env_base + cpb]);
+            }
             self.has_prev_pose[e] = true;
             self.prev2_action[e] = self.prev_action[e];
             self.prev_action[e] = self.last_action[e];
@@ -5378,10 +5755,15 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             // (possibly new) level's patch.
             if c.fell || timeout {
                 if let Some(ter) = &mut self.terrain {
-                    let p = poses[env_base + self.idx.torso_link as usize].translation;
+                    let (px, py) = if let Some((_, _, gb, _, _, _)) = gs.as_ref() {
+                        (gb[11 * self.n + e], gb[12 * self.n + e])
+                    } else {
+                        let p = poses[env_base + self.idx.torso_link as usize].translation;
+                        (p.x, p.y)
+                    };
                     let [lx, ly] = ter.last_xy[e];
                     let traveled =
-                        ter.travel[e] + ((p.x - lx).powi(2) + (p.y - ly).powi(2)).sqrt();
+                        ter.travel[e] + ((px - lx).powi(2) + (py - ly).powi(2)).sqrt();
                     let rng = &mut ter.rng[e];
                     ter.curriculum[e].on_episode_end(traveled, rng);
                 }
