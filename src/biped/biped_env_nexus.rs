@@ -24,6 +24,7 @@
 //! Joint angles / velocities, base linear / angular velocity all come from
 //! `links_workspace[k].{coords, joint_rot, rb_vels}` (rb_vels is world-space).
 
+use khal::BufferUsages;
 use khal::backend::{Backend, Buffer, GpuBackend as KhalGpuBackend};
 use khal::re_exports::wgpu;
 use nexus3d::rbd::dynamics::RbdSimParams;
@@ -1523,6 +1524,21 @@ pub struct BipedNexusBatchEnv {
     /// Trainer-installed dropout override for the actor's step cue (annealed
     /// exploration schedule). None = the BIPED_STEP_CUE_DROPOUT env default.
     step_cue_dropout_override: Option<f32>,
+    /// Per-step leg PD targets, row-major `[NUM_JOINTS x n]` (`j*n + e` — the
+    /// layout `gpu_scatter_motor_targets` reads). Staged host-side then pushed
+    /// in ONE `write_buffer` + one scatter dispatch, replacing the per-env
+    /// `stage_motor_position` mirror staging + full `links_static` upload
+    /// (which re-sent the whole mirror every step). The mirror flush is now
+    /// only needed when arm playback stages held-joint targets — and it must
+    /// run BEFORE the scatter, or the stale mirror legs overwrite it.
+    motor_targets_host: Vec<f32>,
+    motor_targets_gpu: Option<vortx::tensor::Tensor<f32>>,
+    /// Per-env effective delay `k` (0 on the first post-reset step) for the
+    /// on-device delay-state refresh — the only piece of the delay state
+    /// that still crosses PCIe per step ([n] floats; prev-targets are copied
+    /// device-side from the pre-scatter target tensor).
+    delay_keff_host: Vec<f32>,
+    delay_keff_gpu: Option<vortx::tensor::Tensor<f32>>,
     /// AMASS/SONIC upper-body playback (BIPED_ARM_MOTION=<clip dir>): while
     /// the command is "stand", the held waist+arm joints replay a random clip
     /// window as an unobserved moving-mass disturbance, and the legs must
@@ -2442,6 +2458,10 @@ impl BipedNexusBatchEnv {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.8),
             step_cue_dropout_override: None,
+            motor_targets_host: vec![0.0; NUM_JOINTS * num_envs],
+            motor_targets_gpu: None,
+            delay_keff_host: vec![0.0; num_envs],
+            delay_keff_gpu: None,
             limit_dwell,
             global_step: 0,
             dbg_stance: Vec::new(),
@@ -2490,24 +2510,34 @@ impl BipedNexusBatchEnv {
                 .resample_steps(&mut env.rng[e], env.task.control_dt());
             env.arm_resample(e);
         }
+        // Publish the reset templates as GPU-resident blobs ONCE — batched
+        // episode resets read them straight off the device (no per-reset
+        // snapshot clone or staging upload).
+        {
+            let snaps: Vec<&RbdSnapshot> = env.template_snapshots.iter().collect();
+            env.state.publish_reset_templates(&env.gpu, &snaps);
+        }
         // BIPED_TERRAIN: teleport every env onto its initial-level patch (the
         // as-built state stands on flat ground at the origin). Uses the same
         // template each env was built from, so its DR sample is preserved.
         // Training is on-terrain from step 0, like AGILE.
         if env.terrain.is_some() {
+            let dpb = env.state.multibodies_mut().dofs_per_batch_count() as usize;
+            let mut meta = Vec::with_capacity(num_envs);
+            let mut offs = Vec::with_capacity(num_envs);
             for e in 0..num_envs {
                 let t = e % env.templates.len().max(1);
                 let off = env.terrain_spawn_offset(e, t);
-                env.state.reset_env_from_snapshot_offset(
-                    &env.gpu,
-                    e as u32,
-                    &env.template_snapshots[t],
-                    off,
-                );
+                meta.push((e as u32, t as u32));
+                offs.push(off);
                 if env.motor_delay.is_some() {
                     env.delay_fresh[e] = true;
                 }
             }
+            // Zero dof velocities = the templates' build-time state (at rest).
+            let dof_vels = vec![0.0f32; num_envs * dpb];
+            env.state
+                .reset_envs_from_templates(&env.gpu, &meta, &offs, &dof_vels);
         }
         env
     }
@@ -3139,8 +3169,35 @@ impl BipedNexusBatchEnv {
         (sync_ms, graph_ms)
     }
 
+    /// Push the staged `motor_targets_host` to the GPU (one upload + one
+    /// scatter dispatch). When arm playback staged held-joint targets in the
+    /// `links_static` mirror, flush the mirror FIRST: its leg lanes are stale,
+    /// and the scatter overwrites them only if it runs after.
+    fn flush_arms_and_scatter_targets(&mut self) {
+        if self.arm_motion.is_some() || self.live_arm.is_some() {
+            self.state
+                .multibodies_mut()
+                .flush_links_static(&self.gpu)
+                .expect("flush held targets");
+        }
+        let mut tg = self.motor_targets_gpu.take().unwrap_or_else(|| {
+            vortx::tensor::Tensor::vector(
+                &self.gpu,
+                &self.motor_targets_host,
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )
+            .expect("motor targets tensor")
+        });
+        self.gpu
+            .write_buffer(tg.buffer_mut(), 0, &self.motor_targets_host)
+            .expect("motor targets upload");
+        self.scatter_targets_gpu(&tg);
+        self.motor_targets_gpu = Some(tg);
+    }
+
     /// Stage one env's joint position targets into the host `links_static`
     /// mirror (uploaded by the next `flush_links_static`).
+    #[allow(dead_code)]
     fn stage_env_targets(&mut self, e: usize, targets: &[f32; NUM_JOINTS]) {
         for k in 0..NUM_JOINTS {
             let link = self.idx.actuated[k].0;
@@ -3335,9 +3392,16 @@ impl BipedNexusBatchEnv {
         // targets in the one links_static upload.
         self.stage_arm_motion();
 
-        // (1) Stage every env's motor targets host-side in the mirror, then
-        // push the whole `links_static` buffer in ONE write_buffer call.
-        // Replaces `num_envs * NUM_JOINTS` per-step write_buffer calls.
+        // (1) Stage every env's leg targets into the row-major host vec, then
+        // ONE ~[12 x n] upload + one scatter dispatch writes them into the
+        // motor constraints on-device. Replaces the per-env mirror staging +
+        // full `links_static` upload (the whole links mirror crossed PCIe
+        // every step just to change 12 floats per env).
+        //
+        // Arm playback still goes through the mirror: when active, flush it
+        // FIRST — the mirror's leg lanes are stale now, so the scatter must
+        // land after the flush to overwrite them (this ordering is
+        // load-bearing).
         //
         // With BIPED_MOTOR_DELAY, the delay itself runs GPU-side (see the
         // delay-state upload below); staging is identical to the no-delay path.
@@ -3345,23 +3409,14 @@ impl BipedNexusBatchEnv {
         if self.motor_delay.is_none() {
             for e in 0..self.n {
                 let targets = self.task.joint_targets(&actions[e]);
-                for k in 0..NUM_JOINTS {
-                    let link = self.idx.actuated[k].0;
-                    self.state.multibodies_mut().stage_motor_position(
-                        e as u32,
-                        link,
-                        JointAxis::AngZ,
-                        targets[k],
-                    );
+                for (k, t) in targets.iter().enumerate() {
+                    self.motor_targets_host[k * self.n + e] = *t;
                 }
             }
             self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
 
             let t = Instant::now();
-            self.state
-                .multibodies_mut()
-                .flush_links_static(&self.gpu)
-                .expect("flush motor targets");
+            self.flush_arms_and_scatter_targets();
             self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
         } else {
             // GPU-side delay: stage the CURRENT targets for every env (exactly
@@ -3374,50 +3429,90 @@ impl BipedNexusBatchEnv {
             for e in 0..self.n {
                 self.delay_now[e] = self.task.joint_targets(&actions[e]);
                 let tg = self.delay_now[e];
-                self.stage_env_targets(e, &tg);
+                for (k, t) in tg.iter().enumerate() {
+                    self.motor_targets_host[k * self.n + e] = *t;
+                }
             }
             self.timings.stage_motors_ns += t.elapsed().as_nanos() as u64;
 
             let t = Instant::now();
-            self.state
-                .multibodies_mut()
-                .flush_links_static(&self.gpu)
-                .expect("flush motor targets");
-            let stride = self.state.multibodies_mut().motor_delay_stride() as usize;
-            if self.delay_state_buf.len() != stride * self.n {
-                self.delay_state_buf = vec![0.0; stride * self.n];
-            }
-            for e in 0..self.n {
-                let base = e * stride;
-                self.delay_state_buf[base] = 0.0; // tick
-                self.delay_state_buf[base + 1] = if self.delay_fresh[e] {
-                    self.delay_fresh[e] = false;
-                    0.0 // first post-reset command applies from substep 0
-                } else {
-                    self.delay_k[e] as f32
-                };
-                for j in 0..NUM_JOINTS {
-                    let link = self.idx.actuated[j].0 as usize;
-                    self.delay_state_buf[base + 2 + link] = self.delay_prev_targets[e][j];
+            // Device path: refresh the delay state ON-GPU, BEFORE the scatter
+            // overwrites the target tensor — its current content IS last
+            // step's targets, i.e. exactly `delay_prev_targets`. Only `k_eff`
+            // ([n] floats) still crosses PCIe. Host path when arm playback
+            // must mirror held prev lanes, or before the first scatter has
+            // populated the tensor (the delay buffer is zero-init, so
+            // untouched lanes match the host path's zero fill).
+            let host_delay = self.arm_motion.is_some()
+                || self.live_arm.is_some()
+                || self.motor_targets_gpu.is_none();
+            if !host_delay {
+                for e in 0..self.n {
+                    self.delay_keff_host[e] = if self.delay_fresh[e] {
+                        self.delay_fresh[e] = false;
+                        0.0 // first post-reset command applies from substep 0
+                    } else {
+                        self.delay_k[e] as f32
+                    };
                 }
-                // Held links: mirror the just-staged playback target into the
-                // prev slot (prev == current → the delay swap is an identity
-                // for the upper body; the buffer default of 0.0 would dip the
-                // elbows toward q=0 for the first k substeps of every step).
-                if self.arm_motion.is_some() {
-                    let n_held = self.idx.held.len();
-                    for (j, h) in self.idx.held.iter().enumerate() {
-                        self.delay_state_buf[base + 2 + h.link as usize] =
-                            self.arm_staged[e * n_held + j];
+                let mut keff = self.delay_keff_gpu.take().unwrap_or_else(|| {
+                    vortx::tensor::Tensor::vector(
+                        &self.gpu,
+                        &self.delay_keff_host,
+                        BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                    )
+                    .expect("keff tensor")
+                });
+                self.gpu
+                    .write_buffer(keff.buffer_mut(), 0, &self.delay_keff_host)
+                    .expect("keff upload");
+                let tg = self.motor_targets_gpu.take().unwrap();
+                let links = self.actuated_link_ids();
+                self.state
+                    .multibodies_mut()
+                    .update_motor_delay_state_gpu(&self.gpu, &tg, &keff, &links)
+                    .expect("delay state update");
+                self.motor_targets_gpu = Some(tg);
+                self.delay_keff_gpu = Some(keff);
+            }
+            self.flush_arms_and_scatter_targets();
+            if host_delay {
+                let stride = self.state.multibodies_mut().motor_delay_stride() as usize;
+                if self.delay_state_buf.len() != stride * self.n {
+                    self.delay_state_buf = vec![0.0; stride * self.n];
+                }
+                for e in 0..self.n {
+                    let base = e * stride;
+                    self.delay_state_buf[base] = 0.0; // tick
+                    self.delay_state_buf[base + 1] = if self.delay_fresh[e] {
+                        self.delay_fresh[e] = false;
+                        0.0 // first post-reset command applies from substep 0
+                    } else {
+                        self.delay_k[e] as f32
+                    };
+                    for j in 0..NUM_JOINTS {
+                        let link = self.idx.actuated[j].0 as usize;
+                        self.delay_state_buf[base + 2 + link] = self.delay_prev_targets[e][j];
+                    }
+                    // Held links: mirror the just-staged playback target into the
+                    // prev slot (prev == current → the delay swap is an identity
+                    // for the upper body; the buffer default of 0.0 would dip the
+                    // elbows toward q=0 for the first k substeps of every step).
+                    if self.arm_motion.is_some() {
+                        let n_held = self.idx.held.len();
+                        for (j, h) in self.idx.held.iter().enumerate() {
+                            self.delay_state_buf[base + 2 + h.link as usize] =
+                                self.arm_staged[e * n_held + j];
+                        }
                     }
                 }
+                let buf = std::mem::take(&mut self.delay_state_buf);
+                self.state
+                    .multibodies_mut()
+                    .write_motor_delay_state(&self.gpu, &buf)
+                    .expect("write motor delay state");
+                self.delay_state_buf = buf;
             }
-            let buf = std::mem::take(&mut self.delay_state_buf);
-            self.state
-                .multibodies_mut()
-                .write_motor_delay_state(&self.gpu, &buf)
-                .expect("write motor delay state");
-            self.delay_state_buf = buf;
             self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
         }
 
@@ -4310,53 +4405,68 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
     /// Reset one env by copying a randomly-chosen spawn template into its slot.
     /// Returns the fresh obs / critic_obs for that env.
     pub async fn reset_env(&mut self, env: usize) -> (Vec<f32>, Vec<f32>) {
-        // Pick a template via this env's RNG so reset choices are deterministic
-        // for a given seed.
-        let r = self.rng[env].range(0.0, 1.0);
-        let t = ((r * self.templates.len() as f32) as usize).min(self.templates.len() - 1);
-        if self.terrain.is_some() {
+        self.reset_envs(&[env]).await.pop().unwrap()
+    }
+
+    /// Batched episode reset: host bookkeeping per env, then ONE GPU submit
+    /// restoring every env from the GPU-resident templates (no per-reset
+    /// snapshot clone, staging upload, or strided velocity writes — the
+    /// sequential path cost seconds per iteration at early-training fall
+    /// rates). RNG draw order per env matches the old sequential
+    /// `reset_env` exactly: template pick → terrain offset → reset
+    /// velocities → command.
+    pub async fn reset_envs(&mut self, envs: &[usize]) -> Vec<(Vec<f32>, Vec<f32>)> {
+        let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
+        let mut meta = Vec::with_capacity(envs.len());
+        let mut offs = Vec::with_capacity(envs.len());
+        let mut dof_vels = Vec::with_capacity(envs.len() * dpb);
+        let mut tpls = Vec::with_capacity(envs.len());
+        for &env in envs {
+            // Pick a template via this env's RNG so reset choices are
+            // deterministic for a given seed.
+            let r = self.rng[env].range(0.0, 1.0);
+            let t = ((r * self.templates.len() as f32) as usize).min(self.templates.len() - 1);
+            tpls.push(t);
             // Teleport to the env's current difficulty patch (level was
             // already updated by the curriculum when the episode ended).
-            let off = self.terrain_spawn_offset(env, t);
-            self.state.reset_env_from_snapshot_offset(
-                &self.gpu,
-                env as u32,
-                &self.template_snapshots[t],
-                off,
-            );
-        } else {
-            self.state
-                .reset_env_from_snapshot(&self.gpu, env as u32, &self.template_snapshots[t]);
+            let off = if self.terrain.is_some() {
+                self.terrain_spawn_offset(env, t)
+            } else {
+                Vec3::ZERO
+            };
+            meta.push((env as u32, t as u32));
+            offs.push(off);
+            // AGILE reset-velocity randomization: the fresh env starts in
+            // motion. Values land in the dof_state velocity section via the
+            // batch kernel; zeros = the template's build-time state (at rest).
+            let base = dof_vels.len();
+            dof_vels.resize(base + dpb, 0.0);
+            if self.reset_vel {
+                let v = &mut dof_vels[base..];
+                v[0] = self.rng[env].range(-0.25, 0.25);
+                v[1] = self.rng[env].range(-0.25, 0.25);
+                for d in 3..6 {
+                    v[d] = self.rng[env].range(-0.5, 0.5);
+                }
+                for d in 6..dpb {
+                    v[d] = self.rng[env].range(-1.0, 1.0);
+                }
+            }
+            self.reset_host_state(env, t);
         }
-        // AGILE reset-velocity randomization: overwrite the fresh env's dof
-        // velocities (snapshot resets them to 0) so the episode starts in
-        // motion. Layout per env in `dof_state`: [0..3) root lin, [3..6) root
-        // ang, [6..dpb) joint velocities; element-offset write touches only
-        // this env's slice of the velocity section.
-        if self.reset_vel {
-            let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
-            let mut v = vec![0.0f32; dpb];
-            v[0] = self.rng[env].range(-0.25, 0.25);
-            v[1] = self.rng[env].range(-0.25, 0.25);
-            for d in 3..6 {
-                v[d] = self.rng[env].range(-0.5, 0.5);
-            }
-            for d in 6..dpb {
-                v[d] = self.rng[env].range(-1.0, 1.0);
-            }
-            // Upstream-base layout is BATCH-INTERLEAVED (dof d of env e at
-            // d·n + e), so one env's velocities are strided — write per-dof.
-            // Fine at reset frequency; a real port would batch this.
-            for (d, val) in v.iter().enumerate() {
-                self.gpu
-                    .write_buffer(
-                        self.state.multibodies_mut().dof_state_mut().buffer_mut(),
-                        (d * self.n + env) as u64,
-                        core::slice::from_ref(val),
-                    )
-                    .expect("dof_state reset-velocity write");
-            }
+        self.state
+            .reset_envs_from_templates(&self.gpu, &meta, &offs, &dof_vels);
+        let mut out = Vec::with_capacity(envs.len());
+        for (i, &env) in envs.iter().enumerate() {
+            out.push(self.reset_obs(env, tpls[i]).await);
         }
+        out
+    }
+
+    /// The host-side half of an episode reset (everything except the GPU
+    /// state restore): sole-normal cache, command resample, playback/counter/
+    /// sensor bookkeeping, actuator-delay redraw.
+    fn reset_host_state(&mut self, env: usize, t: usize) {
         // Mirror the template's sole-normal so update_feet's tilt makes sense.
         // Cached per-template (constant) — NO per-reset rapier-scene rebuild.
         self.foot_sole_local[env] = self.template_foot_sole[t];
@@ -4395,7 +4505,11 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
         // the next step seeds them again with zero velocity.
         self.has_prev_joint_pos[env] = false;
         self.has_prev_pose[env] = false;
+    }
 
+    /// Fresh obs / critic_obs for a just-reset env (cached template spawn obs
+    /// with the env's new command patched in; readback fallback).
+    async fn reset_obs(&mut self, env: usize, t: usize) -> (Vec<f32>, Vec<f32>) {
         // Fast path: serve the cached per-template spawn obs with the fresh
         // command patched into [12:16] — NO `slurp_poses` readback (the dominant
         // per-reset cost). The post-reset state is the template spawn state
