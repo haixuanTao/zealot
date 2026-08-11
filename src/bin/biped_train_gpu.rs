@@ -112,6 +112,36 @@ fn stage_norm_flat<'a>(
     flat
 }
 
+
+/// Transpose per-env obs `[n][dim]` into the row-major staging `[dim][n]`,
+/// rayon over env blocks: each env's vec is read SEQUENTIALLY (17 cachelines)
+/// instead of the row-major gather's one pointer-chase per (d, e) — ~2x on
+/// wide obs. Blocks own disjoint column ranges, so writes never share lines.
+fn stage_transpose(dst: &mut [f32], src: &[Vec<f32>], dim: usize, n: usize) {
+    const EB: usize = 32;
+    // SAFETY-free parallelism: wrap dst in per-block raw parts via chunks of
+    // the COLUMN index — rayon over env blocks writing strided columns.
+    let dst_ptr = SendPtr(dst.as_mut_ptr());
+    (0..n.div_ceil(EB)).into_par_iter().for_each(|b| {
+        let p = dst_ptr; // move the Send wrapper into the closure
+        let e0 = b * EB;
+        let e1 = (e0 + EB).min(n);
+        for e in e0..e1 {
+            let row = &src[e];
+            for d in 0..dim {
+                // Each block writes columns [e0, e1) only — disjoint.
+                unsafe { *p.0.add(d * n + e) = row[d] };
+            }
+        }
+    });
+}
+
+/// Raw-pointer Send wrapper for the disjoint-column transpose writes.
+#[derive(Clone, Copy)]
+struct SendPtr(*mut f32);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
 fn mk(b: &GpuBackend, m: &DMatrix<f32>, u: BufferUsages) -> Tensor<f32> {
     Tensor::matrix_from_na(b, m, u).unwrap()
 }
@@ -752,9 +782,9 @@ fn main() {
         // BIPED_VERIFY_STAGE=1 (element-wise device-vs-host compare).
         let total_cols = if mirror_aug { 2 * T * n } else { T * n };
         let mut raw_obs_dev =
-            Tensor::<f32>::vector_uninit(&bk, (T * od * n) as u32, rw).unwrap();
+            Tensor::<f32>::vector_uninit(&bk, ((T + 1) * od * n) as u32, rw).unwrap();
         let mut raw_cobs_dev =
-            Tensor::<f32>::vector_uninit(&bk, (T * cd * n) as u32, rw).unwrap();
+            Tensor::<f32>::vector_uninit(&bk, ((T + 1) * cd * n) as u32, rw).unwrap();
         let mut f_obs_dev =
             Tensor::<f32>::matrix_uninit(&bk, od as u32, total_cols as u32, rw).unwrap();
         let mut f_cobs_dev =
@@ -776,6 +806,7 @@ fn main() {
         let sign_id_c = Tensor::vector(&bk, &vec![1.0f32; cd], st).unwrap();
         let sign_mir_c = Tensor::vector(&bk, &sp_c.sign, st).unwrap();
         let mut raw_stage = vec![0.0f32; od.max(cd) * n];
+        let mut gauss_buf: Vec<f32> = Vec::new();
         let verify_stage = std::env::var("BIPED_VERIFY_STAGE").is_ok();
         // Per-step params for the device-side ROLLOUT staging (step_select
         // picks the raw-arena step; the policy input is [dim × n], stride n).
@@ -798,9 +829,9 @@ fn main() {
             .unwrap()
         };
         let prm_roll_o: Vec<Tensor<vortx::linalg::PpoStageParams>> =
-            (0..T).map(|t| stage_prm(od, n, 0, t as u32 + 1)).collect();
+            (0..=T).map(|t| stage_prm(od, n, 0, t as u32 + 1)).collect();
         let prm_roll_c: Vec<Tensor<vortx::linalg::PpoStageParams>> =
-            (0..T).map(|t| stage_prm(cd, n, 0, t as u32 + 1)).collect();
+            (0..=T).map(|t| stage_prm(cd, n, 0, t as u32 + 1)).collect();
         let mut a_net = GpuMlp::new(&bk, &ac.actor, mb);
         let mut c_net = GpuMlp::new(&bk, &ac.critic, mb);
         let ad_ = NUM_JOINTS;
@@ -1044,28 +1075,14 @@ fn main() {
                 // Stage this step's RAW obs into the device rollout arenas
                 // (step-blocked [T][dim][n]) — the update's staging kernel
                 // reads them in place; the batch never re-crosses PCIe.
-                raw_stage[..od * n]
-                    .par_chunks_mut(n)
-                    .enumerate()
-                    .for_each(|(d, row)| {
-                        for (e, r) in row.iter_mut().enumerate() {
-                            *r = gc[e][d];
-                        }
-                    });
+                stage_transpose(&mut raw_stage[..od * n], &gc, od, n);
                 bk.write_buffer(
                     raw_obs_dev.buffer_mut(),
                     (t_step * od * n) as u64,
                     &raw_stage[..od * n],
                 )
                 .unwrap();
-                raw_stage[..cd * n]
-                    .par_chunks_mut(n)
-                    .enumerate()
-                    .for_each(|(d, row)| {
-                        for (e, r) in row.iter_mut().enumerate() {
-                            *r = gcc[e][d];
-                        }
-                    });
+                stage_transpose(&mut raw_stage[..cd * n], &gcc, cd, n);
                 bk.write_buffer(
                     raw_cobs_dev.buffer_mut(),
                     (t_step * cd * n) as u64,
@@ -1081,41 +1098,63 @@ fn main() {
                 // evolve WITHIN the rollout, which a per-iter affine can't
                 // represent).
                 let (means, values) = if norm_freeze {
-                    let mut enc = bk.begin_encoding();
+                    // Staging + both MLP forwards on ONE cursor → one submit.
+                    let mut cur = EncCursor::new(&bk);
                     {
-                        let mut pass = enc.begin_pass("policy_stage", None);
+                        let mut pass = cur.pass("policy_stage");
                         ppo.stage_batch(&mut pass, &prm_roll_o[t_step], &raw_obs_dev, &roll_mean_o, &roll_inv_o, &perm_id_o, &sign_id_o, gpu.actor_input_mut(), n as u32, od as u32).unwrap();
                         ppo.stage_batch(&mut pass, &prm_roll_c[t_step], &raw_cobs_dev, &roll_mean_c, &roll_inv_c, &perm_id_c, &sign_id_c, gpu.critic_input_mut(), n as u32, cd as u32).unwrap();
                     }
-                    bk.submit(enc).unwrap();
-                    gpu.forward_prestaged(&bk).await.unwrap()
+                    gpu.encode_actor(&bk, &mut cur).unwrap();
+                    gpu.encode_critic(&bk, &mut cur).unwrap();
+                    cur.flush();
+                    bk.synchronize().unwrap();
+                    gpu.read_forward_outputs(&bk).await.unwrap()
                 } else {
                     gpu.forward(&bk, &ac, &gc, &gcc).await.unwrap()
                 };
                 pr_fwd += tp.elapsed().as_secs_f64();
                 let tp = Instant::now();
-                let mut acts = Vec::with_capacity(n);
-                for e in 0..n {
-                    let mean = means[e];
-                    let mut a = vec![0.0f32; NUM_JOINTS];
-                    for k in 0..NUM_JOINTS {
-                        a[k] = mean[k] + ac.log_std[k].exp() * rng.gauss();
-                    }
-                    let lp = ac.logp(&a, &mean[..]);
-                    acts.push(to_action(&a));
-                    samp[e].push(Sample {
-                        // The staging kernel reads obs from the device
-                        // arenas; host copies only when the parity check
-                        // needs them.
-                        obs: if verify_stage { gc[e].clone() } else { vec![] },
-                        critic_obs: if verify_stage { gcc[e].clone() } else { vec![] },
-                        action: a,
-                        mean_old: mean.to_vec(),
-                        logp_old: lp,
-                        value_old: values[e],
-                        adv: 0.0,
-                        ret: 0.0,
+                // Phase A (serial, tight): every gauss draw in the EXACT
+                // per-env order of the old loop — the shared-LCG sequence is
+                // training-trajectory-affecting, so it must not change.
+                // Phase B (parallel): the per-env math + allocations, which
+                // dominated this phase's wall-clock.
+                if gauss_buf.len() != n * NUM_JOINTS {
+                    gauss_buf.resize(n * NUM_JOINTS, 0.0);
+                }
+                for g in gauss_buf.iter_mut() {
+                    *g = rng.gauss();
+                }
+                let std_k: [f32; NUM_JOINTS] =
+                    std::array::from_fn(|k| ac.log_std[k].exp());
+                let mut acts = vec![[0.0f32; NUM_JOINTS]; n];
+                acts.par_iter_mut()
+                    .zip(samp.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(e, (act, se))| {
+                        let mean = means[e];
+                        let mut a = vec![0.0f32; NUM_JOINTS];
+                        for k in 0..NUM_JOINTS {
+                            a[k] = mean[k] + std_k[k] * gauss_buf[e * NUM_JOINTS + k];
+                        }
+                        let lp = ac.logp(&a, &mean[..]);
+                        *act = to_action(&a);
+                        se.push(Sample {
+                            // The staging kernel reads obs from the device
+                            // arenas; host copies only when the parity check
+                            // needs them.
+                            obs: if verify_stage { gc[e].clone() } else { vec![] },
+                            critic_obs: if verify_stage { gcc[e].clone() } else { vec![] },
+                            action: a,
+                            mean_old: mean.to_vec(),
+                            logp_old: lp,
+                            value_old: values[e],
+                            adv: 0.0,
+                            ret: 0.0,
+                        });
                     });
+                for e in 0..n {
                     vs[e].push(values[e]);
                 }
                 pr_samp += tp.elapsed().as_secs_f64();
@@ -1178,10 +1217,37 @@ fn main() {
             let roll_s = t_roll.elapsed().as_secs_f64();
             // ---------------- GAE + batch ----------------
             let t_gae = Instant::now();
-            // Per-env bootstrap value + GAE are independent across envs; run them
-            // in parallel, then flatten in env order so the batch is unchanged.
+            // Bootstrap values V(s_T) for ALL envs in ONE device forward:
+            // stage the final post-rollout states into arena slot T and run
+            // the prestaged forward (the actor half rides along, ~free).
+            // Replaces 4096 per-env HOST critic forwards (~0.08 s/iter) —
+            // and is MORE consistent, since every other value in the GAE
+            // stream (`vs`) already came from this same GPU path.
+            let boot_vals: Vec<f32> = if norm_freeze {
+                stage_transpose(&mut raw_stage[..od * n], &gc, od, n);
+                bk.write_buffer(raw_obs_dev.buffer_mut(), (T * od * n) as u64, &raw_stage[..od * n])
+                    .unwrap();
+                stage_transpose(&mut raw_stage[..cd * n], &gcc, cd, n);
+                bk.write_buffer(raw_cobs_dev.buffer_mut(), (T * cd * n) as u64, &raw_stage[..cd * n])
+                    .unwrap();
+                let mut cur = EncCursor::new(&bk);
+                {
+                    let mut pass = cur.pass("bootstrap_stage");
+                    ppo.stage_batch(&mut pass, &prm_roll_o[T], &raw_obs_dev, &roll_mean_o, &roll_inv_o, &perm_id_o, &sign_id_o, gpu.actor_input_mut(), n as u32, od as u32).unwrap();
+                    ppo.stage_batch(&mut pass, &prm_roll_c[T], &raw_cobs_dev, &roll_mean_c, &roll_inv_c, &perm_id_c, &sign_id_c, gpu.critic_input_mut(), n as u32, cd as u32).unwrap();
+                }
+                gpu.encode_actor(&bk, &mut cur).unwrap();
+                gpu.encode_critic(&bk, &mut cur).unwrap();
+                cur.flush();
+                bk.synchronize().unwrap();
+                gpu.read_forward_outputs(&bk).await.unwrap().1
+            } else {
+                (0..n).map(|e| ac.value(&gcc[e])).collect()
+            };
+            // Per-env GAE is independent across envs; run in parallel, then
+            // flatten in env order so the batch is unchanged.
             samp.par_iter_mut().enumerate().for_each(|(e, se)| {
-                let lv = ac.value(&gcc[e]);
+                let lv = boot_vals[e];
                 let (adv, retn) = gae(&rs[e], &vs[e], &ds[e], lv, GAMMA, LAM);
                 for t in 0..T {
                     se[t].adv = adv[t];

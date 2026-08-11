@@ -299,4 +299,31 @@ impl GpuPolicy {
             .encode(backend, &self.ops, &mut self.shapes, cur, self.ct)?;
         Ok(())
     }
+
+    /// Critic counterpart of [`Self::encode_actor`].
+    pub fn encode_critic(&mut self, backend: &GpuBackend, cur: &mut EncCursor) -> anyhow::Result<()> {
+        self.critic
+            .encode(backend, &self.ops, &mut self.shapes, cur, self.ct)?;
+        Ok(())
+    }
+
+    /// Read back (means, values) after an encoded+synchronized forward —
+    /// the readback half of [`Self::forward_prestaged`], for callers that
+    /// fold the staging and MLP encode into one submission.
+    pub async fn read_forward_outputs(
+        &self,
+        backend: &GpuBackend,
+    ) -> anyhow::Result<(Vec<[f32; NUM_JOINTS]>, Vec<f32>)> {
+        let n = self.n;
+        let a_out = backend.slow_read_vec(self.actor.output().buffer()).await?;
+        let c_out = backend.slow_read_vec(self.critic.output().buffer()).await?;
+        let mut means = vec![[0f32; NUM_JOINTS]; n];
+        for e in 0..n {
+            for r in 0..NUM_JOINTS {
+                means[e][r] = a_out[r * n + e];
+            }
+        }
+        let values: Vec<f32> = (0..n).map(|e| c_out[e]).collect();
+        Ok((means, values))
+    }
 }

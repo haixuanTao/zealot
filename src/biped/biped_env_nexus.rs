@@ -1533,6 +1533,10 @@ pub struct BipedNexusBatchEnv {
     /// run BEFORE the scatter, or the stale mirror legs overwrite it.
     motor_targets_host: Vec<f32>,
     motor_targets_gpu: Option<vortx::tensor::Tensor<f32>>,
+    /// Double buffer for the single-submit delay+scatter step: the delay
+    /// kernel must read LAST step's targets at execution time, so the new
+    /// targets upload goes to the alternate tensor and the roles swap.
+    motor_targets_alt: Option<vortx::tensor::Tensor<f32>>,
     /// Per-env effective delay `k` (0 on the first post-reset step) for the
     /// on-device delay-state refresh — the only piece of the delay state
     /// that still crosses PCIe per step ([n] floats; prev-targets are copied
@@ -2460,6 +2464,7 @@ impl BipedNexusBatchEnv {
             step_cue_dropout_override: None,
             motor_targets_host: vec![0.0; NUM_JOINTS * num_envs],
             motor_targets_gpu: None,
+            motor_targets_alt: None,
             delay_keff_host: vec![0.0; num_envs],
             delay_keff_gpu: None,
             limit_dwell,
@@ -3466,16 +3471,53 @@ impl BipedNexusBatchEnv {
                 self.gpu
                     .write_buffer(keff.buffer_mut(), 0, &self.delay_keff_host)
                     .expect("keff upload");
-                let tg = self.motor_targets_gpu.take().unwrap();
+                // One encoder, one submit: delay refresh, then the target
+                // scatter. The delay kernel reads LAST step's targets AT
+                // EXECUTION time, so the new targets are uploaded into the
+                // ALTERNATE tensor (a host write into the same buffer would
+                // land before the queued kernel runs) and the roles swap.
+                let prev_t = self.motor_targets_gpu.take().unwrap();
+                let mut next_t = self.motor_targets_alt.take().unwrap_or_else(|| {
+                    vortx::tensor::Tensor::vector(
+                        &self.gpu,
+                        &self.motor_targets_host,
+                        BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                    )
+                    .expect("motor targets alt tensor")
+                });
+                self.gpu
+                    .write_buffer(next_t.buffer_mut(), 0, &self.motor_targets_host)
+                    .expect("motor targets upload");
                 let links = self.actuated_link_ids();
+                let gpu: *const KhalGpuBackend = &self.gpu;
+                let mut enc = unsafe { &*gpu }.begin_encoding();
                 self.state
                     .multibodies_mut()
-                    .update_motor_delay_state_gpu(&self.gpu, &tg, &keff, &links)
+                    .encode_update_motor_delay_state(
+                        unsafe { &*gpu },
+                        &mut enc,
+                        &prev_t,
+                        &keff,
+                        &links,
+                    )
                     .expect("delay state update");
-                self.motor_targets_gpu = Some(tg);
+                self.state
+                    .multibodies_mut()
+                    .encode_scatter_motor_targets(
+                        unsafe { &*gpu },
+                        &mut enc,
+                        &next_t,
+                        &links,
+                        JointAxis::AngZ as u32,
+                    )
+                    .expect("encode scatter");
+                self.gpu.submit(enc).expect("delay+scatter submit");
+                self.motor_targets_gpu = Some(next_t);
+                self.motor_targets_alt = Some(prev_t);
                 self.delay_keff_gpu = Some(keff);
+            } else {
+                self.flush_arms_and_scatter_targets();
             }
-            self.flush_arms_and_scatter_targets();
             if host_delay {
                 let stride = self.state.multibodies_mut().motor_delay_stride() as usize;
                 if self.delay_state_buf.len() != stride * self.n {
