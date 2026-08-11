@@ -254,6 +254,39 @@ impl GpuPolicy {
         &mut self.actor.a[0]
     }
 
+    /// … the critic's input activation, same contract …
+    pub fn critic_input_mut(&mut self) -> &mut Tensor<f32> {
+        &mut self.critic.a[0]
+    }
+
+    /// Batched forward with the inputs ALREADY staged on device (normalized
+    /// [dim × n] written into `actor_input_mut`/`critic_input_mut` by a
+    /// staging kernel) — skips the host normalize + transpose + upload of
+    /// [`Self::forward`]; the readback halves are identical.
+    pub async fn forward_prestaged(
+        &mut self,
+        backend: &GpuBackend,
+    ) -> anyhow::Result<(Vec<[f32; NUM_JOINTS]>, Vec<f32>)> {
+        let n = self.n;
+        let mut cur = EncCursor::new(backend);
+        self.actor
+            .encode(backend, &self.ops, &mut self.shapes, &mut cur, self.ct)?;
+        self.critic
+            .encode(backend, &self.ops, &mut self.shapes, &mut cur, self.ct)?;
+        cur.flush();
+        backend.synchronize()?;
+        let a_out = backend.slow_read_vec(self.actor.output().buffer()).await?;
+        let c_out = backend.slow_read_vec(self.critic.output().buffer()).await?;
+        let mut means = vec![[0f32; NUM_JOINTS]; n];
+        for e in 0..n {
+            for r in 0..NUM_JOINTS {
+                means[e][r] = a_out[r * n + e];
+            }
+        }
+        let values: Vec<f32> = (0..n).map(|e| c_out[e]).collect();
+        Ok((means, values))
+    }
+
     /// … the output activation (row-major [act_dim × n]) …
     pub fn actor_output(&self) -> &Tensor<f32> {
         self.actor.output()

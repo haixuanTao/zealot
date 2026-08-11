@@ -194,6 +194,16 @@ impl Normalizer {
         pending.m2.clear();
     }
 
+    /// The whitening affine as `(mean, 1/std)` — the exact transform
+    /// [`Self::normalize`] applies (before the ±5 clamp). For fused
+    /// batch-staging paths that inline the normalization.
+    pub fn affine(&self) -> (Vec<f32>, Vec<f32>) {
+        let inv = (0..self.mean.len())
+            .map(|i| 1.0 / (self.m2[i] / self.count).max(1e-8).sqrt())
+            .collect();
+        (self.mean.clone(), inv)
+    }
+
     /// Whiten `x` to ~zero-mean/unit-variance, clamped to ±5.
     pub fn normalize(&self, x: &[f32]) -> Vec<f32> {
         (0..x.len())
