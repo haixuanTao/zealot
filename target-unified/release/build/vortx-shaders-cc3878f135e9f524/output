@@ -1,0 +1,3 @@
+cargo::metadata=manifest_dir=/home/baguette/Documents/work/vortx-unified/vortx-shaders
+cargo:rerun-if-changed=build.rs
+cargo::rustc-check-cfg=cfg(target_arch_is_gpu)
