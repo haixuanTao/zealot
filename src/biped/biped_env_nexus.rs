@@ -29,7 +29,7 @@ use khal::re_exports::wgpu;
 use nexus3d::rbd::dynamics::RbdSimParams;
 use nexus3d::rbd::math::Pose as NexusPose;
 use nexus3d::rbd::math::Vector as NexusVector;
-use nexus3d::rbd::pipeline::{EnvResetSpec, RbdPipeline, RbdSnapshot, RbdState};
+use nexus3d::rbd::pipeline::{RbdPipeline, RbdSnapshot, RbdState};
 use nexus3d::rbd::queries::GpuIndexedContact as NexusIndexedContact;
 use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint as NexusMbContact;
 use nexus3d::rbd::shaders::dynamics::MAX_CONTACT_SENSORS;
@@ -2341,7 +2341,7 @@ impl BipedNexusBatchEnv {
         // instead of re-sending ~10 KB of template state per env.
         {
             let refs: Vec<&RbdSnapshot> = template_snapshots.iter().collect();
-            state.upload_reset_templates(&gpu, &refs);
+            state.publish_reset_templates(&gpu, &refs);
         }
 
         // Per-env initial sole-normal: every env starts from the corresponding
@@ -5406,19 +5406,24 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             // Borrow the templates directly — the spawn teleport is applied by
             // the scatter kernel and the velocity override lands in the staging
             // build, so nothing is cloned per reset.
-            let specs: Vec<EnvResetSpec<'_>> = group
-                .iter()
-                .zip(plans.iter())
-                .zip(ts.iter())
-                .map(|((e, (offset, vels)), t)| EnvResetSpec {
-                    dst_env: *e as u32,
-                    template_idx: *t as u32,
-                    offset: *offset,
-                    dof_vels: vels.as_deref(),
-                })
-                .collect();
-            self.state.reset_envs_from_snapshots(&self.gpu, &specs);
-            drop(specs);
+            let dpb = self.state.multibodies_mut().dofs_per_batch_count() as usize;
+            let mut meta = Vec::with_capacity(group.len());
+            let mut offs = Vec::with_capacity(group.len());
+            // Flat [env x dofs_per_batch]; zeros = the template build-time
+            // (at rest) velocities, matching the old per-env None fallback.
+            let mut dof_vels = vec![0.0f32; group.len() * dpb];
+            for (i, ((e, (offset, vels)), t)) in
+                group.iter().zip(plans.iter()).zip(ts.iter()).enumerate()
+            {
+                meta.push((*e as u32, *t as u32));
+                offs.push(*offset);
+                if let Some(v) = vels.as_deref() {
+                    let m = v.len().min(dpb);
+                    dof_vels[i * dpb..i * dpb + m].copy_from_slice(&v[..m]);
+                }
+            }
+            self.state
+                .reset_envs_from_templates(&self.gpu, &meta, &offs, &dof_vels);
             // The feet history is device-owned, so a reset must clear it there
             // too — otherwise air time keeps accumulating across the teleport
             // and every gait term reads a stale swing.

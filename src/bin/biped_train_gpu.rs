@@ -830,6 +830,12 @@ fn main() {
         let t_so = Tensor::vector(&bk, &mirror_sign_obs, BufferUsages::STORAGE).unwrap();
         let t_pc = Tensor::vector(&bk, &mirror_perm_cobs, BufferUsages::STORAGE).unwrap();
         let t_sc = Tensor::vector(&bk, &mirror_sign_cobs, BufferUsages::STORAGE).unwrap();
+        // Identity tables for the un-mirrored halves (the stage kernel always
+        // applies `perm`/`sign`).
+        let t_po_id = Tensor::vector(&bk, &(0..od as u32).collect::<Vec<u32>>(), BufferUsages::STORAGE).unwrap();
+        let t_so_id = Tensor::vector(&bk, &vec![1.0f32; od], BufferUsages::STORAGE).unwrap();
+        let t_pc_id = Tensor::vector(&bk, &(0..cd as u32).collect::<Vec<u32>>(), BufferUsages::STORAGE).unwrap();
+        let t_sc_id = Tensor::vector(&bk, &vec![1.0f32; cd], BufferUsages::STORAGE).unwrap();
         {
             let mut r = Lcg::new(7);
             let xo: Vec<f32> = (0..od).map(|_| (r.unit() * 6.0 - 3.0)).collect();
@@ -1273,27 +1279,22 @@ fn main() {
             // about obs is materialized on the host.
             let t_stg_dev = Instant::now();
             let half = if mirror_aug { total / 2 } else { 0 };
-            let stage_p = |dim: usize| PpoStageParams {
+            let stage_p = |dim: usize, off: usize| PpoStageParams {
                 dim: dim as u32,
-                num_envs: n as u32,
-                horizon: T as u32,
-                total: total as u32,
-                mirror_half: half as u32,
-                clamp: 5.0,
-                raw_offset: 0,
+                n: n as u32,
+                steps: T as u32,
+                total_cols: total as u32,
+                col_offset: off as u32,
+                step_select: 0,
                 pad1: 0,
+                pad2: 0,
             };
-            // Reuse the very buffers the rollout normalized against.
-            let po = Tensor::scalar(&bk, stage_p(od), BufferUsages::UNIFORM | BufferUsages::STORAGE)
-                .unwrap();
-            let po_mir = Tensor::scalar(
-                &bk,
-                PpoStageParams { mirror_half: total as u32, ..stage_p(od) },
-                BufferUsages::UNIFORM | BufferUsages::STORAGE,
-            )
-            .unwrap();
-            let pc = Tensor::scalar(&bk, stage_p(cd), BufferUsages::UNIFORM | BufferUsages::STORAGE)
-                .unwrap();
+            let pu = BufferUsages::UNIFORM | BufferUsages::STORAGE;
+            // One params tensor per output half (col_offset differs).
+            let po0 = Tensor::scalar(&bk, stage_p(od, 0), pu).unwrap();
+            let po1 = Tensor::scalar(&bk, stage_p(od, half), pu).unwrap();
+            let pc0 = Tensor::scalar(&bk, stage_p(cd, 0), pu).unwrap();
+            let pc1 = Tensor::scalar(&bk, stage_p(cd, half), pu).unwrap();
             // Allocated ONCE (uninit — the kernel writes every element).
             // Rebuilding these per iteration cost a host zero-fill plus a full
             // upload of exactly the bytes this change exists to stop sending.
@@ -1317,22 +1318,26 @@ fn main() {
                 let mut cur = EncCursor::new(&bk);
                 {
                     let mut pass = cur.pass("ppo_stage_obs");
-                    ppo.stage_batch(
-                        &mut pass, &po, gpu.raw_obs(), &nb.perm_o, &nb.sign_o, &nb.mean_o, &nb.inv_o, &mut *f_obs,
-                        (od * total) as u32,
-                    )
-                    .unwrap();
-                    ppo.stage_batch(
-                        &mut pass, &pc, gpu.raw_cobs(), &nb.perm_c, &nb.sign_c, &nb.mean_c, &nb.inv_c, &mut *f_cobs,
-                        (cd * total) as u32,
-                    )
-                    .unwrap();
+                    // Batch layout is [mirrored; originals]: mirror tables for
+                    // the first half, identity for the second.
+                    if mirror_aug {
+                        ppo.stage_batch(&mut pass, &po0, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po, &t_so, &mut *f_obs, half as u32, od as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &po1, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po_id, &t_so_id, &mut *f_obs, half as u32, od as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &pc0, gpu.raw_cobs(), &nb.mean_c, &nb.inv_c, &t_pc, &t_sc, &mut *f_cobs, half as u32, cd as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &pc1, gpu.raw_cobs(), &nb.mean_c, &nb.inv_c, &t_pc_id, &t_sc_id, &mut *f_cobs, half as u32, cd as u32).unwrap();
+                    } else {
+                        ppo.stage_batch(&mut pass, &po0, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po_id, &t_so_id, &mut *f_obs, total as u32, od as u32).unwrap();
+                        ppo.stage_batch(&mut pass, &pc0, gpu.raw_cobs(), &nb.mean_c, &nb.inv_c, &t_pc_id, &t_sc_id, &mut *f_cobs, total as u32, cd as u32).unwrap();
+                    }
+                    // Mirror-loss target: the same staging with each half using
+                    // the other tables (mirror of mirror = identity).
                     if let Some(mir) = f_obs_mir_buf.as_mut() {
-                        ppo.stage_batch(
-                            &mut pass, &po_mir, gpu.raw_obs(), &nb.perm_o, &nb.sign_o, &nb.mean_o,
-                            &nb.inv_o, mir, (od * total) as u32,
-                        )
-                        .unwrap();
+                        if mirror_aug {
+                            ppo.stage_batch(&mut pass, &po0, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po_id, &t_so_id, &mut *mir, half as u32, od as u32).unwrap();
+                            ppo.stage_batch(&mut pass, &po1, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po, &t_so, &mut *mir, half as u32, od as u32).unwrap();
+                        } else {
+                            ppo.stage_batch(&mut pass, &po0, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po, &t_so, &mut *mir, total as u32, od as u32).unwrap();
+                        }
                     }
                 }
                 cur.flush();

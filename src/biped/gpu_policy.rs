@@ -199,6 +199,12 @@ pub struct GpuPolicy {
     stage: vortx::linalg::Ppo,
     stage_p_obs: Option<Tensor<vortx::linalg::PpoStageParams>>,
     stage_p_cobs: Option<Tensor<vortx::linalg::PpoStageParams>>,
+    /// Identity signed-permutation tables (the new stage kernel always
+    /// applies `perm`; the per-step policy-input staging must not mirror).
+    id_perm_o: Option<Tensor<u32>>,
+    id_sign_o: Option<Tensor<f32>>,
+    id_perm_c: Option<Tensor<u32>>,
+    id_sign_c: Option<Tensor<f32>>,
     /// Normalizer affine + (unused here) mirror tables, refreshed per iteration.
     norm: Option<NormBufs>,
     /// Step-blocked `[T][dim][n]` raw rollout observations, retained on device
@@ -220,6 +226,10 @@ impl GpuPolicy {
             stage: vortx::linalg::Ppo::from_backend(backend)?,
             stage_p_obs: None,
             stage_p_cobs: None,
+            id_perm_o: None,
+            id_sign_o: None,
+            id_perm_c: None,
+            id_sign_c: None,
             norm: None,
             raw_obs: None,
             raw_cobs: None,
@@ -300,31 +310,32 @@ impl GpuPolicy {
         self.scratch_raw_obs = ro;
         self.scratch_raw_cobs = rc;
 
-        // Params for the "one step, no mirror" form of the staging kernel.
-        let mk_p = |dim: usize, off: usize| vortx::linalg::PpoStageParams {
+        // Params for the single-step (`step_select`) form of the staging
+        // kernel: columns are the n envs of rollout step `step_sel - 1`.
+        let mk_p = |dim: usize, step_sel: usize| vortx::linalg::PpoStageParams {
             dim: dim as u32,
-            num_envs: n as u32,
-            horizon: 1,
-            total: n as u32,
-            mirror_half: 0,
-            clamp: 5.0,
-            raw_offset: off as u32,
+            n: n as u32,
+            steps: 0,
+            total_cols: n as u32,
+            col_offset: 0,
+            step_select: step_sel as u32,
             pad1: 0,
+            pad2: 0,
         };
         let pu = BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST;
         if self.stage_p_obs.is_none() {
-            self.stage_p_obs = Some(Tensor::scalar(backend, mk_p(obs_dim, 0), pu)?);
-            self.stage_p_cobs = Some(Tensor::scalar(backend, mk_p(crit_dim, 0), pu)?);
+            self.stage_p_obs = Some(Tensor::scalar(backend, mk_p(obs_dim, 1), pu)?);
+            self.stage_p_cobs = Some(Tensor::scalar(backend, mk_p(crit_dim, 1), pu)?);
         }
         backend.write_buffer(
             self.stage_p_obs.as_mut().unwrap().buffer_mut(),
             0,
-            &[mk_p(obs_dim, step * obs_dim * n)],
+            &[mk_p(obs_dim, step + 1)],
         )?;
         backend.write_buffer(
             self.stage_p_cobs.as_mut().unwrap().buffer_mut(),
             0,
-            &[mk_p(crit_dim, step * crit_dim * n)],
+            &[mk_p(crit_dim, step + 1)],
         )?;
 
         let mut cur = EncCursor::new(backend);
@@ -341,12 +352,14 @@ impl GpuPolicy {
             );
             let mut pass = cur.pass("policy_input_normalize");
             stage.stage_batch(
-                &mut pass, po, raw_o, &nb.perm_o, &nb.sign_o, &nb.mean_o, &nb.inv_o,
-                &mut self.actor.a[0], (obs_dim * n) as u32,
+                &mut pass, po, raw_o, &nb.mean_o, &nb.inv_o,
+                self.id_perm_o.as_ref().unwrap(), self.id_sign_o.as_ref().unwrap(),
+                &mut self.actor.a[0], n as u32, obs_dim as u32,
             )?;
             stage.stage_batch(
-                &mut pass, pc, raw_c, &nb.perm_c, &nb.sign_c, &nb.mean_c, &nb.inv_c,
-                &mut self.critic.a[0], (crit_dim * n) as u32,
+                &mut pass, pc, raw_c, &nb.mean_c, &nb.inv_c,
+                self.id_perm_c.as_ref().unwrap(), self.id_sign_c.as_ref().unwrap(),
+                &mut self.critic.a[0], n as u32, crit_dim as u32,
             )?;
         }
         self.actor
@@ -387,6 +400,11 @@ impl GpuPolicy {
         let u = BufferUsages::STORAGE | BufferUsages::COPY_DST;
         self.raw_obs = Some(Tensor::vector_uninit(backend, (horizon * od * n) as u32, u)?);
         self.raw_cobs = Some(Tensor::vector_uninit(backend, (horizon * cd * n) as u32, u)?);
+        let sb = BufferUsages::STORAGE;
+        self.id_perm_o = Some(Tensor::vector(backend, &(0..od as u32).collect::<Vec<u32>>(), sb)?);
+        self.id_sign_o = Some(Tensor::vector(backend, &vec![1.0f32; od], sb)?);
+        self.id_perm_c = Some(Tensor::vector(backend, &(0..cd as u32).collect::<Vec<u32>>(), sb)?);
+        self.id_sign_c = Some(Tensor::vector(backend, &vec![1.0f32; cd], sb)?);
         Ok(())
     }
 
