@@ -15,14 +15,14 @@ physics engine.
 
 <table align="center">
   <tr>
-    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/walk-forward-perturbation.gif" width="290" alt="Forward walk under pushes"><br><sub>Forward walk under pushes</sub></td>
-    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/walk-backward.gif" width="290" alt="Backward walk"><br><sub>Backward walk</sub></td>
-    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/lateral-walk.gif" width="290" alt="Lateral walk"><br><sub>Lateral walk</sub></td>
+    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/walk-forward-perturbation.gif" width="230" alt="Forward walk under pushes"><br><sub>Forward walk under pushes</sub></td>
+    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/walk-backward.gif" width="230" alt="Backward walk"><br><sub>Backward walk</sub></td>
+    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/lateral-walk.gif" width="230" alt="Lateral walk"><br><sub>Lateral walk</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/yaw-rotation.gif" width="290" alt="Yaw tracking"><br><sub>Yaw tracking</sub></td>
-    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/pick-and-place.gif" width="290" alt="Upper-body teleop pick and place"><br><sub>Upper-body teleop (pick &amp; place)</sub></td>
-    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/dancing.gif" width="290" alt="Dancing"><br><sub>Dancing</sub></td>
+    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/yaw-rotation.gif" width="230" alt="Yaw tracking"><br><sub>Yaw tracking</sub></td>
+    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/pick-and-place.gif" width="230" alt="Upper-body teleop pick and place"><br><sub>Upper-body teleop (pick &amp; place)</sub></td>
+    <td align="center"><img src="https://github.com/haixuanTao/zealot/releases/download/readme-media-2026-08-13/dancing.gif" width="230" alt="Dancing"><br><sub>Dancing</sub></td>
   </tr>
 </table>
 
