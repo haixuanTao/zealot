@@ -13,7 +13,25 @@ PPO trainer, and deployment — written entirely in Rust, on top of
 [nexus](https://github.com/dimforge/nexus), dimforge's cross-platform GPU
 physics engine.
 
-[![Tap the ground and the G1 walks there — live in the browser](docs/img/web-demo.gif)](https://haixuantao.github.io/zealot/)
+<p align="center">
+  <a href="https://haixuantao.github.io/zealot/"><img src="docs/gifs/walk-forward-perturbation.gif" width="320" alt="Zero-shot sim-to-real: the physical G1 walking forward under pushes on a zealot policy"></a>
+</p>
+
+**Zero-shot sim-to-real.** The policy above trained entirely in the nexus
+GPU env — the same one running in the [browser
+demo](https://haixuantao.github.io/zealot/) — and drives the physical G1
+unchanged (`deploy/g1_real`, 50 Hz PD over DDS): no fine-tuning, no
+adaptation pass, walking forward while being pushed.
+
+## On the real robot
+
+| Backward walk | Lateral walk | Yaw tracking | Upper-body teleop |
+| :-: | :-: | :-: | :-: |
+| ![Walking backward](docs/gifs/walk-backward.gif) | ![Lateral walk](docs/gifs/lateral-walk.gif) | ![Yaw rotation](docs/gifs/yaw-rotation.gif) | ![Pick-and-place with teleoperated arms while the policy balances](docs/gifs/pick-and-place.gif) |
+
+The velocity command tracks in every direction, and the held upper-body
+joints can be driven externally — VR teleop for pick-and-place — while the
+legs keep balance, the same disturbance regime the policy trained under.
 
 ## Why it's built this way
 
