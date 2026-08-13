@@ -2660,8 +2660,25 @@ impl BipedNexusBatchEnv {
                 );
                 on
             },
-            use_gpu_obs: std::env::var("BIPED_GPU_OBS").is_ok()
-                && std::env::var("BIPED_VERIFY_REWARD").is_err(),
+            use_gpu_obs: {
+                // DEFAULT ON (with the device reward stack — they were
+                // measured as a pair): obs assembled + stacked + noised on
+                // device, host keeps a 1/16 stats subsample.
+                // `BIPED_GPU_OBS=0` opts back into host assembly;
+                // `BIPED_VERIFY_REWARD` forces the host paths. Non-CUDA
+                // backends fall back at the first step (guard in `step`).
+                let on = std::env::var("BIPED_GPU_OBS").map_or(true, |v| v != "0")
+                    && std::env::var("BIPED_VERIFY_REWARD").is_err();
+                eprintln!(
+                    "[env] obs assembly: {}",
+                    if on {
+                        "DEVICE (stack+noise on gpu; BIPED_GPU_OBS=0 for host)"
+                    } else {
+                        "HOST"
+                    }
+                );
+                on
+            },
             gpu_obs_stack: None,
             dev_obs_head: Vec::new(),
             dev_obs_reset: Vec::new(),
