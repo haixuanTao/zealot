@@ -13,7 +13,13 @@ PPO trainer, and deployment — written entirely in Rust, on top of
 [nexus](https://github.com/dimforge/nexus), dimforge's cross-platform GPU
 physics engine.
 
-[![Tap the ground and the G1 walks there — live in the browser](docs/img/web-demo.gif)](https://haixuantao.github.io/zealot/)
+<p align="center">
+  <img src="docs/gifs/walk-forward-perturbation.gif" width="290" alt="Forward walk under pushes">
+  <img src="docs/gifs/walk-backward.gif" width="290" alt="Backward walk">
+  <img src="docs/gifs/lateral-walk.gif" width="290" alt="Lateral walk">
+  <img src="docs/gifs/yaw-rotation.gif" width="290" alt="Yaw tracking">
+  <img src="docs/gifs/pick-and-place.gif" width="290" alt="Upper-body teleop pick and place">
+</p>
 
 ## Why it's built this way
 

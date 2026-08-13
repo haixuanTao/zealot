@@ -1,10 +1,10 @@
 //! Retargeted mocap clips (AMASS / SONIC → G1 joint space), used as an
-//! upper-body DISTURBANCE source for the balance curriculum: while the
-//! command is "stand", the held (non-action) joints replay a random window
-//! of a random clip, so the legs learn to keep the pelvis level under
-//! realistic arm + waist motion instead of a frozen home pose. The policy
-//! never observes the upper body — the moving mass is an unmodeled
-//! perturbation, exactly like a human carrying/gesturing.
+//! upper-body DISTURBANCE source for the balance curriculum: under any
+//! command — standing or walking — the held (non-action) joints replay a
+//! random window of a random clip, so the legs learn to keep the pelvis
+//! level under realistic arm + waist motion instead of a frozen home pose.
+//! The policy never observes the upper body — the moving mass is an
+//! unmodeled perturbation, exactly like a human carrying/gesturing.
 //!
 //! File format: the SONIC CSV export. Header row
 //! `Frame,root_translateX..Z,root_rotateX..Z,<joint>_dof,...`; angles are
