@@ -13,22 +13,13 @@ PPO trainer, and deployment — written entirely in Rust, on top of
 [nexus](https://github.com/dimforge/nexus), dimforge's cross-platform GPU
 physics engine.
 
-**Zero-shot sim-to-real.** Every clip below is the physical G1 driven by a
-policy trained entirely in the nexus GPU env — the same one running in the
-[browser demo](https://haixuantao.github.io/zealot/) — deployed unchanged
-(`deploy/g1_real`, 50 Hz PD over DDS): no fine-tuning, no adaptation pass.
-
-| Forward walk under pushes | Backward walk | Lateral walk |
-| :-: | :-: | :-: |
-| ![The G1 walking forward while being pushed](docs/gifs/walk-forward-perturbation.gif) | ![Walking backward](docs/gifs/walk-backward.gif) | ![Lateral walk](docs/gifs/lateral-walk.gif) |
-
-| Yaw tracking | Upper-body teleop (pick & place) |
-| :-: | :-: |
-| ![Yaw rotation](docs/gifs/yaw-rotation.gif) | ![Pick-and-place with teleoperated arms while the policy balances](docs/gifs/pick-and-place.gif) |
-
-The velocity command tracks in every direction, and the held upper-body
-joints can be driven externally — VR teleop for pick-and-place — while the
-legs keep balance, the same disturbance regime the policy trained under.
+<p align="center">
+  <img src="docs/gifs/walk-forward-perturbation.gif" width="290" alt="Forward walk under pushes">
+  <img src="docs/gifs/walk-backward.gif" width="290" alt="Backward walk">
+  <img src="docs/gifs/lateral-walk.gif" width="290" alt="Lateral walk">
+  <img src="docs/gifs/yaw-rotation.gif" width="290" alt="Yaw tracking">
+  <img src="docs/gifs/pick-and-place.gif" width="290" alt="Upper-body teleop pick and place">
+</p>
 
 ## Why it's built this way
 
