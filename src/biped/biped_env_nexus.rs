@@ -1787,6 +1787,10 @@ pub struct BipedNexusBatchEnv {
     dev_obs_seed: u32,
     /// `BIPED_OBS_NOISE` scale, resolved once.
     dev_obs_noise: f32,
+    /// Consolidated `[32 x n]` staging for ALL reward-term outputs — packed
+    /// by device copies inside the fused submit so ONE readback replaces
+    /// seven per-group round trips.
+    gpu_terms_all: Option<vortx::tensor::Tensor<f32>>,
     /// `BIPED_SKIP_OBS`: skip the host obs assembly to price it. Wrong
     /// training; measurement only.
     skip_obs: bool,
@@ -2650,6 +2654,7 @@ impl BipedNexusBatchEnv {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1.0),
+            gpu_terms_all: None,
             cached_cue_b: Vec::new(),
             cached_gh: Vec::new(),
             skip_obs: std::env::var("BIPED_SKIP_OBS").is_ok(),
@@ -5746,6 +5751,33 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         .encode(&self.gpu, &mut enc, mp, pt, &pchest, &hpp, &fellv)
                         .expect("enc misc terms");
                 }
+                if rg {
+                    // Pack all seven term outputs into one staging tensor
+                    // (device copies ride the same submit) — ONE readback
+                    // instead of seven round trips.
+                    use khal::backend::Encoder as _;
+                    if self.gpu_terms_all.is_none() {
+                        self.gpu_terms_all = Some(
+                            vortx::tensor::Tensor::vector_uninit(
+                                &self.gpu,
+                                (32 * n) as u32,
+                                khal::BufferUsages::STORAGE
+                                    | khal::BufferUsages::COPY_DST
+                                    | khal::BufferUsages::COPY_SRC,
+                            )
+                            .expect("terms_all"),
+                        );
+                    }
+                    let dst = self.gpu_terms_all.as_mut().unwrap();
+                    let mut db = dst.buffer_mut();
+                    enc.copy_buffer_to_buffer::<f32>(&self.gpu_reward.as_ref().unwrap().out_tensor().buffer(), 0, &mut db, 0, 3 * n).expect("pack act");
+                    enc.copy_buffer_to_buffer::<f32>(&self.gpu_joint_terms.as_ref().unwrap().out_tensor().buffer(), 0, &mut db, 3 * n, 4 * n).expect("pack jnt");
+                    enc.copy_buffer_to_buffer::<f32>(&self.gpu_torque_terms.as_ref().unwrap().out_tensor().buffer(), 0, &mut db, 7 * n, 3 * n).expect("pack trq");
+                    enc.copy_buffer_to_buffer::<f32>(&self.gpu_base_terms.as_ref().unwrap().out_tensor().buffer(), 0, &mut db, 10 * n, 6 * n).expect("pack bas");
+                    enc.copy_buffer_to_buffer::<f32>(&self.gpu_feet_terms.as_ref().unwrap().out_tensor().buffer(), 0, &mut db, 16 * n, 8 * n).expect("pack fee");
+                    enc.copy_buffer_to_buffer::<f32>(&self.gpu_gait_terms.as_ref().unwrap().out_tensor().buffer(), 0, &mut db, 24 * n, 5 * n).expect("pack gai");
+                    enc.copy_buffer_to_buffer::<f32>(&self.gpu_misc_terms.as_ref().unwrap().out_tensor().buffer(), 0, &mut db, 29 * n, 3 * n).expect("pack mis");
+                }
                 self.gpu.submit(enc).expect("gpu reward submit");
             }
             if go && self.gpu_obs_stack.is_some() {
@@ -5761,15 +5793,17 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 self.dev_obs_seed = self.dev_obs_seed.wrapping_add(0x9e37_79b9);
             }
 
-            // -- term-matrix readbacks (the only D2H the rewards need) --
+            // -- ONE consolidated term readback (the only D2H rewards need) --
             if rg {
-            let rt = self.gpu_reward.as_ref().unwrap().read(&self.gpu).await.expect("rd action");
-            let jt = self.gpu_joint_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd joint");
-            let tt = self.gpu_torque_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd torque");
-            let btm = self.gpu_base_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd base");
-            let ftm = self.gpu_feet_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd feet");
-            let gtm = self.gpu_gait_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd gait");
-            let mtm = self.gpu_misc_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd misc");
+            let all = self
+                .gpu
+                .slow_read_vec(self.gpu_terms_all.as_ref().unwrap().buffer())
+                .await
+                .expect("rd terms");
+            let (rt, jt) = (&all[..3 * n], &all[3 * n..7 * n]);
+            let (tt, btm) = (&all[7 * n..10 * n], &all[10 * n..16 * n]);
+            let (ftm, gtm) = (&all[16 * n..24 * n], &all[24 * n..29 * n]);
+            let mtm = &all[29 * n..32 * n];
 
             // -- scatter into comps by the verified mappings; total = Σ comps --
             const ACT_T: [(usize, usize); 3] = [(6, 0), (7, 1), (29, 2)];

@@ -135,6 +135,11 @@ impl GpuRewardMiscTerms {
 
     /// Read this kernel's output. Valid only once the encoder it was recorded
     /// into has been submitted.
+    /// This group's `[rows x n]` output tensor (for the consolidation copies).
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
     pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
@@ -266,6 +271,11 @@ impl GpuRewardGaitTerms {
 
     /// Read this kernel's output. Valid only once the encoder it was recorded
     /// into has been submitted.
+    /// This group's `[rows x n]` output tensor (for the consolidation copies).
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
     pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
@@ -402,6 +412,11 @@ impl GpuRewardFeetTerms {
 
     /// Read this kernel's output. Valid only once the encoder it was recorded
     /// into has been submitted.
+    /// This group's `[rows x n]` output tensor (for the consolidation copies).
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
     pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
@@ -770,6 +785,11 @@ impl GpuRewardBaseTerms {
 
     /// Read this kernel's output. Valid only once the encoder it was recorded
     /// into has been submitted.
+    /// This group's `[rows x n]` output tensor (for the consolidation copies).
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
     pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
@@ -1177,6 +1197,11 @@ impl GpuRewardTorqueTerms {
 
     /// Read this kernel's output. Valid only once the encoder it was recorded
     /// into has been submitted.
+    /// This group's `[rows x n]` output tensor (for the consolidation copies).
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
     pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
@@ -1334,6 +1359,11 @@ impl GpuRewardJointTerms {
 
     /// Read this kernel's output. Valid only once the encoder it was recorded
     /// into has been submitted.
+    /// This group's `[rows x n]` output tensor (for the consolidation copies).
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
     pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
@@ -1491,6 +1521,11 @@ impl GpuRewardTerms {
 
     /// Read this kernel's output. Valid only once the encoder it was recorded
     /// into has been submitted.
+    /// This group's `[rows x n]` output tensor (for the consolidation copies).
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
     pub async fn read(&self, backend: &GpuBackend) -> Result<Vec<f32>, khal::backend::GpuBackendError> {
         backend.slow_read_vec(self.out.buffer()).await
     }
