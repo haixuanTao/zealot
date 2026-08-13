@@ -1758,7 +1758,8 @@ pub struct BipedNexusBatchEnv {
     /// `BIPED_SKIP_REWARD`: skip the host reward evaluation to price it. Gives
     /// WRONG training; measurement only.
     skip_reward: bool,
-    /// `BIPED_GPU_REWARD=1`: consume the GPU reward terms as the source of
+    /// GPU reward terms as the source of truth — DEFAULT ON
+    /// (`BIPED_GPU_REWARD=0` opts back into host evaluation): consume
     /// truth — the host term math is skipped and `comps` are filled from the
     /// device stack (one fused encode + submit per step, term-matrix
     /// readbacks only). The host keeps state assembly, obs, the step cue,
@@ -2642,8 +2643,23 @@ impl BipedNexusBatchEnv {
             gpu_observe: None,
             verify_cue: std::env::var("BIPED_VERIFY_CUE").is_ok(),
             skip_reward: std::env::var("BIPED_SKIP_REWARD").is_ok(),
-            use_gpu_reward: std::env::var("BIPED_GPU_REWARD").is_ok()
-                && std::env::var("BIPED_VERIFY_REWARD").is_err(),
+            use_gpu_reward: {
+                // DEFAULT ON: the fused device term stack is the production
+                // reward path (verified element-exact against the host terms).
+                // `BIPED_GPU_REWARD=0` opts back into the host evaluation;
+                // `BIPED_VERIFY_REWARD` forces host + comparison.
+                let on = std::env::var("BIPED_GPU_REWARD").map_or(true, |v| v != "0")
+                    && std::env::var("BIPED_VERIFY_REWARD").is_err();
+                eprintln!(
+                    "[env] reward terms: {}",
+                    if on {
+                        "DEVICE (fused gpu term stack; BIPED_GPU_REWARD=0 for host)"
+                    } else {
+                        "HOST"
+                    }
+                );
+                on
+            },
             use_gpu_obs: std::env::var("BIPED_GPU_OBS").is_ok()
                 && std::env::var("BIPED_VERIFY_REWARD").is_err(),
             gpu_obs_stack: None,
