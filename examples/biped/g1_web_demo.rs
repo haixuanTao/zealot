@@ -1039,10 +1039,10 @@ pub async fn run(cfg: DemoCfg) {
         OrbitCamera3d::new(Vec3::new(-4.5, -5.5, 3.2), Vec3::new(0.0, 0.0, 0.6))
     };
     camera.set_up_axis(Vec3::Z);
-    // The demo opens already framed on one robot, and the page scrolls under
-    // the canvas — so the wheel may only pull OUT from here. Zooming further
-    // in just buries the camera in the robot and steals the page's scroll.
-    camera.set_min_dist(camera.dist());
+    // The embedding page owns the plain wheel (it scrolls); zoom arrives as
+    // ctrl/cmd+wheel or a trackpad pinch, both directions. Floor the zoom
+    // just short of burying the camera inside the robot.
+    camera.set_min_dist(0.8);
 
     let mut scene = SceneNode3d::empty();
     scene.add_directional_light(Vec3::new(1.0, -2.0, -3.0));

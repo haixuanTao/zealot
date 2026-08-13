@@ -294,8 +294,9 @@ function GitHubButton({large}: {large?: boolean}) {
   );
 }
 
-/// The demo iframes forward downward wheel events instead of zooming, so the
-/// page keeps scrolling even while the cursor is over a canvas.
+/// The demo iframes forward plain wheel events (both directions) instead of
+/// zooming — ctrl/cmd+wheel zooms inside the iframe — so the page keeps
+/// scrolling even while the cursor is over a canvas.
 function useForwardedScroll() {
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {

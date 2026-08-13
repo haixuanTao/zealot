@@ -264,18 +264,37 @@ write_index_html() {
     })();
   </script>
   <script>
-    // The page embedding this demo scrolls; the canvas would otherwise eat
-    // every wheel event. Scrolling DOWN is forwarded to the parent so the
-    // story below the fold stays reachable — the wheel still zooms the
-    // camera OUT (scroll up), which is all that's useful since the demo
-    // opens already framed on one robot.
-    addEventListener('wheel', (e) => {
-      if (e.deltaY > 0 && parent !== window) {
+    // Embedded-maps wheel contract: a plain wheel always scrolls the
+    // EMBEDDING page (forwarded both directions, so the story below the
+    // fold stays reachable), while ctrl/cmd+wheel — which is also what a
+    // trackpad pinch reports — falls through to the canvas and zooms the
+    // camera BOTH ways. A transient overlay teaches the modifier whenever
+    // a plain wheel hits. Standalone opens keep plain-wheel zoom.
+    (() => {
+      if (parent === window) return;
+      const hint = document.createElement('div');
+      hint.textContent = /Mac|iP/.test(navigator.platform || '')
+        ? '⌘ + scroll to zoom' : 'Ctrl + scroll to zoom';
+      hint.style.cssText = 'position:fixed;left:50%;bottom:18%;transform:translateX(-50%);'
+        + 'background:#000b;color:#9fd8dc;font:13px system-ui;padding:8px 14px;'
+        + 'border-radius:6px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:9';
+      document.body.appendChild(hint);
+      let t;
+      addEventListener('wheel', (e) => {
+        if (e.ctrlKey || e.metaKey) {
+          // Keep the browser's own page-zoom off; the event still
+          // propagates to the canvas, where winit zooms the camera.
+          e.preventDefault();
+          return;
+        }
         e.preventDefault();
         e.stopPropagation();
         parent.postMessage({zealotScroll: e.deltaY}, location.origin);
-      }
-    }, {capture: true, passive: false});
+        hint.style.opacity = '1';
+        clearTimeout(t);
+        t = setTimeout(() => { hint.style.opacity = '0'; }, 1200);
+      }, {capture: true, passive: false});
+    })();
   </script>
   <script type="module">
     import init from './pkg/example.js';
