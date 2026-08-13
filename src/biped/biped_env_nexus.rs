@@ -1788,6 +1788,10 @@ pub struct BipedNexusBatchEnv {
     dev_obs_seed: u32,
     /// `BIPED_OBS_NOISE` scale, resolved once.
     dev_obs_noise: f32,
+    /// `BIPED_VERIFY_REWARD` resolved once — gates the verify-only debug
+    /// field population in the per-env closure (feet_dbg, joint_vel_dbg),
+    /// which costs real time at 4096 envs when populated every step.
+    verify_mode: bool,
     /// Consolidated `[32 x n]` staging for ALL reward-term outputs — packed
     /// by device copies inside the fused submit so ONE readback replaces
     /// seven per-group round trips.
@@ -2687,6 +2691,7 @@ impl BipedNexusBatchEnv {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1.0),
+            verify_mode: std::env::var("BIPED_VERIFY_REWARD").is_ok(),
             gpu_terms_all: None,
             cached_cue_b: Vec::new(),
             cached_gh: Vec::new(),
@@ -4358,12 +4363,25 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 // measurement only. Vectors keep their length so every
                 // downstream consumer (gc/gcc, fill_raw, the bootstrap) still
                 // does its normal work — this isolates assembly, not transfer.
-                let mut obs = vec![0.0; OBS_DIM];
-                let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
                 // Under BIPED_GPU_OBS the device assembles the policy obs;
                 // the host keeps a 1/16 stride subsample purely to feed the
                 // normalizer statistics (uniform across terrain families).
-                if !self.skip_obs && (!self.use_gpu_obs || (e & 15) == 0) {
+                // Non-subsample envs get EMPTY vecs — no alloc/zero/noise/
+                // stack for 15/16 of the batch (~5 MB/step of zeroing).
+                // Envs hitting the episode-timeout cap THIS step also get
+                // host obs: the trainer bootstraps V(s_final) with a host
+                // critic forward on `critic_obs` for truncated (not fallen)
+                // episodes — an empty vec there is a panic. (step_count was
+                // already incremented, so this matches the serial commit's
+                // `timeout` predicate exactly.)
+                let host_obs = !self.skip_obs
+                    && (!self.use_gpu_obs
+                        || (e & 15) == 0
+                        || self.step_count[e] >= self.task.max_steps());
+                let mut obs = if host_obs { vec![0.0; OBS_DIM] } else { Vec::new() };
+                let mut critic_obs =
+                    if host_obs { vec![0.0; CRITIC_OBS_DIM] } else { Vec::new() };
+                if host_obs {
                     self.task.observe(&state, &self.cmd[e], &mut obs);
                     self.task
                         .observe_critic(&state, &self.cmd[e], &mut critic_obs);
@@ -4377,7 +4395,11 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     }
                 }
                 PerEnv {
-                    joint_vel_dbg: state.joint_vel,
+                    joint_vel_dbg: if self.verify_mode {
+                        state.joint_vel
+                    } else {
+                        [0.0; NUM_JOINTS]
+                    },
                     // The host's `stepping` predicate, recomputed here from the
                     // same state the reward uses, so the GPU gate is checked
                     // against the identical condition.
@@ -4396,6 +4418,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     cue_h_dbg: state.step_cue.height,
                     feet_dbg: {
                         let mut f = [0.0f32; 22];
+                        if self.verify_mode {
                         for (i, fo) in state.feet.iter().enumerate() {
                             let b = i * 11;
                             f[b] = fo.contact as u8 as f32;
@@ -4409,6 +4432,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                             f[b + 8] = fo.pos_xy[1];
                             f[b + 9] = fo.vz;
                             f[b + 10] = fo.force_rate;
+                        }
                         }
                         f
                     },
@@ -5900,7 +5924,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             .unwrap_or(1.0);
         let mut outs = Vec::with_capacity(self.n);
         for (e, mut c) in computed.into_iter().enumerate() {
-            if obs_noise > 0.0 {
+            if obs_noise > 0.0 && !c.obs.is_empty() {
                 let rng = &mut self.rng[e];
                 // joint_pos_rel [16..28]: ±0.01 rad
                 for v in &mut c.obs[NUM_JOINTS + 4..2 * NUM_JOINTS + 4] {
@@ -6020,7 +6044,13 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             hist.env_views()
                 .into_par_iter()
                 .zip(outs.par_iter_mut())
-                .for_each(|(mut view, o)| view.push_stacked_replace(&mut o.obs));
+                .for_each(|(mut view, o)| {
+                    // Device-obs mode: non-subsample envs carry no host obs;
+                    // their rings refresh at reset (reset_stacked) instead.
+                    if !o.obs.is_empty() {
+                        view.push_stacked_replace(&mut o.obs);
+                    }
+                });
         }
         self.timings.serial_commit_ns += t.elapsed().as_nanos() as u64;
         self.timings.steps += 1;
