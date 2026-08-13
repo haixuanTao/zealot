@@ -1758,6 +1758,13 @@ pub struct BipedNexusBatchEnv {
     /// `BIPED_SKIP_REWARD`: skip the host reward evaluation to price it. Gives
     /// WRONG training; measurement only.
     skip_reward: bool,
+    /// `BIPED_GPU_REWARD=1`: consume the GPU reward terms as the source of
+    /// truth — the host term math is skipped and `comps` are filled from the
+    /// device stack (one fused encode + submit per step, term-matrix
+    /// readbacks only). The host keeps state assembly, obs, the step cue,
+    /// termination detection and feet bookkeeping. Ignored under
+    /// `BIPED_VERIFY_REWARD`, which needs the host values to compare against.
+    use_gpu_reward: bool,
     /// `BIPED_SKIP_OBS`: skip the host obs assembly to price it. Wrong
     /// training; measurement only.
     skip_obs: bool,
@@ -2609,6 +2616,8 @@ impl BipedNexusBatchEnv {
             gpu_observe: None,
             verify_cue: std::env::var("BIPED_VERIFY_CUE").is_ok(),
             skip_reward: std::env::var("BIPED_SKIP_REWARD").is_ok(),
+            use_gpu_reward: std::env::var("BIPED_GPU_REWARD").is_ok()
+                && std::env::var("BIPED_VERIFY_REWARD").is_err(),
             skip_obs: std::env::var("BIPED_SKIP_OBS").is_ok(),
             gpu_feet_terms: None,
             gpu_gait_terms: None,
@@ -3971,7 +3980,8 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             .ok().and_then(|v| v.parse().ok()).unwrap_or(0.03);
         let step_cue_hn: f32 = std::env::var("BIPED_STEP_CUE_H_NOISE")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(0.02);
-        let computed: Vec<PerEnv> = (0..self.n)
+        #[allow(unused_mut)]
+        let mut computed: Vec<PerEnv> = (0..self.n)
             .into_par_iter()
             .with_min_len(64)
             .map(|e| {
@@ -4140,7 +4150,9 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 // reward evaluation from the rest of the per-env block, so the
                 // GPU port's ~0.55 ms/step can be priced against what it would
                 // actually replace. Produces WRONG training — measurement only.
-                let rb = if self.skip_reward {
+                let rb = if self.skip_reward || self.use_gpu_reward {
+                    // BIPED_GPU_REWARD: the device stack computes every term;
+                    // `comps` are filled after the parallel block.
                     Default::default()
                 } else {
                     self.task.reward(&state, &self.cmd[e])
@@ -4183,7 +4195,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 }
                 // Soft self-collision penalty: ramp up as any L/R pair intrudes
                 // inside `sc_margin` (legs crossing). ~0 for a clean stance.
-                if sc_weight > 0.0 {
+                if sc_weight > 0.0 && !self.use_gpu_reward {
                     let intrusion: f32 = self
                         .idx
                         .self_collision_pairs
@@ -4205,7 +4217,9 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 // while the leg term ramps with the curriculum (`torque_w`). WBC
                 // lerobot base weights: -5e-4 legs, -1.5e-3 ankle pitch, -6.5e-3
                 // ankle roll (coupled, weakest).
-                if torque_w > 0.0 || ankle_torque_w > 0.0 || power_w > 0.0 || w_knee_torques > 0.0 {
+                if !self.use_gpu_reward
+                    && (torque_w > 0.0 || ankle_torque_w > 0.0 || power_w > 0.0 || w_knee_torques > 0.0)
+                {
                     let q_target = self.task.joint_targets(&actions[e]);
                     let mut leg_pen = 0.0f32;
                     let mut ankle_pen = 0.0f32;
@@ -4245,7 +4259,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 }
                 // Chest roll/pitch rate penalty (see `chest_w` above). Same
                 // finite-diff ω approximation as `read_state_from_poses`.
-                if chest_w > 0.0 && self.has_prev_pose[e] {
+                if chest_w > 0.0 && self.has_prev_pose[e] && !self.use_gpu_reward {
                     let cur = &poses[env_base + chest_link];
                     let prev = &self.prev_body_poses[env_base + chest_link];
                     let dq = cur.rotation * prev.rotation.conjugate();
@@ -5161,6 +5175,474 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 "[verify_misc_terms] self_coll={:.2e} chest_ang_vel={:.2e} termination={:.2e}",
                 wm[0], wm[1], wm[2]
             );
+        }
+
+        // ---- GPU reward consumption (BIPED_GPU_REWARD=1) ----
+        // The parallel block above skipped every reward-term computation;
+        // compute all seven device term groups here — state kernels + term
+        // kernels in ONE encoder and ONE submit (the shape `BIPED_FUSE_BENCH`
+        // measured) — then read the term matrices back and fill `comps`.
+        // Host state assembly, obs, the step cue, termination detection and
+        // the feet bookkeeping above are unchanged; the device values were
+        // verified element-wise against the host terms (BIPED_VERIFY_REWARD).
+        if self.use_gpu_reward {
+            let t = Instant::now();
+            let n = self.n;
+            let jn = NUM_JOINTS * n;
+            let bps = (self.state.body_poses().len() as usize / n) as u32;
+            let cpb = self.idx.colliders_per_batch as usize;
+            let dtc = self.task.control_dt();
+
+            // -- lazy init: identical constructors to the verify path --
+            if self.gpu_reward.is_none() {
+                self.gpu_reward = Some(
+                    zealot_gpu_obs::GpuRewardTerms::new(
+                        &self.gpu,
+                        n,
+                        NUM_JOINTS,
+                        &self.task.hip_yawroll_idx(),
+                    )
+                    .expect("gpu reward terms"),
+                );
+            }
+            if self.gpu_joints.is_none() {
+                let rest: Vec<glamx::Vec4> = (0..NUM_JOINTS)
+                    .map(|k| {
+                        let r = self.idx.actuated_rest_quat[k];
+                        glamx::Vec4::new(r.x, r.y, r.z, r.w)
+                    })
+                    .collect();
+                let children: Vec<u32> =
+                    (0..NUM_JOINTS).map(|k| self.idx.actuated[k].0).collect();
+                self.gpu_joints = Some(
+                    zealot_gpu_obs::GpuJointState::new(
+                        &self.gpu,
+                        n,
+                        NUM_JOINTS,
+                        &self.idx.actuated_parent_links,
+                        &children,
+                        &rest,
+                        bps,
+                        dtc,
+                    )
+                    .expect("gpu joint state"),
+                );
+            }
+            if self.gpu_joint_terms.is_none() {
+                let dpos: Vec<f32> =
+                    (0..NUM_JOINTS).map(|k| self.robot.joints[k].default_pos).collect();
+                let lo: Vec<f32> =
+                    (0..NUM_JOINTS).map(|k| self.robot.joints[k].pos_limit.0 * 0.9).collect();
+                let hi: Vec<f32> =
+                    (0..NUM_JOINTS).map(|k| self.robot.joints[k].pos_limit.1 * 0.9).collect();
+                self.gpu_joint_terms = Some(
+                    zealot_gpu_obs::GpuRewardJointTerms::new(
+                        &self.gpu,
+                        n,
+                        NUM_JOINTS,
+                        &dpos,
+                        &lo,
+                        &hi,
+                        &self.task.hip_yawroll_idx(),
+                        &(0..NUM_JOINTS)
+                            .map(|k| self.robot.mirror[k] as u32)
+                            .collect::<Vec<_>>(),
+                        &(0..NUM_JOINTS)
+                            .map(|k| self.robot.mirror_sign[k])
+                            .collect::<Vec<_>>(),
+                    )
+                    .expect("gpu joint terms"),
+                );
+            }
+            if self.gpu_torque_terms.is_none() {
+                let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(1e-4);
+                let w_ankle_t = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1.5e-3);
+                let w_ankle_roll = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(0.0);
+                let w_knee = self.knobs.w_knee_torques;
+                let js = &self.task.robot.joints;
+                let kp: Vec<f32> = (0..NUM_JOINTS).map(|k| js[k].kp).collect();
+                let kd: Vec<f32> = (0..NUM_JOINTS).map(|k| js[k].kd).collect();
+                let eff: Vec<f32> = (0..NUM_JOINTS).map(|k| js[k].effort_limit).collect();
+                let wl = vec![w_torques; NUM_JOINTS];
+                let wa: Vec<f32> = (0..NUM_JOINTS)
+                    .map(|k| {
+                        let nm = &js[k].name;
+                        if nm.contains("ankle") {
+                            let roll = nm.contains("ankle_roll") || nm.contains("anklex");
+                            w_ankle_t + if roll { w_ankle_roll } else { 0.0 }
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let wk: Vec<f32> = (0..NUM_JOINTS)
+                    .map(|k| if js[k].name.contains("knee") { w_knee } else { 0.0 })
+                    .collect();
+                self.gpu_torque_terms = Some(
+                    zealot_gpu_obs::GpuRewardTorqueTerms::new(
+                        &self.gpu, n, NUM_JOINTS, &kp, &kd, &eff, &wl, &wa, &wk,
+                    )
+                    .expect("gpu torque terms"),
+                );
+            }
+            if self.gpu_base.is_none() {
+                self.gpu_base = Some(
+                    zealot_gpu_obs::GpuBaseState::new(
+                        &self.gpu,
+                        n,
+                        bps,
+                        self.idx.torso_link,
+                        dtc,
+                    )
+                    .expect("gpu base state"),
+                );
+            }
+            if self.gpu_feet.is_none() {
+                let ff = self.robot.foot_forward_local;
+                self.gpu_feet = Some(
+                    zealot_gpu_obs::GpuFeetState::new(
+                        &self.gpu,
+                        n,
+                        NUM_FEET,
+                        &(0..NUM_FEET).map(|i| self.idx.foot_links[i]).collect::<Vec<_>>(),
+                        &[ff[0], ff[1], ff[2]],
+                        zealot_obs_shaders::FeetStateParams {
+                            n_envs: n as u32,
+                            colliders_per_env: cpb as u32,
+                            torso_link: self.idx.torso_link,
+                            control_dt: dtc,
+                            contact_z: env_var("BIPED_CONTACT_Z")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.05),
+                            contact_force_n: self.contact_force_n,
+                            contact_sense: self.contact_sense as u32,
+                            body_weight: self.robot.total_mass * 9.81,
+                        },
+                    )
+                    .expect("gpu feet"),
+                );
+            }
+            if self.gpu_base_terms.is_none() {
+                self.gpu_base_terms =
+                    Some(zealot_gpu_obs::GpuRewardBaseTerms::new(&self.gpu, n).expect("base terms"));
+            }
+            if self.gpu_feet_terms.is_none() {
+                self.gpu_feet_terms =
+                    Some(zealot_gpu_obs::GpuRewardFeetTerms::new(&self.gpu, n).expect("feet terms"));
+            }
+            if self.gpu_gait_terms.is_none() {
+                self.gpu_gait_terms =
+                    Some(zealot_gpu_obs::GpuRewardGaitTerms::new(&self.gpu, n).expect("gait terms"));
+            }
+            if self.gpu_misc_terms.is_none() {
+                let pa: Vec<u32> =
+                    self.idx.self_collision_pairs.iter().map(|&(a, _)| a as u32).collect();
+                let pb: Vec<u32> =
+                    self.idx.self_collision_pairs.iter().map(|&(_, b)| b as u32).collect();
+                self.gpu_misc_terms = Some(
+                    zealot_gpu_obs::GpuRewardMiscTerms::new(&self.gpu, n, &pa, &pb)
+                        .expect("misc terms"),
+                );
+            }
+
+            // -- host-staged inputs (same layouts as the verify path) --
+            let mut la = vec![0.0f32; jn];
+            let mut pa = vec![0.0f32; jn];
+            let mut p2a = vec![0.0f32; jn];
+            for e in 0..n {
+                for k in 0..NUM_JOINTS {
+                    la[k * n + e] = self.last_action[e][k];
+                    pa[k * n + e] = self.prev_action[e][k];
+                    p2a[k * n + e] = self.prev2_action[e][k];
+                }
+            }
+            let hp: Vec<u32> = (0..n).map(|e| self.has_prev_joint_pos[e] as u32).collect();
+            let hpp: Vec<u32> = (0..n).map(|e| self.has_prev_pose[e] as u32).collect();
+            let gh: Vec<f32> = (0..n)
+                .map(|e| {
+                    let tp = &poses[e * bps as usize + self.idx.torso_link as usize];
+                    self.terrain
+                        .as_ref()
+                        .map_or(0.0, |ter| ter.strip_for(e).height(tp.translation.x, tp.translation.y))
+                })
+                .collect();
+            let mut sole = vec![0.0f32; NUM_FEET * 3 * n];
+            let mut fgh = vec![0.0f32; NUM_FEET * n];
+            let mut sfv = vec![0.0f32; NUM_FEET * n];
+            let mut pfv = vec![0.0f32; NUM_FEET * n];
+            for e in 0..n {
+                for i in 0..NUM_FEET {
+                    let sl = self.foot_sole_local[e][i];
+                    sole[(i * 3) * n + e] = sl.x;
+                    sole[(i * 3 + 1) * n + e] = sl.y;
+                    sole[(i * 3 + 2) * n + e] = sl.z;
+                    let link = self.idx.foot_links[i] as usize;
+                    let fpz = &poses[e * cpb + link].translation;
+                    fgh[i * n + e] = self
+                        .terrain
+                        .as_ref()
+                        .map_or(0.0, |ter| ter.strip_for(e).height(fpz.x, fpz.y));
+                    sfv[i * n + e] = self.sensed_force[e][i];
+                    pfv[i * n + e] = self.prev_sensed_force[e][i];
+                }
+            }
+            let hpf: Vec<u32> = (0..n).map(|e| self.has_prev_force[e] as u32).collect();
+            let w = &self.task.weights;
+            let (w_ar, w_hip, w_arr) =
+                (w.action_rate, w.action_rate_hipz_hipx, w.action_rate_rate);
+            let (wp, wl, wv, wb) = (w.pose, w.dof_pos_limits, w.dof_vel, w.bilateral_symmetry);
+            let gate = self.task.sym_yaw_gate;
+            let yaws: Vec<f32> = (0..n).map(|e| self.cmd[e].yaw_rate).collect();
+            let (tw, atw, pw) =
+                (self.torque_scale, self.knobs.ankle_torque_w, self.knobs.power_w);
+            let tr = self.targets_row.clone();
+            let tk = &self.task;
+            let bp = zealot_obs_shaders::RewardBaseParams {
+                n_envs: n as u32,
+                dt: dtc,
+                w_track_lin: tk.weights.track_lin_vel,
+                w_forward_progress: tk.weights.forward_progress,
+                w_track_ang: tk.weights.track_ang_vel,
+                w_upright: tk.weights.upright,
+                w_base_height: tk.weights.base_height,
+                w_body_ang_vel: tk.weights.body_ang_vel,
+                w_lin_vel_z: tk.weights.lin_vel_z,
+                std_lin: tk.stds.lin_vel,
+                std_ang: tk.stds.ang_vel,
+                std_base_h: tk.stds.base_height,
+                std_upright: tk.stds.upright,
+                step_std_base_h: tk.step_std_base_h,
+                step_std_upright: tk.step_std_upright,
+                step_relax_dist: tk.step_relax_dist,
+                h_target_stand: tk.weights.base_height_target_stand,
+                h_target_walk: tk.weights.base_height_target,
+                pad0: 0,
+                pad1: 0,
+            };
+            let fp = zealot_obs_shaders::RewardFeetParams {
+                n_envs: n as u32,
+                dt: dtc,
+                w_flight: w.flight,
+                w_foot_slip: w.foot_slip,
+                w_force_rate: w.force_rate,
+                force_rate_deadband: w.force_rate_deadband,
+                w_foot_orientation: w.foot_orientation,
+                w_feet_yaw_mean: w.feet_yaw_mean,
+                w_feet_yaw_diff: w.feet_yaw_diff,
+                w_feet_distance: w.feet_distance,
+                feet_distance_ref: w.feet_distance_ref,
+                w_touchdown_vz: w.touchdown_vz,
+                touchdown_vz_h: w.touchdown_vz_h,
+                touchdown_vz_ok: w.touchdown_vz_ok,
+                pad0: 0,
+                pad1: 0,
+            };
+            let gp = zealot_obs_shaders::RewardGaitParams {
+                n_envs: n as u32,
+                dt: dtc,
+                w_air_time: w.air_time,
+                w_single_support: w.single_support,
+                w_stand_planted: w.stand_planted,
+                w_foot_clearance: w.foot_clearance,
+                foot_clearance_target: w.foot_clearance_target,
+                w_gait_clock: w.gait_clock,
+                gait_swing_ratio: w.gait_swing_ratio,
+                max_swing_s: 0.45,
+                foot_rest_h: 0.035,
+                step_clear_margin: 0.05,
+                step_relax_dist: self.task.step_relax_dist,
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
+            };
+            let mp = zealot_obs_shaders::RewardMiscParams {
+                n_envs: n as u32,
+                colliders_per_env: cpb as u32,
+                n_pairs: self.idx.self_collision_pairs.len() as u32,
+                dt: dtc,
+                sc_margin: self.knobs.sc_margin,
+                sc_weight: self.knobs.sc_weight,
+                chest_link: self.idx.chest_link,
+                chest_w: self.knobs.chest_w,
+                w_termination: self.task.weights.termination,
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
+            };
+            let mut cmdb = vec![0.0f32; 4 * n];
+            let mut cueb = vec![0.0f32; 4 * n];
+            let mut aux = vec![0.0f32; 5 * n];
+            for e in 0..n {
+                let c = &self.cmd[e];
+                cmdb[e] = c.vx;
+                cmdb[n + e] = c.vy;
+                cmdb[2 * n + e] = c.yaw_rate;
+                cmdb[3 * n + e] = c.speed();
+                let cd = computed[e].cue_dbg;
+                cueb[e] = cd[0];
+                cueb[n + e] = cd[1];
+                cueb[2 * n + e] = cd[2];
+                cueb[3 * n + e] = cd[3];
+                let sp2 = c.vx * c.vx + c.vy * c.vy;
+                let bq = &computed[e].base_dbg;
+                let vb = zealot_env::math::quat_rotate_inv(
+                    [bq[0], bq[1], bq[2], bq[3]],
+                    [bq[4], bq[5], bq[6]],
+                );
+                aux[e] = self.gait_phase[e];
+                aux[n + e] = if sp2 > 1e-6 {
+                    ((vb[0] * c.vx + vb[1] * c.vy) / sp2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                aux[2 * n + e] = c.speed();
+                aux[3 * n + e] = computed[e].cue_h_dbg;
+                aux[4 * n + e] = computed[e].stepping_dbg;
+            }
+            let chest_link = self.idx.chest_link as usize;
+            let mut pchest = vec![0.0f32; 4 * n];
+            let mut fellv = vec![0u32; n];
+            for e in 0..n {
+                let pq = self.prev_body_poses[e * cpb + chest_link].rotation;
+                pchest[e] = pq.x;
+                pchest[n + e] = pq.y;
+                pchest[2 * n + e] = pq.z;
+                pchest[3 * n + e] = pq.w;
+                fellv[e] = computed[e].fell as u32;
+            }
+
+            // -- one fused encoder, one submit --
+            {
+                let mut enc = self.gpu.begin_encoding();
+                {
+                    let pt = self.state.body_poses();
+                    self.gpu_joints
+                        .as_mut()
+                        .unwrap()
+                        .encode(&self.gpu, &mut enc, pt, &hp)
+                        .expect("enc joints");
+                }
+                {
+                    let pt = self.state.body_poses();
+                    self.gpu_base
+                        .as_mut()
+                        .unwrap()
+                        .encode(&self.gpu, &mut enc, pt, &hpp, &gh)
+                        .expect("enc base");
+                }
+                {
+                    let pt = self.state.body_poses();
+                    self.gpu_feet
+                        .as_mut()
+                        .unwrap()
+                        .encode(
+                            &self.gpu,
+                            &mut enc,
+                            pt,
+                            zealot_gpu_obs::FeetInputs {
+                                sole_local: &sole,
+                                prev_force: &pfv,
+                                ground_h: &fgh,
+                                sensed_force: &sfv,
+                                have_prev: &hpp,
+                                have_prev_force: &hpf,
+                            },
+                        )
+                        .expect("enc feet");
+                }
+                self.gpu_reward
+                    .as_mut()
+                    .unwrap()
+                    .encode(&self.gpu, &mut enc, &la, &pa, &p2a, dtc, w_ar, w_hip, w_arr)
+                    .expect("enc action terms");
+                {
+                    let joints_ref = self.gpu_joints.as_ref().unwrap();
+                    self.gpu_joint_terms
+                        .as_mut()
+                        .unwrap()
+                        .encode(&self.gpu, &mut enc, joints_ref, dtc, wp, wl, wv, wb, gate, &yaws)
+                        .expect("enc joint terms");
+                    self.gpu_torque_terms
+                        .as_mut()
+                        .unwrap()
+                        .encode(&self.gpu, &mut enc, joints_ref, &tr, dtc, tw, atw, pw)
+                        .expect("enc torque terms");
+                }
+                {
+                    let base_t = self.gpu_base.as_ref().unwrap().out_tensor();
+                    let feet_t = self.gpu_feet.as_ref().unwrap().out_tensor();
+                    self.gpu_base_terms
+                        .as_mut()
+                        .unwrap()
+                        .encode_dev(&self.gpu, &mut enc, bp, base_t, &cmdb, &cueb)
+                        .expect("enc base terms");
+                    self.gpu_feet_terms
+                        .as_mut()
+                        .unwrap()
+                        .encode_dev(&self.gpu, &mut enc, fp, feet_t, base_t)
+                        .expect("enc feet terms");
+                    self.gpu_gait_terms
+                        .as_mut()
+                        .unwrap()
+                        .encode_dev(&self.gpu, &mut enc, gp, feet_t, &aux)
+                        .expect("enc gait terms");
+                }
+                {
+                    let pt = self.state.body_poses();
+                    self.gpu_misc_terms
+                        .as_mut()
+                        .unwrap()
+                        .encode(&self.gpu, &mut enc, mp, pt, &pchest, &hpp, &fellv)
+                        .expect("enc misc terms");
+                }
+                self.gpu.submit(enc).expect("gpu reward submit");
+            }
+
+            // -- term-matrix readbacks (the only D2H the rewards need) --
+            let rt = self.gpu_reward.as_ref().unwrap().read(&self.gpu).await.expect("rd action");
+            let jt = self.gpu_joint_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd joint");
+            let tt = self.gpu_torque_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd torque");
+            let btm = self.gpu_base_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd base");
+            let ftm = self.gpu_feet_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd feet");
+            let gtm = self.gpu_gait_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd gait");
+            let mtm = self.gpu_misc_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd misc");
+
+            // -- scatter into comps by the verified mappings; total = Σ comps --
+            const ACT_T: [(usize, usize); 3] = [(6, 0), (7, 1), (29, 2)];
+            const JNT_T: [(usize, usize); 4] = [(4, 0), (10, 1), (11, 2), (5, 3)];
+            const TRQ_T: [(usize, usize); 3] = [(20, 0), (21, 1), (24, 2)];
+            const BAS_T: [(usize, usize); 6] = [(0, 0), (1, 1), (2, 2), (3, 3), (8, 4), (9, 5)];
+            const FEE_T: [(usize, usize); 8] =
+                [(13, 0), (15, 1), (28, 2), (17, 3), (18, 4), (27, 5), (19, 6), (30, 7)];
+            const GAI_T: [(usize, usize); 5] = [(12, 0), (14, 1), (26, 2), (16, 3), (25, 4)];
+            const MIS_T: [(usize, usize); 3] = [(22, 0), (31, 1), (23, 2)];
+            for e in 0..n {
+                let c = &mut computed[e];
+                for &(comp, row) in &ACT_T {
+                    c.comps[comp] = rt[row * n + e];
+                }
+                for &(comp, row) in &JNT_T {
+                    c.comps[comp] = jt[row * n + e];
+                }
+                for &(comp, row) in &TRQ_T {
+                    c.comps[comp] = tt[row * n + e];
+                }
+                for &(comp, row) in &BAS_T {
+                    c.comps[comp] = btm[row * n + e];
+                }
+                for &(comp, row) in &FEE_T {
+                    c.comps[comp] = ftm[row * n + e];
+                }
+                for &(comp, row) in &GAI_T {
+                    c.comps[comp] = gtm[row * n + e];
+                }
+                for &(comp, row) in &MIS_T {
+                    c.comps[comp] = mtm[row * n + e];
+                }
+                c.reward = c.comps.iter().sum();
+            }
+            self.timings.par_compute_ns += t.elapsed().as_nanos() as u64;
         }
 
         // (5) Serial commit: per-env mutable state + StepOut assembly.
