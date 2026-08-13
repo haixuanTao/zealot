@@ -309,6 +309,66 @@ impl GpuPolicy {
         }
         self.scratch_raw_obs = ro;
         self.scratch_raw_cobs = rc;
+        self.forward_from_raw(backend, ac, step).await
+    }
+
+    /// Device-obs forward: the raw observations are already ON DEVICE
+    /// (`BIPED_GPU_OBS` — the env's `GpuObserve` assembled them). Copy the
+    /// `[dim x n]` tensors into raw-arena slot `step` (device-to-device, no
+    /// host round trip) and run the same staged forward as `forward`.
+    pub async fn forward_dev(
+        &mut self,
+        backend: &GpuBackend,
+        ac: &ActorCritic,
+        obs_dev: &Tensor<f32>,
+        cobs_dev: &Tensor<f32>,
+        step: usize,
+    ) -> anyhow::Result<(Vec<[f32; NUM_JOINTS]>, Vec<f32>)> {
+        use khal::backend::Encoder as _;
+        let n = self.n;
+        let (obs_dim, crit_dim) = (self.actor.dims[0], self.critic.dims[0]);
+        if std::env::var("BIPED_DEV_OBS_DBG").is_ok() {
+            eprintln!(
+                "[dev_obs] obs_dev.len={} cobs_dev.len={} raw_obs.len={} raw_cobs.len={} obs_dim={obs_dim} crit_dim={crit_dim} n={n} step={step}",
+                obs_dev.len(),
+                cobs_dev.len(),
+                self.raw_obs.as_ref().unwrap().len(),
+                self.raw_cobs.as_ref().unwrap().len(),
+            );
+        }
+        {
+            let mut enc = backend.begin_encoding();
+            enc.copy_buffer_to_buffer::<f32>(
+                &obs_dev.buffer(),
+                0,
+                &mut self.raw_obs.as_mut().expect("init_raw_batch").buffer_mut(),
+                step * obs_dim * n,
+                obs_dim * n,
+            )?;
+            enc.copy_buffer_to_buffer::<f32>(
+                &cobs_dev.buffer(),
+                0,
+                &mut self.raw_cobs.as_mut().expect("init_raw_batch").buffer_mut(),
+                step * crit_dim * n,
+                crit_dim * n,
+            )?;
+            backend.submit(enc)?;
+        }
+        self.forward_from_raw(backend, ac, step).await
+    }
+
+    /// Stage slot `step` of the raw arena into the policy inputs, run both
+    /// nets and read back `(means, values)` — shared tail of `forward` /
+    /// `forward_dev`.
+    async fn forward_from_raw(
+        &mut self,
+        backend: &GpuBackend,
+        ac: &ActorCritic,
+        step: usize,
+    ) -> anyhow::Result<(Vec<[f32; NUM_JOINTS]>, Vec<f32>)> {
+        let n = self.n;
+        let (obs_dim, crit_dim) = (self.actor.dims[0], self.critic.dims[0]);
+        let _ = ac;
 
         // Params for the single-step (`step_select`) form of the staging
         // kernel: columns are the n envs of rollout step `step_sel - 1`.

@@ -821,6 +821,14 @@ fn main() {
         // Retain raw rollout observations on device so the PPO batch is built
         // there (normalize + clamp + mirror) instead of on the host.
         gpu.init_raw_batch(&bk, T + 1).expect("raw batch buffers");
+        // BIPED_GPU_OBS: the env assembles obs on device; the policy forward
+        // consumes the tensors directly (no host obs transpose / upload). The
+        // first-ever forward and the normalizer stats subsample stay host-fed.
+        let gpu_obs_dev = env.gpu_obs_active();
+        let mut dev_obs_ready = false;
+        if gpu_obs_dev {
+            eprintln!("[launch] BIPED_GPU_OBS: device obs -> policy (host keeps 1/16 stats subsample)");
+        }
         // Mirror as an explicit signed permutation, cross-checked against the
         // real mirror functions before anything depends on it.
         let (mirror_perm_obs, mirror_sign_obs) = mirror_table(od, mirror_obs);
@@ -1106,6 +1114,11 @@ fn main() {
             for step_i in 0..T {
                 let t_ph = Instant::now();
                 for e in 0..n {
+                    // Device-obs mode: only the 1/16 stride subsample carries
+                    // real host obs (the rest are zeros) — stats read those.
+                    if gpu_obs_dev && (e & 15) != 0 {
+                        continue;
+                    }
                     if norm_freeze {
                         pn_obs.push(&gc[e]);
                         pn_cobs.push(&gcc[e]);
@@ -1117,7 +1130,12 @@ fn main() {
                     d_norm += t_ph.elapsed().as_micros();
                 }
                 let t_ph = Instant::now();
-                let (means, values) = gpu.forward(&bk, &ac, &gc, &gcc, step_i).await.unwrap();
+                let (means, values) = if gpu_obs_dev && dev_obs_ready {
+                    let (ot, ct2) = env.device_obs_tensors().unwrap();
+                    gpu.forward_dev(&bk, &ac, ot, ct2, step_i).await.unwrap()
+                } else {
+                    gpu.forward(&bk, &ac, &gc, &gcc, step_i).await.unwrap()
+                };
                 if roll_prof {
                     d_fwd += t_ph.elapsed().as_micros();
                 }
@@ -1148,6 +1166,7 @@ fn main() {
                 }
                 let t_ph = Instant::now();
                 let outs = env.step(&acts).await;
+                dev_obs_ready = gpu_obs_dev;
                 if roll_prof {
                     d_step += t_ph.elapsed().as_micros();
                 }
@@ -1218,7 +1237,12 @@ fn main() {
             // stream (ported from perf/v29-reimpl; replaces n host critic
             // forwards). Raw-arena slot T absorbs the obs write.
             let boot_vals: Vec<f32> = if norm_freeze {
-                let (_bm, bv) = gpu.forward(&bk, &ac, &gc, &gcc, T).await.unwrap();
+                let (_bm, bv) = if gpu_obs_dev && dev_obs_ready {
+                    let (ot, ct2) = env.device_obs_tensors().unwrap();
+                    gpu.forward_dev(&bk, &ac, ot, ct2, T).await.unwrap()
+                } else {
+                    gpu.forward(&bk, &ac, &gc, &gcc, T).await.unwrap()
+                };
                 bv
             } else {
                 (0..n).map(|e| ac.value(&gcc[e])).collect()

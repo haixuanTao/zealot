@@ -1765,6 +1765,28 @@ pub struct BipedNexusBatchEnv {
     /// termination detection and feet bookkeeping. Ignored under
     /// `BIPED_VERIFY_REWARD`, which needs the host values to compare against.
     use_gpu_reward: bool,
+    /// `BIPED_GPU_OBS=1`: assemble the actor/critic observations on device
+    /// (`GpuObserve`) and expose the tensors for the policy to consume
+    /// directly — the host skips obs assembly for all but a 1/16 env-stride
+    /// subsample kept for the normalizer statistics. Ignored under
+    /// `BIPED_VERIFY_REWARD`.
+    use_gpu_obs: bool,
+    /// Step-cue staging cached for the post-reset obs re-encode (stale for
+    /// just-reset envs for one step — they spawn away from step edges).
+    cached_cue_b: Vec<f32>,
+    /// Per-env local terrain height cached from the fused block, updated for
+    /// reset envs from their spawn offset, for the post-reset re-encode.
+    cached_gh: Vec<f32>,
+    /// Device noise+stacking for the actor obs (`BIPED_OBS_HISTORY > 1`).
+    gpu_obs_stack: Option<zealot_gpu_obs::GpuObsStack>,
+    /// Host mirror of the device obs ring head (pre-push value per step).
+    dev_obs_head: Vec<u32>,
+    /// Envs whose episode reset since the last device stack (replicate).
+    dev_obs_reset: Vec<u32>,
+    /// Per-step device noise seed (advanced every stack).
+    dev_obs_seed: u32,
+    /// `BIPED_OBS_NOISE` scale, resolved once.
+    dev_obs_noise: f32,
     /// `BIPED_SKIP_OBS`: skip the host obs assembly to price it. Wrong
     /// training; measurement only.
     skip_obs: bool,
@@ -2618,6 +2640,18 @@ impl BipedNexusBatchEnv {
             skip_reward: std::env::var("BIPED_SKIP_REWARD").is_ok(),
             use_gpu_reward: std::env::var("BIPED_GPU_REWARD").is_ok()
                 && std::env::var("BIPED_VERIFY_REWARD").is_err(),
+            use_gpu_obs: std::env::var("BIPED_GPU_OBS").is_ok()
+                && std::env::var("BIPED_VERIFY_REWARD").is_err(),
+            gpu_obs_stack: None,
+            dev_obs_head: Vec::new(),
+            dev_obs_reset: Vec::new(),
+            dev_obs_seed: 0x5eed_0b5e,
+            dev_obs_noise: std::env::var("BIPED_OBS_NOISE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0),
+            cached_cue_b: Vec::new(),
+            cached_gh: Vec::new(),
             skip_obs: std::env::var("BIPED_SKIP_OBS").is_ok(),
             gpu_feet_terms: None,
             gpu_gait_terms: None,
@@ -4277,7 +4311,10 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 // does its normal work — this isolates assembly, not transfer.
                 let mut obs = vec![0.0; OBS_DIM];
                 let mut critic_obs = vec![0.0; CRITIC_OBS_DIM];
-                if !self.skip_obs {
+                // Under BIPED_GPU_OBS the device assembles the policy obs;
+                // the host keeps a 1/16 stride subsample purely to feed the
+                // normalizer statistics (uniform across terrain families).
+                if !self.skip_obs && (!self.use_gpu_obs || (e & 15) == 0) {
                     self.task.observe(&state, &self.cmd[e], &mut obs);
                     self.task
                         .observe_critic(&state, &self.cmd[e], &mut critic_obs);
@@ -5185,7 +5222,9 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
         // Host state assembly, obs, the step cue, termination detection and
         // the feet bookkeeping above are unchanged; the device values were
         // verified element-wise against the host terms (BIPED_VERIFY_REWARD).
-        if self.use_gpu_reward {
+        if self.use_gpu_reward || self.use_gpu_obs {
+            let rg = self.use_gpu_reward;
+            let go = self.use_gpu_obs;
             let t = Instant::now();
             let n = self.n;
             let jn = NUM_JOINTS * n;
@@ -5194,7 +5233,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             let dtc = self.task.control_dt();
 
             // -- lazy init: identical constructors to the verify path --
-            if self.gpu_reward.is_none() {
+            if rg && self.gpu_reward.is_none() {
                 self.gpu_reward = Some(
                     zealot_gpu_obs::GpuRewardTerms::new(
                         &self.gpu,
@@ -5228,7 +5267,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     .expect("gpu joint state"),
                 );
             }
-            if self.gpu_joint_terms.is_none() {
+            if rg && self.gpu_joint_terms.is_none() {
                 let dpos: Vec<f32> =
                     (0..NUM_JOINTS).map(|k| self.robot.joints[k].default_pos).collect();
                 let lo: Vec<f32> =
@@ -5254,7 +5293,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     .expect("gpu joint terms"),
                 );
             }
-            if self.gpu_torque_terms.is_none() {
+            if rg && self.gpu_torque_terms.is_none() {
                 let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(1e-4);
                 let w_ankle_t = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1.5e-3);
                 let w_ankle_roll = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(0.0);
@@ -5297,7 +5336,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     .expect("gpu base state"),
                 );
             }
-            if self.gpu_feet.is_none() {
+            if rg && self.gpu_feet.is_none() {
                 let ff = self.robot.foot_forward_local;
                 self.gpu_feet = Some(
                     zealot_gpu_obs::GpuFeetState::new(
@@ -5323,19 +5362,19 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     .expect("gpu feet"),
                 );
             }
-            if self.gpu_base_terms.is_none() {
+            if rg && self.gpu_base_terms.is_none() {
                 self.gpu_base_terms =
                     Some(zealot_gpu_obs::GpuRewardBaseTerms::new(&self.gpu, n).expect("base terms"));
             }
-            if self.gpu_feet_terms.is_none() {
+            if rg && self.gpu_feet_terms.is_none() {
                 self.gpu_feet_terms =
                     Some(zealot_gpu_obs::GpuRewardFeetTerms::new(&self.gpu, n).expect("feet terms"));
             }
-            if self.gpu_gait_terms.is_none() {
+            if rg && self.gpu_gait_terms.is_none() {
                 self.gpu_gait_terms =
                     Some(zealot_gpu_obs::GpuRewardGaitTerms::new(&self.gpu, n).expect("gait terms"));
             }
-            if self.gpu_misc_terms.is_none() {
+            if rg && self.gpu_misc_terms.is_none() {
                 let pa: Vec<u32> =
                     self.idx.self_collision_pairs.iter().map(|&(a, _)| a as u32).collect();
                 let pb: Vec<u32> =
@@ -5343,6 +5382,43 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 self.gpu_misc_terms = Some(
                     zealot_gpu_obs::GpuRewardMiscTerms::new(&self.gpu, n, &pa, &pb)
                         .expect("misc terms"),
+                );
+            }
+
+            if go && self.gpu_obs_stack.is_none() && zealot_env::knobs::OBS_HISTORY.get() > 1 {
+                let hist = zealot_env::knobs::OBS_HISTORY.get();
+                let frame = OBS_DIM;
+                // Noise amplitude table — the serial-commit block's slots:
+                // joint_pos_rel 0.01, joint_vel 1.5, projected_gravity 0.05,
+                // gyro 0.2 (48-dim frames on), everything else clean.
+                let mut amp = vec![0.0f32; frame];
+                let a = NUM_JOINTS + 4;
+                amp[a..a + NUM_JOINTS].fill(0.01);
+                amp[a + NUM_JOINTS..a + 2 * NUM_JOINTS].fill(1.5);
+                amp[a + 2 * NUM_JOINTS..a + 2 * NUM_JOINTS + 3].fill(0.05);
+                if frame >= 48 {
+                    amp[45..48].fill(0.2);
+                }
+                self.gpu_obs_stack = Some(
+                    zealot_gpu_obs::GpuObsStack::new(&self.gpu, n, frame, hist, &amp)
+                        .expect("gpu obs stack"),
+                );
+                self.dev_obs_head = vec![0u32; n];
+                self.dev_obs_reset = vec![1u32; n];
+            }
+            if go && self.gpu_observe.is_none() {
+                let defaults: Vec<f32> =
+                    (0..NUM_JOINTS).map(|k| self.robot.joints[k].default_pos).collect();
+                self.gpu_observe = Some(
+                    zealot_gpu_obs::GpuObserve::new(
+                        &self.gpu,
+                        n,
+                        NUM_JOINTS as u32,
+                        OBS_DIM,
+                        CRITIC_OBS_DIM,
+                        &defaults,
+                    )
+                    .expect("gpu observe"),
                 );
             }
 
@@ -5367,6 +5443,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         .map_or(0.0, |ter| ter.strip_for(e).height(tp.translation.x, tp.translation.y))
                 })
                 .collect();
+            self.cached_gh = gh.clone();
             let mut sole = vec![0.0f32; NUM_FEET * 3 * n];
             let mut fgh = vec![0.0f32; NUM_FEET * n];
             let mut sfv = vec![0.0f32; NUM_FEET * n];
@@ -5512,6 +5589,22 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 fellv[e] = computed[e].fell as u32;
             }
 
+            let mut cmd_b = vec![0.0f32; 4 * n];
+            let mut ph_b = vec![0.0f32; n];
+            let mut cue_b = vec![0.0f32; 10 * n];
+            if go {
+                for e in 0..n {
+                    cmd_b[e] = self.cmd[e].vx;
+                    cmd_b[n + e] = self.cmd[e].vy;
+                    cmd_b[2 * n + e] = self.cmd[e].yaw_rate;
+                    ph_b[e] = self.gait_phase[e];
+                    for k in 0..10 {
+                        cue_b[k * n + e] = computed[e].cue_obs[k];
+                    }
+                }
+                self.cached_cue_b = cue_b.clone();
+            }
+
             // -- one fused encoder, one submit --
             {
                 let mut enc = self.gpu.begin_encoding();
@@ -5531,7 +5624,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         .encode(&self.gpu, &mut enc, pt, &hpp, &gh)
                         .expect("enc base");
                 }
-                {
+                if rg {
                     let pt = self.state.body_poses();
                     self.gpu_feet
                         .as_mut()
@@ -5551,12 +5644,50 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         )
                         .expect("enc feet");
                 }
-                self.gpu_reward
-                    .as_mut()
-                    .unwrap()
-                    .encode(&self.gpu, &mut enc, &la, &pa, &p2a, dtc, w_ar, w_hip, w_arr)
-                    .expect("enc action terms");
-                {
+                if go {
+                    let (qt, qdt) = {
+                        let j = self.gpu_joints.as_ref().unwrap();
+                        (j.q_tensor(), j.qd_tensor())
+                    };
+                    let btn = self.gpu_base.as_ref().unwrap().out_tensor();
+                    self.gpu_observe
+                        .as_mut()
+                        .unwrap()
+                        .encode(&self.gpu, &mut enc, 0, &la, &cmd_b, &ph_b, &cue_b, qt, qdt, btn)
+                        .expect("enc observe");
+                }
+                if go {
+                    if let Some(stack) = self.gpu_obs_stack.as_mut() {
+                        let fresh = self.gpu_observe.as_ref().unwrap().obs_tensor();
+                        stack
+                            .encode(
+                                &self.gpu,
+                                &mut enc,
+                                zealot_obs_shaders::ObsStackParams {
+                                    n_envs: n as u32,
+                                    frame: OBS_DIM as u32,
+                                    hist: zealot_env::knobs::OBS_HISTORY.get() as u32,
+                                    noise_scale: self.dev_obs_noise,
+                                    seed: self.dev_obs_seed,
+                                    only_reset: 0,
+                                    _pad1: 0,
+                                    _pad2: 0,
+                                },
+                                fresh,
+                                &self.dev_obs_head,
+                                &self.dev_obs_reset,
+                            )
+                            .expect("enc obs stack");
+                    }
+                }
+                if rg {
+                    self.gpu_reward
+                        .as_mut()
+                        .unwrap()
+                        .encode(&self.gpu, &mut enc, &la, &pa, &p2a, dtc, w_ar, w_hip, w_arr)
+                        .expect("enc action terms");
+                }
+                if rg {
                     let joints_ref = self.gpu_joints.as_ref().unwrap();
                     self.gpu_joint_terms
                         .as_mut()
@@ -5569,7 +5700,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         .encode(&self.gpu, &mut enc, joints_ref, &tr, dtc, tw, atw, pw)
                         .expect("enc torque terms");
                 }
-                {
+                if rg {
                     let base_t = self.gpu_base.as_ref().unwrap().out_tensor();
                     let feet_t = self.gpu_feet.as_ref().unwrap().out_tensor();
                     self.gpu_base_terms
@@ -5588,7 +5719,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         .encode_dev(&self.gpu, &mut enc, gp, feet_t, &aux)
                         .expect("enc gait terms");
                 }
-                {
+                if rg {
                     let pt = self.state.body_poses();
                     self.gpu_misc_terms
                         .as_mut()
@@ -5598,8 +5729,21 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 }
                 self.gpu.submit(enc).expect("gpu reward submit");
             }
+            if go && self.gpu_obs_stack.is_some() {
+                let hist = zealot_env::knobs::OBS_HISTORY.get() as u32;
+                for e in 0..n {
+                    if self.dev_obs_reset[e] != 0 {
+                        self.dev_obs_head[e] = 0;
+                        self.dev_obs_reset[e] = 0;
+                    } else {
+                        self.dev_obs_head[e] = (self.dev_obs_head[e] + 1) % hist;
+                    }
+                }
+                self.dev_obs_seed = self.dev_obs_seed.wrapping_add(0x9e37_79b9);
+            }
 
             // -- term-matrix readbacks (the only D2H the rewards need) --
+            if rg {
             let rt = self.gpu_reward.as_ref().unwrap().read(&self.gpu).await.expect("rd action");
             let jt = self.gpu_joint_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd joint");
             let tt = self.gpu_torque_terms.as_ref().unwrap().read(&self.gpu).await.expect("rd torque");
@@ -5641,6 +5785,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     c.comps[comp] = mtm[row * n + e];
                 }
                 c.reward = c.comps.iter().sum();
+            }
             }
             self.timings.par_compute_ns += t.elapsed().as_nanos() as u64;
         }
@@ -5831,6 +5976,25 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
     /// Read the accumulated per-phase timings and reset the counters.
     /// Pair with the timed loop in `biped_fps.rs` to get a breakdown of
     /// where the per-step budget went.
+    /// Device obs tensors (actor, critic), row-major `[dim x n]` — present
+    /// once the first step's fused block has run under `BIPED_GPU_OBS=1`.
+    pub fn device_obs_tensors(&self) -> Option<(&vortx::tensor::Tensor<f32>, &vortx::tensor::Tensor<f32>)> {
+        if !self.use_gpu_obs {
+            return None;
+        }
+        let obs = self.gpu_observe.as_ref()?;
+        if let Some(stack) = self.gpu_obs_stack.as_ref() {
+            Some((stack.out_tensor(), obs.cobs_tensor()))
+        } else {
+            Some((obs.obs_tensor(), obs.cobs_tensor()))
+        }
+    }
+
+    /// True when device obs assembly is on (`BIPED_GPU_OBS=1`).
+    pub fn gpu_obs_active(&self) -> bool {
+        self.use_gpu_obs
+    }
+
     pub fn take_step_timings(&mut self) -> StepTimings {
         std::mem::take(&mut self.timings)
     }
@@ -5899,6 +6063,17 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             {
                 meta.push((*e as u32, *t as u32));
                 offs.push(*offset);
+                if self.use_gpu_obs && self.dev_obs_reset.len() == self.n {
+                    self.dev_obs_reset[*e] = 1;
+                }
+                if self.use_gpu_obs && self.cached_gh.len() == self.n {
+                    // Spawn lands at the teleport offset; refresh the cached
+                    // local terrain height for the post-reset obs re-encode.
+                    self.cached_gh[*e] = self
+                        .terrain
+                        .as_ref()
+                        .map_or(0.0, |ter| ter.strip_for(*e).height(offset.x, offset.y));
+                }
                 if let Some(v) = vels.as_deref() {
                     let m = v.len().min(dpb);
                     dof_vels[i * dpb..i * dpb + m].copy_from_slice(&v[..m]);
@@ -5938,6 +6113,107 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 t_scatter as f64 / 1000.0,
                 t_finish as f64 / 1000.0,
             );
+        }
+        // BIPED_GPU_OBS: the device obs tensors were assembled BEFORE these
+        // resets, so just-reset envs would act on pre-reset observations for
+        // one step. Re-encode joint/base state (their has_prev flags are
+        // freshly cleared, so velocities read zero exactly like the host
+        // path) and the observation assembly. Feet state is NOT re-encoded —
+        // its history commit already ran this step and the device history
+        // reset above handles the teleport. The cached step cue is one step
+        // stale for the reset envs (they spawn away from step edges).
+        if self.use_gpu_obs && self.gpu_observe.is_some() {
+            let n = self.n;
+            let hp: Vec<u32> = (0..n).map(|e| self.has_prev_joint_pos[e] as u32).collect();
+            let hpp: Vec<u32> = (0..n).map(|e| self.has_prev_pose[e] as u32).collect();
+            let gh = if self.cached_gh.len() == n {
+                self.cached_gh.clone()
+            } else {
+                vec![0.0f32; n]
+            };
+            let mut la = vec![0.0f32; NUM_JOINTS * n];
+            for e in 0..n {
+                for k in 0..NUM_JOINTS {
+                    la[k * n + e] = self.last_action[e][k];
+                }
+            }
+            let mut cmd_b = vec![0.0f32; 4 * n];
+            let mut ph_b = vec![0.0f32; n];
+            for e in 0..n {
+                cmd_b[e] = self.cmd[e].vx;
+                cmd_b[n + e] = self.cmd[e].vy;
+                cmd_b[2 * n + e] = self.cmd[e].yaw_rate;
+                ph_b[e] = self.gait_phase[e];
+            }
+            let cue_b = if self.cached_cue_b.len() == 10 * n {
+                self.cached_cue_b.clone()
+            } else {
+                vec![0.0f32; 10 * n]
+            };
+            let mut enc = self.gpu.begin_encoding();
+            {
+                let pt = self.state.body_poses();
+                self.gpu_joints
+                    .as_mut()
+                    .unwrap()
+                    .encode(&self.gpu, &mut enc, pt, &hp)
+                    .expect("reset re-enc joints");
+            }
+            {
+                let pt = self.state.body_poses();
+                self.gpu_base
+                    .as_mut()
+                    .unwrap()
+                    .encode(&self.gpu, &mut enc, pt, &hpp, &gh)
+                    .expect("reset re-enc base");
+            }
+            {
+                let (qt, qdt) = {
+                    let j = self.gpu_joints.as_ref().unwrap();
+                    (j.q_tensor(), j.qd_tensor())
+                };
+                let bt = self.gpu_base.as_ref().unwrap().out_tensor();
+                self.gpu_observe
+                    .as_mut()
+                    .unwrap()
+                    .encode(&self.gpu, &mut enc, 0, &la, &cmd_b, &ph_b, &cue_b, qt, qdt, bt)
+                    .expect("reset re-enc observe");
+            }
+            if let Some(stack) = self.gpu_obs_stack.as_mut() {
+                // only_reset: replicate the fresh post-reset frame for the
+                // reset envs; everyone else's ring and stacked output stay
+                // untouched (their step already ran).
+                let fresh = self.gpu_observe.as_ref().unwrap().obs_tensor();
+                stack
+                    .encode(
+                        &self.gpu,
+                        &mut enc,
+                        zealot_obs_shaders::ObsStackParams {
+                            n_envs: n as u32,
+                            frame: OBS_DIM as u32,
+                            hist: zealot_env::knobs::OBS_HISTORY.get() as u32,
+                            noise_scale: self.dev_obs_noise,
+                            seed: self.dev_obs_seed,
+                            only_reset: 1,
+                            _pad1: 0,
+                            _pad2: 0,
+                        },
+                        fresh,
+                        &self.dev_obs_head,
+                        &self.dev_obs_reset,
+                    )
+                    .expect("reset re-enc stack");
+            }
+            self.gpu.submit(enc).expect("reset re-enc submit");
+            if self.gpu_obs_stack.is_some() {
+                for e in 0..self.n {
+                    if self.dev_obs_reset[e] != 0 {
+                        self.dev_obs_head[e] = 0;
+                        self.dev_obs_reset[e] = 0;
+                    }
+                }
+                self.dev_obs_seed = self.dev_obs_seed.wrapping_add(0x9e37_79b9);
+            }
         }
         out
     }

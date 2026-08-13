@@ -1657,3 +1657,122 @@ pub fn gpu_observe(
         out_cobs.write(cb + (od + 10) * n + e, if clive { 1.0 } else { 0.0 });
     }
 }
+
+/// Scalar parameters for [`gpu_obs_noise_stack`] (uniform).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "spirv", target_arch = "nvptx64")),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub struct ObsStackParams {
+    pub n_envs: u32,
+    /// Single-frame width (the env OBS_DIM, e.g. 53).
+    pub frame: u32,
+    /// History depth `H` (`BIPED_OBS_HISTORY`).
+    pub hist: u32,
+    /// Sensor-noise scale (`BIPED_OBS_NOISE`); 0 disables the noise.
+    pub noise_scale: f32,
+    /// Per-step RNG seed (host advances it every control step).
+    pub seed: u32,
+    /// 1 = only touch envs with `reset` set (the post-reset re-encode);
+    /// their frames replicate, everyone else's ring/out stay untouched.
+    pub only_reset: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// xorshift-style hash → uniform in [-1, 1]. NOT the host RNG stream — the
+/// noise realization differs from the host path (same distribution); the
+/// amplitudes and slots match exactly.
+#[inline]
+fn hash_unit(seed: u32, e: u32, r: u32) -> f32 {
+    let mut x = seed
+        ^ e.wrapping_mul(0x2c8c_a5a5)
+        ^ r.wrapping_mul(0xac56_4b05)
+        ^ 0x9e37_79b9;
+    x = (x ^ (x >> 16)).wrapping_mul(0x0045_d9f3b);
+    x = (x ^ (x >> 16)).wrapping_mul(0x0045_d9f3b);
+    x ^= x >> 16;
+    ((x >> 8) as f32) / 8_388_608.0 - 1.0
+}
+
+/// Sensor noise + observation-history stacking, one thread per env — the
+/// device port of the host serial-commit noise block plus
+/// `ObsHistory::push_stacked` / `reset_stacked` (oldest→newest, episode
+/// resets replicate the fresh frame into every slot).
+///
+/// `fresh` is [`gpu_observe`]'s actor frame `[frame x n]`; `amp` is the
+/// per-row noise amplitude table (built host-side: joint_pos 0.01,
+/// joint_vel 1.5, gravity 0.05, gyro 0.2, everything else 0). `head` is the
+/// HOST-tracked ring head BEFORE this step's push (the host advances its
+/// mirror after encoding, so the kernel stays pure w.r.t. control state);
+/// `reset` marks envs whose episode reset since the previous stack.
+/// `ring` is `[hist*frame x n]`; `out` is the stacked policy frame
+/// `[hist*frame x n]`, oldest→newest — bit-compatible with the host layout.
+#[spirv_bindgen]
+#[spirv(compute(threads(64)))]
+pub fn gpu_obs_noise_stack(
+    #[spirv(global_invocation_id)] invocation_id: UVec3,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] params: &ObsStackParams,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] fresh: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] amp: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] head: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] reset: &[u32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] ring: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 6)] out: &mut [f32],
+) {
+    let e = invocation_id.x as usize;
+    let n = params.n_envs as usize;
+    if e >= n {
+        return;
+    }
+    if params.only_reset != 0 && reset.read(e) == 0 {
+        return;
+    }
+    let frame = params.frame as usize;
+    let hist = params.hist as usize;
+    let scale = params.noise_scale;
+    if reset.read(e) != 0 {
+        // Episode reset: replicate the (noised) fresh frame into every ring
+        // slot and the whole stacked output — `ObsHistory::reset_stacked`.
+        let mut r = 0;
+        while r < frame {
+            let mut v = fresh.read(r * n + e);
+            if scale > 0.0 {
+                v += hash_unit(params.seed, e as u32, r as u32) * amp.read(r) * scale;
+            }
+            let mut s = 0;
+            while s < hist {
+                ring.write((s * frame + r) * n + e, v);
+                out.write((s * frame + r) * n + e, v);
+                s += 1;
+            }
+            r += 1;
+        }
+    } else {
+        // Normal step: push the noised frame over the oldest slot, then lay
+        // the window out oldest→newest — `ObsHistory::push_stacked`.
+        let h0 = head.read(e) as usize;
+        let mut r = 0;
+        while r < frame {
+            let mut v = fresh.read(r * n + e);
+            if scale > 0.0 {
+                v += hash_unit(params.seed, e as u32, r as u32) * amp.read(r) * scale;
+            }
+            ring.write((h0 * frame + r) * n + e, v);
+            r += 1;
+        }
+        let oldest = (h0 + 1) % hist;
+        let mut i = 0;
+        while i < hist {
+            let s = (oldest + i) % hist;
+            let mut r = 0;
+            while r < frame {
+                out.write((i * frame + r) * n + e, ring.read((s * frame + r) * n + e));
+                r += 1;
+            }
+            i += 1;
+        }
+    }
+}

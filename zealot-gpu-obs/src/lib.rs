@@ -1859,3 +1859,99 @@ impl GpuObserve {
         Ok((o, c))
     }
 }
+
+/// Host binding for sensor noise + observation-history stacking.
+#[derive(Shader)]
+struct ObsStackShader {
+    stack: shaders::GpuObsNoiseStack,
+}
+
+/// Device port of the host obs-noise block + `ObsHistory` ring
+/// (`BIPED_GPU_OBS` with `BIPED_OBS_HISTORY > 1`). The ring head is
+/// HOST-tracked (upload per step); episode resets replicate.
+pub struct GpuObsStack {
+    shader: ObsStackShader,
+    params: Tensor<shaders::ObsStackParams>,
+    amp: Tensor<f32>,
+    head: Tensor<u32>,
+    reset: Tensor<u32>,
+    ring: Tensor<f32>,
+    out: Tensor<f32>,
+    n: usize,
+}
+
+impl GpuObsStack {
+    pub fn new(
+        backend: &GpuBackend,
+        n: usize,
+        frame: usize,
+        hist: usize,
+        amp: &[f32],
+    ) -> Result<Self, GpuBackendError> {
+        let st = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        Ok(Self {
+            shader: ObsStackShader::from_backend(backend)?,
+            params: Tensor::scalar(
+                backend,
+                shaders::ObsStackParams {
+                    n_envs: n as u32,
+                    frame: frame as u32,
+                    hist: hist as u32,
+                    noise_scale: 0.0,
+                    seed: 0,
+                    only_reset: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                },
+                BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            )?,
+            amp: Tensor::vector(backend, amp, st)?,
+            head: Tensor::vector(backend, &vec![0u32; n], st)?,
+            reset: Tensor::vector(backend, &vec![1u32; n], st)?,
+            ring: Tensor::vector(backend, &vec![0.0f32; hist * frame * n], st)?,
+            out: Tensor::vector_uninit(
+                backend,
+                (hist * frame * n) as u32,
+                st | BufferUsages::COPY_SRC,
+            )?,
+            n,
+        })
+    }
+
+    /// The stacked `[hist*frame x n]` policy observation, oldest→newest.
+    pub fn out_tensor(&self) -> &Tensor<f32> {
+        &self.out
+    }
+
+    /// Record noise + stack into a SHARED encoder; `fresh` is
+    /// [`GpuObserve`]'s actor frame tensor.
+    pub fn encode(
+        &mut self,
+        backend: &GpuBackend,
+        enc: &mut Enc,
+        params: shaders::ObsStackParams,
+        fresh: &Tensor<f32>,
+        head: &[u32],
+        reset: &[u32],
+    ) -> Result<(), GpuBackendError> {
+        backend.write_buffer(self.params.buffer_mut(), 0, &[params])?;
+        backend.write_buffer(self.head.buffer_mut(), 0, head)?;
+        backend.write_buffer(self.reset.buffer_mut(), 0, reset)?;
+        {
+            let mut pass = enc.begin_pass("[obs] noise+stack", None);
+            self.shader.stack.call(
+                &mut pass,
+                self.n as u32,
+                &self.params,
+                fresh,
+                &self.amp,
+                &self.head,
+                &self.reset,
+                &mut self.ring,
+                &mut self.out,
+            )?;
+        }
+        Ok(())
+    }
+}
+
