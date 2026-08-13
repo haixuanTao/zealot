@@ -13,13 +13,18 @@ PPO trainer, and deployment — written entirely in Rust, on top of
 [nexus](https://github.com/dimforge/nexus), dimforge's cross-platform GPU
 physics engine.
 
-<p align="center">
-  <img src="docs/gifs/walk-forward-perturbation.gif" width="290" alt="Forward walk under pushes">
-  <img src="docs/gifs/walk-backward.gif" width="290" alt="Backward walk">
-  <img src="docs/gifs/lateral-walk.gif" width="290" alt="Lateral walk">
-  <img src="docs/gifs/yaw-rotation.gif" width="290" alt="Yaw tracking">
-  <img src="docs/gifs/pick-and-place.gif" width="290" alt="Upper-body teleop pick and place">
-</p>
+<table align="center">
+  <tr>
+    <td align="center"><img src="docs/gifs/walk-forward-perturbation.gif" width="290" alt="Forward walk under pushes"><br><sub>Forward walk under pushes</sub></td>
+    <td align="center"><img src="docs/gifs/walk-backward.gif" width="290" alt="Backward walk"><br><sub>Backward walk</sub></td>
+    <td align="center"><img src="docs/gifs/lateral-walk.gif" width="290" alt="Lateral walk"><br><sub>Lateral walk</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/gifs/yaw-rotation.gif" width="290" alt="Yaw tracking"><br><sub>Yaw tracking</sub></td>
+    <td align="center"><img src="docs/gifs/pick-and-place.gif" width="290" alt="Upper-body teleop pick and place"><br><sub>Upper-body teleop (pick &amp; place)</sub></td>
+    <td></td>
+  </tr>
+</table>
 
 ## Why it's built this way
 
