@@ -38,6 +38,7 @@ elif [ -z "$BIPED_ARM_MOTION" ]; then
         echo "ERROR: ~/sonic-motions not found — this box would train WITHOUT the" >&2
         echo "AMASS upper-body disturbance. rsync the dataset here, point" >&2
         echo "BIPED_ARM_MOTION at a clip dir, or opt out with BIPED_ARM_MOTION=off." >&2
+        echo "See docs/arm-motion-dataset.md for how to get the data." >&2
         exit 1
     fi
 fi
