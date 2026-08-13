@@ -983,7 +983,7 @@ source = "git+https://github.com/sebcrozet/Rust-CUDA.git?branch=glam-up#039c38d9
 dependencies = [
  "bitflags 2.13.1",
  "cuda_std_macros",
- "glam 0.32.1",
+ "glam 0.33.2",
  "half",
  "paste",
  "vek",
@@ -1739,10 +1739,6 @@ name = "glam"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f70749695b063ecbf6b62949ccccde2e733ec3ecbbd71d467dca4e5c6c97cca0"
-dependencies = [
- "bytemuck",
- "libm",
-]
 
 [[package]]
 name = "glam"
@@ -3428,8 +3424,6 @@ dependencies = [
 [[package]]
 name = "parry3d"
 version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42cb0f1726c9fa25cad2583862ed86a3beee3a9b1f9fbe1fac8518615e778903"
 dependencies = [
  "approx",
  "arrayvec",
@@ -6121,7 +6115,3 @@ dependencies = [
  "syn 2.0.119",
  "winnow",
 ]
-
-[[patch.unused]]
-name = "parry3d"
-version = "0.26.1"

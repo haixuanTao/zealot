@@ -820,7 +820,7 @@ fn main() {
         let ppo = Ppo::from_backend(&bk).unwrap();
         // Retain raw rollout observations on device so the PPO batch is built
         // there (normalize + clamp + mirror) instead of on the host.
-        gpu.init_raw_batch(&bk, T).expect("raw batch buffers");
+        gpu.init_raw_batch(&bk, T + 1).expect("raw batch buffers");
         // Mirror as an explicit signed permutation, cross-checked against the
         // real mirror functions before anything depends on it.
         let (mirror_perm_obs, mirror_sign_obs) = mirror_table(od, mirror_obs);
@@ -1207,10 +1207,20 @@ fn main() {
             let roll_s = t_roll.elapsed().as_secs_f64();
             // ---------------- GAE + batch ----------------
             let t_gae = Instant::now();
-            // Per-env bootstrap value + GAE are independent across envs; run them
-            // in parallel, then flatten in env order so the batch is unchanged.
+            // Bootstrap values V(s_T) for ALL envs in ONE device forward
+            // through the same GPU path as every other value in the GAE
+            // stream (ported from perf/v29-reimpl; replaces n host critic
+            // forwards). Raw-arena slot T absorbs the obs write.
+            let boot_vals: Vec<f32> = if norm_freeze {
+                let (_bm, bv) = gpu.forward(&bk, &ac, &gc, &gcc, T).await.unwrap();
+                bv
+            } else {
+                (0..n).map(|e| ac.value(&gcc[e])).collect()
+            };
+            // Per-env GAE is independent across envs; run in parallel, then
+            // flatten in env order so the batch is unchanged.
             samp.par_iter_mut().enumerate().for_each(|(e, se)| {
-                let lv = ac.value(&gcc[e]);
+                let lv = boot_vals[e];
                 let (adv, retn) = gae(&rs[e], &vs[e], &ds[e], lv, GAMMA, LAM);
                 for t in 0..T {
                     se[t].adv = adv[t];
@@ -1261,6 +1271,7 @@ fn main() {
             // (step-blocked), so the batch is assembled there: normalize +
             // clamp + mirror augmentation in one dispatch per tensor. Nothing
             // about obs is materialized on the host.
+            let t_stg_dev = Instant::now();
             let half = if mirror_aug { total / 2 } else { 0 };
             let stage_p = |dim: usize| PpoStageParams {
                 dim: dim as u32,
@@ -1367,6 +1378,8 @@ fn main() {
                 });
                 println!("[verify_stage] obs maxdiff={wo:.3e} critic maxdiff={wc:.3e}");
             }
+            let stg_dev_s = t_stg_dev.elapsed().as_secs_f64();
+            let t_stg_h2d = Instant::now();
             let mut act_arena = vec![0f32; total * ad_];
             act_arena
                 .par_chunks_mut(ad_)
@@ -1405,6 +1418,9 @@ fn main() {
                 st,
             );
             let f_ret = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].ret), st);
+            if std::env::var("BIPED_UPD_PROF2").is_ok() {
+                eprintln!("[prof-upd2] stage_dev={stg_dev_s:.3}s stage_h2d={:.3}s", t_stg_h2d.elapsed().as_secs_f64());
+            }
             let ap = Tensor::scalar(
                 &bk,
                 PpoActorParams {
