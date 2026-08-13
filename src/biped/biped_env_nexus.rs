@@ -1431,8 +1431,9 @@ const GAIT_PERIOD_MIN: f32 = 0.40;
 /// AMASS/SONIC upper-body playback config (see the `arm_motion` field).
 struct ArmMotionCfg {
     clips: Vec<zealot_env::motion::MotionClip>,
-    /// P(a standing command plays a clip) — BIPED_ARM_MOTION_P, default 0.7:
-    /// most stands get moving arms, but quiet stands stay in the curriculum.
+    /// P(a command window plays a clip) — BIPED_ARM_MOTION_P, default 0.7:
+    /// rolled on EVERY command resample (standing and walking alike), so most
+    /// windows get moving arms but quiet-arm ones stay in the curriculum.
     p: f32,
     /// Amplitude blend home→clip — BIPED_ARM_MOTION_SCALE, default 1.0.
     /// <1 attenuates the retargeted motion toward `held_home` (curriculum
@@ -1523,10 +1524,10 @@ pub struct BipedNexusBatchEnv {
     /// Trainer-installed dropout override for the actor's step cue (annealed
     /// exploration schedule). None = the BIPED_STEP_CUE_DROPOUT env default.
     step_cue_dropout_override: Option<f32>,
-    /// AMASS/SONIC upper-body playback (BIPED_ARM_MOTION=<clip dir>): while
-    /// the command is "stand", the held waist+arm joints replay a random clip
-    /// window as an unobserved moving-mass disturbance, and the legs must
-    /// balance under it. None = off (bit-identical staging to before).
+    /// AMASS/SONIC upper-body playback (BIPED_ARM_MOTION=<clip dir>): under
+    /// any command — standing or walking — the held waist+arm joints replay a
+    /// random clip window as an unobserved moving-mass disturbance, and the
+    /// legs must balance under it. None = off (bit-identical staging to before).
     arm_motion: Option<ArmMotionCfg>,
     /// Dedicated RNG stream (clip choice / start offset / activation roll) so
     /// enabling playback leaves the command/DR stream untouched.
@@ -1537,8 +1538,8 @@ pub struct BipedNexusBatchEnv {
     arm_active: Vec<bool>,
     /// Crossfade progress ∈ [0,1] from `arm_from` toward the current
     /// destination (clip pose or home), ramped over ~0.5 s. Reset to 0 on
-    /// EVERY destination switch — activation, deactivation, AND a
-    /// stand→stand resample that draws a fresh clip window — so the held
+    /// EVERY destination switch — activation, deactivation, AND a command
+    /// resample that draws a fresh clip window — so the held
     /// PD targets never see a step input between unrelated poses.
     arm_blend: Vec<f32>,
     /// Externally-driven held-joint targets (VR teleop / web demo): when
@@ -2342,6 +2343,11 @@ impl BipedNexusBatchEnv {
             );
             ArmMotionCfg { clips, p, scale }
         });
+        if arm_motion.is_none() {
+            println!(
+                "arm-motion playback DISABLED (BIPED_ARM_MOTION unset) — held joints hold the home pose"
+            );
+        }
         let arm_rng: Vec<Lcg> = (0..num_envs)
             .map(|e| Lcg::new(seed ^ ((e as u64).wrapping_mul(2654435761)) ^ 0xA53A))
             .collect();
@@ -3153,19 +3159,18 @@ impl BipedNexusBatchEnv {
         }
     }
 
-    /// Roll the upper-body playback state for env `e` against its CURRENT
-    /// command. Called wherever the command (re)samples: playback only runs
-    /// while standing (`speed() < 0.1` — the same gate as the gait clock and
-    /// stand height), so a walk command always blends the arms back home.
+    /// Roll the upper-body playback state for env `e`. Called wherever the
+    /// command (re)samples: every fresh command — standing OR walking — rolls
+    /// `chance(p)` for a new clip window, so the legs learn to balance under
+    /// arm motion in both regimes; a losing roll blends the arms back home.
     fn arm_resample(&mut self, e: usize) {
         let Some(am) = self.arm_motion.as_ref() else { return };
         let (n_clips, p) = (am.clips.len(), am.p);
         let n_held = self.idx.held.len();
-        let standing = self.cmd[e].speed() < 0.1;
-        if standing && self.arm_rng[e].chance(p) {
+        if self.arm_rng[e].chance(p) {
             let c = ((self.arm_rng[e].unit() * n_clips as f32) as usize).min(n_clips - 1);
             // Random start with runway: uniformly inside the clip minus the
-            // longest plausible stand dwell (a finished clip freezes on its
+            // longest plausible command dwell (a finished clip freezes on its
             // last frame — legal, just less motion than intended).
             let dur = self.arm_motion.as_ref().unwrap().clips[c].duration();
             let t0 = self.arm_rng[e].range(0.0, (dur - 8.0).max(0.0));
@@ -3227,7 +3232,7 @@ impl BipedNexusBatchEnv {
             // is the LIVE external target, the clip pose (already moving
             // during the fade), or home; `arm_from` was snapshotted at the
             // last destination switch, so every transition — activation,
-            // deactivation, stand→stand clip swap, live install/clear —
+            // deactivation, resample clip swap, live install/clear —
             // leaves from wherever the arms currently are.
             let b = (self.arm_blend[e] + dt / 0.5).min(1.0);
             self.arm_blend[e] = b;

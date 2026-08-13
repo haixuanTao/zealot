@@ -25,8 +25,22 @@ else
     export KHAL_BACKEND=webgpu
     FEATURES="gpu biped_gpu"
 fi
-# Arm-motion playback dataset (machine-local path; unset = arms hold still).
-[ -d "$HOME/sonic-motions" ] && export BIPED_ARM_MOTION="$HOME/sonic-motions"
+# Arm-motion playback dataset (machine-local path). Missing dataset is a HARD
+# ERROR — a box without ~/sonic-motions used to silently train with frozen
+# arms. To intentionally train without it: BIPED_ARM_MOTION=off scripts/train.sh
+if [ "$BIPED_ARM_MOTION" = "off" ]; then
+    unset BIPED_ARM_MOTION
+    echo "[launch] arm-motion playback explicitly disabled (BIPED_ARM_MOTION=off)"
+elif [ -z "$BIPED_ARM_MOTION" ]; then
+    if [ -d "$HOME/sonic-motions" ]; then
+        export BIPED_ARM_MOTION="$HOME/sonic-motions"
+    else
+        echo "ERROR: ~/sonic-motions not found — this box would train WITHOUT the" >&2
+        echo "AMASS upper-body disturbance. rsync the dataset here, point" >&2
+        echo "BIPED_ARM_MOTION at a clip dir, or opt out with BIPED_ARM_MOTION=off." >&2
+        exit 1
+    fi
+fi
 ITERS="${1:-50000}"
 ENVS="${2:-4096}"
 CKPT="${3:-$HOME/overnight/biped_$(date +%Y%m%d_%H%M).safetensors}"
