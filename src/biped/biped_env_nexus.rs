@@ -5426,16 +5426,27 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             let mut la = vec![0.0f32; jn];
             let mut pa = vec![0.0f32; jn];
             let mut p2a = vec![0.0f32; jn];
-            for e in 0..n {
-                for k in 0..NUM_JOINTS {
-                    la[k * n + e] = self.last_action[e][k];
-                    pa[k * n + e] = self.prev_action[e][k];
-                    p2a[k * n + e] = self.prev2_action[e][k];
-                }
+            {
+                // Row-parallel transpose (the serial e-major loop gave back
+                // the par_compute parallelism this block was measured against).
+                let (lact, pact, p2act) =
+                    (&self.last_action, &self.prev_action, &self.prev2_action);
+                la.par_chunks_mut(n)
+                    .zip(pa.par_chunks_mut(n))
+                    .zip(p2a.par_chunks_mut(n))
+                    .enumerate()
+                    .for_each(|(k, ((lr, pr), p2r))| {
+                        for e in 0..n {
+                            lr[e] = lact[e][k];
+                            pr[e] = pact[e][k];
+                            p2r[e] = p2act[e][k];
+                        }
+                    });
             }
             let hp: Vec<u32> = (0..n).map(|e| self.has_prev_joint_pos[e] as u32).collect();
             let hpp: Vec<u32> = (0..n).map(|e| self.has_prev_pose[e] as u32).collect();
             let gh: Vec<f32> = (0..n)
+                .into_par_iter()
                 .map(|e| {
                     let tp = &poses[e * bps as usize + self.idx.torso_link as usize];
                     self.terrain
@@ -5448,21 +5459,29 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             let mut fgh = vec![0.0f32; NUM_FEET * n];
             let mut sfv = vec![0.0f32; NUM_FEET * n];
             let mut pfv = vec![0.0f32; NUM_FEET * n];
-            for e in 0..n {
-                for i in 0..NUM_FEET {
-                    let sl = self.foot_sole_local[e][i];
-                    sole[(i * 3) * n + e] = sl.x;
-                    sole[(i * 3 + 1) * n + e] = sl.y;
-                    sole[(i * 3 + 2) * n + e] = sl.z;
-                    let link = self.idx.foot_links[i] as usize;
-                    let fpz = &poses[e * cpb + link].translation;
-                    fgh[i * n + e] = self
-                        .terrain
-                        .as_ref()
-                        .map_or(0.0, |ter| ter.strip_for(e).height(fpz.x, fpz.y));
-                    sfv[i * n + e] = self.sensed_force[e][i];
-                    pfv[i * n + e] = self.prev_sensed_force[e][i];
-                }
+            {
+                let (fsl, sf, psf) =
+                    (&self.foot_sole_local, &self.sensed_force, &self.prev_sensed_force);
+                sole.par_chunks_mut(3 * n)
+                    .zip(fgh.par_chunks_mut(n))
+                    .zip(sfv.par_chunks_mut(n).zip(pfv.par_chunks_mut(n)))
+                    .enumerate()
+                    .for_each(|(i, ((so, fg), (sv, pv)))| {
+                        let link = self.idx.foot_links[i] as usize;
+                        for e in 0..n {
+                            let sl = fsl[e][i];
+                            so[e] = sl.x;
+                            so[n + e] = sl.y;
+                            so[2 * n + e] = sl.z;
+                            let fpz = &poses[e * cpb + link].translation;
+                            fg[e] = self
+                                .terrain
+                                .as_ref()
+                                .map_or(0.0, |ter| ter.strip_for(e).height(fpz.x, fpz.y));
+                            sv[e] = sf[e][i];
+                            pv[e] = psf[e][i];
+                        }
+                    });
             }
             let hpf: Vec<u32> = (0..n).map(|e| self.has_prev_force[e] as u32).collect();
             let w = &self.task.weights;
@@ -5761,8 +5780,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 [(13, 0), (15, 1), (28, 2), (17, 3), (18, 4), (27, 5), (19, 6), (30, 7)];
             const GAI_T: [(usize, usize); 5] = [(12, 0), (14, 1), (26, 2), (16, 3), (25, 4)];
             const MIS_T: [(usize, usize); 3] = [(22, 0), (31, 1), (23, 2)];
-            for e in 0..n {
-                let c = &mut computed[e];
+            computed.par_iter_mut().enumerate().for_each(|(e, c)| {
                 for &(comp, row) in &ACT_T {
                     c.comps[comp] = rt[row * n + e];
                 }
@@ -5785,7 +5803,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     c.comps[comp] = mtm[row * n + e];
                 }
                 c.reward = c.comps.iter().sum();
-            }
+            });
             }
             self.timings.par_compute_ns += t.elapsed().as_nanos() as u64;
         }
