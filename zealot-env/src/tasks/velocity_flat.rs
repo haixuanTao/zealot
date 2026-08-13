@@ -912,6 +912,12 @@ impl Default for VelocityFlatTask {
 }
 
 impl VelocityFlatTask {
+    /// Hip yaw/roll joint indices — the subset `action_rate_hipz_hipx` sums
+    /// over. Exposed so the GPU reward kernel can be handed the same mask.
+    pub fn hip_yawroll_idx(&self) -> [usize; 4] {
+        self.hip_yawroll_idx
+    }
+
     /// Build the task with the deployed policy's settings, for the robot
     /// selected by `BIPED_ROBOT` (see [`RobotSpec::from_env`]).
     pub fn new() -> Self {

@@ -195,6 +195,19 @@ impl Normalizer {
     }
 
     /// Whiten `x` to ~zero-mean/unit-variance, clamped to ±5.
+    /// Per-feature `(mean, 1/σ)` — the affine form of [`Self::normalize`],
+    /// hoisted so a caller staging a large batch can fuse normalization into a
+    /// single pass instead of allocating a `Vec` per sample. Callers must still
+    /// apply the same ±5 clamp.
+    pub fn affine(&self) -> (Vec<f32>, Vec<f32>) {
+        let inv_sd = self
+            .m2
+            .iter()
+            .map(|m2| 1.0 / (m2 / self.count).max(1e-8).sqrt())
+            .collect();
+        (self.mean.clone(), inv_sd)
+    }
+
     pub fn normalize(&self, x: &[f32]) -> Vec<f32> {
         (0..x.len())
             .map(|i| {
