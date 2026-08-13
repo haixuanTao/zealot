@@ -3542,6 +3542,17 @@ impl BipedNexusBatchEnv {
     }
 
     pub async fn step(&mut self, actions: &[[f32; NUM_JOINTS]]) -> Vec<StepOut> {
+        // The device reward/obs paths are validated on native CUDA only —
+        // on WebGPU/Metal one of the kernels still fails naga validation, so
+        // fall back to the host paths there (logged once, first step).
+        if (self.use_gpu_reward || self.use_gpu_obs) && !self.gpu.is_cuda() {
+            eprintln!(
+                "[env] non-CUDA backend: falling back to HOST reward/obs \
+                 (device paths not yet validated on WebGPU/Metal)"
+            );
+            self.use_gpu_reward = false;
+            self.use_gpu_obs = false;
+        }
         assert_eq!(actions.len(), self.n);
 
         // (0) Upper-body playback: restage the held-joint targets FIRST, so
