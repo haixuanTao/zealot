@@ -2142,6 +2142,14 @@ fn main() {
                     ));
                     if let Some(lvl) = env.mean_terrain_level() {
                         s.push_str(&format!(" terrain_level={lvl:.3}"));
+                        // Population max alongside the mean: the mean hides the
+                        // front-runners (mean 0.8 has envs on row 6; mean ~2.85
+                        // had them near row 10-12), and "how high do the best
+                        // envs climb" is the question the mean can't answer.
+                        if let Some(st) = env.terrain_curriculum_state() {
+                            let mx = st.iter().map(|&(l, _, _)| l).max().unwrap_or(0);
+                            s.push_str(&format!(" terrain_max={mx}"));
+                        }
                     }
                     println!("{s}");
                 }

@@ -95,7 +95,7 @@ async fn train(
                 ac.record_obs(&cur[e], &cur_c[e]);
             }
             let (means, values) = gpu
-                .forward(env.backend(), ac, &cur, &cur_c)
+                .forward(env.backend(), ac, &cur, &cur_c, 0)
                 .await
                 .expect("gpu policy forward");
 
