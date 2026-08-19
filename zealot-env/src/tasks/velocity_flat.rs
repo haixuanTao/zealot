@@ -55,8 +55,18 @@ pub const UP: usize = 2;
 // probe it gives the edge DIRECTION -- which is what lets the robot meet a
 // step at an angle rather than only head-on. Trained against a terrain oracle
 // with sensor-shaped noise (see `StepCue`).
+// `+ 2*NUM_HELD_OBS` at the very end (slots 53..79): the UPPER-BODY block —
+// the 13 held-joint PD TARGETS and their finite-diff velocities. Until now the
+// policy was blind to the arms: the AMASS playback moved 13 joints of mass and
+// the legs only found out via the gyro, one control step after the torso
+// already started tipping. Targets, not measured angles, on purpose: the
+// controller COMMANDS the arms, so targets are exactly known on hardware too,
+// and they LEAD the physical motion — feedforward, not just faster feedback.
+// Zero-padded (targets = home, vel = 0) when the robot has fewer held joints
+// or playback is off.
+pub const NUM_HELD_OBS: usize = 13;
 pub const OBS_DIM: usize =
-    NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2 + 3 + 5;
+    NUM_JOINTS + 4 + NUM_JOINTS + NUM_JOINTS + 3 + 2 + 3 + 5 + 2 * NUM_HELD_OBS;
 /// Action vector length: one position target per leg DOF.
 pub const ACTION_DIM: usize = NUM_JOINTS;
 /// Privileged (critic) observation length: policy obs plus base linear & angular
@@ -238,6 +248,11 @@ pub struct RobotState {
     pub step_cue: StepCue,
     /// The clean oracle cue, critic-only (asymmetric AC). Zero when unknown.
     pub step_cue_clean: StepCue,
+    /// Held-joint (upper body) PD targets, staging order. Home pose when
+    /// playback is off; zero-padded past the robot's held-joint count.
+    pub held_pos: [f32; NUM_HELD_OBS],
+    /// Finite-diff velocity of `held_pos` (per control step / dt).
+    pub held_vel: [f32; NUM_HELD_OBS],
 }
 
 impl Default for RobotState {
@@ -253,6 +268,8 @@ impl Default for RobotState {
             phase: 0.0,
             step_cue: StepCue::default(),
             step_cue_clean: StepCue::default(),
+            held_pos: [0.0; NUM_HELD_OBS],
+            held_vel: [0.0; NUM_HELD_OBS],
         }
     }
 }
@@ -1168,6 +1185,15 @@ impl VelocityFlatTask {
         put(obs, &mut o, if live { cue.edge_sin } else { 0.0 });
         put(obs, &mut o, if live { cue.edge_cos } else { 0.0 });
         put(obs, &mut o, if live { 1.0 } else { 0.0 });
+        // Upper-body block LAST (slots 53..79), so every earlier slot keeps its
+        // v22-v28 meaning — mirror transform / sim2sim / controller all index
+        // by position. No noise: targets are the controller's own commands.
+        for i in 0..NUM_HELD_OBS {
+            put(obs, &mut o, state.held_pos[i]);
+        }
+        for i in 0..NUM_HELD_OBS {
+            put(obs, &mut o, state.held_vel[i]);
+        }
         debug_assert_eq!(o, OBS_DIM);
     }
 
@@ -1690,11 +1716,12 @@ mod tests {
 
     #[test]
     fn obs_dim_consistent() {
-        // 45 through v21; + base_ang_vel(3) from v22; + step_cue(5) from v28.
+        // 45 through v21; + base_ang_vel(3) from v22; + step_cue(5) from v28;
+        // + upper-body block (13 held targets + 13 target vels) from v29.
         // This is the OBSERVATION CONTRACT -- the three sim2sim harnesses and
         // the lerobot controller all rebuild this vector by offset, so widening
         // it means updating them too, not just this number.
-        assert_eq!(OBS_DIM, 53);
+        assert_eq!(OBS_DIM, 79);
         assert_eq!(ACTION_DIM, 12);
         let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         let mut obs = vec![0.0; OBS_DIM];
@@ -2014,11 +2041,11 @@ mod tests {
 
         st.step_cue = StepCue { distance: 0.42, height: 0.18, edge_sin: 0.5, edge_cos: 0.87, valid: 0.0 };
         task.observe(&st, &cmd, &mut obs);
-        assert_eq!(&obs[OBS_DIM - 5..], &[0.0; 5], "stale cue leaked through valid=0");
+        assert_eq!(&obs[48..53], &[0.0; 5], "stale cue leaked through valid=0");
 
         st.step_cue = StepCue { distance: 0.42, height: 0.18, edge_sin: 0.5, edge_cos: 0.87, valid: 1.0 };
         task.observe(&st, &cmd, &mut obs);
-        assert_eq!(&obs[OBS_DIM - 5..], &[0.42, 0.18, 0.5, 0.87, 1.0]);
+        assert_eq!(&obs[48..53], &[0.42, 0.18, 0.5, 0.87, 1.0]);
     }
 
     /// The cue must not disturb the slots every other consumer indexes by
@@ -2036,7 +2063,7 @@ mod tests {
         let mut st2 = st;
         st2.step_cue = StepCue { distance: 1.0, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
         task.observe(&st2, &cmd, &mut cued);
-        assert_eq!(with[..OBS_DIM - 5], cued[..OBS_DIM - 5],
+        assert_eq!(with[..48], cued[..48],
                    "setting the step cue changed a pre-existing observation slot");
     }
 

@@ -1635,6 +1635,9 @@ pub struct BipedNexusBatchEnv {
     /// prev==current (identity) for held links instead of a zero from the
     /// buffer default.
     arm_staged: Vec<f32>,
+    /// `arm_staged` from the PREVIOUS control step — finite-diff source for the
+    /// held-target velocity in the upper-body obs block.
+    prev_arm_staged: Vec<f32>,
     /// `arm_staged` transposed into the motor scatter's row-major
     /// `[held x env]` layout (`j * n + e`). Uploaded and scattered straight
     /// into `links_static` on device each step, replacing the whole-mirror
@@ -2614,6 +2617,12 @@ impl BipedNexusBatchEnv {
                 .cycle()
                 .take(n_held * num_envs)
                 .collect(),
+            prev_arm_staged: held_homes
+                .iter()
+                .copied()
+                .cycle()
+                .take(n_held * num_envs)
+                .collect(),
             cmd,
             step_count,
             resample_at,
@@ -2757,6 +2766,18 @@ impl BipedNexusBatchEnv {
                 // backends fall back at the first step (guard in `step`).
                 let on = std::env::var("BIPED_GPU_OBS").map_or(true, |v| v != "0")
                     && std::env::var("BIPED_VERIFY_REWARD").is_err();
+                // The device obs kernel predates the upper-body block (obs 79):
+                // it still writes the 53-dim layout. Force HOST assembly until
+                // the kernel grows the two new inputs; measured cost at
+                // stats-stride 1 is ~1% (host2 0.813 vs devfix1 0.803 s/iter).
+                let on = on && {
+                    if on {
+                        eprintln!(
+                            "[env] BIPED_GPU_OBS requested but the device kernel predates the upper-body obs block — forcing HOST assembly"
+                        );
+                    }
+                    false
+                };
                 eprintln!(
                     "[env] obs assembly: {}",
                     if on {
@@ -3266,6 +3287,22 @@ impl BipedNexusBatchEnv {
                 // Filled by the caller (needs the terrain + this env's pose).
                 step_cue: Default::default(),
             step_cue_clean: Default::default(),
+                held_pos: {
+                    let mut hp = [0.0f32; zealot_env::tasks::velocity_flat::NUM_HELD_OBS];
+                    let nh = self.idx.held.len().min(hp.len());
+                    hp[..nh].copy_from_slice(&self.arm_staged[env * self.idx.held.len()..][..nh]);
+                    hp
+                },
+                held_vel: {
+                    let mut hv = [0.0f32; zealot_env::tasks::velocity_flat::NUM_HELD_OBS];
+                    let nh = self.idx.held.len().min(hv.len());
+                    for j in 0..nh {
+                        hv[j] = (self.arm_staged[env * self.idx.held.len() + j]
+                            - self.prev_arm_staged[env * self.idx.held.len() + j])
+                            / control_dt;
+                    }
+                    hv
+                },
             },
             joint_pos,
         )
@@ -3526,6 +3563,7 @@ impl BipedNexusBatchEnv {
         self.arm_blend[e] = if self.live_arm.is_some() { 0.0 } else { 1.0 };
         for (j, h) in self.idx.held.iter().enumerate() {
             self.arm_staged[e * n_held + j] = h.home;
+            self.prev_arm_staged[e * n_held + j] = h.home;
             self.arm_from[e * n_held + j] = h.home;
         }
     }
@@ -3537,6 +3575,9 @@ impl BipedNexusBatchEnv {
     /// staging stays bit-identical to before.
     fn stage_arm_motion(&mut self) {
         let dt = self.task.control_dt();
+        // Snapshot BEFORE restaging: the obs block's target velocity is
+        // (current - previous)/dt over one control step.
+        self.prev_arm_staged.copy_from_slice(&self.arm_staged);
         if self.arm_motion.is_none() && self.live_arm.is_none() && self.live_fadeout == 0 {
             return;
         }

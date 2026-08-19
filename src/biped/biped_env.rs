@@ -1203,6 +1203,9 @@ impl BipedEnv {
             // CPU env has no terrain, so the probe never reports a step.
             step_cue: Default::default(),
             step_cue_clean: Default::default(),
+            // Rapier CPU env has no arm playback — home/zero block.
+            held_pos: [0.0; zealot_env::tasks::velocity_flat::NUM_HELD_OBS],
+            held_vel: [0.0; zealot_env::tasks::velocity_flat::NUM_HELD_OBS],
         }
     }
 }

@@ -211,8 +211,36 @@ fn mirror_frame(o: &[f32]) -> Vec<f32> {
     if o.len() > 50 {
         m[50] = -o[50]; // edge_sin
     }
+    // Upper-body block (53..66 target pos, 66..79 target vel): L/R held joints
+    // swap with the leg sign convention; both sub-blocks mirror identically.
+    if o.len() > 66 {
+        for (base, _) in [(53usize, "pos"), (66usize, "vel")] {
+            for i in 0..13 {
+                m[base + i] = HSIGN[i] * o[base + HMIRROR[i]];
+            }
+        }
+    }
     m
 }
+// Upper-body (held-joint) mirror, staging order for the G1 29-DOF:
+// [waist_yaw, waist_roll, waist_pitch,
+//  L_sh_pitch, L_sh_roll, L_sh_yaw, L_elbow, L_wrist_roll,
+//  R_sh_pitch, R_sh_roll, R_sh_yaw, R_elbow, R_wrist_roll].
+// Same sign convention as the legs: pitch keeps sign, roll/yaw negate; the
+// waist joints are their own mirror image. The order is ASSERTED against
+// env.held_joint_names() at startup — a reordered MJCF fails loudly there.
+const HMIRROR: [usize; 13] = [0, 1, 2, 8, 9, 10, 11, 12, 3, 4, 5, 6, 7];
+const HSIGN: [f32; 13] = [
+    -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0,
+];
+const HELD_NAMES: [&str; 13] = [
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+    "left_elbow_joint", "left_wrist_roll_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+    "right_elbow_joint", "right_wrist_roll_joint",
+];
+
 // With BIPED_OBS_HISTORY the actor obs is H stacked 45-frames — the mirror is
 // block-diagonal (each frame mirrors independently). H=1 = the plain frame.
 fn mirror_obs(o: &[f32]) -> Vec<f32> {
@@ -884,6 +912,19 @@ fn main() {
         let t_so_id = Tensor::vector(&bk, &vec![1.0f32; od], BufferUsages::STORAGE).unwrap();
         let t_pc_id = Tensor::vector(&bk, &(0..cd as u32).collect::<Vec<u32>>(), BufferUsages::STORAGE).unwrap();
         let t_sc_id = Tensor::vector(&bk, &vec![1.0f32; cd], BufferUsages::STORAGE).unwrap();
+        // The HMIRROR/HSIGN tables above assume the G1 29-DOF held-joint
+        // staging order; a robot with a different held set must fail here, not
+        // train with a silently wrong mirror.
+        {
+            let held = env.held_joint_names();
+            if !held.is_empty() {
+                assert_eq!(
+                    held,
+                    HELD_NAMES.map(String::from).to_vec(),
+                    "held-joint order does not match the upper-body mirror tables"
+                );
+            }
+        }
         {
             let mut r = Lcg::new(7);
             let xo: Vec<f32> = (0..od).map(|_| (r.unit() * 6.0 - 3.0)).collect();
