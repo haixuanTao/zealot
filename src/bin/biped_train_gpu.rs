@@ -48,6 +48,7 @@ use zealot_env::robots::{RobotSpec, NUM_JOINTS};
 use zealot_rl::ActorCritic;
 use zealot_rl::net::Mlp;
 use zealot_rl::ppo::{Sample, gae};
+use zealot_rl::trainstate::{MomentSet, TrainState, sidecar_path};
 use zealot_rl::rng::Lcg;
 
 const LOG_SQRT_2PI: f32 = 0.918_938_5;
@@ -469,10 +470,12 @@ impl GpuMlp {
             b: (0..l)
                 .map(|i| mk(bk, &DMatrix::from_fn(d[i + 1], 1, |r, _| net.b[i][r]), rw))
                 .collect(),
-            mw: (0..l).map(|i| mk(bk, &z(d[i + 1], d[i]), st)).collect(),
-            vw: (0..l).map(|i| mk(bk, &z(d[i + 1], d[i]), st)).collect(),
-            mb: (0..l).map(|i| mk(bk, &z(d[i + 1], 1), st)).collect(),
-            vb: (0..l).map(|i| mk(bk, &z(d[i + 1], 1), st)).collect(),
+            // `rw`, not `st`: the Adam moments are read back into the
+            // `<ckpt>.train` sidecar on every checkpoint, which needs COPY_SRC.
+            mw: (0..l).map(|i| mk(bk, &z(d[i + 1], d[i]), rw)).collect(),
+            vw: (0..l).map(|i| mk(bk, &z(d[i + 1], d[i]), rw)).collect(),
+            mb: (0..l).map(|i| mk(bk, &z(d[i + 1], 1), rw)).collect(),
+            vb: (0..l).map(|i| mk(bk, &z(d[i + 1], 1), rw)).collect(),
             a: (0..=l).map(|i| mk(bk, &z(d[i], m), rw)).collect(),
             bb: (0..l).map(|i| mk(bk, &z(d[i + 1], m), st)).collect(),
             delta: (0..l).map(|i| mk(bk, &z(d[i + 1], m), rw)).collect(),
@@ -661,6 +664,36 @@ impl GpuMlp {
         }
         Ok(())
     }
+    /// Read Adam's persistent moments into the flat row-major layout the
+    /// `<ckpt>.train` sidecar stores (`mw`/`vw` `[out x in]`, `mb`/`vb`
+    /// `[out]`) — the weight-side equivalent is `read_into`.
+    async fn read_moments(&self, bk: &GpuBackend) -> MomentSet {
+        let (mut mw, mut vw, mut mb, mut vb) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..self.w.len() {
+            let (out, inp) = (self.dims[i + 1], self.dims[i]);
+            let n2 = out * inp;
+            mw.push(bk.slow_read_vec(self.mw[i].buffer()).await.unwrap()[..n2].to_vec());
+            vw.push(bk.slow_read_vec(self.vw[i].buffer()).await.unwrap()[..n2].to_vec());
+            mb.push(bk.slow_read_vec(self.mb[i].buffer()).await.unwrap()[..out].to_vec());
+            vb.push(bk.slow_read_vec(self.vb[i].buffer()).await.unwrap()[..out].to_vec());
+        }
+        MomentSet { dims: self.dims.clone(), mw, vw, mb, vb }
+    }
+
+    /// Restore moments saved by [`read_moments`](Self::read_moments).
+    /// Recreating the tensors is safe for the reason `write_w` gives: the
+    /// update passes only borrow them per pass.
+    fn write_moments(&mut self, bk: &GpuBackend, ms: &MomentSet) {
+        let rw = BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST;
+        for l in 0..self.w.len() {
+            let (out, inp) = (self.dims[l + 1], self.dims[l]);
+            self.mw[l] = mk(bk, &wmat(&ms.mw[l], out, inp), rw);
+            self.vw[l] = mk(bk, &wmat(&ms.vw[l], out, inp), rw);
+            self.mb[l] = mk(bk, &DMatrix::from_fn(out, 1, |r, _| ms.mb[l][r]), rw);
+            self.vb[l] = mk(bk, &DMatrix::from_fn(out, 1, |r, _| ms.vb[l][r]), rw);
+        }
+    }
+
     /// Write the trained GPU weights back into a CPU `Mlp` (`w[l]` is row-major
     /// `[out x in]`, `b[l]` is `[out x 1]`).
     async fn read_into(&self, bk: &GpuBackend, net: &mut Mlp) {
@@ -825,6 +858,13 @@ fn main() {
         // consumes the tensors directly (no host obs transpose / upload). The
         // first-ever forward and the normalizer stats subsample stay host-fed.
         let gpu_obs_dev = env.gpu_obs_active();
+        // Same stride the env uses to decide which envs carry host obs
+        // (BIPED_OBS_STATS_STRIDE, default 16; power of two, checked there).
+        let obs_stats_mask: usize = std::env::var("BIPED_OBS_STATS_STRIDE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(16)
+            - 1;
         let mut dev_obs_ready = false;
         if gpu_obs_dev {
             eprintln!("[launch] BIPED_GPU_OBS: device obs -> policy (host keeps 1/16 stats subsample)");
@@ -868,6 +908,48 @@ fn main() {
         );
         let mut a_net = GpuMlp::new(&bk, &ac.actor, mb);
         let mut c_net = GpuMlp::new(&bk, &ac.critic, mb);
+        // Training state the POLICY checkpoint deliberately does not carry (it
+        // stays small because the wasm demos embed it): Adam's moments + global
+        // step, the best-so-far reward EMA, and the terrain curriculum. Losing
+        // those is not cosmetic — Adam restarts from zero moments at t=0, so
+        // bias correction makes the first updates enormous and kicks a
+        // converged policy off its optimum, and the best-tracker re-arms from
+        // -inf, overwriting a `<ckpt>.best` that was BETTER than anything the
+        // resumed run will reach. Optional by design: a missing or mismatched
+        // sidecar just means the old cold-start behavior.
+        let resume_state = if resumed {
+            let sc = sidecar_path(&ckpt);
+            match TrainState::load(&sc) {
+                Ok(ts) if ts.matches(&ac.actor.dims, &ac.critic.dims) => {
+                    a_net.write_moments(&bk, &ts.actor);
+                    c_net.write_moments(&bk, &ts.critic);
+                    env.set_terrain_curriculum_state(&ts.terrain);
+                    println!(
+                        "[resume] optimizer state restored from {sc} (gstep {}, {} iters done, best reward-EMA {:.4}, {} terrain envs)",
+                        ts.gstep,
+                        ts.iter_done,
+                        ts.best_ema,
+                        ts.terrain.len()
+                    );
+                    Some(ts)
+                }
+                Ok(ts) => {
+                    println!(
+                        "[resume] WARNING {sc} is for a different architecture (actor {:?} critic {:?}) — Adam COLD-STARTS and `.best` re-arms",
+                        ts.actor.dims, ts.critic.dims
+                    );
+                    None
+                }
+                Err(e) => {
+                    println!(
+                        "[resume] WARNING no usable optimizer state at {sc} ({e}) — Adam COLD-STARTS from zero moments and `.best` re-arms from -inf. Expect a transient reward drop; back up `{ckpt}.best` first."
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let ad_ = NUM_JOINTS;
         let mut lst = mk(&bk, &DMatrix::from_fn(ad_, 1, |r, _| ac.log_std[r]), rw);
         let (mut mls, mut vls) = (
@@ -912,7 +994,8 @@ fn main() {
             &DMatrix::<f32>::from_element(ad_, mb, mirror_loss * scale_mb),
             st,
         );
-        let mut gstep: u64 = 0;
+        // Continues the Adam bias-correction schedule across a resume.
+        let mut gstep: u64 = resume_state.as_ref().map_or(0, |ts| ts.gstep);
         let mut lr = LR; // adaptive-KL LR, persists across iterations
         // Best-checkpoint tracking. The adaptive-KL controller can oscillate a
         // CONVERGED policy off its peak late in training (reward drifts down,
@@ -920,8 +1003,10 @@ fn main() {
         // the LATEST (possibly degraded) weights. Track a smoothed reward and
         // save the peak policy separately to `<ckpt>.best` — that's the one to
         // deploy; overtraining then can't cost us the good model.
-        let mut rew_ema = 0.0f32;
-        let mut best_ema = f32::NEG_INFINITY;
+        let mut rew_ema = resume_state.as_ref().map_or(0.0f32, |ts| ts.rew_ema);
+        let mut best_ema = resume_state
+            .as_ref()
+            .map_or(f32::NEG_INFINITY, |ts| ts.best_ema);
         // LR floor override (BIPED_LR_MIN). rsl_rl's adaptive-KL schedule brakes
         // down to 1e-5; our 1e-4 default was tuned for the shaped reward and is
         // too high a floor for spikier reward sets (KL runs away when the
@@ -1114,9 +1199,10 @@ fn main() {
             for step_i in 0..T {
                 let t_ph = Instant::now();
                 for e in 0..n {
-                    // Device-obs mode: only the 1/16 stride subsample carries
+                    // Device-obs mode: only the stats-stride subsample carries
                     // real host obs (the rest are zeros) — stats read those.
-                    if gpu_obs_dev && (e & 15) != 0 {
+                    // Stride mirrors the env's BIPED_OBS_STATS_STRIDE.
+                    if gpu_obs_dev && (e & (obs_stats_mask)) != 0 {
                         continue;
                     }
                     if norm_freeze {
@@ -1213,6 +1299,63 @@ fn main() {
                         gcc[e] = c;
                     }
                     to_reset.clear();
+                }
+                // BIPED_VERIFY_STACK: device-assembled STACKED obs vs the host
+                // rings, on the subsample envs that carry both. The frame-level
+                // device assembly has its own audit (BIPED_VERIFY_REWARD); this
+                // covers what that one can't — the ring heads, reset
+                // replication, and window ordering of the device stack. Run
+                // with BIPED_OBS_NOISE=0: the two paths draw noise from
+                // different RNGs, so any nonzero noise makes them differ by
+                // construction.
+                if gpu_obs_dev && dev_obs_ready && std::env::var("BIPED_VERIFY_STACK").is_ok() {
+                    bk.synchronize().unwrap();
+                    let (ot, ct2) = env.device_obs_tensors().unwrap();
+                    let dev: Vec<f32> = bk.slow_read_vec(ot.buffer()).await.unwrap();
+                    let devc: Vec<f32> = bk.slow_read_vec(ct2.buffer()).await.unwrap();
+                    let (mut wo, mut wc, mut wo_i, mut wc_i, mut cnt) =
+                        (0.0f32, 0.0f32, 0usize, 0usize, 0usize);
+                    for e in (0..n).step_by(obs_stats_mask + 1) {
+                        if gc[e].is_empty() {
+                            continue;
+                        }
+                        cnt += 1;
+                        for r in 0..od {
+                            let d = (dev[r * n + e] - gc[e][r]).abs();
+                            if d > wo {
+                                wo = d;
+                                wo_i = r;
+                            }
+                        }
+                        for r in 0..cd {
+                            let d = (devc[r * n + e] - gcc[e][r]).abs();
+                            if d > wc {
+                                wc = d;
+                                wc_i = r;
+                            }
+                        }
+                    }
+                    println!(
+                        "[verify_stack] step {step_i}: actor maxdiff={wo:.3e} (slot {wo_i}) critic maxdiff={wc:.3e} (slot {wc_i}) over {cnt} envs"
+                    );
+                    if std::env::var("BIPED_VERIFY_STACK").as_deref() == Ok("2") && wc > 1e-3 {
+                        let mut per = vec![0.0f32; cd];
+                        for e in (0..n).step_by(obs_stats_mask + 1) {
+                            if gcc[e].is_empty() {
+                                continue;
+                            }
+                            for r in 0..cd {
+                                per[r] = per[r].max((devc[r * n + e] - gcc[e][r]).abs());
+                            }
+                        }
+                        let bad: Vec<String> = per
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, d)| **d > 1e-3)
+                            .map(|(r, d)| format!("{r}:{d:.2e}"))
+                            .collect();
+                        println!("[verify_stack]   bad critic slots: {}", bad.join(" "));
+                    }
                 }
                 if roll_prof {
                     d_post += t_ph.elapsed().as_micros();
@@ -2020,17 +2163,49 @@ fn main() {
             // warm up 200 iters before arming so early-training garbage never
             // wins. `<ckpt>.best` = the peak policy to deploy.
             let mean_step_rew = total_reward / total as f32;
-            rew_ema = if it == 0 { mean_step_rew } else { 0.98 * rew_ema + 0.02 * mean_step_rew };
+            rew_ema = if it == 0 && resume_state.is_none() {
+                mean_step_rew
+            } else {
+                0.98 * rew_ema + 0.02 * mean_step_rew
+            };
             if !ckpt.is_empty() && it >= 200 && rew_ema > best_ema {
                 best_ema = rew_ema;
                 if ac.save(&format!("{ckpt}.best")).is_ok() {
                     println!("[best] new peak reward-EMA {rew_ema:.4} @iter {it} → {ckpt}.best");
                 }
             }
+            // Optimizer/curriculum sidecar, on the same cadence as the latest
+            // checkpoint so a resume always finds state matching those weights.
+            if !ckpt.is_empty() && (it % 50 == 0 || it == iters - 1) {
+                let ts = TrainState {
+                    actor: a_net.read_moments(&bk).await,
+                    critic: c_net.read_moments(&bk).await,
+                    gstep,
+                    iter_done: it as u64 + 1,
+                    best_ema,
+                    rew_ema,
+                    terrain: env.terrain_curriculum_state().unwrap_or_default(),
+                };
+                let _ = ts.save(&sidecar_path(&ckpt));
+            }
         }
         if !ckpt.is_empty() {
             ac.save(&ckpt).expect("save");
-            println!("saved → {ckpt} (latest); best policy at {ckpt}.best (reward-EMA {best_ema:.4})");
+            let ts = TrainState {
+                actor: a_net.read_moments(&bk).await,
+                critic: c_net.read_moments(&bk).await,
+                gstep,
+                iter_done: iters as u64,
+                best_ema,
+                rew_ema,
+                terrain: env.terrain_curriculum_state().unwrap_or_default(),
+            };
+            let sc = sidecar_path(&ckpt);
+            match ts.save(&sc) {
+                Ok(()) => println!("saved → {ckpt} (latest) + {sc} (optimizer state, resumable)"),
+                Err(e) => println!("saved → {ckpt} (latest); WARNING {sc} failed ({e}) — a resume will cold-start Adam"),
+            }
+            println!("best policy at {ckpt}.best (reward-EMA {best_ema:.4})");
         }
     });
 }

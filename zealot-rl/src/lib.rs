@@ -15,6 +15,9 @@
 //! - `ppo`  — diagonal-Gaussian actor-critic, GAE(λ), clipped PPO update with
 //!            adaptive-KL LR + entropy bonus.
 //! - `rng`  — a small deterministic LCG for init / exploration.
+//! - `trainstate` — the `<ckpt>.train` sidecar: Adam moments, global step and
+//!            curriculum progress, i.e. the state a *resumed* run needs but
+//!            [`ppo::ActorCritic`] deliberately does not carry.
 //!
 //! These are the CPU reference implementation (a port of the `pendulum_ppo`
 //! math); a `burn`/GPU backend can later sit behind the same [`ppo::ActorCritic`]
@@ -23,9 +26,11 @@
 pub mod net;
 pub mod ppo;
 pub mod rng;
+pub mod trainstate;
 
 pub use net::{Adam, Mlp, MlpGrad};
 pub use ppo::{ActorCritic, PpoConfig, PpoStats, Sample, gae};
+pub use trainstate::{MomentSet, TrainState};
 
 /// Crate version — used to sanity-check that the workspace links.
 pub fn version() -> &'static str {

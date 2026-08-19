@@ -755,6 +755,23 @@ impl TerrainCurriculum {
         Self::init_inner(rng)
     }
 
+    /// Full state as `(level, successes, failures)` — for the `<ckpt>.train`
+    /// sidecar, so a resumed run keeps the difficulty the population earned
+    /// instead of redrawing every env from `U{0,1}`.
+    pub fn state(&self) -> (u32, u32, u32) {
+        (self.level, self.successes, self.failures)
+    }
+
+    /// Inverse of [`state`](Self::state). `level` is clamped to the terrain's
+    /// row count, so a sidecar written against a taller terrain still loads.
+    pub fn from_state(level: u32, successes: u32, failures: u32) -> Self {
+        TerrainCurriculum {
+            level: level.min(ROWS as u32 - 1),
+            successes,
+            failures,
+        }
+    }
+
     fn init_inner(rng: &mut Lcg) -> Self {
         let level = if rng.range(0.0, 1.0) < 0.5 { 0 } else { 1 };
         TerrainCurriculum { level, successes: 0, failures: 0 }

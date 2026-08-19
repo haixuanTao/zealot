@@ -1440,6 +1440,14 @@ struct ArmMotionCfg {
     /// <1 attenuates the retargeted motion toward `held_home` (curriculum
     /// knob if full-amplitude dance clips topple everything early on).
     scale: f32,
+    /// BIPED_ARM_STATIC=1: hold a random clip POSE instead of playing the
+    /// clip. The pose is still drawn from the data (random clip, random time),
+    /// so the upper-body configuration distribution is unchanged — but it does
+    /// not animate, so the legs get the altered mass distribution without the
+    /// continuous disturbance. Playback roughly halves episode length (3.6 s
+    /// vs 5.1 s without it), which starves the terrain curriculum: promotion
+    /// needs >4 m of travel, so envs pile up on row 0.
+    static_pose: bool,
 }
 
 
@@ -1627,6 +1635,18 @@ pub struct BipedNexusBatchEnv {
     /// prev==current (identity) for held links instead of a zero from the
     /// buffer default.
     arm_staged: Vec<f32>,
+    /// `arm_staged` transposed into the motor scatter's row-major
+    /// `[held x env]` layout (`j * n + e`). Uploaded and scattered straight
+    /// into `links_static` on device each step, replacing the whole-mirror
+    /// `flush_links_static` — that pushed 416 B x links x envs (44 MB at 4096
+    /// envs, 26 links) to carry 213 KB of held targets, and its actuated
+    /// entries were deliberately stale and immediately overwritten by the
+    /// actuated scatter.
+    held_targets_row: Vec<f32>,
+    /// Persistent device buffer behind `held_targets_row` (built on first use).
+    held_targets_gpu: Option<vortx::tensor::Tensor<f32>>,
+    /// `BIPED_HELD_SCATTER=0` opts back into the whole-mirror upload.
+    use_held_scatter: bool,
     /// Consecutive control steps each joint has spent inside its position-limit
     /// band, per env (`env * NUM_JOINTS + joint`). Atomic so the parallel
     /// per-env step closure can update its own entries. Drives the
@@ -1766,6 +1786,12 @@ pub struct BipedNexusBatchEnv {
     /// termination detection and feet bookkeeping. Ignored under
     /// `BIPED_VERIFY_REWARD`, which needs the host values to compare against.
     use_gpu_reward: bool,
+    /// Env-index stride of the host obs subsample kept for normalizer stats
+    /// under device obs (`BIPED_OBS_STATS_STRIDE`, default 16 = the original
+    /// hard-coded 1/16). 1 = every env (host-obs-parity statistics; costs the
+    /// full host assembly the subsample was avoiding). Must be a power of two
+    /// (the gate is a mask).
+    obs_stats_stride: usize,
     /// `BIPED_GPU_OBS=1`: assemble the actor/critic observations on device
     /// (`GpuObserve`) and expose the tensors for the policy to consume
     /// directly — the host skips obs assembly for all but a 1/16 env-stride
@@ -1782,10 +1808,21 @@ pub struct BipedNexusBatchEnv {
     gpu_obs_stack: Option<zealot_gpu_obs::GpuObsStack>,
     /// Host mirror of the device obs ring head (pre-push value per step).
     dev_obs_head: Vec<u32>,
+    /// All-zero head array for the hist-1 critic ring (head mod 1 == 0).
+    dev_obs_head_c: Vec<u32>,
     /// Envs whose episode reset since the last device stack (replicate).
     dev_obs_reset: Vec<u32>,
     /// Per-step device noise seed (advanced every stack).
     dev_obs_seed: u32,
+    /// hist-1 "stack" holding the critic frame (`BIPED_GPU_OBS`). Exists for
+    /// its masked-update semantics, not for history: the episode-reset path
+    /// re-encodes `gpu_observe` with post-step inputs, which produces garbage
+    /// finite-diff velocities for every NON-reset env. The actor is protected
+    /// by the history ring (`only_reset=1` leaves non-reset windows alone);
+    /// the critic used to point straight at the clobbered raw frame, so every
+    /// step with >=1 reset fed the critic wrong joint/base velocities for ALL
+    /// envs. This ring gives the critic the same protection (hist=1, no noise).
+    gpu_cobs_stack: Option<zealot_gpu_obs::GpuObsStack>,
     /// `BIPED_OBS_NOISE` scale, resolved once.
     dev_obs_noise: f32,
     /// `BIPED_VERIFY_REWARD` resolved once — gates the verify-only debug
@@ -2495,14 +2532,16 @@ impl BipedNexusBatchEnv {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1.0);
+            let static_pose = std::env::var("BIPED_ARM_STATIC").map_or(false, |v| v != "0");
             let total_s: f32 = clips.iter().map(|c| c.duration()).sum();
             println!(
-                "arm-motion playback ENABLED: {} clips ({:.0} s total) driving {} held joints, p={p}, scale={scale}, fps={fps}",
+                "arm-motion {} ENABLED: {} clips ({:.0} s total) driving {} held joints, p={p}, scale={scale}, fps={fps}",
+                if static_pose { "STATIC POSE (BIPED_ARM_STATIC; clips sampled, not played)" } else { "playback" },
                 clips.len(),
                 total_s,
                 idx.held.len()
             );
-            ArmMotionCfg { clips, p, scale }
+            ArmMotionCfg { clips, p, scale, static_pose }
         });
         if arm_motion.is_none() {
             println!(
@@ -2514,6 +2553,21 @@ impl BipedNexusBatchEnv {
             .collect();
         let n_held = idx.held.len();
         let held_homes: Vec<f32> = idx.held.iter().map(|h| h.home).collect();
+        // Held targets reach the GPU by the same scatter the actuated joints
+        // already use, instead of re-uploading the entire links_static mirror
+        // every step. `BIPED_HELD_SCATTER=0` restores the old whole-mirror path.
+        let use_held_scatter = std::env::var("BIPED_HELD_SCATTER").map_or(true, |v| v != "0")
+            && !idx.held.is_empty();
+        if !idx.held.is_empty() {
+            println!(
+                "[env] held-joint targets: {}",
+                if use_held_scatter {
+                    "DEVICE scatter (BIPED_HELD_SCATTER=0 for the whole-mirror upload)"
+                } else {
+                    "whole-mirror upload (BIPED_HELD_SCATTER=0)"
+                }
+            );
+        }
         let sampler = CommandSampler::default();
         let sampler_default = CommandSampler::default();
 
@@ -2542,6 +2596,18 @@ impl BipedNexusBatchEnv {
                 .take(n_held * num_envs)
                 .collect(),
             arm_scratch: vec![0.0; n_held],
+            held_targets_row: {
+                // Transpose of the `arm_staged` home fill: [held x env].
+                let mut v = vec![0.0f32; n_held * num_envs];
+                for e in 0..num_envs {
+                    for (j, h) in held_homes.iter().enumerate() {
+                        v[j * num_envs + e] = *h;
+                    }
+                }
+                v
+            },
+            held_targets_gpu: None,
+            use_held_scatter,
             arm_staged: held_homes
                 .iter()
                 .copied()
@@ -2664,6 +2730,17 @@ impl BipedNexusBatchEnv {
                 );
                 on
             },
+            obs_stats_stride: {
+                let st: usize = std::env::var("BIPED_OBS_STATS_STRIDE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16);
+                assert!(
+                    st.is_power_of_two(),
+                    "BIPED_OBS_STATS_STRIDE must be a power of two, got {st}"
+                );
+                st
+            },
             use_gpu_obs: {
                 // DEFAULT ON (with the device reward stack — they were
                 // measured as a pair): obs assembled + stacked + noised on
@@ -2685,8 +2762,10 @@ impl BipedNexusBatchEnv {
             },
             gpu_obs_stack: None,
             dev_obs_head: Vec::new(),
+            dev_obs_head_c: Vec::new(),
             dev_obs_reset: Vec::new(),
             dev_obs_seed: 0x5eed_0b5e,
+            gpu_cobs_stack: None,
             dev_obs_noise: std::env::var("BIPED_OBS_NOISE")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -3398,9 +3477,16 @@ impl BipedNexusBatchEnv {
             let c = ((self.arm_rng[e].unit() * n_clips as f32) as usize).min(n_clips - 1);
             // Random start with runway: uniformly inside the clip minus the
             // longest plausible command dwell (a finished clip freezes on its
-            // last frame — legal, just less motion than intended).
-            let dur = self.arm_motion.as_ref().unwrap().clips[c].duration();
-            let t0 = self.arm_rng[e].range(0.0, (dur - 8.0).max(0.0));
+            // last frame — legal, just less motion than intended). Under
+            // BIPED_ARM_STATIC the pose never advances, so there is nothing to
+            // run out of — draw from the WHOLE clip for maximum pose spread.
+            let am = self.arm_motion.as_ref().unwrap();
+            let dur = am.clips[c].duration();
+            let t0 = if am.static_pose {
+                self.arm_rng[e].range(0.0, dur)
+            } else {
+                self.arm_rng[e].range(0.0, (dur - 8.0).max(0.0))
+            };
             self.arm_clip[e] = c as u32;
             self.arm_time[e] = t0;
             self.arm_active[e] = true;
@@ -3469,7 +3555,11 @@ impl BipedNexusBatchEnv {
             self.arm_blend[e] = b;
             let s = b * b * (3.0 - 2.0 * b);
             if self.arm_active[e] {
-                self.arm_time[e] += dt;
+                // STATIC: hold whatever pose `arm_resample` drew — advance the
+                // clock only when actually playing back.
+                if !self.arm_motion.as_ref().is_some_and(|am| am.static_pose) {
+                    self.arm_time[e] += dt;
+                }
                 if let Some(am) = &self.arm_motion {
                     let clip = &am.clips[self.arm_clip[e] as usize];
                     clip.sample(self.arm_time[e], &mut self.arm_scratch);
@@ -3498,6 +3588,59 @@ impl BipedNexusBatchEnv {
                 self.arm_staged[e * n_held + j] = q;
             }
         }
+        // Transpose env-major `arm_staged` into the scatter's `[held x env]`
+        // layout. ~53k f32 at 4096 envs — trivial next to the 44 MB upload it
+        // replaces, and it keeps the staging loop's borrow of `mbs` intact.
+        if self.use_held_scatter {
+            let n = self.n;
+            for e in 0..n {
+                for j in 0..n_held {
+                    self.held_targets_row[j * n + e] = self.arm_staged[e * n_held + j];
+                }
+            }
+        }
+    }
+
+    /// Upload the staged held-joint targets and scatter them into
+    /// `links_static` on device — the held-joint twin of
+    /// [`flush_motor_targets`](Self::flush_motor_targets), and the on-device
+    /// equivalent of `stage_motor_position` + `flush_links_static` that
+    /// `scatter_motor_targets` documents.
+    ///
+    /// Note this bypasses `links_static_mirror`: `stage_arm_motion` still
+    /// keeps the mirror current, so the mirror-based callers
+    /// (`stage_and_flush_arm_targets` for the web demo's single-submit step,
+    /// and `bench_physics_modes`) are unaffected.
+    fn flush_held_targets(&mut self) {
+        let n_held = self.idx.held.len();
+        if n_held == 0 {
+            return;
+        }
+        let n = self.n;
+        if self.held_targets_gpu.is_none() {
+            self.held_targets_gpu = Some(
+                vortx::tensor::Tensor::matrix(
+                    &self.gpu,
+                    n_held as u32,
+                    n as u32,
+                    &self.held_targets_row,
+                    khal::BufferUsages::STORAGE | khal::BufferUsages::COPY_DST,
+                )
+                .expect("held target buffer"),
+            );
+        } else {
+            let buf = self.held_targets_gpu.as_mut().unwrap();
+            self.gpu
+                .write_buffer(buf.buffer_mut(), 0, &self.held_targets_row)
+                .expect("held target upload");
+        }
+        let links: Vec<u32> = self.idx.held.iter().map(|h| h.link).collect();
+        let targets = self.held_targets_gpu.take().expect("held targets");
+        self.state
+            .multibodies_mut()
+            .scatter_motor_targets_gpu(&self.gpu, &targets, &links, JointAxis::AngZ as u32)
+            .expect("scatter_held_targets_gpu");
+        self.held_targets_gpu = Some(targets);
     }
 
     /// Names of the PD-held (non-action) joints in staging order — the key
@@ -3605,10 +3748,14 @@ impl BipedNexusBatchEnv {
             // per env — the scatter is the only writer). So flush first, then
             // scatter the fresh targets over the top, before any substep runs.
             if std::mem::take(&mut self.held_dirty) {
-                self.state
-                    .multibodies_mut()
-                    .flush_links_static(&self.gpu)
-                    .expect("flush held targets");
+                if self.use_held_scatter {
+                    self.flush_held_targets();
+                } else {
+                    self.state
+                        .multibodies_mut()
+                        .flush_links_static(&self.gpu)
+                        .expect("flush held targets");
+                }
             }
             self.flush_motor_targets();
             self.timings.flush_static_ns += t.elapsed().as_nanos() as u64;
@@ -3633,10 +3780,14 @@ impl BipedNexusBatchEnv {
             let t = Instant::now();
             // Flush BEFORE the scatter — see the no-delay branch.
             if std::mem::take(&mut self.held_dirty) {
-                self.state
-                    .multibodies_mut()
-                    .flush_links_static(&self.gpu)
-                    .expect("flush held targets");
+                if self.use_held_scatter {
+                    self.flush_held_targets();
+                } else {
+                    self.state
+                        .multibodies_mut()
+                        .flush_links_static(&self.gpu)
+                        .expect("flush held targets");
+                }
             }
             self.flush_motor_targets();
             let stride = self.state.multibodies_mut().motor_delay_stride() as usize;
@@ -4376,7 +4527,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 // `timeout` predicate exactly.)
                 let host_obs = !self.skip_obs
                     && (!self.use_gpu_obs
-                        || (e & 15) == 0
+                        || (e & (self.obs_stats_stride - 1)) == 0
                         || self.step_count[e] >= self.task.max_steps());
                 let mut obs = if host_obs { vec![0.0; OBS_DIM] } else { Vec::new() };
                 let mut critic_obs =
@@ -5479,6 +5630,22 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 self.dev_obs_head = vec![0u32; n];
                 self.dev_obs_reset = vec![1u32; n];
             }
+            if go && self.gpu_cobs_stack.is_none() {
+                self.gpu_cobs_stack = Some(
+                    zealot_gpu_obs::GpuObsStack::new(
+                        &self.gpu,
+                        n,
+                        CRITIC_OBS_DIM,
+                        1,
+                        &vec![0.0f32; CRITIC_OBS_DIM],
+                    )
+                    .expect("gpu cobs ring"),
+                );
+                self.dev_obs_head_c = vec![0u32; n];
+                if self.dev_obs_reset.is_empty() {
+                    self.dev_obs_reset = vec![1u32; n];
+                }
+            }
             if go && self.gpu_observe.is_none() {
                 let defaults: Vec<f32> =
                     (0..NUM_JOINTS).map(|k| self.robot.joints[k].default_pos).collect();
@@ -5749,6 +5916,29 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         .expect("enc observe");
                 }
                 if go {
+                    if let Some(cst) = self.gpu_cobs_stack.as_mut() {
+                        // Latch this step's critic frame into the ring (hist=1,
+                        // no noise) so the reset re-encode can't clobber it.
+                        let freshc = self.gpu_observe.as_ref().unwrap().cobs_tensor();
+                        cst.encode(
+                            &self.gpu,
+                            &mut enc,
+                            zealot_obs_shaders::ObsStackParams {
+                                n_envs: n as u32,
+                                frame: CRITIC_OBS_DIM as u32,
+                                hist: 1,
+                                noise_scale: 0.0,
+                                seed: 0,
+                                only_reset: 0,
+                                _pad1: 0,
+                                _pad2: 0,
+                            },
+                            freshc,
+                            &self.dev_obs_head_c,
+                            &self.dev_obs_reset,
+                        )
+                        .expect("enc cobs ring");
+                    }
                     if let Some(stack) = self.gpu_obs_stack.as_mut() {
                         let fresh = self.gpu_observe.as_ref().unwrap().obs_tensor();
                         stack
@@ -6099,6 +6289,30 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
         })
     }
 
+    /// Per-env terrain curriculum state `(level, successes, failures)` for the
+    /// `<ckpt>.train` sidecar. `None` when the terrain curriculum is off.
+    pub fn terrain_curriculum_state(&self) -> Option<Vec<(u32, u32, u32)>> {
+        self.terrain
+            .as_ref()
+            .map(|t| t.curriculum.iter().map(|c| c.state()).collect())
+    }
+
+    /// Restore per-env curriculum state saved by
+    /// [`terrain_curriculum_state`](Self::terrain_curriculum_state). The env
+    /// count is allowed to differ between runs — entries are reused cyclically,
+    /// which preserves the *distribution* of earned difficulty rather than
+    /// throwing it away. No-op when the curriculum is off or `st` is empty.
+    pub fn set_terrain_curriculum_state(&mut self, st: &[(u32, u32, u32)]) {
+        if st.is_empty() {
+            return;
+        }
+        let Some(t) = self.terrain.as_mut() else { return };
+        for (i, c) in t.curriculum.iter_mut().enumerate() {
+            let (l, s, f) = st[i % st.len()];
+            *c = TerrainCurriculum::from_state(l, s, f);
+        }
+    }
+
     /// Read the accumulated per-phase timings and reset the counters.
     /// Pair with the timed loop in `biped_fps.rs` to get a breakdown of
     /// where the per-step budget went.
@@ -6109,10 +6323,17 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             return None;
         }
         let obs = self.gpu_observe.as_ref()?;
+        // Critic: the latched ring copy, NOT the raw frame — the raw frame is
+        // clobbered for all envs by the episode-reset re-encode.
+        let cobs = self
+            .gpu_cobs_stack
+            .as_ref()
+            .map(|c| c.out_tensor())
+            .unwrap_or_else(|| obs.cobs_tensor());
         if let Some(stack) = self.gpu_obs_stack.as_ref() {
-            Some((stack.out_tensor(), obs.cobs_tensor()))
+            Some((stack.out_tensor(), cobs))
         } else {
-            Some((obs.obs_tensor(), obs.cobs_tensor()))
+            Some((obs.obs_tensor(), cobs))
         }
     }
 
@@ -6329,6 +6550,31 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         &self.dev_obs_reset,
                     )
                     .expect("reset re-enc stack");
+            }
+            if let Some(cst) = self.gpu_cobs_stack.as_mut() {
+                // Reset envs take the freshly re-encoded critic frame; every
+                // other env's latched frame stays exactly as the step wrote it
+                // (the re-encoded raw cobs is garbage for them — post-step
+                // inputs, zero finite-diff velocities).
+                let freshc = self.gpu_observe.as_ref().unwrap().cobs_tensor();
+                cst.encode(
+                    &self.gpu,
+                    &mut enc,
+                    zealot_obs_shaders::ObsStackParams {
+                        n_envs: n as u32,
+                        frame: CRITIC_OBS_DIM as u32,
+                        hist: 1,
+                        noise_scale: 0.0,
+                        seed: 0,
+                        only_reset: 1,
+                        _pad1: 0,
+                        _pad2: 0,
+                    },
+                    freshc,
+                    &self.dev_obs_head_c,
+                    &self.dev_obs_reset,
+                )
+                .expect("reset re-enc cobs ring");
             }
             self.gpu.submit(enc).expect("reset re-enc submit");
             if self.gpu_obs_stack.is_some() {
