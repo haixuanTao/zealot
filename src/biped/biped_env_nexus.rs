@@ -2731,10 +2731,17 @@ impl BipedNexusBatchEnv {
                 on
             },
             obs_stats_stride: {
+                // Default 1 (every env): the fixed 1/16 subsample measurably
+                // hurt learning (fresh 1500-iter A/B: last-third step_rew
+                // 0.0219 vs 0.0243 with stride 1, host parity). It is a FIXED
+                // env-index subsample, so it also biases the stats toward
+                // those envs' curriculum state. Costs ~13% iter time at 2048
+                // envs (host assembly for all envs) — raise to 16 to trade
+                // stats quality back for speed.
                 let st: usize = std::env::var("BIPED_OBS_STATS_STRIDE")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(16);
+                    .unwrap_or(1);
                 assert!(
                     st.is_power_of_two(),
                     "BIPED_OBS_STATS_STRIDE must be a power of two, got {st}"

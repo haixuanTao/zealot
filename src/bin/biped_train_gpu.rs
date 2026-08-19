@@ -863,7 +863,7 @@ fn main() {
         let obs_stats_mask: usize = std::env::var("BIPED_OBS_STATS_STRIDE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(16)
+            .unwrap_or(1)
             - 1;
         let mut dev_obs_ready = false;
         if gpu_obs_dev {
