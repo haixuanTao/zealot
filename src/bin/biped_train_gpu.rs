@@ -372,47 +372,19 @@ fn action_sperm() -> SPerm {
         sign: JSIGN.to_vec(),
     }
 }
-// obs frame(45) signed perm — exactly the index/sign pattern of `mirror_frame`.
-fn obs_frame_sperm() -> SPerm {
-    let mut perm: Vec<usize> = (0..45).collect();
-    let mut sign = vec![1.0f32; 45];
-    for i in 0..NUM_JOINTS {
-        perm[i] = JMIRROR[i];
-        sign[i] = JSIGN[i]; // last_action
-        perm[16 + i] = 16 + JMIRROR[i];
-        sign[16 + i] = JSIGN[i]; // joint_pos
-        perm[28 + i] = 28 + JMIRROR[i];
-        sign[28 + i] = JSIGN[i]; // joint_vel
+// Input reps are DERIVED from the live mirror functions via `mirror_table`
+// (the same startup-verified extraction the GPU staging uses) instead of a
+// hand-rolled index list. The previous hand-rolled versions were fossilized at
+// the 45-dim v21 frame — no gyro, no step cue, no upper-body block — so
+// BIPED_MIRROR_NET would have panicked (dim mismatch) or projected onto a
+// wrong subspace on every frame layout since. Deriving kills the drift class:
+// mirror_frame is the single source of truth.
+fn sperm_from(dim: usize, f: impl Fn(&[f32]) -> Vec<f32>) -> SPerm {
+    let (perm, sign) = mirror_table(dim, f);
+    SPerm {
+        perm: perm.into_iter().map(|p| p as usize).collect(),
+        sign,
     }
-    sign[13] = -1.0; // cmd vy
-    sign[14] = -1.0; // cmd yaw
-    sign[41] = -1.0; // proj_grav lateral
-    sign[43] = -1.0; // gait phase sin
-    sign[44] = -1.0; // gait phase cos
-    SPerm { perm, sign }
-}
-// Full actor-input signed perm: the frame perm tiled H times (block-diagonal),
-// matching `mirror_obs`.
-fn obs_sperm() -> SPerm {
-    let f = obs_frame_sperm();
-    let h = *OBS_H;
-    let mut perm = Vec::with_capacity(OBS_FRAME * h);
-    let mut sign = Vec::with_capacity(OBS_FRAME * h);
-    for b in 0..h {
-        perm.extend(f.perm.iter().map(|&p| p + OBS_FRAME * b));
-        sign.extend_from_slice(&f.sign);
-    }
-    SPerm { perm, sign }
-}
-// critic(51) signed perm = obs frame(45) + [lin_vel(3), ang_vel(3)] per `mirror_critic`.
-fn critic_sperm() -> SPerm {
-    let mut sp = obs_frame_sperm();
-    sp.perm.extend(45..51);
-    sp.sign.extend(std::iter::repeat(1.0).take(6));
-    sp.sign[46] = -1.0; // lin_vel lateral
-    sp.sign[48] = -1.0; // ang_vel roll
-    sp.sign[50] = -1.0; // ang_vel yaw
-    sp
 }
 /// Project every layer of `net` onto the equivariant subspace for the given
 /// per-layer reps (`reps[l]` acts on layer-l activations; `reps[0]` = input rep,
@@ -435,7 +407,7 @@ fn symmetrize_mlp(net: &mut Mlp, reps: &[SPerm]) {
     }
 }
 fn actor_reps(net: &Mlp) -> Vec<SPerm> {
-    let mut r = vec![obs_sperm()];
+    let mut r = vec![sperm_from(net.dims[0], mirror_obs)];
     for &h in &net.dims[1..net.dims.len() - 1] {
         r.push(SPerm::pair_swap(h));
     }
@@ -443,7 +415,7 @@ fn actor_reps(net: &Mlp) -> Vec<SPerm> {
     r
 }
 fn critic_reps(net: &Mlp) -> Vec<SPerm> {
-    let mut r = vec![critic_sperm()];
+    let mut r = vec![sperm_from(net.dims[0], mirror_critic)];
     for &h in &net.dims[1..net.dims.len() - 1] {
         r.push(SPerm::pair_swap(h));
     }
