@@ -686,6 +686,8 @@ def main():
         _lh = np.array([tr[5] for tr in _tr]); _rh = np.array([tr[6] for tr in _tr])
         fsep = np.linalg.norm((_lf - _rf)[:, :2], axis=1)
         hsep = np.linalg.norm((_lh - _rh)[:, :2], axis=1)
+        if os.environ.get("S2S_TRACE_NPZ"):
+            np.savez(os.environ["S2S_TRACE_NPZ"], q=_q, tau=_t, act=_a)
         print(f"STANCE feet lateral sep: mean={fsep.mean():.3f} p5={np.percentile(fsep,5):.3f}"
               f" p95={np.percentile(fsep,95):.3f} m | hip sep: {hsep.mean():.3f} m"
               f" | splay = feet - hips = {fsep.mean()-hsep.mean():+.3f} m")

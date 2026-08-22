@@ -1016,6 +1016,35 @@ fn main() {
         // the LATEST (possibly degraded) weights. Track a smoothed reward and
         // save the peak policy separately to `<ckpt>.best` — that's the one to
         // deploy; overtraining then can't cost us the good model.
+        // BIPED_STD_MIN: per-joint exploration floors, "substr=sigma" pairs
+        // matched against joint names (e.g. "ankle_roll=1.0"), comma-separated.
+        // Unset = no floor beyond the global LOG_STD_MIN. Diagnostic knob for
+        // the ankle-pinning investigation: v26 (the last clean-ankled policy)
+        // kept ankle_roll sigma at 1.0 for its whole run; every later policy's
+        // collapsed to ~0.7, which is what makes bracing on the endstop
+        // reliable enough to pay. This floor reproduces the v26 condition.
+        let std_min_lstd: Vec<f32> = {
+            let mut f = vec![f32::NEG_INFINITY; NUM_JOINTS];
+            if let Ok(spec) = std::env::var("BIPED_STD_MIN") {
+                for part in spec.split(',') {
+                    if let Some((pat, v)) = part.split_once('=') {
+                        if let Ok(sig) = v.trim().parse::<f32>() {
+                            for i in 0..NUM_JOINTS {
+                                if ROBOT.joints[i].name.contains(pat.trim()) {
+                                    f[i] = sig.ln();
+                                }
+                            }
+                        }
+                    }
+                }
+                let held: Vec<&str> = (0..NUM_JOINTS)
+                    .filter(|&i| f[i].is_finite())
+                    .map(|i| ROBOT.joints[i].name)
+                    .collect();
+                println!("[train] BIPED_STD_MIN floors: {held:?} -> {spec}");
+            }
+            f
+        };
         let mut rew_ema = resume_state.as_ref().map_or(0.0f32, |ts| ts.rew_ema);
         let mut best_ema = resume_state
             .as_ref()
@@ -2068,8 +2097,9 @@ fn main() {
             const LOG_STD_MIN: f32 = -1.6; // std 0.20
             const LOG_STD_MAX: f32 = 0.0; // std 1.0
             let mut clamped = false;
-            for v in ac.log_std.iter_mut() {
-                let c = v.clamp(LOG_STD_MIN, LOG_STD_MAX);
+            for (i, v) in ac.log_std.iter_mut().enumerate() {
+                let lo = LOG_STD_MIN.max(std_min_lstd[i]);
+                let c = v.clamp(lo, LOG_STD_MAX);
                 if c != *v {
                     *v = c;
                     clamped = true;
