@@ -4466,6 +4466,28 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 } else {
                     (false, false)
                 };
+                if std::env::var("BIPED_RESET_DEBUG").is_ok() && self.step_count[e] <= 3 {
+                    // The fault's OWN power number for every early step (not
+                    // just trips): P(pj>thr | sc) becomes directly measurable.
+                    let qt_dbg = self.task.joint_targets(&actions[e]);
+                    let mut wp = 0.0f32;
+                    let mut wi = 0usize;
+                    for i in 0..NUM_JOINTS {
+                        let j = &self.task.robot.joints[i];
+                        let tau = (j.kp * (qt_dbg[i] - state.joint_pos[i])
+                            - j.kd * state.joint_vel[i])
+                            .clamp(-j.effort_limit, j.effort_limit);
+                        let pj = (tau * state.joint_vel[i]).abs();
+                        if pj > wp {
+                            wp = pj;
+                            wi = i;
+                        }
+                    }
+                    eprintln!(
+                        "[post] e {e} sc {} pj {wp:.0} j {wi} kqd {:+.2}",
+                        self.step_count[e], state.joint_vel[3]
+                    );
+                }
                 let fell = illegal
                     || crossed
                     || vel_fault
@@ -6722,6 +6744,9 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
         } else {
             None
         };
+        if std::env::var("BIPED_RESET_DEBUG").is_ok() {
+            eprintln!("[rst] e {env} t {t} ps {:.3} ms {:.3}", self.template_dr[t].pd_scale, self.template_dr[t].mass_scale);
+        }
         (t, off.unwrap_or(NexusVector::ZERO), vels)
     }
 

@@ -62,16 +62,34 @@ fn main() {
         let mut ssr_n = [0u64; 6];
         let mut ssr_max = [0.0f32; 6];
         let (mut g_up_sum, mut g_up_n, mut g_up_bad) = (0.0f64, 0u64, 0u64);
+        // FLAIL_STEP_TEST=1: single sustained step-input on the left knee at
+        // t=50 with zero action elsewhere — the response curve exposes the
+        // delay implementation's true applied-target timing.
+        let step_test = std::env::var("FLAIL_STEP_TEST").is_ok();
         for t in 0..steps {
             let mut acts: Vec<[f32; NUM_JOINTS]> = Vec::with_capacity(n);
             for _ in 0..n {
                 let mut a = [0.0f32; NUM_JOINTS];
-                for k in 0..NUM_JOINTS {
-                    a[k] = scale * rng.gauss();
+                if step_test {
+                    if t >= 50 {
+                        for k in 0..NUM_JOINTS {
+                            a[k] = 1.5; // flail-scale sustained step, all joints
+                        }
+                    }
+                } else {
+                    for k in 0..NUM_JOINTS {
+                        a[k] = scale * rng.gauss();
+                    }
                 }
                 acts.push(a);
             }
             let outs = env.step(&acts).await;
+            if step_test && (46..60).contains(&t) {
+                let o0 = &outs[0].obs;
+                if o0.len() >= 40 {
+                    println!("STEPTEST t={t} kneeQ {:+.4} kneeQd {:+.2}", o0[16 + 3], o0[28 + 3]);
+                }
+            }
             // FLAIL_RESET=1: reset tripped envs like the trainer does, and
             // histogram episode lengths — separates steady-state spikes from
             // reset-transient re-trip cascades.
