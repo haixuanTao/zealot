@@ -1468,6 +1468,9 @@ pub struct StepKnobs {
     pub vel_term: f32,
     pub power_term: f32,
     pub env_term: f32,
+    /// Post-reset transient-fault grace window, control steps
+    /// (BIPED_FAULT_GRACE_STEPS, default 4; 0 = faults always armed).
+    pub fault_grace: u16,
     pub dwell_max: u16,
     pub slam_vel: f32,
     pub joint_power_term: f32,
@@ -1492,6 +1495,10 @@ impl StepKnobs {
             vel_term: f("BIPED_DOF_VEL_TERM", 1.0),
             power_term: f("BIPED_POWER_TERM", 3000.0),
             env_term: f("BIPED_ENVELOPE_TERM", 0.0),
+            fault_grace: env_var("BIPED_FAULT_GRACE_STEPS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4u16),
             dwell_max: env_var("BIPED_LIMIT_DWELL_STEPS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -4352,7 +4359,21 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         let pb = poses[env_base + b as usize].translation;
                         (pa - pb).length_squared() < sc_term * sc_term
                     });
-                let vel_fault = vel_term > 0.0
+                // Post-reset fault GRACE window. The pre-rebase state pipeline
+                // served cached spawn state for the first ~4 control steps
+                // after a reset, which as a side effect made every transient
+                // fault detector BLIND while the spawn PD slam settled. The
+                // ported pipeline computes real state immediately, so the
+                // detectors started tripping on the (unchanged, physical)
+                // settling transient — trip -> reset -> transient -> trip, a
+                // cascade that truncated exploration ~3x and collapsed the
+                // terrain curriculum. Restore the old semantics explicitly:
+                // transient faults arm only after BIPED_FAULT_GRACE_STEPS
+                // (default 4) steps of episode age. Falls/timeouts unaffected;
+                // dwell has its own counter and needs no grace.
+                let in_grace = self.step_count[e] <= self.knobs.fault_grace as u32;
+                let vel_fault = !in_grace
+                    && vel_term > 0.0
                     && (0..NUM_JOINTS).any(|i| {
                         state.joint_vel[i].abs()
                             > self.task.robot.joints[i].vel_limit * vel_term
@@ -4381,16 +4402,16 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 };
                 // Slamming a joint endstop: inside the band AND still moving
                 // into it above the energy threshold.
-                let slam_fault = slam_vel > 0.0
+                let slam_fault = !in_grace
+                    && slam_vel > 0.0
                     && (0..NUM_JOINTS).any(|i| {
                         let (lo, hi) = self.task.robot.joints[i].pos_limit;
                         let (q, v) = (state.joint_pos[i], state.joint_vel[i]);
                         (q < lo + SLAM_BAND && v < -slam_vel)
                             || (q > hi - SLAM_BAND && v > slam_vel)
                     });
-                let (power_fault, envelope_fault) = if power_term > 0.0
-                    || env_term > 0.0
-                    || joint_power_term > 0.0
+                let (power_fault, envelope_fault) = if !in_grace
+                    && (power_term > 0.0 || env_term > 0.0 || joint_power_term > 0.0)
                 {
                     let q_target = self.task.joint_targets(&actions[e]);
                     let mut p = 0.0f32;
@@ -4416,11 +4437,32 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                             }
                         }
                     }
-                    (
-                        (power_term > 0.0 && p > power_term)
-                            || (joint_power_term > 0.0 && pj_max > joint_power_term),
-                        env_viol,
-                    )
+                    let fault_hit = (power_term > 0.0 && p > power_term)
+                        || (joint_power_term > 0.0 && pj_max > joint_power_term);
+                    // BIPED_FAULT_DEBUG: on a power trip, print the offending
+                    // joint and its tau/qd so post-reset spikes can be
+                    // localized to a physical subsystem.
+                    if fault_hit && std::env::var("BIPED_FAULT_DEBUG").is_ok() {
+                        let mut wi = 0;
+                        let mut wp = 0.0f32;
+                        for i in 0..NUM_JOINTS {
+                            let j = &self.task.robot.joints[i];
+                            let tau = (j.kp * (q_target[i] - state.joint_pos[i])
+                                - j.kd * state.joint_vel[i])
+                                .clamp(-j.effort_limit, j.effort_limit);
+                            let pj = (tau * state.joint_vel[i]).abs();
+                            if pj > wp {
+                                wp = pj;
+                                wi = i;
+                            }
+                        }
+                        let jn = &self.task.robot.joints[wi].name;
+                        eprintln!(
+                            "[fault] env {e} steps {} joint {jn} pj {wp:.0}W qd {:+.1} q {:+.2} tgt {:+.2}",
+                            self.step_count[e], state.joint_vel[wi], state.joint_pos[wi], q_target[wi]
+                        );
+                    }
+                    (fault_hit, env_viol)
                 } else {
                     (false, false)
                 };
