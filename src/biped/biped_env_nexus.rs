@@ -2455,7 +2455,16 @@ impl BipedNexusBatchEnv {
                     _ => None,
                 }
             })
-            .or(Some((0, 4)));
+            // DEFAULT OFF. The pre-rebase delay implementation was a silent
+            // no-op (verified by pinned-k step-input test, commit c689152), so
+            // every released and hardware-flown policy (v19-v28) trained
+            // without real actuator delay — and transferred with no sim-to-real
+            // gap. The rescue-port host path is the first WORKING delay; left
+            // on by default it makes the training world measurably harsher
+            // (2x step-2 fault power) for a robustness margin that was never
+            // load-bearing. Opt in explicitly (e.g. BIPED_MOTOR_DELAY=0,4 or
+            // "4" for 0..=4) if a latency-sensitive target needs it.
+            .or(Some((0, 0)));
         if let Some((min, max)) = motor_delay {
             assert!(
                 min <= max && max <= task.decimation,
