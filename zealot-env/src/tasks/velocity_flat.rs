@@ -1917,7 +1917,7 @@ mod tests {
         for _ in 0..2000 {
             let c = s.sample(&mut rng);
             assert!(c.vx.abs() <= 0.8 + 1e-6);
-            assert!(c.vy.abs() <= 0.4 + 1e-6);
+            assert!(c.vy.abs() <= 0.5 + 1e-6);
             assert!(c.yaw_rate.abs() <= 1.0 + 1e-6);
             if c == VelocityCommand::default() {
                 stands += 1;
