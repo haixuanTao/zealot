@@ -1,8 +1,8 @@
 # Arm-motion dataset (`~/sonic-motions`)
 
-Retargeted mocap clips (AMASS → G1 joint space, exported through NVIDIA's
-[GR00T-WholeBodyControl](https://github.com/NVIDIA/GR00T-WholeBodyControl)
-/ SONIC pipeline) that training replays on the PD-held waist + arm joints as
+Retargeted mocap clips (LAFAN1 → G1 joint space, from the public
+[lvhaidong/LAFAN1_Retargeting_Dataset](https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset),
+converted to the GR00T-WholeBodyControl / SONIC export format) that training replays on the PD-held waist + arm joints as
 an **unobserved moving-mass disturbance** — under both stand and walk
 commands, the legs must balance while the upper body gestures. This is *not*
 an imitation objective: the policy never observes or controls the upper body.
@@ -51,10 +51,15 @@ a hard error at load. Parser: `zealot-env/src/motion.rs`.
    rsync -av <box>:~/sonic-motions/ ~/sonic-motions/
    ```
 
-2. **Regenerate from source**: the clips are AMASS mocap retargeted to the
-   G1 by GR00T-WholeBodyControl's SONIC motion pipeline, exported as the
-   CSV format above. AMASS itself requires (free, registered) access at
-   <https://amass.is.tue.mpg.de>.
+2. **Regenerate from source** (no token needed — the dataset is public):
+
+   ```sh
+   python3 scripts/make_motions.py   # downloads + converts into /workspace/sonic-motions
+   ```
+
+   The script pulls the walk/run/sprint clips from the LAFAN1 G1 retargeting
+   dataset and converts headerless-radians CSV to the header/degrees/cm
+   format above.
 
 Sanity-check a copy before a long run — the loader validates joint columns,
 and a one-clip smoke test replays in MuJoCo via
