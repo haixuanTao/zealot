@@ -325,7 +325,13 @@ def main():
     assert policy.act_dim == 12, policy.act_dim
     assert policy.obs_dim % HIST == 0, policy.obs_dim
     frame = policy.obs_dim // HIST
-    assert frame in (45, 48, 53), f"unexpected obs frame width {frame}"
+    assert frame in (45, 48, 53, 79), f"unexpected obs frame width {frame}"
+    # 79 = v29+ upper-body block: held-joint PD targets (13) + target vels (13)
+    # appended after the cue. The harness holds the arms at the TRAINING homes
+    # and never moves them, so the block is the constant home vector + zeros.
+    HELD_HOMES = np.array([0.0, 0.0, 0.0,          # waist yaw/roll/pitch
+                           0.2, 0.2, 0.0, 1.28, 0.0,   # L shoulder p/r/y, elbow, wrist
+                           0.2, -0.2, 0.0, 1.28, 0.0]) # R
     print(f"obs frame {frame} ({'no' if frame == 45 else 'with'} gyro{', step cue' if frame >= 53 else ''})")
 
     model = mujoco.MjModel.from_xml_path(MODEL_XML)
@@ -513,6 +519,10 @@ def main():
                     o[52] = 1.0
                 else:
                     o[48:53] = 0.0
+        if frame >= 79:
+            o[53:66] = HELD_HOMES
+            o[66:79] = 0.0
+
         if frames_hist is None:
             frames_hist = [o.copy() for _ in range(HIST)]  # reset-replicate
         else:
