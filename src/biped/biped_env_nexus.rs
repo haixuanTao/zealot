@@ -2149,7 +2149,9 @@ impl BipedNexusBatchEnv {
             let shapes: Vec<SharedShape> = strips
                 .iter()
                 .map(|s| {
-                    let (v, t) = s.mesh();
+                    // Three mirrored lanes: no flat ground within lateral
+                    // reach of an episode (see TerrainStrip::mesh_tiled).
+                    let (v, t) = s.mesh_tiled();
                     mk_shape(v, t)
                 })
                 .collect();

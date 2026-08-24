@@ -1066,7 +1066,7 @@ async fn record(cfg: &DemoCfg, out: &str, seconds: f32) {
         };
         // Env 0's family (env % 3 == 0) — must match the physics strip.
         let strip = TerrainStrip::generate_with(TerrainFamily::Boxes, ENV_SEED, render_params);
-        let (v, t) = strip.mesh();
+        let (v, t) = strip.mesh_tiled();
         let sv: Vec<Vec3> = v.into_iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
         let mut node = scene.add_trimesh(sv, t, Vec3::ONE, true);
         node.set_color(Color::new(0.30, 0.42, 0.40, 1.0));

@@ -581,26 +581,39 @@ impl TerrainStrip {
     /// emitted mesh's triangulation (each cell split along the (i,j)→(i+1,j+1)
     /// diagonal). Returns 0.0 (the flat backstop top) outside the strip.
     pub fn height(&self, x: f32, y: f32) -> f32 {
+        // Laterally the strip mirror-tiles forever: reflect y into the
+        // canonical lane so there is no flat world to escape to sideways
+        // (the collider carries three lanes — see mesh_tiled(); commanded
+        // drift cannot exceed that in an episode). X keeps the flat
+        // origin/overrun so spawn and strip-end semantics are unchanged.
+        // NOTE: the strip's real width is ny*hs, which rounding can leave
+        // slightly off 2*STRIP_HALF_W — mirror about the ACTUAL edges or the
+        // seam remap is off by a fraction of a cell.
+        let w2 = self.ny as f32 * self.hs;
+        let mut ly = (y + STRIP_HALF_W).rem_euclid(2.0 * w2);
+        if ly > w2 {
+            ly = 2.0 * w2 - ly;
+        }
         if matches!(self.family, TerrainFamily::Step) {
             // Must match mesh_boxes(): constant within each cell.
             let lx = x - STRIP_X0;
-            let ly = y + STRIP_HALF_W;
-            if lx < 0.0 || ly < 0.0 {
+            if lx < 0.0 {
                 return 0.0;
             }
-            let (ci, cj) = ((lx / self.hs) as usize, (ly / self.hs) as usize);
-            if ci >= self.nx || cj >= self.ny {
+            let ci = (lx / self.hs) as usize;
+            let cj = ((ly / self.hs) as usize).min(self.ny - 1);
+            if ci >= self.nx {
                 return 0.0;
             }
             return self.step_cell_height(ci, cj);
         }
         let lx = x - STRIP_X0;
-        let ly = y + STRIP_HALF_W;
-        if lx < 0.0 || ly < 0.0 {
+        if lx < 0.0 {
             return 0.0;
         }
-        let (fx, fy) = (lx / self.hs, ly / self.hs);
-        if fx >= self.nx as f32 || fy >= self.ny as f32 {
+        let fx = lx / self.hs;
+        let fy = (ly / self.hs).min(self.ny as f32 - 1e-4);
+        if fx >= self.nx as f32 {
             return 0.0;
         }
         let (i, j) = (fx as usize, fy as usize);
@@ -630,6 +643,26 @@ impl TerrainStrip {
             }
         }
         m
+    }
+
+    /// Three-lane mirror tiling of [`Self::mesh`]: the strip plus a mirrored
+    /// copy across each long edge (y in [-3W, +3W]). Mirroring makes the
+    /// seams height-continuous (the edge row is shared exactly), each copy
+    /// stays independently watertight, and the winding flip keeps ORIENTED
+    /// pseudo-normals outward. Matches the lateral reflection in
+    /// [`Self::height`], so a robot drifting off the center lane keeps
+    /// walking rough ground instead of escaping onto the flat backstop.
+    pub fn mesh_tiled(&self) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let (v0, t0) = self.mesh();
+        let mut verts = v0.clone();
+        let mut tris = t0.clone();
+        let top_edge = -STRIP_HALF_W + self.ny as f32 * self.hs;
+        for mirror_about in [top_edge, -STRIP_HALF_W] {
+            let base = verts.len() as u32;
+            verts.extend(v0.iter().map(|p| [p[0], 2.0 * mirror_about - p[1], p[2]]));
+            tris.extend(t0.iter().map(|t| [base + t[0], base + t[2], base + t[1]]));
+        }
+        (verts, tris)
     }
 
     /// Closed-slab triangle mesh (top surface + perimeter skirts + full-grid
@@ -810,6 +843,30 @@ impl TerrainCurriculum {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lateral_mirror_tiling_is_seamless() {
+        use super::*;
+        for fam in [TerrainFamily::Boxes, TerrainFamily::Rough, TerrainFamily::Wave, TerrainFamily::Step] {
+            let s = TerrainStrip::generate_with(fam, 0xC0FFEE, TerrainParams::default());
+            for k in 0..200 {
+                let x = STRIP_X0 + 1.0 + (k as f32) * 0.61;
+                // Mirror symmetry about each long edge, and 2-period tiling.
+                let w = s.ny as f32 * s.hs;
+                let top = -STRIP_HALF_W + w;
+                for d in [0.0317f32, 0.7013, 2.9113] {
+                    let a = s.height(x, top - d);
+                    let b = s.height(x, top + d);
+                    assert!((a - b).abs() < 1e-4, "{fam:?} seam top x={x} d={d}: {a} vs {b}");
+                    let c = s.height(x, -STRIP_HALF_W - d);
+                    let e = s.height(x, -STRIP_HALF_W + d);
+                    assert!((c - e).abs() < 1e-4, "{fam:?} seam bottom x={x} d={d}");
+                    let f = s.height(x, top + d + 2.0 * w);
+                    assert!((b - f).abs() < 1e-4, "{fam:?} period x={x} d={d}");
+                }
+            }
+        }
+    }
+
     use super::*;
 
     fn strip(f: TerrainFamily) -> TerrainStrip {
