@@ -25,7 +25,7 @@
 //! can't even hold the standing pose — see git history — so the nexus env
 //! stays the single source of truth.)
 //!
-//! Rendering is a kiss3d stick figure mirroring `render_biped.py`: one scene
+//! Rendering is a kiss3d stick figure mirroring the retired stick-figure renderer: one scene
 //! node per MJCF body posed from the GPU snapshot each frame, with link
 //! capsules parented statically (parent→child offsets are rigid), spheres at
 //! the joints and the foot collision capsules on the feet.

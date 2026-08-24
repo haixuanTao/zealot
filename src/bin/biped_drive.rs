@@ -4,8 +4,8 @@
 //! prints the base trajectory: per-second position/heading/velocity, a final
 //! commanded-vs-achieved summary, and a top-down ASCII map of the path. Also
 //! writes a CSV (t,x,y,z,yaw) for plotting and a rollout JSON in the
-//! `render_biped.py` format, so the run can be rendered to video:
-//!   `python3 scripts/render_biped.py /tmp/biped_drive.json /tmp/biped_drive.mp4`
+//! `render_biped_mujoco.py` format, so the run can be rendered to video:
+//!   `python3 scripts/render_biped_mujoco.py /tmp/biped_drive.json /tmp/biped_drive.mp4`
 //!
 //! Run:
 //!   `cargo run --release --example biped_drive --features biped_gpu -- \
@@ -242,7 +242,7 @@ fn main() {
         std::fs::write(&csv_path, csv).expect("write csv");
         println!("trajectory csv → {csv_path}");
 
-        // Rollout JSON in the `render_biped.py` format (same hand-rolled
+        // Rollout JSON in the `render_biped_mujoco.py` format (same hand-rolled
         // writer as biped_render_nexus — no serde dep).
         let (names, edges, feet) = env.skeleton();
         let mut s = String::from("{\n");
@@ -287,7 +287,7 @@ fn main() {
         s.push_str("  ]\n}\n");
         std::fs::write(&json_path, s).expect("write rollout json");
         println!(
-            "rollout json → {json_path}\nrender: python3 scripts/render_biped.py {json_path} /tmp/biped_drive.mp4"
+            "rollout json → {json_path}\nrender: python3 scripts/render_biped_mujoco.py {json_path} /tmp/biped_drive.mp4"
         );
     });
 }
