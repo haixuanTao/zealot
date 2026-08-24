@@ -999,6 +999,189 @@ impl PoseStream {
 
 /// Demo entry point — the thin `g1_web`/`g1_terrain_web` examples call this
 /// from their `#[kiss3d::main] main`.
+
+/// `--record <out.mp4> [seconds]`: offline video capture. Renders the same
+/// scene as the interactive demo (baked visuals, the physics' own terrain
+/// mesh) into a kiss3d OffscreenSurface — no display server needed — and
+/// pipes raw RGB frames to ffmpeg at the control rate (50 fps). The policy
+/// comes from `--ckpt <path-or-HF-spec>` (else the embedded default), so any
+/// training checkpoint can be recorded live: one robot, blocking CPU
+/// stepping, physics-truth camera follow.
+#[cfg(not(target_arch = "wasm32"))]
+async fn record(cfg: &DemoCfg, out: &str, seconds: f32) {
+    use std::io::Write as _;
+    let args: Vec<String> = std::env::args().collect();
+    // `--lvl <0..19>` overrides the spawn difficulty (native cfg pins it).
+    let lvl = args
+        .iter()
+        .position(|a| a == "--lvl")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|l| l.min(19))
+        .unwrap_or(cfg.terrain_level);
+    configure_env(cfg.terrain, lvl, cfg.terrain_amp_pct, cfg.terrain_slope_deg);
+    let ckpt_spec = args
+        .iter()
+        .position(|a| a == "--ckpt")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| cfg.ckpt.clone());
+    let (ac, ckpt_name) = match &ckpt_spec {
+        // A checkpoint on disk loads directly (load_ckpt would parse the
+        // path as a Hugging Face owner/repo spec).
+        Some(spec) if std::path::Path::new(spec).exists() => (
+            ActorCritic::load_from_bytes(&std::fs::read(spec).expect("read ckpt"))
+                .expect("parse ckpt"),
+            spec.clone(),
+        ),
+        Some(spec) => load_ckpt(spec).await.expect("load --ckpt"),
+        None => (
+            ActorCritic::load_from_bytes(POLICY_BIN).expect("policy checkpoint"),
+            DEFAULT_CKPT.to_string(),
+        ),
+    };
+    println!("record: {ckpt_name} -> {out} ({seconds} s)");
+
+    let (w, h) = (1280u32, 720u32);
+    let mut surface = kiss3d::window::OffscreenSurface::new(w, h).await;
+    let mut scene = SceneNode3d::empty();
+    scene.add_directional_light(Vec3::new(1.0, -2.0, -3.0));
+
+    // Ground slab + the exact terrain mesh the physics collides with.
+    let (slab_cx, slab_len) = if cfg.terrain { (80.0, 400.0) } else { (0.0, 60.0) };
+    let slab_drop = if cfg.terrain { 0.02 } else { 0.0 };
+    let mut ground = scene.add_cube(slab_len, 60.0, 0.1);
+    ground.set_position(Vec3::new(slab_cx, 0.0, -0.05 - slab_drop));
+    ground.set_color(Color::new(0.13, 0.30, 0.31, 1.0));
+    for i in -14..=(if cfg.terrain { 100 } else { 14 }) {
+        let mut stripe = scene.add_cube(0.02, 60.0, 0.002);
+        stripe.set_position(Vec3::new(i as f32, 0.0, 0.001 - slab_drop));
+        stripe.set_color(Color::new(0.21, 0.42, 0.44, 1.0));
+    }
+    const ENV_SEED: u64 = 0xC0FFEE;
+    let mut strip0: Option<TerrainStrip> = None;
+    if cfg.terrain {
+        let render_params = TerrainParams {
+            amp: cfg.terrain_amp_pct as f32 / 100.0,
+            slope: (cfg.terrain_slope_deg.min(45) as f32).to_radians().tan(),
+        };
+        // Env 0's family (env % 3 == 0) — must match the physics strip.
+        let strip = TerrainStrip::generate_with(TerrainFamily::Boxes, ENV_SEED, render_params);
+        let (v, t) = strip.mesh();
+        let sv: Vec<Vec3> = v.into_iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
+        let mut node = scene.add_trimesh(sv, t, Vec3::ONE, true);
+        node.set_color(Color::new(0.30, 0.42, 0.40, 1.0));
+        strip0 = Some(strip);
+    }
+
+    // One robot: baked visual meshes per body, stick-figure fallback.
+    let mjcf = parse_mjcf(MJCF_XML);
+    let visuals = load_visuals();
+    let body_color = Color::new(0.75, 0.78, 0.80, 1.0);
+    let joint_color = Color::new(0.208, 0.757, 0.804, 1.0);
+    let foot_color = Color::new(0.925, 0.702, 0.208, 1.0);
+    let mut body_nodes: Vec<SceneNode3d> = Vec::with_capacity(mjcf.len());
+    for body in &mjcf {
+        let mut group = scene.add_group();
+        if let Some(groups) = visuals.get(&body.name) {
+            let color = if body.name == "pelvis" {
+                Color::new(0.80, 0.82, 0.85, 1.0)
+            } else if body.name.contains("ankle_roll") {
+                Color::new(0.28, 0.30, 0.33, 1.0)
+            } else {
+                Color::new(0.60, 0.63, 0.66, 1.0)
+            };
+            for (_rgba, verts, tris) in groups {
+                let mut node = group.add_trimesh(verts.clone(), tris.clone(), Vec3::ONE, false);
+                node.set_color(color);
+            }
+        } else {
+            let mut joint = group.add_sphere(0.035);
+            joint.set_color(joint_color);
+            for (p1, p2, r) in &body.capsules {
+                let a = Vec3::new(p1.x, p1.y, p1.z);
+                let b = Vec3::new(p2.x, p2.y, p2.z);
+                add_segment(&mut group, a, b, (*r).max(0.015), foot_color);
+            }
+        }
+        body_nodes.push(group);
+    }
+    for body in &mjcf {
+        if let Some(p) = body.parent {
+            if visuals.contains_key(&body.name) && visuals.contains_key(&mjcf[p].name) {
+                continue;
+            }
+            let child_origin = Vec3::new(body.local_pos.x, body.local_pos.y, body.local_pos.z);
+            let mut parent_node = body_nodes[p].clone();
+            add_segment(&mut parent_node, Vec3::ZERO, child_origin, 0.028, body_color);
+        }
+    }
+
+    let mut env = BipedNexusBatchEnv::new(MJCF_XML, 1, 1, ENV_SEED).await;
+    let (mut obs, _) = env.reset_env(0).await;
+    let cmd: Vec<f32> = std::env::var("BIPED_RENDER_CMD")
+        .ok()
+        .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![0.4, 0.0, 0.0]);
+    env.pin_command_for(0, cmd[0], cmd[1], cmd[2]);
+
+    let mut ff = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", &format!("{w}x{h}"), "-r", "50", "-i", "-",
+            "-vf", "vflip,format=yuv420p", "-c:v", "libx264", "-crf", "21", out,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn ffmpeg (is it installed?)");
+    let mut ff_in = ff.stdin.take().expect("ffmpeg stdin");
+
+    let steps = (seconds / DT) as usize;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut falls = 0u32;
+    for step in 0..steps {
+        let mut a = [0.0f32; NUM_JOINTS];
+        a.copy_from_slice(&ac.mean(&obs)[..NUM_JOINTS]);
+        let outs = env.step(&[a]).await;
+        if outs[0].done {
+            if outs[0].fell {
+                falls += 1;
+            }
+            obs = env.reset_env(0).await.0;
+            env.pin_command_for(0, cmd[0], cmd[1], cmd[2]);
+        } else {
+            obs.clone_from(&outs[0].obs);
+        }
+        let poses = env.snapshot().await;
+        for (i, node) in body_nodes.iter_mut().enumerate() {
+            let p = &poses[i];
+            let pos = Vec3::new(p.translation.x, p.translation.y, p.translation.z);
+            let rot = Rot3::from_xyzw(p.rotation.x, p.rotation.y, p.rotation.z, p.rotation.w);
+            node.set_pose(Pose3::from_parts(pos, rot));
+        }
+        let (base, _) = env.base_pose_for(0, &poses);
+        let gz = strip0.as_ref().map_or(0.0, |s| s.height(base[0], base[1]));
+        let focus = Vec3::new(base[0], base[1], gz + 0.6);
+        let mut camera = OrbitCamera3d::new(
+            focus + Vec3::new(-1.6, -3.0, 1.6),
+            focus,
+        );
+        camera.set_up_axis(Vec3::Z);
+        surface.render_3d(&mut scene, &mut camera).await;
+        surface.snap(&mut buf);
+        ff_in.write_all(&buf).expect("write frame");
+        if step % 250 == 0 {
+            println!(
+                "record t={:>5.1}s x={:+.2} falls={falls}",
+                step as f32 * DT,
+                base[0]
+            );
+        }
+    }
+    drop(ff_in);
+    let st = ff.wait().expect("ffmpeg wait");
+    println!("record: wrote {out} ({} frames, falls={falls}, ffmpeg {st})", steps);
+}
+
 pub async fn run(cfg: DemoCfg) {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
@@ -1011,6 +1194,14 @@ pub async fn run(cfg: DemoCfg) {
     #[cfg(not(target_arch = "wasm32"))]
     if std::env::args().any(|a| a == "--resident-probe") {
         resident_probe().await;
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(i) = std::env::args().position(|a| a == "--record") {
+        let args: Vec<String> = std::env::args().collect();
+        let out = args.get(i + 1).cloned().unwrap_or_else(|| "/tmp/g1_record.mp4".into());
+        let seconds: f32 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(15.0);
+        record(&cfg, &out, seconds).await;
         return;
     }
     configure_env(cfg.terrain, cfg.terrain_level, cfg.terrain_amp_pct, cfg.terrain_slope_deg);
