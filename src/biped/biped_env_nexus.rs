@@ -535,7 +535,7 @@ pub struct LinkIndices {
     /// Multibody link index for each MJCF body (in `mjcf: Vec<MjBody>` order).
     /// Used by `body_positions_for` to render the skeleton in MJCF order — the
     /// same order the CPU env's `body_positions()` returns and the python
-    /// renderer (`render_biped.py`) expects.
+    /// renderer (`render_biped_mujoco.py`) expects.
     pub mjcf_to_link: Vec<u32>,
 
     /// Parent multibody link index for each actuated joint (in `JOINT_NAMES`
