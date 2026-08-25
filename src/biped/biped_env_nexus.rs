@@ -1506,7 +1506,7 @@ impl StepKnobs {
             slam_vel: f("BIPED_LIMIT_SLAM_VEL", 2.0),
             joint_power_term: f("BIPED_JOINT_POWER_TERM", 1500.0),
             ankle_torque_w: f("BIPED_ANKLE_TORQUE_W", 4.0),
-            w_knee_torques: f("BIPED_W_KNEE_TORQUES", 7e-5),
+            w_knee_torques: f("BIPED_W_KNEE_TORQUES", 2e-5),
             // MECH_POWER_W wins; POWER_W is the legacy alias.
             power_w: env_var("BIPED_MECH_POWER_W")
                 .ok()
@@ -2045,10 +2045,15 @@ impl BipedNexusBatchEnv {
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(-0.3);
+        // -3.0 (was -1.0, free-descent threshold tightened 0.3 -> 0.2 m/s):
+        // at -1.0 the impact term was ~-0.0004/step — noise. Tripled, and with
+        // the repriced knee free to flex and absorb, it shapes touchdowns.
+        // Measured (knee_impact run): median knee flexion 0.42 rad vs 0.17,
+        // near-extension time 24% -> 1%, learning curve unchanged.
         task.weights.touchdown_vz = std::env::var("BIPED_W_TOUCHDOWN_VZ")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(-1.0);
+            .unwrap_or(-3.0);
         if let Some(v) = std::env::var("BIPED_TOUCHDOWN_VZ_OK")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
@@ -4238,7 +4243,7 @@ impl BipedNexusBatchEnv {
         // peaks — the likely terrain-curriculum blocker (clearance needs
         // knee flexion). 2x (not 1x) keeps some extra effort pressure since
         // nexus's torque-to-stand runs higher than PhysX's.
-        let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(1e-4);
+        let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(5e-5);
         let w_ankle_torques = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1.5e-3);
         let w_ankle_roll_torques = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(0.0);
         // Knee-specific torque extra (BIPED_W_KNEE_TORQUES, per-step weight on
@@ -4937,7 +4942,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             if self.gpu_torque_terms.is_none() {
                 // Resolve the host's joint-NAME classification once, into
                 // per-joint weights the kernel just multiplies by.
-                let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(1e-4);
+                let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(5e-5);
                 let w_ankle_t = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1.5e-3);
                 let w_ankle_roll = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(0.0);
                 let w_knee = self.knobs.w_knee_torques;
@@ -5659,7 +5664,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 );
             }
             if rg && self.gpu_torque_terms.is_none() {
-                let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(1e-4);
+                let w_torques = env_f32("BIPED_W_TORQUES").unwrap_or(5e-5);
                 let w_ankle_t = env_f32("BIPED_W_ANKLE_TORQUES").unwrap_or(1.5e-3);
                 let w_ankle_roll = env_f32("BIPED_W_ANKLE_ROLL_TORQUES").unwrap_or(0.0);
                 let w_knee = self.knobs.w_knee_torques;

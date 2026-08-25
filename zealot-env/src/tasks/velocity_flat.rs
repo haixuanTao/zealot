@@ -661,7 +661,7 @@ impl Default for RewardWeights {
             // "swing → settle → swing" cycle without farmable waddle.
             action_rate_rate: 0.0, // off — enable with BIPED_W_ACTION_RATE_RATE
             touchdown_vz: 0.0,     // off — enable with BIPED_W_TOUCHDOWN_VZ
-            touchdown_vz_ok: 0.3,
+            touchdown_vz_ok: 0.2, // was 0.3 — landings beyond 0.2 m/s now cost
             touchdown_vz_h: 0.10,
             force_rate: 0.0, // off by default — enable with BIPED_W_FORCE_RATE
             force_rate_deadband: 0.15,
