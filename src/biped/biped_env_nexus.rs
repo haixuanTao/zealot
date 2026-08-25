@@ -2526,10 +2526,28 @@ impl BipedNexusBatchEnv {
         } else {
             vec![0; num_envs]
         };
-        // AMASS/SONIC upper-body playback (BIPED_ARM_MOTION=<dir of SONIC
-        // csv clips>). Loaded against the model's held joints BY NAME, so a
-        // clip column set that doesn't cover them fails here, not silently.
-        let arm_motion = std::env::var("BIPED_ARM_MOTION").ok().map(|dir| {
+        // LAFAN1/SONIC upper-body playback. Loaded against the model's held
+        // joints BY NAME, so a clip column set that doesn't cover them fails
+        // here, not silently. DEFAULT ON: when BIPED_ARM_MOTION is unset and
+        // ~/sonic-motions exists, it plays — training with gesturing arms is
+        // the deploy-realistic world (a silent frozen-arm run cost us a
+        // regression hunt once already). BIPED_ARM_MOTION=off|0 opts out
+        // explicitly; any other value is a clip directory.
+        let arm_dir: Option<String> = match std::env::var("BIPED_ARM_MOTION") {
+            Ok(v) if v == "off" || v == "0" || v.is_empty() => None,
+            Ok(v) => Some(v),
+            Err(_) => {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+                let d = format!("{home}/sonic-motions");
+                if std::path::Path::new(&d).is_dir() {
+                    eprintln!("[env] arm motion DEFAULT: using {d} (BIPED_ARM_MOTION=off to disable)");
+                    Some(d)
+                } else {
+                    None
+                }
+            }
+        };
+        let arm_motion = arm_dir.map(|dir| {
             assert!(
                 !idx.held.is_empty(),
                 "BIPED_ARM_MOTION needs PD-held joints (unset BIPED_LOCK_HELD, use a 29dof model)"
@@ -2566,7 +2584,7 @@ impl BipedNexusBatchEnv {
         });
         if arm_motion.is_none() {
             println!(
-                "arm-motion playback DISABLED (BIPED_ARM_MOTION unset) — held joints hold the home pose"
+                "arm-motion playback DISABLED (off / no clip dir found) — held joints hold the home pose"
             );
         }
         let arm_rng: Vec<Lcg> = (0..num_envs)

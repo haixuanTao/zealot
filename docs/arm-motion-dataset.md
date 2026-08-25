@@ -9,12 +9,15 @@ an imitation objective: the policy never observes or controls the upper body.
 
 ## How training consumes it
 
-`scripts/train.sh` auto-exports `BIPED_ARM_MOTION=$HOME/sonic-motions` when
-that directory exists, and **refuses to launch** when it doesn't — a box
-without the dataset used to silently train with frozen arms. Options:
+Arm motion is **on by default**: when `BIPED_ARM_MOTION` is unset the env
+itself uses `$HOME/sonic-motions` if it exists (and logs that it did) — a
+box without the dataset used to silently train with frozen arms.
+`scripts/train.sh` additionally refuses to launch when the dataset is
+missing. Options:
 
 - `BIPED_ARM_MOTION=<dir>` — use a dataset at another path.
-- `BIPED_ARM_MOTION=off` — explicitly opt out (arms hold the home pose).
+- `BIPED_ARM_MOTION=off` (or `0`) — explicitly opt out (arms hold the home
+  pose).
 
 Every env construction logs one of `arm-motion playback ENABLED: N clips …`
 or `arm-motion playback DISABLED …`, so any training log records which mode
