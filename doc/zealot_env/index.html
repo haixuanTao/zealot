@@ -1,0 +1,57 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Vectorized RL environment + MDP layer over the nexus GPU physics engine."><title>zealot_env - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="zealot_env" data-themes="" data-resource-suffix="" data-rustdoc-version="1.96.0-nightly (55e86c996 2026-04-02)" data-channel="nightly" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate zealot_env</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../zealot_env/index.html">zealot_<wbr>env</a><span class="version">0.1.0</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#getting-started" title="Getting started">Getting started</a></li><li><a href="#architecture" title="Architecture">Architecture</a></li></ul><h3><a href="#reexports">Crate Items</a></h3><ul class="block"><li><a href="#reexports" title="Re-exports">Re-exports</a></li><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>zealot_<wbr>env</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/zealot_env/lib.rs.html#1-71">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Vectorized RL environment + MDP layer over the nexus GPU physics engine.</p>
+<h2 id="getting-started"><a class="doc-anchor" href="#getting-started">§</a>Getting started</h2>
+<p><strong>Watch it walk first — nothing to install:</strong> the
+<a href="https://haixuantao.github.io/zealot/">live demo</a> is this training
+environment compiled to WebAssembly, stepping nexus GPU physics in your
+browser. Tap the ground and the robot walks there; switch engine tabs to
+step the same checkpoint through rapier.js and MuJoCo; load any published
+policy from the
+<a href="https://huggingface.co/haixuantao/zealot-g1-locomotion">Hugging Face repo</a>
+by handle or URL.</p>
+<p><strong>Train the humanoid</strong> (needs the
+<a href="https://github.com/Rust-GPU/cargo-gpu"><code>cargo-gpu</code></a> toolchain — see the
+<a href="https://github.com/haixuanTao/zealot/blob/master/docs/development.md">development guide</a>):</p>
+<div class="example-wrap"><pre class="language-sh"><code>BIPED_ROBOT=g1_29dof_agile BIPED_CUTILE_GEMM=1 BIPED_TERRAIN=1 \
+  cargo run --release --example biped_train_gpu \
+  --features &quot;gpu biped_gpu cutile&quot; -- 50000 4096 my_policy.safetensors</code></pre></div>
+<p><strong>Watch <em>your</em> policy walk:</strong> upload the checkpoint to any Hugging Face
+repo and open
+<code>https://haixuantao.github.io/zealot/?ckpt=your-name/your-repo</code>.</p>
+<p>More: <a href="https://github.com/haixuanTao/zealot/blob/master/docs/getting-started.md">getting started</a> ·
+<a href="https://github.com/haixuanTao/zealot/blob/master/docs/explanation.md">how it’s built and why</a> ·
+<a href="https://github.com/haixuanTao/zealot/blob/master/docs/benchmarks.md">benchmarks</a></p>
+<h2 id="architecture"><a class="doc-anchor" href="#architecture">§</a>Architecture</h2>
+<p>This is zealot’s “Isaac Lab tier”: it wraps nexus’s batched
+<code>GpuPhysicsPipeline</code> into a gym-style vectorized environment and provides
+the MDP managers. nexus already supports the primitives this needs
+(per-env reset today; motor-target writes and velocity readback after a
+~10-line nexus patch).</p>
+<p>Modules:</p>
+<ul>
+<li><code>config</code> — the generic <a href="config/trait.EnvConfig.html" title="trait zealot_env::config::EnvConfig"><code>EnvConfig</code></a> task interface (the MDP contract).</li>
+<li><code>math</code>   — dependency-free vec/quat helpers used by the MDP.</li>
+<li><code>obs_history</code> — per-env observation-frame stacking (<code>BIPED_OBS_HISTORY</code>).</li>
+<li><code>rng</code>    — a small deterministic LCG for command / domain sampling.</li>
+<li><code>robots</code> — robot asset specs (pure data): LeRobot bipedal, Unitree G1,
+Unitree H2 Plus (select with <code>BIPED_ROBOT</code>).</li>
+<li><code>tasks</code>  — concrete task MDPs; currently flat velocity tracking.</li>
+</ul>
+<p>Planned (built incrementally):</p>
+<ul>
+<li><code>env</code>     — vectorized runtime: <code>reset()</code>, <code>step(actions) -&gt; (obs, reward, done)</code>,
+driving nexus’s batched pipeline across all parallel environments.</li>
+</ul>
+</div></details><h2 id="reexports" class="section-header">Re-exports<a href="#reexports" class="anchor">§</a></h2><dl class="item-table reexports"><dt id="reexport.BodyState"><code>pub use config::<a class="struct" href="config/struct.BodyState.html" title="struct zealot_env::config::BodyState">BodyState</a>;</code></dt><dt id="reexport.EnvConfig"><code>pub use config::<a class="trait" href="config/trait.EnvConfig.html" title="trait zealot_env::config::EnvConfig">EnvConfig</a>;</code></dt><dt id="reexport.ObsHistory"><code>pub use obs_history::<a class="struct" href="obs_history/struct.ObsHistory.html" title="struct zealot_env::obs_history::ObsHistory">ObsHistory</a>;</code></dt><dt id="reexport.JointSpec"><code>pub use robots::<a class="struct" href="robots/struct.JointSpec.html" title="struct zealot_env::robots::JointSpec">JointSpec</a>;</code></dt><dt id="reexport.LeRobotBipedal"><code>pub use robots::<a class="type" href="robots/lerobot_bipedal/type.LeRobotBipedal.html" title="type zealot_env::robots::lerobot_bipedal::LeRobotBipedal">LeRobotBipedal</a>;</code></dt><dt id="reexport.RobotSpec"><code>pub use robots::<a class="struct" href="robots/struct.RobotSpec.html" title="struct zealot_env::robots::RobotSpec">RobotSpec</a>;</code></dt><dt id="reexport.NUM_JOINTS"><code>pub use robots::<a class="constant" href="robots/constant.NUM_JOINTS.html" title="constant zealot_env::robots::NUM_JOINTS">NUM_JOINTS</a>;</code></dt><dt id="reexport.VelocityFlatTask"><code>pub use tasks::<a class="struct" href="tasks/velocity_flat/struct.VelocityFlatTask.html" title="struct zealot_env::tasks::velocity_flat::VelocityFlatTask">VelocityFlatTask</a>;</code></dt></dl><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="config/index.html" title="mod zealot_env::config">config</a></dt><dd>The environment interface — zealot’s MDP / “manager” layer (the Isaac Lab tier).</dd><dt><a class="mod" href="knobs/index.html" title="mod zealot_env::knobs">knobs</a></dt><dd>THE config — every runtime knob that more than one crate/site consumes is
+declared here EXACTLY ONCE (env-var name + default + doc), parsed once,
+cached for the process lifetime.</dd><dt><a class="mod" href="math/index.html" title="mod zealot_env::math">math</a></dt><dd>Minimal vector / quaternion helpers.</dd><dt><a class="mod" href="motion/index.html" title="mod zealot_env::motion">motion</a></dt><dd>Retargeted mocap clips (AMASS / SONIC → G1 joint space), used as an
+upper-body DISTURBANCE source for the balance curriculum: under any
+command — standing or walking — the held (non-action) joints replay a
+random window of a random clip, so the legs learn to keep the pelvis
+level under realistic arm + waist motion instead of a frozen home pose.
+The policy never observes the upper body — the moving mass is an
+unmodeled perturbation, exactly like a human carrying/gesturing.</dd><dt><a class="mod" href="obs_history/index.html" title="mod zealot_env::obs_history">obs_<wbr>history</a></dt><dd>Per-env observation-history stacking (<code>BIPED_OBS_HISTORY=H</code>).</dd><dt><a class="mod" href="rng/index.html" title="mod zealot_env::rng">rng</a></dt><dd>A tiny, deterministic LCG — enough for command sampling and domain
+randomization without pulling in <code>rand</code>. Same generator the pendulum examples
+use, lifted here so the env layer can sample reproducibly from a seed.</dd><dt><a class="mod" href="robots/index.html" title="mod zealot_env::robots">robots</a></dt><dd>Robot asset specifications — the analogue of AGILE’s <code>assets/robots/*.py</code>.</dd><dt><a class="mod" href="tasks/index.html" title="mod zealot_env::tasks">tasks</a></dt><dd>Task definitions — the analogue of AGILE’s <code>rl_env/tasks/*</code>.</dd><dt><a class="mod" href="terrain/index.html" title="mod zealot_env::terrain">terrain</a></dt><dd>Rough-terrain generation + difficulty curriculum (<code>BIPED_TERRAIN=1</code>),
+ported from WBC-AGILE’s <code>MEDIUM_ROUGH_TERRAIN_CFG</code> +
+<code>terrain_levels_vel_curriculum</code> so zealot trains under the same
+stepping-forcing mechanism as NVIDIA’s pipeline.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.version.html" title="fn zealot_env::version">version</a></dt><dd>Crate version — used to sanity-check that the workspace links.</dd></dl></section></div></main></body></html>

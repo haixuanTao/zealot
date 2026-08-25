@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ACTION_DIM","CRITIC_OBS_DIM","FWD","LAT","NUM_FEET","NUM_HELD_OBS","OBS_DIM","UP"],"struct":["BaseState","CommandSampler","FootObs","RewardBreakdown","RewardStds","RewardWeights","RobotState","StepCue","VelocityCommand","VelocityFlatTask"]};

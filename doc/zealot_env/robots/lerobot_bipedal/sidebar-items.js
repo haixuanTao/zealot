@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["JOINT_NAMES"],"fn":["lerobot"],"type":["LeRobotBipedal"]};
