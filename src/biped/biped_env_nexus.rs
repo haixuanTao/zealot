@@ -1471,6 +1471,7 @@ pub struct StepKnobs {
     /// Post-reset transient-fault grace window, control steps
     /// (BIPED_FAULT_GRACE_STEPS, default 4; 0 = faults always armed).
     pub fault_grace: u16,
+    pub fault_persist: u16,
     pub dwell_max: u16,
     pub slam_vel: f32,
     pub joint_power_term: f32,
@@ -1499,6 +1500,17 @@ impl StepKnobs {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(4u16),
+            // Debounce for the transient e-stops (vel/slam/power/envelope):
+            // the condition must hold this many CONSECUTIVE control steps to
+            // trip. A single 20 ms sample is far more often a contact-solver
+            // spike than real hardware distress (10-take probe: upright robot
+            // e-stopped mid-stride with nothing visibly wrong), and every
+            // real fault mode these guards target persists for several
+            // frames. 1 = old single-sample behavior.
+            fault_persist: env_var("BIPED_FAULT_PERSIST")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2u16),
             dwell_max: env_var("BIPED_LIMIT_DWELL_STEPS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -1664,6 +1676,8 @@ pub struct BipedNexusBatchEnv {
     /// (54-66% of frames), but LEANING on one is the standing pathology
     /// (median dwell 19 steps standing vs 9 walking).
     limit_dwell: Vec<std::sync::atomic::AtomicU16>,
+    /// Debounce streaks for the transient e-stops, [env*3+family].
+    fault_streak: Vec<std::sync::atomic::AtomicU16>,
 
     /// Global control-step counter (for push-perturbation scheduling).
     global_step: u64,
@@ -2492,6 +2506,12 @@ impl BipedNexusBatchEnv {
         let limit_dwell: Vec<std::sync::atomic::AtomicU16> = (0..num_envs * NUM_JOINTS)
             .map(|_| std::sync::atomic::AtomicU16::new(0))
             .collect();
+        // Transient-fault debounce streaks: [env * 3 + family], families
+        // 0=vel 1=slam 2=power/envelope. Own-env entries only (like
+        // limit_dwell), so relaxed atomics never race.
+        let fault_streak: Vec<std::sync::atomic::AtomicU16> = (0..num_envs * 3)
+            .map(|_| std::sync::atomic::AtomicU16::new(0))
+            .collect();
         let reset_vel = std::env::var("BIPED_RESET_VEL").map_or(true, |v| v != "0");
         if reset_vel {
             println!("reset-velocity randomization ENABLED (AGILE reset_base/joints: lin ±0.25, ang ±0.5, joints ±1.0)");
@@ -2726,6 +2746,7 @@ impl BipedNexusBatchEnv {
                 .unwrap_or(0.8),
             step_cue_dropout_override: None,
             limit_dwell,
+            fault_streak,
             global_step: 0,
             dbg_stance: Vec::new(),
             push_vel,
@@ -4529,15 +4550,44 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         self.step_count[e], state.joint_vel[3]
                     );
                 }
+                // Debounce (BIPED_FAULT_PERSIST): a transient e-stop only
+                // fires after N consecutive offending steps; one clean step
+                // resets its streak. Falls, dwell (own counter) and illegal
+                // contacts are exempt.
+                let persist = self.knobs.fault_persist.max(1);
+                let mut debounced = |fam: usize, raw: bool| -> bool {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let c = &self.fault_streak[e * 3 + fam];
+                    if raw {
+                        c.fetch_add(1, Relaxed) + 1 >= persist
+                    } else {
+                        c.store(0, Relaxed);
+                        false
+                    }
+                };
+                let vel_fault = debounced(0, vel_fault);
+                let slam_fault = debounced(1, slam_fault);
+                let pw_fault = debounced(2, power_fault || envelope_fault);
+                let genuine_fall = self.task.fell_over(&state.base);
                 let fell = illegal
                     || crossed
                     || vel_fault
                     || slam_fault
                     || dwell_fault
-                    || power_fault
-                    || envelope_fault
-                    || self.task.fell_over(&state.base)
+                    || pw_fault
+                    || genuine_fall
                     || !state.base.height.is_finite();
+                // BIPED_FAULT_DEBUG: name EVERY termination cause (the power
+                // print above only covers power trips — a 10-take probe
+                // "e-stopped while upright" turned out to be untraceable
+                // because the other five causes were silent).
+                if fell && std::env::var("BIPED_FAULT_DEBUG").is_ok() {
+                    eprintln!(
+                        "[term] e {e} sc {} illegal={} crossed={} vel={} slam={} dwell={} power={} fall={} h={:.3}",
+                        self.step_count[e], illegal, crossed, vel_fault, slam_fault,
+                        dwell_fault, pw_fault, genuine_fall, state.base.height
+                    );
+                }
                 // BIPED_SKIP_REWARD: A/B lever isolating the cost of the host
                 // reward evaluation from the rest of the per-env block, so the
                 // GPU port's ~0.55 ms/step can be priced against what it would
@@ -4581,6 +4631,9 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     use std::sync::atomic::Ordering::Relaxed;
                     for i in 0..NUM_JOINTS {
                         self.limit_dwell[e * NUM_JOINTS + i].store(0, Relaxed);
+                    }
+                    for fam in 0..3 {
+                        self.fault_streak[e * 3 + fam].store(0, Relaxed);
                     }
                     comps[23] = self.task.weights.termination;
                     reward += self.task.weights.termination;
