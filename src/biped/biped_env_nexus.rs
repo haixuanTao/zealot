@@ -3741,6 +3741,13 @@ impl BipedNexusBatchEnv {
     /// Hold-pose targets of the held joints, same order as
     /// `held_joint_names()` — the fallback for joints an external source
     /// doesn't provide.
+    /// Current and previous PD-held targets (`arm_staged`), env-major
+    /// `[env * n_held + j]` — the trainer/demo source for the 79-dim obs
+    /// frame's upper-body block (targets + finite-diff velocity).
+    pub fn held_staged(&self) -> (&[f32], &[f32]) {
+        (&self.arm_staged, &self.prev_arm_staged)
+    }
+
     pub fn held_joint_homes(&self) -> Vec<f32> {
         self.idx.held.iter().map(|h| h.home).collect()
     }

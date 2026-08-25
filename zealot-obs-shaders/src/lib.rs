@@ -69,7 +69,10 @@ pub const HIST: usize = 5;
 /// earlier were 45, v24 added the gyro at [45..48), v28 the step cue at
 /// [48..53). Checkpoints published before and after each change all have to
 /// load and walk, so the width is a runtime value, not a rebuild.
-pub const FRAME: usize = 53;
+pub const FRAME: usize = 79;
+/// The step-cue frame (v28): everything of [`FRAME`] except the upper-body
+/// held block.
+pub const FRAME_CUE: usize = 53;
 /// The pre-gyro frame, still used by every v21-and-earlier checkpoint.
 pub const FRAME_NO_GYRO: usize = 45;
 /// The gyro-era frame (v24–v27): everything of [[FRAME]] except the step cue.
@@ -204,6 +207,19 @@ pub fn gpu_assemble_obs(
     o[45] = av.x + 2.0 * (uy * t1z - uz * t1y);
     o[46] = av.y + 2.0 * (uz * t1x - ux * t1z);
     o[47] = av.z + 2.0 * (ux * t1y - uy * t1x);
+
+    // Upper-body held block (v29+, 79-dim frames): the 13 PD-held joint
+    // targets and their finite-diff velocities, streamed by the host into
+    // cmd slots [4..30) (the cmd buffer is 30 slots/env). Guarded on `fr`
+    // so cue-era policies never read past the old 4-slot region.
+    if fr >= FRAME {
+        let mut k = 0;
+        while k < 13 {
+            o[53 + k] = cmd.read((4 + k) * ne + eu);
+            o[66 + k] = cmd.read((17 + k) * ne + eu);
+            k += 1;
+        }
+    }
 
     // History ring: slot ep%5; on episode start replicate into all slots.
     let slot = (ep as u32 % HIST as u32) as usize;

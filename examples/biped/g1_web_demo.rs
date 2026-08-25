@@ -780,11 +780,11 @@ async fn load_ckpt(spec: &str) -> Result<(ActorCritic, String), String> {
     // step-cue block is fed the all-zero "no step detected" pattern);
     // refuse anything else HERE so the caller's fallback runs instead of
     // the demo dying at GpuObs setup.
-    use zealot_gpu_obs::shaders::{FRAME, FRAME_GYRO, FRAME_NO_GYRO, HIST};
+    use zealot_gpu_obs::shaders::{FRAME, FRAME_CUE, FRAME_GYRO, FRAME_NO_GYRO, HIST};
     let fr = ac.obs_norm.state().0.len() / HIST;
-    if fr != FRAME && fr != FRAME_GYRO && fr != FRAME_NO_GYRO {
+    if fr != FRAME && fr != FRAME_CUE && fr != FRAME_GYRO && fr != FRAME_NO_GYRO {
         return Err(format!(
-            "{}: {fr}-dim obs frames — the demo runs {FRAME_NO_GYRO}-, {FRAME_GYRO}- or {FRAME}-dim policies",
+            "{}: {fr}-dim obs frames — the demo runs {FRAME_NO_GYRO}-, {FRAME_GYRO}-, {FRAME_CUE}- or {FRAME}-dim policies",
             ckpt_label(&url)
         ));
     }
@@ -1432,8 +1432,15 @@ pub async fn run(cfg: DemoCfg) {
         action_scale: spec.joints[0].action_scale,
     };
     let mut gobs = zealot_gpu_obs::GpuObs::new(&backend, n_robots, &obs_cfg).expect("gpu obs");
+    let obs_frame = ac.obs_norm.state().0.len() / zealot_gpu_obs::shaders::HIST;
     for e in 0..n_robots {
         gobs.set_cmd(&backend, e, cmds[e]).expect("cmd");
+        // 79-dim policies observe the held-joint targets: seed with the
+        // homes (zero velocity); refreshed per control step below.
+        if obs_frame >= zealot_gpu_obs::shaders::FRAME {
+            let homes = env.held_joint_homes();
+            gobs.set_held(&backend, e, &homes, &[0.0; 13]).expect("held");
+        }
     }
     // CPU-side episode counters (timeout + reset bookkeeping only).
     let mut ep_steps: Vec<u32> = vec![0; n_robots];
@@ -1976,6 +1983,22 @@ pub async fn run(cfg: DemoCfg) {
             // Encode + submit only; the per-frame render snapshot below is
             // the sole GPU→CPU fence.
             let step_t0 = Instant::now();
+            // 79-dim policies observe the held-joint targets: refresh the obs
+            // cmd buffer from the env's arm playback stage (few floats/env —
+            // negligible next to the encoder submit).
+            if obs_frame >= zealot_gpu_obs::shaders::FRAME {
+                let (cur, prev) = env.held_staged();
+                let nh = cur.len() / n_robots;
+                for e in 0..n_robots {
+                    let c = &cur[e * nh..(e + 1) * nh];
+                    let vel: Vec<f32> = c
+                        .iter()
+                        .zip(&prev[e * nh..(e + 1) * nh])
+                        .map(|(a, b)| (a - b) / DT)
+                        .collect();
+                    gobs.set_held(&backend, e, c, &vel).expect("held");
+                }
+            }
             // Single-submit control step: obs assembly, policy GEMMs, action
             // commit and motor scatter all share ONE command buffer (each
             // submit is a wasm→JS→browser crossing).

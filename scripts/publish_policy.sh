@@ -9,10 +9,11 @@
 # fixed name the website demo and the sim2sim bench pages fetch at boot, so
 # a release needs NO site redeploy. Needs `hf auth login` once.
 #
-# Browser caveat: the web demos build 45- or 48-dim obs frames. A checkpoint
-# with wider frames (e.g. the 53-dim step-cue policies) uploads fine but the
-# site will refuse it and fall back to the embedded policy — extend the obs
-# shader (zealot-obs-shaders) before tagging one of those as latest.
+# Browser caveat: the web demos assemble 45/48/53/79-dim obs frames (79 = the
+# upper-body held block, supported since the obs-shader extension). A LIVE
+# site only gains new widths after the wasm demos are rebuilt and redeployed
+# (website/scripts/build-demos.sh) — until then it refuses unknown widths and
+# falls back to the embedded policy.
 set -eo pipefail
 REPO=haixuantao/zealot-g1-locomotion
 

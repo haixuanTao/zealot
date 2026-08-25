@@ -21,7 +21,7 @@ use vortx::tensor::Tensor;
 pub type Enc = <GpuBackend as Backend>::Encoder;
 
 use shaders::{
-    C_DEFAULT, C_HI, C_LEN, C_LINK, C_LO, C_MEAN, C_STD, FRAME, FRAME_GYRO, FRAME_NO_GYRO, HIST,
+    C_DEFAULT, C_HI, C_LEN, C_LINK, C_LO, C_MEAN, C_STD, FRAME, FRAME_CUE, FRAME_GYRO, FRAME_NO_GYRO, HIST,
     N_ACT,
     STATE_STRIDE,
 };
@@ -712,7 +712,7 @@ impl GpuRewardBaseTerms {
                 BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
             )?,
             base: Tensor::vector_uninit(backend, (13 * n) as u32, st)?,
-            cmd: Tensor::vector(backend, &vec![0.0f32; 4 * n], st)?,
+            cmd: Tensor::vector(backend, &vec![0.0f32; 30 * n], st)?,
             cue: Tensor::vector(backend, &vec![0.0f32; 4 * n], st)?,
             out: Tensor::vector_uninit(backend, (6 * n) as u32, st | BufferUsages::COPY_SRC)?,
             n,
@@ -1616,9 +1616,9 @@ impl GpuObs {
         assert_eq!(cfg.norm_mean.len(), cfg.norm_std.len());
         let frame = cfg.norm_mean.len() / HIST;
         assert!(
-            (frame == FRAME || frame == FRAME_GYRO || frame == FRAME_NO_GYRO)
+            (frame == FRAME || frame == FRAME_CUE || frame == FRAME_GYRO || frame == FRAME_NO_GYRO)
                 && frame * HIST == cfg.norm_mean.len(),
-            "unsupported obs layout: {} = {HIST} x {frame} (expected a frame of {FRAME_NO_GYRO}, {FRAME_GYRO} or {FRAME})",
+            "unsupported obs layout: {} = {HIST} x {frame} (expected a frame of {FRAME_NO_GYRO}, {FRAME_GYRO}, {FRAME_CUE} or {FRAME})",
             cfg.norm_mean.len(),
         );
         let mut consts = vec![0.0f32; C_LEN];
@@ -1639,7 +1639,7 @@ impl GpuObs {
             bundle: ObsBundle::from_backend(backend)?,
             state: Tensor::vector(backend, &vec![0.0f32; STATE_STRIDE * n], st)?,
             hist: Tensor::vector(backend, &vec![0.0f32; HIST * FRAME * n], st)?,
-            cmd: Tensor::vector(backend, &vec![0.0f32; 4 * n], st)?,
+            cmd: Tensor::vector(backend, &vec![0.0f32; 30 * n], st)?,
             consts: Tensor::vector(backend, &consts, st)?,
             targets: {
                 // Prefill with the home pose so the very first physics step
@@ -1669,6 +1669,25 @@ impl GpuObs {
     ) -> Result<(), GpuBackendError> {
         for (c, v) in [cmd[0], cmd[1], cmd[2], 0.0].into_iter().enumerate() {
             backend.write_buffer(self.cmd.buffer_mut(), (c * self.n + e) as u64, &[v])?;
+        }
+        Ok(())
+    }
+
+    /// Stream env `e`'s upper-body held-joint PD targets + finite-diff
+    /// velocities into the obs cmd buffer (slots [4..30)) — the source of the
+    /// 79-dim frame's [53..79) block. No-op data for narrower policies.
+    pub fn set_held(
+        &mut self,
+        backend: &GpuBackend,
+        e: usize,
+        pos: &[f32],
+        vel: &[f32],
+    ) -> Result<(), GpuBackendError> {
+        for (k, v) in pos.iter().take(13).enumerate() {
+            backend.write_buffer(self.cmd.buffer_mut(), ((4 + k) * self.n + e) as u64, &[*v])?;
+        }
+        for (k, v) in vel.iter().take(13).enumerate() {
+            backend.write_buffer(self.cmd.buffer_mut(), ((17 + k) * self.n + e) as u64, &[*v])?;
         }
         Ok(())
     }
@@ -1796,7 +1815,7 @@ impl GpuObserve {
                 BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
             )?,
             last_action: Tensor::vector(backend, &vec![0.0f32; num_joints as usize * n], st)?,
-            cmd: Tensor::vector(backend, &vec![0.0f32; 4 * n], st)?,
+            cmd: Tensor::vector(backend, &vec![0.0f32; 30 * n], st)?,
             default_pos: Tensor::vector(backend, default_pos, st)?,
             phase: Tensor::vector(backend, &vec![0.0f32; n], st)?,
             cue: Tensor::vector(backend, &vec![0.0f32; 10 * n], st)?,
