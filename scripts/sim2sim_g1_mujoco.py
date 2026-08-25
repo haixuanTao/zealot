@@ -393,6 +393,20 @@ def main():
                 held.append((qa, da, kp, kd, eff, q_hold, name, lo, hi))
                 break
     print(f"policy joints: 12, held joints: {len(held)}")
+    # Training-order view of the held joints for the frame-79 obs block
+    # (matches biped_train_gpu's HELD_NAMES; obs carries the PD TARGETS and
+    # their finite-diff velocity, exactly like arm_staged in training).
+    TRAIN_HELD = [
+        "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+        "left_elbow_joint", "left_wrist_roll_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+        "right_elbow_joint", "right_wrist_roll_joint",
+    ]
+    _held_by_name = {h[6]: h for h in held}
+    held_obs_rows = [_held_by_name[n] for n in TRAIN_HELD if n in _held_by_name]
+    held_obs_cur = np.array([h[5] for h in held_obs_rows])
+    held_obs_prev = held_obs_cur.copy()
 
     free_q = model.jnt_qposadr[0]  # floating base is joint 0
     free_d = model.jnt_dofadr[0]   # its first velocity DOF (linear x)
@@ -452,7 +466,23 @@ def main():
 
     trans_track = [] if TRANS_JSON else None
 
+    held_tgt = {}
     for t in range(n_ctrl):
+        # Held-joint PD targets for THIS control step (home, or clip faded
+        # in) — computed before obs so the frame-79 block sees the same
+        # target the PD applies, like the trainer's arm_staged.
+        held_tgt = {}
+        if _arm_clip is not None:
+            _fade = min(1.0, (t * CONTROL_DT) / 0.5)
+            _fade = _fade * _fade * (3.0 - 2.0 * _fade)
+            for _qa, _da, _kp, _kd, _eff, _qh, _nm, _lo, _hi in held:
+                _cq = arm_clip_pose(_nm, ARM_T0 + t * CONTROL_DT)
+                if _cq is not None:
+                    _dst = _qh + ARM_SCALE * (_cq - _qh)
+                    held_tgt[_qa] = float(np.clip(
+                        _qh + _fade * (_dst - _qh), _lo, _hi))
+        held_obs_cur = np.array(
+            [held_tgt.get(h[0], h[5]) for h in held_obs_rows])
         if CMD_SWITCH is not None and t * CONTROL_DT >= CMD_SWITCH[0]:
             CMD[:] = CMD_SWITCH[1]
         q = data.qpos[pol_q].copy()
@@ -520,8 +550,10 @@ def main():
                 else:
                     o[48:53] = 0.0
         if frame >= 79:
-            o[53:66] = HELD_HOMES
-            o[66:79] = 0.0
+            n = len(held_obs_cur)
+            o[53:53 + n] = held_obs_cur
+            o[66:66 + n] = (held_obs_cur - held_obs_prev) / CONTROL_DT
+            held_obs_prev = held_obs_cur.copy()
 
         if frames_hist is None:
             frames_hist = [o.copy() for _ in range(HIST)]  # reset-replicate
@@ -539,18 +571,6 @@ def main():
             act_f[:] = ACT_LPF * action + (1.0 - ACT_LPF) * act_f
             action = act_f.copy()
         target = np.clip(DEFAULT_POS + ACTION_SCALE * action, pol_rng[:, 0], pol_rng[:, 1])
-
-        # Per-step held-joint targets: home, or the arm clip (faded in).
-        held_tgt = {}
-        if _arm_clip is not None:
-            _fade = min(1.0, (t * CONTROL_DT) / 0.5)
-            _fade = _fade * _fade * (3.0 - 2.0 * _fade)
-            for _qa, _da, _kp, _kd, _eff, _qh, _nm, _lo, _hi in held:
-                _cq = arm_clip_pose(_nm, ARM_T0 + t * CONTROL_DT)
-                if _cq is not None:
-                    _dst = _qh + ARM_SCALE * (_cq - _qh)
-                    held_tgt[_qa] = float(np.clip(
-                        _qh + _fade * (_dst - _qh), _lo, _hi))
 
         if ARM_LOG is not None and _arm_clip is not None:
             _r=[t*CONTROL_DT]
