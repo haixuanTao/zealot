@@ -2137,10 +2137,10 @@ pub async fn run(cfg: DemoCfg) {
             // Safari/Firefox WebGPU behaviour gets diagnosed at all.
             #[cfg(target_arch = "wasm32")]
             if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                // GPU-boundary rates over the window (submits/passes/copies/
-                // uploads/maps per second) — khal's wasm perf counters.
-                let (c_sub, c_pass, c_copy, c_wr, c_map) =
-                    khal::backend::webgpu::perf_counters::take();
+                // GPU-boundary rates over the window. khal's rescue lineage
+                // dropped the wasm perf counters (backend::webgpu went
+                // private) — zeros keep the HUD shape until they grow back.
+                let (c_sub, c_pass, c_copy, c_wr, c_map) = (0u32, 0u32, 0u32, 0u32, 0u32);
                 let cps = |v: u32| (v as f32 / win).round();
                 doc.set_title(&format!(
                     "z| falls={} sole={:+.3} spd={:.2} cmd={:.2} rt={:.0}% fps={:.0} stale={:.0}% gap={:.0}ms gpu[sub={} pass={} cp={} wr={} map={}] |in|={:.4} |act|={:.4} nan={}",
