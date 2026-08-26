@@ -1473,6 +1473,8 @@ pub struct StepKnobs {
     pub fault_grace: u16,
     pub fault_persist: u16,
     pub fault_forgive: u16,
+    pub fault_penalize: bool,
+    pub fault_penalty: f32,
     pub dwell_max: u16,
     pub slam_vel: f32,
     pub joint_power_term: f32,
@@ -1523,6 +1525,21 @@ impl StepKnobs {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3u16),
+            // BIPED_FAULT_MODE=penalize: transient e-stops (vel/slam/power,
+            // post-debounce) charge BIPED_FAULT_PENALTY per offending step
+            // instead of terminating. The robot is upright and recoverable
+            // when these fire — terminating discards a useful on-distribution
+            // trajectory and pays the reset. The penalty must approximate the
+            // DISCOUNTED FUTURE the termination would have forfeited (~V(s),
+            // not the -2 explicit term cost) or it under-deters: default 10.
+            // Falls, illegal contact and dwell always terminate.
+            fault_penalize: env_var("BIPED_FAULT_MODE")
+                .map(|v| v == "penalize")
+                .unwrap_or(false),
+            fault_penalty: env_var("BIPED_FAULT_PENALTY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10.0f32),
             dwell_max: env_var("BIPED_LIMIT_DWELL_STEPS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -4596,12 +4613,11 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 let slam_fault = debounced(1, slam_fault);
                 let pw_fault = debounced(2, power_fault || envelope_fault);
                 let genuine_fall = self.task.fell_over(&state.base);
+                let transient_fault = vel_fault || slam_fault || pw_fault;
                 let fell = illegal
                     || crossed
-                    || vel_fault
-                    || slam_fault
+                    || (transient_fault && !self.knobs.fault_penalize)
                     || dwell_fault
-                    || pw_fault
                     || genuine_fall
                     || !state.base.height.is_finite();
                 // BIPED_FAULT_DEBUG: name EVERY termination cause (the power
@@ -4665,6 +4681,13 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     self.fault_forgiven[e].store(0, Relaxed);
                     comps[23] = self.task.weights.termination;
                     reward += self.task.weights.termination;
+                }
+                // Penalize-mode transient fault: charge per offending step,
+                // logged into the termination component so the [rb] line
+                // shows the cost, but the episode lives on.
+                if transient_fault && self.knobs.fault_penalize && !fell {
+                    comps[23] -= self.knobs.fault_penalty;
+                    reward -= self.knobs.fault_penalty;
                 }
                 // Soft self-collision penalty: ramp up as any L/R pair intrudes
                 // inside `sc_margin` (legs crossing). ~0 for a clean stance.
