@@ -4619,10 +4619,18 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 let slam_fault = debounced(1, slam_fault);
                 let pw_fault = debounced(2, power_fault || envelope_fault);
                 let genuine_fall = self.task.fell_over(&state.base);
-                let transient_fault = vel_fault || slam_fault || pw_fault;
+                // Slam is EXCLUDED from penalize mode: it is an
+                // instantaneous hardware-damaging impact, not a recoverable
+                // transient — evaluated under terminate rules, a policy
+                // trained with slam-as-fine slammed endstops 23x in 18 s
+                // (every one labeled slam=true), i.e. it learned to pay the
+                // fine. Vel/power keep penalize: their fines stayed at noise
+                // (~-0.001/step) while delivering the 3-4x plateau speedup.
+                let transient_fault = vel_fault || pw_fault;
                 let fell = illegal
                     || crossed
                     || (transient_fault && !self.knobs.fault_penalize)
+                    || slam_fault
                     || dwell_fault
                     || genuine_fall
                     || !state.base.height.is_finite();
