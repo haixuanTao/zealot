@@ -1472,6 +1472,7 @@ pub struct StepKnobs {
     /// (BIPED_FAULT_GRACE_STEPS, default 4; 0 = faults always armed).
     pub fault_grace: u16,
     pub fault_persist: u16,
+    pub fault_forgive: u16,
     pub dwell_max: u16,
     pub slam_vel: f32,
     pub joint_power_term: f32,
@@ -1511,6 +1512,17 @@ impl StepKnobs {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2u16),
+            // Debounce forgiveness budget per episode: only this many
+            // isolated (below-persist) spike events are forgiven before the
+            // next raw violation trips immediately. Closes the flicker
+            // loophole — a policy alternating violate/clean every frame
+            // would otherwise never accumulate a streak. Real artifacts run
+            // ~1 per 90 s, nowhere near the budget; systematic abuse
+            // exhausts it in a fraction of a second. Large value = cap off.
+            fault_forgive: env_var("BIPED_FAULT_FORGIVE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3u16),
             dwell_max: env_var("BIPED_LIMIT_DWELL_STEPS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -1678,6 +1690,8 @@ pub struct BipedNexusBatchEnv {
     limit_dwell: Vec<std::sync::atomic::AtomicU16>,
     /// Debounce streaks for the transient e-stops, [env*3+family].
     fault_streak: Vec<std::sync::atomic::AtomicU16>,
+    /// Forgiven spike events per env this episode (flicker-loophole cap).
+    fault_forgiven: Vec<std::sync::atomic::AtomicU16>,
 
     /// Global control-step counter (for push-perturbation scheduling).
     global_step: u64,
@@ -2512,6 +2526,10 @@ impl BipedNexusBatchEnv {
         let fault_streak: Vec<std::sync::atomic::AtomicU16> = (0..num_envs * 3)
             .map(|_| std::sync::atomic::AtomicU16::new(0))
             .collect();
+        // Forgiven-spike events this episode (shared across families).
+        let fault_forgiven: Vec<std::sync::atomic::AtomicU16> = (0..num_envs)
+            .map(|_| std::sync::atomic::AtomicU16::new(0))
+            .collect();
         let reset_vel = std::env::var("BIPED_RESET_VEL").map_or(true, |v| v != "0");
         if reset_vel {
             println!("reset-velocity randomization ENABLED (AGILE reset_base/joints: lin ±0.25, ang ±0.5, joints ±1.0)");
@@ -2747,6 +2765,7 @@ impl BipedNexusBatchEnv {
             step_cue_dropout_override: None,
             limit_dwell,
             fault_streak,
+            fault_forgiven,
             global_step: 0,
             dbg_stance: Vec::new(),
             push_vel,
@@ -4555,13 +4574,21 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 // resets its streak. Falls, dwell (own counter) and illegal
                 // contacts are exempt.
                 let persist = self.knobs.fault_persist.max(1);
+                let forgive = self.knobs.fault_forgive;
                 let mut debounced = |fam: usize, raw: bool| -> bool {
                     use std::sync::atomic::Ordering::Relaxed;
                     let c = &self.fault_streak[e * 3 + fam];
                     if raw {
-                        c.fetch_add(1, Relaxed) + 1 >= persist
+                        // Budget exhausted -> no more forgiveness: any raw
+                        // violation trips (blocks the flicker loophole).
+                        self.fault_streak[e * 3 + fam].fetch_add(1, Relaxed) + 1 >= persist
+                            || self.fault_forgiven[e].load(Relaxed) >= forgive
                     } else {
-                        c.store(0, Relaxed);
+                        // A streak that ended below the persist threshold was
+                        // a forgiven spike event — charge the budget.
+                        if c.swap(0, Relaxed) > 0 {
+                            self.fault_forgiven[e].fetch_add(1, Relaxed);
+                        }
                         false
                     }
                 };
@@ -4635,6 +4662,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     for fam in 0..3 {
                         self.fault_streak[e * 3 + fam].store(0, Relaxed);
                     }
+                    self.fault_forgiven[e].store(0, Relaxed);
                     comps[23] = self.task.weights.termination;
                     reward += self.task.weights.termination;
                 }
@@ -6855,6 +6883,13 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
         self.cmd[env] = eval_cmd_override().unwrap_or_else(|| self.sampler.sample(&mut self.rng[env]));
         self.arm_reset(env); // respawn holds home — kill playback instantly
         self.arm_resample(env); // then re-roll against the fresh command
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            for fam in 0..3 {
+                self.fault_streak[env * 3 + fam].store(0, Relaxed);
+            }
+            self.fault_forgiven[env].store(0, Relaxed);
+        }
         self.step_count[env] = 0;
         self.resample_at[env] = self
             .sampler
@@ -7027,6 +7062,13 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     .copy_from_slice(&self.arm_staged[e * n_held..(e + 1) * n_held]);
                 self.arm_blend[e] = 0.0;
             }
+        }
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            for fam in 0..3 {
+                self.fault_streak[e * 3 + fam].store(0, Relaxed);
+            }
+            self.fault_forgiven[e].store(0, Relaxed);
         }
         self.step_count[e] = 0;
         // Pin the resample so the command stays where the caller pins it.
