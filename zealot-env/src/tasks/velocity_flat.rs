@@ -910,6 +910,13 @@ pub struct VelocityFlatTask {
     pub min_base_height: f32,
     /// Indices of the hip yaw/roll DOFs (for `action_rate_hipz_hipx`).
     hip_yawroll_idx: [usize; 4],
+    /// Ankle-roll joint indices — in the `pose` lateral-neutrality penalty
+    /// since the torque-price cut: without it the policy camps the foot at
+    /// the ±0.262 rad roll stop (measured: every dwell e-stop of the
+    /// bent-knee lineage was left_ankle_roll pinned at +limit — the
+    /// historical "ankle pinning" failure returned as soon as limit-riding
+    /// torque got cheap).
+    ankle_roll_idx: [usize; 2],
     /// Cue distance under which the step-manoeuvre relaxation applies (m).
     pub step_relax_dist: f32,
     /// Widened base-height kernel while stepping (m).
@@ -946,6 +953,22 @@ impl VelocityFlatTask {
         // The hip yaw/roll DOFs for the targeted action-rate penalty (these
         // lateral-hip joints are the jittery ones) come from the spec.
         let hip_yawroll_idx = robot.hip_yawroll;
+        let mut ankle_roll_idx = [0usize; 2];
+        {
+            let mut k = 0;
+            for (i, j) in robot.joints.iter().enumerate() {
+                if j.name.contains("ankle_roll") && k < 2 {
+                    ankle_roll_idx[k] = i;
+                    k += 1;
+                }
+            }
+            assert!(k == 2 || k == 0, "expected 0 or 2 ankle_roll joints, found {k}");
+            if k == 0 {
+                // Model without named ankle rolls (lerobot): point at the
+                // hips so the extra terms are duplicates, not garbage.
+                ankle_roll_idx = [hip_yawroll_idx[0], hip_yawroll_idx[1]];
+            }
+        }
         // Reward-weight overrides for fast retuning without a rebuild. The
         // stand-still local optimum (policy collects upright + base_height +
         // free track_ang at zero command, ignores the velocity command) is the
@@ -1062,6 +1085,7 @@ impl VelocityFlatTask {
             tilt_limit: 70.0_f32.to_radians(),
             min_base_height: robot.min_base_height,
             hip_yawroll_idx,
+            ankle_roll_idx,
             sym_yaw_gate: env_f32("BIPED_SYM_YAW_GATE").unwrap_or(0.0),
             step_relax_dist: env_f32("BIPED_STEP_RELAX_DIST").unwrap_or(0.6),
             step_std_base_h: env_f32("BIPED_STEP_STD_BASE_H").unwrap_or(0.15),
@@ -1313,6 +1337,13 @@ impl VelocityFlatTask {
         let standing = cmd.speed() < 0.1;
         let mut hip_dev2 = 0.0;
         for &i in &self.hip_yawroll_idx {
+            hip_dev2 += (state.joint_pos[i] - self.robot.joints[i].default_pos).powi(2);
+        }
+        // Ankle roll rides the same penalty: near-neutral feet whether
+        // standing or striding; camping the roll stop must out-cost the
+        // stance it buys (at the 0.262 limit this term alone is ~-0.55/step
+        // vs ~0.1 tracking income).
+        for &i in &self.ankle_roll_idx {
             hip_dev2 += (state.joint_pos[i] - self.robot.joints[i].default_pos).powi(2);
         }
         let pose = self.weights.pose * hip_dev2 * dt;
