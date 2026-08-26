@@ -1533,9 +1533,15 @@ impl StepKnobs {
             // DISCOUNTED FUTURE the termination would have forfeited (~V(s),
             // not the -2 explicit term cost) or it under-deters: default 10.
             // Falls, illegal contact and dwell always terminate.
+            // DEFAULT since the A/B: the penalize run reached the terrain
+            // plateau (~13) at iter 3k where every terminate-mode lineage
+            // needed 8-14k — ~3-4x fewer iterations to plateau — with real
+            // falls ~300-500/window (vs ~2.4k episode-enders) and fine
+            // payments flat at ~-0.001/step (avoidance, not budgeting).
+            // BIPED_FAULT_MODE=terminate restores the old behavior.
             fault_penalize: env_var("BIPED_FAULT_MODE")
-                .map(|v| v == "penalize")
-                .unwrap_or(false),
+                .map(|v| v != "terminate")
+                .unwrap_or(true),
             fault_penalty: env_var("BIPED_FAULT_PENALTY")
                 .ok()
                 .and_then(|s| s.parse().ok())
