@@ -63,6 +63,11 @@ address bar on Apply, so a configured demo is a shareable link.
 - `check-browser-fallback.mjs` — the per-browser default-tab matrix (spoofed
   UAs + a real-Firefox pass; `SITE_URL=` to point at production).
 - `check-demo.mjs` — boot check with periodic screenshots (`DEMO_URL=`).
+- `shader_check.mjs` — hooks `createShaderModule` before the wasm boots and
+  reports which kernels the browser's WGSL validation rejects, dumping the
+  generated WGSL so the `:299:21`-style line numbers in the error resolve to
+  readable source (`DEMO_URL=`, `OUT_DIR=`; may run headless — module creation
+  is not rAF-driven).
 
 These run headed on purpose: headless Chrome throttles rAF-driven wasm, and a
 long-lived interactive Chrome profile degrades after many WebGPU loads — the
