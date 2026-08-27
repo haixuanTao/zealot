@@ -1539,9 +1539,15 @@ impl StepKnobs {
             // falls ~300-500/window (vs ~2.4k episode-enders) and fine
             // payments flat at ~-0.001/step (avoidance, not budgeting).
             // BIPED_FAULT_MODE=terminate restores the old behavior.
+            // Reverted to terminate after the clean A/B: with the ankle-roll
+            // pose fix in place, penalize vs terminate ran statistically
+            // identical curves through 28k iterations (12.7 vs 12.7) — the
+            // earlier "3-4x speedup" belonged to the ankle-camping economy
+            // bug, not the mechanism. Terminate is deploy-honest (a real
+            // e-stop cuts power); penalize stays as an opt-in research knob.
             fault_penalize: env_var("BIPED_FAULT_MODE")
-                .map(|v| v != "terminate")
-                .unwrap_or(true),
+                .map(|v| v == "penalize")
+                .unwrap_or(false),
             fault_penalty: env_var("BIPED_FAULT_PENALTY")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -4494,6 +4500,12 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         let c = &self.limit_dwell[e * NUM_JOINTS + i];
                         if q < lo + SLAM_BAND || q > hi - SLAM_BAND {
                             if c.fetch_add(1, Relaxed) + 1 >= dwell_max {
+                                if !hit && std::env::var("BIPED_FAULT_DEBUG").is_ok() {
+                                    eprintln!(
+                                        "[dwell] e {e} joint {i} ({}) q {q:.3} range [{lo:.3},{hi:.3}]",
+                                        self.task.robot.joints[i].name
+                                    );
+                                }
                                 hit = true;
                             }
                         } else {
