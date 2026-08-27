@@ -198,10 +198,17 @@ function nexusBlockedBy(): string | null {
   return null;
 }
 
-/// Where to land someone who cannot run the GPU demo. MuJoCo is the closest
-/// match to what nexus shows (0.35 vs 0.36 m/s on the same policy) and the
-/// name people know — but it ships a 9.7 MB wasm, so phones get rapier, which
-/// streams a small module off a CDN and starts almost immediately.
+/// The engine the front page opens on, every platform. MuJoCo is the name
+/// people know and the closest match to what nexus shows (0.35 vs 0.36 m/s on
+/// the same policy), and unlike nexus it runs everywhere — so every visitor
+/// gets the same working demo instead of a GPU tab that some are bounced off.
+/// nexus stays the headline engine, one click away on the first tab.
+const DEFAULT_DEMO: DemoName = 'mujoco';
+
+/// Where to land someone who asked for the GPU demo (`?tab=nexus`) on a
+/// browser that cannot run it. MuJoCo is the closest match to what nexus
+/// shows — but it ships a 9.7 MB wasm, so phones get rapier, which streams a
+/// small module off a CDN and starts almost immediately.
 function fallbackDemo(blocker: string | null): DemoName {
   return blocker === 'iOS' ? 'rapier' : 'mujoco';
 }
@@ -403,19 +410,20 @@ function PolicyPicker({
 
 function Demo() {
   useForwardedScroll();
-  // Open on an engine this browser can actually run. Safari, Firefox and iOS
-  // get a CPU engine on the front page — the same policy and the same terrain,
-  // just stepped on the CPU — instead of a demo that would fail in front of
-  // them. The nexus tab stays one click away, with the warning.
+  // Still needed even though nexus is no longer the opening tab: it decides
+  // the warning shown when someone clicks through to it, and where a
+  // `?tab=nexus` link lands on a browser that cannot run it.
   const [blocker] = useState(nexusBlockedBy);
-  // `?tab=nexus|rapier|mujoco` deep-links an engine tab (a blocked browser
-  // still falls back off the nexus tab it cannot run).
+  // `?tab=nexus|rapier|mujoco` deep-links an engine tab; everyone else opens
+  // on [`DEFAULT_DEMO`]. A blocked browser that asked for nexus still needs
+  // somewhere to land, and on a phone that is not the 9.7 MB MuJoCo module.
   const [selected, setSelected] = useState<DemoName>(() => {
     const t =
       typeof location !== 'undefined' ? new URLSearchParams(location.search).get('tab') : null;
     const wanted = DEMOS.find((d) => d.name === t)?.name;
     if (wanted && !(wanted === 'nexus' && blocker)) return wanted;
-    return blocker ? fallbackDemo(blocker) : 'nexus';
+    if (wanted === 'nexus' && blocker) return fallbackDemo(blocker);
+    return DEFAULT_DEMO;
   });
   const checkpoints = useHfCheckpoints();
   const [knobs, setKnobs] = useState<Knobs>(knobsFromUrl);
@@ -448,15 +456,20 @@ function Demo() {
     blocker === 'iOS'
       ? 'desktop Chrome (or another Chromium-based browser)'
       : 'Chrome (or another Chromium-based browser)';
-  const warn = !blocker
-    ? null
-    : current.needsWebGPU
-      ? blocker === 'this browser'
+  const warn = current.needsWebGPU
+    ? !blocker
+      ? null
+      : blocker === 'this browser'
         ? `WebGPU is not available in this browser. The simulation runs its physics as WebGPU compute shaders and requires ${elsewhere}.`
         : `This demo does not work on ${blocker}. Its WebGPU implementation doesn't run the physics correctly — please use ${elsewhere}.`
-      : {
-          note: `${blocker} can't run the WebGPU demo, so this is the CPU engine — same policy, same terrain, physics stepped on the CPU. For the GPU one, open this page in ${elsewhere}.`,
-        };
+    : {
+        // Now that a CPU engine opens the page everywhere, the note has to
+        // explain the tab to visitors who could have run nexus too — not just
+        // to the ones who were bounced off it.
+        note: blocker
+          ? `${blocker} can't run the WebGPU demo, so this is the CPU engine — same policy, same terrain, physics stepped on the CPU. For the GPU one, open this page in ${elsewhere}.`
+          : `This is the CPU engine — same policy, same terrain, physics stepped on the CPU. The nexus GPU engine is on the first tab.`,
+      };
 
   return (
     <div className="demo">
