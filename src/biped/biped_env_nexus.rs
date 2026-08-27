@@ -5321,7 +5321,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             // whole question of whether the GPU step can beat the host block.
             if env_var("BIPED_FUSE_BENCH").is_ok() {
                 let reps = 20u32;
-                let t_un = std::time::Instant::now();
+                let t_un = Instant::now();
                 for _ in 0..reps {
                     let pt = self.state.body_poses();
                     let _ = self.gpu_joints.as_mut().unwrap().compute(&self.gpu, pt, &hp).await;
@@ -5330,7 +5330,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 }
                 let d_un = t_un.elapsed().as_secs_f64() / reps as f64;
 
-                let t_f = std::time::Instant::now();
+                let t_f = Instant::now();
                 for _ in 0..reps {
                     let mut e = self.gpu.begin_encoding();
                     {
@@ -5359,7 +5359,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 // The delta against `fused` (two readbacks) isolates the cost of
                 // a readback from the cost of a dispatch, which decides whether
                 // consolidating outputs into one buffer is worth building.
-                let t_1r = std::time::Instant::now();
+                let t_1r = Instant::now();
                 for _ in 0..reps {
                     let mut e = self.gpu.begin_encoding();
                     {
@@ -5384,7 +5384,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 let d_1r = t_1r.elapsed().as_secs_f64() / reps as f64;
 
                 // And the dispatch floor: encode + submit, NO readback at all.
-                let t_0r = std::time::Instant::now();
+                let t_0r = Instant::now();
                 for _ in 0..reps {
                     let mut e = self.gpu.begin_encoding();
                     {
@@ -6667,7 +6667,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
 
         let mut out = Vec::with_capacity(envs.len());
         for group in envs.chunks(chunk.min(envs.len().max(1))) {
-            let t0 = std::time::Instant::now();
+            let t0 = Instant::now();
             let mut ts = Vec::with_capacity(group.len());
             let mut plans = Vec::with_capacity(group.len());
             for &e in group {
@@ -6678,7 +6678,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             if prof {
                 t_prep += t0.elapsed().as_micros();
             }
-            let t1 = std::time::Instant::now();
+            let t1 = Instant::now();
             // Borrow the templates directly — the spawn teleport is applied by
             // the scatter kernel and the velocity override lands in the staging
             // build, so nothing is cloned per reset.
@@ -6727,7 +6727,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
             if prof {
                 t_scatter += t1.elapsed().as_micros();
             }
-            let t2 = std::time::Instant::now();
+            let t2 = Instant::now();
             for (i, &e) in group.iter().enumerate() {
                 out.push(self.reset_finish(e, ts[i]).await);
             }
