@@ -15,6 +15,9 @@
 //
 //   node scripts/shader_check.mjs
 //   DEMO_URL='http://localhost:3000/zealot/demos/g1_web/?n=10' node scripts/shader_check.mjs
+//
+// Knobs: DEMO_URL, OUT_DIR, WAIT_MS, HEADED=1, CHROME (binary), CHROME_ARGS
+// (extra flags, space-separated).
 import fs from 'node:fs';
 import path from 'node:path';
 import puppeteer from 'puppeteer-core';
@@ -40,6 +43,9 @@ const browser = await puppeteer.launch({
     '--enable-features=Vulkan',
     '--no-first-run',
     '--window-size=1280,900',
+    // e.g. CHROME_ARGS='--use-angle=metal' to match the other harnesses, or
+    // '--use-angle=swiftshader' to validate WGSL on a machine with no GPU.
+    ...(process.env.CHROME_ARGS ? process.env.CHROME_ARGS.split(' ').filter(Boolean) : []),
   ],
 });
 
