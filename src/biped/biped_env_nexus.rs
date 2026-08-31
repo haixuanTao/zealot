@@ -2645,7 +2645,7 @@ impl BipedNexusBatchEnv {
     /// joint angles, and finite-diffs the previous step's poses for base /
     /// foot velocities — eliminating the ~13 MB-per-step `links_workspace`
     /// readback that dominated the host loop.
-    async fn slurp_poses(&mut self) -> Vec<NexusPose> {
+    pub(crate) async fn slurp_poses(&mut self) -> Vec<NexusPose> {
         let mut poses: Vec<NexusPose> =
             vec![NexusPose::default(); self.state.body_poses().buffer().len()];
         self.gpu
@@ -4741,6 +4741,45 @@ let w_knee_torques: f32 = std::env::var("BIPED_W_KNEE_TORQUES")
             .slow_read_buffer(cbuf, &mut v)
             .await
             .expect("contacts readback");
+        (len, v)
+    }
+
+    /// DEBUG: dump BatchIndices as read by the GPU + the host-side copy.
+    pub fn dbg_dump_batch_indices(&mut self) {
+        let gpu_view = self
+            .pipeline
+            .dbg_dump_batch_indices(&self.gpu, &self.state)
+            .expect("dump");
+        println!("[bi] gpu-sees {gpu_view:?}");
+    }
+
+    /// DEBUG: standalone re-sync of collider world poses (see nexus).
+    pub fn dbg_resync_collider_poses(&mut self) {
+        self.pipeline
+            .dbg_resync_collider_poses(&self.gpu, &mut self.state)
+            .expect("resync");
+    }
+
+    /// DEBUG: per-collider world poses (the narrow phase's pose input).
+    pub async fn dbg_collider_world_poses(&mut self) -> Vec<NexusPose> {
+        let buf = self.state.dbg_collider_world_poses().buffer();
+        let mut v = vec![NexusPose::default(); buf.len()];
+        self.gpu.slow_read_buffer(buf, &mut v).await.expect("cwp readback");
+        v
+    }
+
+    /// DEBUG: the deferred narrow-phase (trimesh/pfm) work list.
+    pub async fn dbg_pfm_pairs(
+        &mut self,
+    ) -> (Vec<u32>, Vec<nexus3d::rbd::shaders::broad_phase::NarrowPhasePfmPair>) {
+        let (lbuf_t, pbuf_t) = self.state.dbg_pfm_pairs();
+        let lbuf = lbuf_t.buffer();
+        let mut len = vec![0u32; lbuf.len()];
+        self.gpu.slow_read_buffer(lbuf, &mut len).await.expect("pfm len readback");
+        let pbuf = pbuf_t.buffer();
+        let mut v =
+            vec![nexus3d::rbd::shaders::broad_phase::NarrowPhasePfmPair::default(); pbuf.len()];
+        self.gpu.slow_read_buffer(pbuf, &mut v).await.expect("pfm readback");
         (len, v)
     }
 
