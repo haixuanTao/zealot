@@ -169,3 +169,10 @@ CUDA reference run-for-run (rewards, KL, fall rates).
 - **passive_stand falls over at ~step 40** → expected on every backend
   (zero-action PD hold is not a stable stand); it's only a bug if it falls
   *through* the floor.
+
+## Reproducibility
+
+Training is bit-exact run to run (same binary, same GPU, same config):
+identical launches give identical checkpoint hashes. See
+[determinism.md](determinism.md) for what made that true, the
+`NEXUS_DETERMINISTIC` knob, and the two-run hash test to verify it.

@@ -277,3 +277,9 @@ cargo run --release --bin biped_train_gpu \
   `upstream/*`.
 - **5060 vs 5090:** identical code path; just scale `num_envs` down (8 GB vs
   32 GB) and expect proportionally lower throughput.
+
+## Reproducibility
+
+Training is bit-exact run to run on the same binary + GPU — see
+[determinism.md](determinism.md). Verified on Mac Metal; on the CUDA boxes
+run the two-run hash test there once before relying on it.
