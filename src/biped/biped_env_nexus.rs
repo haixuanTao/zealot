@@ -2909,8 +2909,9 @@ impl BipedNexusBatchEnv {
                 // zero here and device obs would have silently dropped the
                 // held-joint block. `fill_held_cmd` now streams it with the
                 // command upload, so the device path is correct — and it takes
-                // the per-sample host obs upload (~490 MB/iteration, 24 ms of
-                // H2D at n=4096) out of the loop.
+                // the per-sample host obs upload out of the loop (measured by
+                // nsys at n=4096: H2D drops 702.2 -> 544.9 MB per iteration,
+                // 40.8 -> 35.5 ms of transfer).
                 //
                 // `BIPED_GPU_OBS=0` still forces the host path, and a robot
                 // with no held joints keeps it too (nothing to stream, and the
@@ -6832,7 +6833,11 @@ impl BipedNexusBatchEnv {
     ///
     /// Bulk-filled into the caller's `cmd_b` (already `30 * n`), so this costs
     /// one upload of 26·n floats per control step — ~426 KB at n=4096, against
-    /// the ~490 MB/iteration of host obs it replaces.
+    /// the 157 MB/iteration of host obs upload it lets the device path skip.
+    ///
+    /// Must be called ONCE per step, after the per-env command loop, not inside
+    /// it: it already iterates every env, so a call per env is O(n²) — that
+    /// mistake cost 2058 ms/step at n=4096 against 1.6 ms correct.
     fn fill_held_cmd(&self, cmd_b: &mut [f32]) {
         let n = self.n;
         let n_held = self.idx.held.len();
