@@ -11,6 +11,9 @@
 mod biped_env;
 #[path = "../biped/biped_env_nexus.rs"]
 mod biped_env_nexus;
+#[cfg(feature = "cutile")]
+#[path = "../biped/cublas.rs"]
+mod cublas;
 #[path = "../biped/cutile_gemm.rs"]
 mod cutile_gemm;
 #[path = "../biped/gpu_policy.rs"]
@@ -310,7 +313,14 @@ fn main() {
     // ===================== FULL CPU ITERATION =====================
     println!("building {n} CPU rapier envs...");
     let mut rng = Lcg::new(7);
-    let mut cpu_envs: Vec<BipedEnv> = (0..n).map(|e| BipedEnv::new(&xml, e as u64)).collect();
+    let n_cpu_envs = if std::env::var_os("BENCH_SKIP_CPU").is_some() {
+        1
+    } else {
+        n
+    };
+    let mut cpu_envs: Vec<BipedEnv> = (0..n_cpu_envs)
+        .map(|e| BipedEnv::new(&xml, e as u64))
+        .collect();
     let (od, cd) = (cpu_envs[0].obs_dim(), cpu_envs[0].critic_obs_dim());
     let mut ac = ActorCritic::new(
         &[od, 256, 256, 128, NUM_JOINTS],
@@ -332,8 +342,12 @@ fn main() {
         (0..n).map(|_| vec![]).collect(),
         (0..n).map(|_| vec![]).collect(),
     );
+    // BENCH_SKIP_CPU=1 — skip the full-CPU reference iteration (the single-threaded
+    // rapier rollout + CPU PPO update dominates wall time at large N). The GPU path
+    // below is unaffected; the CPU column reports 0.
+    let skip_cpu = std::env::var_os("BENCH_SKIP_CPU").is_some();
     let tc = Instant::now();
-    for _ in 0..t_steps {
+    for _ in (0..t_steps).take_while(|_| !skip_cpu) {
         let mut acts = Vec::with_capacity(n);
         for e in 0..n {
             ac.record_obs(&cur[e], &cur_c[e]);
@@ -365,7 +379,7 @@ fn main() {
         }
     }
     let mut batch: Vec<Sample> = Vec::with_capacity(n * t_steps);
-    for e in 0..n {
+    for e in (0..n).take_while(|_| !skip_cpu) {
         let lv = ac.value(&cur_c[e]);
         let (adv, ret) = gae(&rs[e], &vs[e], &ds[e], lv, 0.99, 0.95);
         for t in 0..t_steps {
@@ -374,8 +388,14 @@ fn main() {
             batch.push(std::mem::take(&mut samp[e][t]));
         }
     }
-    ac.update(&mut batch, &cfg);
-    let cpu_iter_ms = tc.elapsed().as_secs_f64() * 1e3;
+    if !skip_cpu {
+        ac.update(&mut batch, &cfg);
+    }
+    let cpu_iter_ms = if skip_cpu {
+        f64::NAN
+    } else {
+        tc.elapsed().as_secs_f64() * 1e3
+    };
     drop(cpu_envs);
 
     // ===================== FULL GPU ITERATION =====================
