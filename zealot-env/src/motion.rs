@@ -108,7 +108,11 @@ impl MotionClip {
         entries.sort(); // deterministic clip indices across runs
         for p in entries {
             let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let name = p.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            let name = p
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             clips.push(Self::parse_csv(&name, &text, joints, fps)?);
         }
         if clips.is_empty() {
@@ -166,7 +170,10 @@ Frame,root_translateX,root_translateY,root_translateZ,waist_yaw_joint_dof,left_e
         // Request order is reversed vs csv column order on purpose: output
         // must follow the REQUEST, and unrequested columns (root, wrist
         // pitch) must not leak in.
-        let j = vec!["left_elbow_joint".to_string(), "waist_yaw_joint".to_string()];
+        let j = vec![
+            "left_elbow_joint".to_string(),
+            "waist_yaw_joint".to_string(),
+        ];
         let c = MotionClip::parse_csv("t", CSV, &j, 30.0).unwrap();
         let mut out = [0.0f32; 2];
         c.sample(0.0, &mut out);

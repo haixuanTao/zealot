@@ -194,12 +194,17 @@ impl RobotSpec {
             "g1_29dof" | "g1_29" | "g1full" => unitree_g1::unitree_g1_29dof(),
             "h2plus" | "h2_plus" | "unitree_h2_plus" => unitree_h2_plus::unitree_h2_plus(),
             other => {
-                panic!("unknown BIPED_ROBOT '{other}' (expected lerobot | g1 | g1_agile | g1_29dof | g1_29dof_agile | h2plus)")
+                panic!(
+                    "unknown BIPED_ROBOT '{other}' (expected lerobot | g1 | g1_agile | g1_29dof | g1_29dof_agile | h2plus)"
+                )
             }
         };
         if let Ok(v) = std::env::var("BIPED_ACTION_SCALE") {
             if let Ok(s) = v.parse::<f32>() {
-                assert!(s > 0.0 && s <= 2.0, "BIPED_ACTION_SCALE {s} out of range (0, 2]");
+                assert!(
+                    s > 0.0 && s <= 2.0,
+                    "BIPED_ACTION_SCALE {s} out of range (0, 2]"
+                );
                 for j in &mut spec.joints {
                     j.action_scale = s;
                 }
@@ -269,7 +274,12 @@ mod tests {
             unitree_h2_plus::unitree_h2_plus(),
         ] {
             let p = spec.mjcf_path();
-            assert!(p.exists(), "{}: MJCF not found at {}", spec.name, p.display());
+            assert!(
+                p.exists(),
+                "{}: MJCF not found at {}",
+                spec.name,
+                p.display()
+            );
         }
     }
 
@@ -277,13 +287,22 @@ mod tests {
         // Unique joint names.
         let mut seen = std::collections::HashSet::new();
         for j in &r.joints {
-            assert!(seen.insert(j.name), "{}: duplicate joint {}", r.name, j.name);
+            assert!(
+                seen.insert(j.name),
+                "{}: duplicate joint {}",
+                r.name,
+                j.name
+            );
         }
         // Mirror is a sign-consistent involution pairing distinct joints.
         for i in 0..NUM_JOINTS {
             let m = r.mirror[i];
             assert_ne!(m, i, "{}: joint {i} mirrors itself", r.name);
-            assert_eq!(r.mirror[m], i, "{}: mirror not an involution at {i}", r.name);
+            assert_eq!(
+                r.mirror[m], i,
+                "{}: mirror not an involution at {i}",
+                r.name
+            );
             assert_eq!(
                 r.mirror_sign[i], r.mirror_sign[m],
                 "{}: mirror sign mismatch {i}<->{m}",

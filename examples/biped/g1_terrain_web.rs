@@ -10,10 +10,10 @@
 
 #[path = "../../src/biped/cutile_gemm.rs"]
 mod cutile_gemm;
-#[path = "../../src/biped/gpu_policy.rs"]
-mod gpu_policy;
 #[path = "g1_web_demo.rs"]
 mod g1_web_demo;
+#[path = "../../src/biped/gpu_policy.rs"]
+mod gpu_policy;
 
 /// URL query param `key=` parsed as an integer (wasm only).
 #[allow(unused)]

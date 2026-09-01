@@ -153,10 +153,19 @@ mod tests {
         assert_eq!(out, vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
 
         // Push frames 2, 3: history becomes [1, 2, 3] oldest→newest.
-        assert_eq!(h.push_stacked(0, &[2.0, 2.0]), vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0]);
-        assert_eq!(h.push_stacked(0, &[3.0, 3.0]), vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+        assert_eq!(
+            h.push_stacked(0, &[2.0, 2.0]),
+            vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0]
+        );
+        assert_eq!(
+            h.push_stacked(0, &[3.0, 3.0]),
+            vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]
+        );
         // Ring wrap: [2, 3, 4].
-        assert_eq!(h.push_stacked(0, &[4.0, 4.0]), vec![2.0, 2.0, 3.0, 3.0, 4.0, 4.0]);
+        assert_eq!(
+            h.push_stacked(0, &[4.0, 4.0]),
+            vec![2.0, 2.0, 3.0, 3.0, 4.0, 4.0]
+        );
 
         // Env 1 untouched by env 0 traffic.
         h.reset(1, &[9.0, 9.0]);

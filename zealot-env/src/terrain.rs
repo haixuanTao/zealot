@@ -109,7 +109,10 @@ pub struct TerrainParams {
 
 impl Default for TerrainParams {
     fn default() -> Self {
-        TerrainParams { amp: 1.0, slope: 0.0 }
+        TerrainParams {
+            amp: 1.0,
+            slope: 0.0,
+        }
     }
 }
 
@@ -400,7 +403,15 @@ impl TerrainStrip {
             }
         }
 
-        TerrainStrip { family, hs, nx, ny, heights, step_theta, step_rise }
+        TerrainStrip {
+            family,
+            hs,
+            nx,
+            ny,
+            heights,
+            step_theta,
+            step_rise,
+        }
     }
 
     fn node(&self, i: usize, j: usize) -> f32 {
@@ -485,19 +496,25 @@ impl TerrainStrip {
                     continue;
                 }
                 let mut j2 = j + 1;
-                while j2 < ny
-                    && (ch(i, j2) - h).abs() <= 1e-6
-                    && (ch(i + 1, j2) - hn).abs() <= 1e-6
+                while j2 < ny && (ch(i, j2) - h).abs() <= 1e-6 && (ch(i + 1, j2) - hn).abs() <= 1e-6
                 {
                     j2 += 1;
                 }
                 let (hi, lo) = (h.max(hn), h.min(hn));
                 if h > hn {
-                    quad([x(i + 1), y(j), hi], [x(i + 1), y(j2), hi],
-                         [x(i + 1), y(j2), lo], [x(i + 1), y(j), lo]);
+                    quad(
+                        [x(i + 1), y(j), hi],
+                        [x(i + 1), y(j2), hi],
+                        [x(i + 1), y(j2), lo],
+                        [x(i + 1), y(j), lo],
+                    );
                 } else {
-                    quad([x(i + 1), y(j2), hi], [x(i + 1), y(j), hi],
-                         [x(i + 1), y(j), lo], [x(i + 1), y(j2), lo]);
+                    quad(
+                        [x(i + 1), y(j2), hi],
+                        [x(i + 1), y(j), hi],
+                        [x(i + 1), y(j), lo],
+                        [x(i + 1), y(j2), lo],
+                    );
                 }
                 j = j2;
             }
@@ -512,19 +529,25 @@ impl TerrainStrip {
                     continue;
                 }
                 let mut i2 = i + 1;
-                while i2 < nx
-                    && (ch(i2, j) - h).abs() <= 1e-6
-                    && (ch(i2, j + 1) - hn).abs() <= 1e-6
+                while i2 < nx && (ch(i2, j) - h).abs() <= 1e-6 && (ch(i2, j + 1) - hn).abs() <= 1e-6
                 {
                     i2 += 1;
                 }
                 let (hi, lo) = (h.max(hn), h.min(hn));
                 if h > hn {
-                    quad([x(i2), y(j + 1), hi], [x(i), y(j + 1), hi],
-                         [x(i), y(j + 1), lo], [x(i2), y(j + 1), lo]);
+                    quad(
+                        [x(i2), y(j + 1), hi],
+                        [x(i), y(j + 1), hi],
+                        [x(i), y(j + 1), lo],
+                        [x(i2), y(j + 1), lo],
+                    );
                 } else {
-                    quad([x(i), y(j + 1), hi], [x(i2), y(j + 1), hi],
-                         [x(i2), y(j + 1), lo], [x(i), y(j + 1), lo]);
+                    quad(
+                        [x(i), y(j + 1), hi],
+                        [x(i2), y(j + 1), hi],
+                        [x(i2), y(j + 1), lo],
+                        [x(i), y(j + 1), lo],
+                    );
                 }
                 i = i2;
             }
@@ -552,14 +575,30 @@ impl TerrainStrip {
                     a2 += 1;
                 }
                 match (along_x, fixed_first) {
-                    (true, true) => quad([x(a), y(0), hv], [x(a), y(0), SLAB_BOTTOM],
-                                         [x(a2), y(0), SLAB_BOTTOM], [x(a2), y(0), hv]),
-                    (true, false) => quad([x(a2), y(ny), hv], [x(a2), y(ny), SLAB_BOTTOM],
-                                          [x(a), y(ny), SLAB_BOTTOM], [x(a), y(ny), hv]),
-                    (false, true) => quad([x(0), y(a2), hv], [x(0), y(a2), SLAB_BOTTOM],
-                                          [x(0), y(a), SLAB_BOTTOM], [x(0), y(a), hv]),
-                    (false, false) => quad([x(nx), y(a), hv], [x(nx), y(a), SLAB_BOTTOM],
-                                           [x(nx), y(a2), SLAB_BOTTOM], [x(nx), y(a2), hv]),
+                    (true, true) => quad(
+                        [x(a), y(0), hv],
+                        [x(a), y(0), SLAB_BOTTOM],
+                        [x(a2), y(0), SLAB_BOTTOM],
+                        [x(a2), y(0), hv],
+                    ),
+                    (true, false) => quad(
+                        [x(a2), y(ny), hv],
+                        [x(a2), y(ny), SLAB_BOTTOM],
+                        [x(a), y(ny), SLAB_BOTTOM],
+                        [x(a), y(ny), hv],
+                    ),
+                    (false, true) => quad(
+                        [x(0), y(a2), hv],
+                        [x(0), y(a2), SLAB_BOTTOM],
+                        [x(0), y(a), SLAB_BOTTOM],
+                        [x(0), y(a), hv],
+                    ),
+                    (false, false) => quad(
+                        [x(nx), y(a), hv],
+                        [x(nx), y(a), SLAB_BOTTOM],
+                        [x(nx), y(a2), SLAB_BOTTOM],
+                        [x(nx), y(a2), hv],
+                    ),
                 }
                 a = a2;
             }
@@ -807,7 +846,11 @@ impl TerrainCurriculum {
 
     fn init_inner(rng: &mut Lcg) -> Self {
         let level = if rng.range(0.0, 1.0) < 0.5 { 0 } else { 1 };
-        TerrainCurriculum { level, successes: 0, failures: 0 }
+        TerrainCurriculum {
+            level,
+            successes: 0,
+            failures: 0,
+        }
     }
 
     /// Episode-end update (called on EVERY termination, incl. timeout —
@@ -846,7 +889,12 @@ mod tests {
     #[test]
     fn lateral_mirror_tiling_is_seamless() {
         use super::*;
-        for fam in [TerrainFamily::Boxes, TerrainFamily::Rough, TerrainFamily::Wave, TerrainFamily::Step] {
+        for fam in [
+            TerrainFamily::Boxes,
+            TerrainFamily::Rough,
+            TerrainFamily::Wave,
+            TerrainFamily::Step,
+        ] {
             let s = TerrainStrip::generate_with(fam, 0xC0FFEE, TerrainParams::default());
             for k in 0..200 {
                 let x = STRIP_X0 + 1.0 + (k as f32) * 0.61;
@@ -856,7 +904,10 @@ mod tests {
                 for d in [0.0317f32, 0.7013, 2.9113] {
                     let a = s.height(x, top - d);
                     let b = s.height(x, top + d);
-                    assert!((a - b).abs() < 1e-4, "{fam:?} seam top x={x} d={d}: {a} vs {b}");
+                    assert!(
+                        (a - b).abs() < 1e-4,
+                        "{fam:?} seam top x={x} d={d}: {a} vs {b}"
+                    );
                     let c = s.height(x, -STRIP_HALF_W - d);
                     let e = s.height(x, -STRIP_HALF_W + d);
                     assert!((c - e).abs() < 1e-4, "{fam:?} seam bottom x={x} d={d}");
@@ -898,10 +949,16 @@ mod tests {
         let s = strip(TerrainFamily::Boxes);
         // Row 0: d < 0.05 → g < 2 mm cells (+ slope apex ≤ 37.5 mm).
         let (lo, hi) = row_extremes(&s, 0);
-        assert!(hi <= 0.006 + apex(0) && lo >= -0.006, "row0 boxes {lo}..{hi}");
+        assert!(
+            hi <= 0.006 + apex(0) && lo >= -0.006,
+            "row0 boxes {lo}..{hi}"
+        );
         // Row 19: cells within ±0.04, plus slope apex ≤ 0.75.
         let (lo, hi) = row_extremes(&s, 19);
-        assert!(hi <= 0.0405 + apex(19) && lo >= -0.0405, "row19 boxes {lo}..{hi}");
+        assert!(
+            hi <= 0.0405 + apex(19) && lo >= -0.0405,
+            "row19 boxes {lo}..{hi}"
+        );
         // Cell jitter must survive on the apex plateau (slope is constant
         // there, so any spread is the checker field): ±1 m around center.
         let (cx, _) = TerrainStrip::patch_center(19);
@@ -912,7 +969,10 @@ mod tests {
             plo = plo.min(h);
             phi = phi.max(h);
         }
-        assert!(phi - plo > 0.03, "row19 boxes plateau should stay rough: {plo}..{phi}");
+        assert!(
+            phi - plo > 0.03,
+            "row19 boxes plateau should stay rough: {plo}..{phi}"
+        );
     }
 
     #[test]
@@ -920,10 +980,16 @@ mod tests {
         let s = strip(TerrainFamily::Rough);
         // One-sided family + up-only slope: heights ≥ 0 everywhere.
         let (lo0, hi0) = row_extremes(&s, 0);
-        assert!(lo0 >= -1e-6 && hi0 <= 0.2 * 0.05 + apex(0) + VERTICAL_SCALE, "row0 rough {lo0}..{hi0}");
+        assert!(
+            lo0 >= -1e-6 && hi0 <= 0.2 * 0.05 + apex(0) + VERTICAL_SCALE,
+            "row0 rough {lo0}..{hi0}"
+        );
         let (lo19, hi19) = row_extremes(&s, 19);
         assert!(lo19 >= -1e-6, "rough+slope is one-sided: {lo19}");
-        assert!(hi19 <= 0.2 + apex(19) + VERTICAL_SCALE, "row19 rough max {hi19}");
+        assert!(
+            hi19 <= 0.2 + apex(19) + VERTICAL_SCALE,
+            "row19 rough max {hi19}"
+        );
         assert!(hi19 > 0.09, "row19 rough should reach near 0.2·d: {hi19}");
     }
 
@@ -932,12 +998,18 @@ mod tests {
         let s = strip(TerrainFamily::Wave);
         // Row 19: family ±A ≈ ±0.25, plus slope apex ≤ 0.75 on the high side.
         let (lo, hi) = row_extremes(&s, 19);
-        assert!(hi <= 0.25 + apex(19) + VERTICAL_SCALE && lo >= -(0.25 + VERTICAL_SCALE), "row19 wave {lo}..{hi}");
+        assert!(
+            hi <= 0.25 + apex(19) + VERTICAL_SCALE && lo >= -(0.25 + VERTICAL_SCALE),
+            "row19 wave {lo}..{hi}"
+        );
         // Wave troughs survive near patch borders where the slope ramps to 0.
         assert!(hi > 0.17 && lo < -0.08, "row19 wave peaks: {lo}..{hi}");
         // Row 0: A ≈ 0.01..0.022 (+ slope apex ≤ 37.5 mm).
         let (lo, hi) = row_extremes(&s, 0);
-        assert!(hi <= 0.025 + apex(0) && lo >= -0.025, "row0 wave {lo}..{hi}");
+        assert!(
+            hi <= 0.025 + apex(0) && lo >= -0.025,
+            "row0 wave {lo}..{hi}"
+        );
     }
 
     /// Dump the step strip's REAL collision mesh to JSON for out-of-band
@@ -952,17 +1024,25 @@ mod tests {
         let (verts, tris) = s.mesh();
         let mut out = String::from("{\"verts\":[");
         for (i, v) in verts.iter().enumerate() {
-            if i > 0 { out.push(','); }
+            if i > 0 {
+                out.push(',');
+            }
             out.push_str(&format!("[{:.4},{:.4},{:.4}]", v[0], v[1], v[2]));
         }
         out.push_str("],\"tris\":[");
         for (i, t) in tris.iter().enumerate() {
-            if i > 0 { out.push(','); }
+            if i > 0 {
+                out.push(',');
+            }
             out.push_str(&format!("[{},{},{}]", t[0], t[1], t[2]));
         }
         out.push_str("]}");
         std::fs::write("/tmp/step_mesh.json", out).unwrap();
-        println!("wrote /tmp/step_mesh.json: {} verts {} tris", verts.len(), tris.len());
+        println!(
+            "wrote /tmp/step_mesh.json: {} verts {} tris",
+            verts.len(),
+            tris.len()
+        );
     }
 
     /// The step face must be TRULY VERTICAL in the emitted mesh -- the
@@ -976,7 +1056,11 @@ mod tests {
         let (verts, tris) = s.mesh();
         let mut best_drop: f32 = 0.0;
         for t in &tris {
-            let (a, b, c) = (verts[t[0] as usize], verts[t[1] as usize], verts[t[2] as usize]);
+            let (a, b, c) = (
+                verts[t[0] as usize],
+                verts[t[1] as usize],
+                verts[t[2] as usize],
+            );
             let xs = [a[0], b[0], c[0]];
             let ys = [a[1], b[1], c[1]];
             let zs = [a[2], b[2], c[2]];
@@ -1035,7 +1119,11 @@ mod tests {
         // The DC slope is present under EVERY family: the row-19 patch center
         // sits near the apex (g·ramp ∈ [0.71, 0.75) minus family lows ≥ −0.25),
         // while row 0 stays near-flat. Borders stay ~0 (continuity).
-        for f in [TerrainFamily::Boxes, TerrainFamily::Rough, TerrainFamily::Wave] {
+        for f in [
+            TerrainFamily::Boxes,
+            TerrainFamily::Rough,
+            TerrainFamily::Wave,
+        ] {
             let s = strip(f);
             let (cx, cy) = TerrainStrip::patch_center(19);
             let h = s.height(cx, cy);
@@ -1066,7 +1154,11 @@ mod tests {
 
     #[test]
     fn sampler_matches_mesh() {
-        for fam in [TerrainFamily::Boxes, TerrainFamily::Rough, TerrainFamily::Wave] {
+        for fam in [
+            TerrainFamily::Boxes,
+            TerrainFamily::Rough,
+            TerrainFamily::Wave,
+        ] {
             let s = strip(fam);
             let (verts, tris) = s.mesh();
             let mut rng = Lcg::new(3);
@@ -1079,9 +1171,16 @@ mod tests {
             let mut checked = 0;
             for _ in 0..20000 {
                 let t = tris[(rng.range(0.0, 1.0) * n_top as f32) as usize % tris.len()];
-                let (a, b, c) = (verts[t[0] as usize], verts[t[1] as usize], verts[t[2] as usize]);
+                let (a, b, c) = (
+                    verts[t[0] as usize],
+                    verts[t[1] as usize],
+                    verts[t[2] as usize],
+                );
                 // Skip non-top faces (skirts/bottom contain z == SLAB_BOTTOM).
-                if a[2] <= SLAB_BOTTOM + 1e-6 || b[2] <= SLAB_BOTTOM + 1e-6 || c[2] <= SLAB_BOTTOM + 1e-6 {
+                if a[2] <= SLAB_BOTTOM + 1e-6
+                    || b[2] <= SLAB_BOTTOM + 1e-6
+                    || c[2] <= SLAB_BOTTOM + 1e-6
+                {
                     continue;
                 }
                 let (mut u, mut v) = (rng.range(0.0, 1.0), rng.range(0.0, 1.0));
@@ -1103,7 +1202,10 @@ mod tests {
                 );
                 checked += 1;
             }
-            assert!(checked > 1000, "{fam:?}: too few top-face samples ({checked})");
+            assert!(
+                checked > 1000,
+                "{fam:?}: too few top-face samples ({checked})"
+            );
         }
     }
 
@@ -1113,7 +1215,10 @@ mod tests {
         let flat = TerrainStrip::generate_with(
             TerrainFamily::Wave,
             42,
-            TerrainParams { amp: 0.0, slope: 0.0 },
+            TerrainParams {
+                amp: 0.0,
+                slope: 0.0,
+            },
         );
         let (lo, hi) = row_extremes(&flat, 19);
         assert!(lo.abs() < 1e-6 && hi.abs() < 1e-6, "amp=0 flat: {lo}..{hi}");
@@ -1125,13 +1230,19 @@ mod tests {
         let base = TerrainStrip::generate_with(
             TerrainFamily::Wave,
             42,
-            TerrainParams { amp: 1.0, slope: 0.0 },
+            TerrainParams {
+                amp: 1.0,
+                slope: 0.0,
+            },
         );
         let (blo, bhi) = row_extremes(&base, 19);
         let big = TerrainStrip::generate_with(
             TerrainFamily::Wave,
             42,
-            TerrainParams { amp: 2.0, slope: 0.0 },
+            TerrainParams {
+                amp: 2.0,
+                slope: 0.0,
+            },
         );
         let (lo, hi) = row_extremes(&big, 19);
         assert!(
@@ -1145,7 +1256,10 @@ mod tests {
         let ramp = TerrainStrip::generate_with(
             TerrainFamily::Rough,
             42,
-            TerrainParams { amp: 0.0, slope: grade },
+            TerrainParams {
+                amp: 0.0,
+                slope: grade,
+            },
         );
         for row in [0u32, 10, 19] {
             let (cx, _) = TerrainStrip::patch_center(row);
@@ -1166,7 +1280,11 @@ mod tests {
     #[test]
     fn curriculum_branches() {
         let mut rng = Lcg::new(1);
-        let mut c = TerrainCurriculum { level: 5, successes: 0, failures: 0 };
+        let mut c = TerrainCurriculum {
+            level: 5,
+            successes: 0,
+            failures: 0,
+        };
         // 2..4 m band: no-op forever.
         for _ in 0..100 {
             c.on_episode_end(3.0, &mut rng);
@@ -1196,7 +1314,11 @@ mod tests {
         }
         assert_eq!((c.level, c.successes, c.failures), (6, 0, 0));
         // Demotion clamps at 0.
-        let mut c0 = TerrainCurriculum { level: 0, successes: 0, failures: 0 };
+        let mut c0 = TerrainCurriculum {
+            level: 0,
+            successes: 0,
+            failures: 0,
+        };
         for _ in 0..10 {
             c0.on_episode_end(0.0, &mut rng);
         }
@@ -1205,7 +1327,11 @@ mod tests {
         let mut seen_non_top = false;
         for seed in 0..50 {
             let mut rt = Lcg::new(seed);
-            let mut ct = TerrainCurriculum { level: ROWS as u32 - 1, successes: 3, failures: 0 };
+            let mut ct = TerrainCurriculum {
+                level: ROWS as u32 - 1,
+                successes: 3,
+                failures: 0,
+            };
             ct.on_episode_end(5.0, &mut rt);
             assert!((ct.level as usize) < ROWS);
             if (ct.level as usize) < ROWS - 1 {

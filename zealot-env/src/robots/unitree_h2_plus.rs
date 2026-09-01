@@ -36,7 +36,7 @@
 //! `*_ankle_pitch_link`, and canonical order (which lists pitch before roll,
 //! matching the G1 convention) deliberately differs from chain order.
 
-use super::{JointSpec, RobotSpec, NUM_JOINTS};
+use super::{JointSpec, NUM_JOINTS, RobotSpec};
 
 /// Canonical policy joint order (see module docs).
 pub const JOINT_NAMES: [&str; NUM_JOINTS] = [
@@ -138,7 +138,9 @@ pub const fn unitree_h2_plus() -> RobotSpec {
         mjcf_rel_path: "assets/robots/unitree_h2_plus_12dof.xml",
         urdf_rel_path: "Documents/work/unitree_ros/robots/h2_plus/H2_Plus.urdf",
         mirror: [6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5],
-        mirror_sign: [1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0],
+        mirror_sign: [
+            1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0,
+        ],
         hip_yawroll: [1, 2, 7, 8], // left/right hip_roll + hip_yaw
         // Only the feet may touch the ground. "ankle" is excluded: the H2's
         // ankle_ROLL link is a small clevis just above the foot, legitimately low.

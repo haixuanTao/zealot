@@ -50,7 +50,12 @@ impl MomentSet {
     /// Every per-layer vector has the length its `dims` entry implies.
     fn is_consistent(&self) -> bool {
         let l = self.layers();
-        if l == 0 || self.mw.len() != l || self.vw.len() != l || self.mb.len() != l || self.vb.len() != l {
+        if l == 0
+            || self.mw.len() != l
+            || self.vw.len() != l
+            || self.mb.len() != l
+            || self.vb.len() != l
+        {
             return false;
         }
         (0..l).all(|i| {
@@ -95,19 +100,37 @@ impl TrainState {
             for l in 0..ms.layers() {
                 let (out, inp) = (ms.dims[l + 1], ms.dims[l]);
                 for (tag, v) in [("mw", &ms.mw[l]), ("vw", &ms.vw[l])] {
-                    owned.push((format!("{prefix}.{tag}_{l}"), f32_vec_bytes(v), vec![out, inp], Dtype::F32));
+                    owned.push((
+                        format!("{prefix}.{tag}_{l}"),
+                        f32_vec_bytes(v),
+                        vec![out, inp],
+                        Dtype::F32,
+                    ));
                 }
                 for (tag, v) in [("mb", &ms.mb[l]), ("vb", &ms.vb[l])] {
-                    owned.push((format!("{prefix}.{tag}_{l}"), f32_vec_bytes(v), vec![out], Dtype::F32));
+                    owned.push((
+                        format!("{prefix}.{tag}_{l}"),
+                        f32_vec_bytes(v),
+                        vec![out],
+                        Dtype::F32,
+                    ));
                 }
             }
             // Architecture, so load can reject a mismatched checkpoint.
             let d: Vec<f32> = ms.dims.iter().map(|&x| x as f32).collect();
-            owned.push((format!("{prefix}.dims"), f32_vec_bytes(&d), vec![d.len()], Dtype::F32));
+            owned.push((
+                format!("{prefix}.dims"),
+                f32_vec_bytes(&d),
+                vec![d.len()],
+                Dtype::F32,
+            ));
         }
         // Counters that must survive exactly — f64 so a long run cannot lose
         // integer precision the way f32 would past 2^24 steps.
-        for (name, v) in [("gstep", self.gstep as f64), ("iter_done", self.iter_done as f64)] {
+        for (name, v) in [
+            ("gstep", self.gstep as f64),
+            ("iter_done", self.iter_done as f64),
+        ] {
             owned.push((name.into(), v.to_le_bytes().to_vec(), vec![1], Dtype::F64));
         }
         for (name, v) in [("best_ema", self.best_ema), ("rew_ema", self.rew_ema)] {
@@ -118,7 +141,12 @@ impl TrainState {
             .iter()
             .flat_map(|&(l, s, f)| [l as f32, s as f32, f as f32])
             .collect();
-        owned.push(("terrain".into(), f32_vec_bytes(&terr), vec![self.terrain.len(), 3], Dtype::F32));
+        owned.push((
+            "terrain".into(),
+            f32_vec_bytes(&terr),
+            vec![self.terrain.len(), 3],
+            Dtype::F32,
+        ));
 
         let views: Vec<(String, TensorView)> = owned
             .iter()
@@ -153,7 +181,10 @@ impl TrainState {
                 .map(|x| x as usize)
                 .collect();
             let l = dims.len().saturating_sub(1);
-            let mut ms = MomentSet { dims, ..Default::default() };
+            let mut ms = MomentSet {
+                dims,
+                ..Default::default()
+            };
             for i in 0..l {
                 ms.mw.push(read_f32(&format!("{prefix}.mw_{i}"))?);
                 ms.vw.push(read_f32(&format!("{prefix}.vw_{i}"))?);
@@ -161,7 +192,9 @@ impl TrainState {
                 ms.vb.push(read_f32(&format!("{prefix}.vb_{i}"))?);
             }
             if !ms.is_consistent() {
-                return Err(io_err_msg(format!("{prefix}: moment shapes disagree with dims")));
+                return Err(io_err_msg(format!(
+                    "{prefix}: moment shapes disagree with dims"
+                )));
             }
             Ok(ms)
         };
@@ -193,7 +226,9 @@ fn f32_vec_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 fn io_err<E: std::fmt::Debug>(e: E) -> std::io::Error {
@@ -212,8 +247,12 @@ mod tests {
         let ms = |dims: Vec<usize>| {
             let l = dims.len() - 1;
             MomentSet {
-                mw: (0..l).map(|i| vec![i as f32 + 0.5; dims[i + 1] * dims[i]]).collect(),
-                vw: (0..l).map(|i| vec![i as f32 + 1.5; dims[i + 1] * dims[i]]).collect(),
+                mw: (0..l)
+                    .map(|i| vec![i as f32 + 0.5; dims[i + 1] * dims[i]])
+                    .collect(),
+                vw: (0..l)
+                    .map(|i| vec![i as f32 + 1.5; dims[i + 1] * dims[i]])
+                    .collect(),
                 mb: (0..l).map(|i| vec![i as f32 + 2.5; dims[i + 1]]).collect(),
                 vb: (0..l).map(|i| vec![i as f32 + 3.5; dims[i + 1]]).collect(),
                 dims,

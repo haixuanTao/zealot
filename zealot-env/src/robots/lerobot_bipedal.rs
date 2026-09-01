@@ -28,7 +28,7 @@
 //!    export / sim-to-real). The adapter already remaps orders, so this choice
 //!    only fixes *our* internal convention, not the physics.
 
-pub use super::{JointSpec, RobotSpec, NUM_JOINTS};
+pub use super::{JointSpec, NUM_JOINTS, RobotSpec};
 
 /// Canonical policy joint order (see module docs). Alphabetical by URDF joint
 /// name — the order the mjlab trainer resolves to with `preserve_order = false`,
@@ -230,7 +230,9 @@ pub const fn lerobot() -> RobotSpec {
         // families (ankley/hipy/knee) mirror equal, lateral (anklex/hipx/hipz)
         // mirror opposite.
         mirror: [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10],
-        mirror_sign: [-1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0],
+        mirror_sign: [
+            -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0,
+        ],
         hip_yawroll: [4, 5, 8, 9], // hipx_left, hipx_right, hipz_left, hipz_right
         illegal_ground_fragments: &["shin", "tigh", "hip"],
         self_collision_pairs: &[

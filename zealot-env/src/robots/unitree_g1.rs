@@ -30,7 +30,7 @@
 //! right leg), so observations/actions — and an eventual ONNX export — line up
 //! with Unitree's deployment convention.
 
-use super::{JointSpec, RobotSpec, NUM_JOINTS};
+use super::{JointSpec, NUM_JOINTS, RobotSpec};
 
 /// Canonical policy joint order (see module docs).
 pub const JOINT_NAMES: [&str; NUM_JOINTS] = [
@@ -136,7 +136,9 @@ pub const fn unitree_g1() -> RobotSpec {
         // Canonical order is left leg [0..6), right leg [6..12): mirror swaps
         // the halves; pitch/knee mirror equal, roll/yaw mirror opposite.
         mirror: [6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5],
-        mirror_sign: [1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0],
+        mirror_sign: [
+            1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0,
+        ],
         hip_yawroll: [1, 2, 7, 8], // left/right hip_roll + hip_yaw
         // Only the feet may touch the ground; hips + knee(shin) links must not.
         // ("ankle" is excluded — those links legitimately sit just above the sole.)
@@ -180,7 +182,11 @@ pub const fn unitree_g1_agile() -> RobotSpec {
         } else {
             // ankles: soft position gain, near-zero damping.
             j.kp = 20.0;
-            j.kd = if contains(name, "ankle_roll") { 0.1 } else { 0.2 };
+            j.kd = if contains(name, "ankle_roll") {
+                0.1
+            } else {
+                0.2
+            };
         }
         j.armature = 0.02;
         j.action_scale = 0.5;
@@ -220,7 +226,9 @@ pub const fn unitree_g1_29dof() -> RobotSpec {
     spec.total_mass = 33.34;
     // A fallen robot contacts the ground with its (collider-less) upper body —
     // count torso/waist/arm links as illegal ground contact alongside hips/knees.
-    spec.illegal_ground_fragments = &["hip", "knee", "torso", "waist", "shoulder", "elbow", "wrist"];
+    spec.illegal_ground_fragments = &[
+        "hip", "knee", "torso", "waist", "shoulder", "elbow", "wrist",
+    ];
     // Fragment match order: most specific first (first match wins).
     spec.held_joints = &[
         ("waist_yaw", 300.0, 5.0, 88.0),
@@ -260,7 +268,9 @@ pub const fn unitree_g1_29dof_agile() -> RobotSpec {
     spec.mjcf_rel_path = "assets/robots/unitree_g1_29dof.xml";
     spec.urdf_rel_path = "Documents/work/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf";
     spec.total_mass = 33.34;
-    spec.illegal_ground_fragments = &["hip", "knee", "torso", "waist", "shoulder", "elbow", "wrist"];
+    spec.illegal_ground_fragments = &[
+        "hip", "knee", "torso", "waist", "shoulder", "elbow", "wrist",
+    ];
     // Fragment match order: most specific first (first match wins).
     spec.held_joints = &[
         ("waist_yaw", 300.0, 5.0, 88.0),
@@ -299,7 +309,9 @@ mod tests {
     fn trained_spec_holds_arms_along_the_body() {
         let r = unitree_g1_29dof_agile();
         assert!(
-            r.held_home.iter().any(|(f, t)| *f == "elbow" && (*t - 1.28).abs() < 1e-6),
+            r.held_home
+                .iter()
+                .any(|(f, t)| *f == "elbow" && (*t - 1.28).abs() < 1e-6),
             "g1_29dof_agile lost its held_home elbow target"
         );
     }

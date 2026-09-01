@@ -178,7 +178,6 @@ pub struct NormBufs {
     pub sign_c: Tensor<f32>,
 }
 
-
 pub struct GpuPolicy {
     actor: GpuNet,
     critic: GpuNet,
@@ -302,10 +301,18 @@ impl GpuPolicy {
         fill_raw(&mut rc, crit_dim, n, cur_c);
         // Step-blocked buffer, so this is ONE contiguous write per step.
         if let Some(rb) = self.raw_obs.as_mut() {
-            backend.write_buffer(rb.buffer_mut(), (step * obs_dim * n) as u64, &ro[..obs_dim * n])?;
+            backend.write_buffer(
+                rb.buffer_mut(),
+                (step * obs_dim * n) as u64,
+                &ro[..obs_dim * n],
+            )?;
         }
         if let Some(rb) = self.raw_cobs.as_mut() {
-            backend.write_buffer(rb.buffer_mut(), (step * crit_dim * n) as u64, &rc[..crit_dim * n])?;
+            backend.write_buffer(
+                rb.buffer_mut(),
+                (step * crit_dim * n) as u64,
+                &rc[..crit_dim * n],
+            )?;
         }
         self.scratch_raw_obs = ro;
         self.scratch_raw_cobs = rc;
@@ -412,14 +419,28 @@ impl GpuPolicy {
             );
             let mut pass = cur.pass("policy_input_normalize");
             stage.stage_batch(
-                &mut pass, po, raw_o, &nb.mean_o, &nb.inv_o,
-                self.id_perm_o.as_ref().unwrap(), self.id_sign_o.as_ref().unwrap(),
-                &mut self.actor.a[0], n as u32, obs_dim as u32,
+                &mut pass,
+                po,
+                raw_o,
+                &nb.mean_o,
+                &nb.inv_o,
+                self.id_perm_o.as_ref().unwrap(),
+                self.id_sign_o.as_ref().unwrap(),
+                &mut self.actor.a[0],
+                n as u32,
+                obs_dim as u32,
             )?;
             stage.stage_batch(
-                &mut pass, pc, raw_c, &nb.mean_c, &nb.inv_c,
-                self.id_perm_c.as_ref().unwrap(), self.id_sign_c.as_ref().unwrap(),
-                &mut self.critic.a[0], n as u32, crit_dim as u32,
+                &mut pass,
+                pc,
+                raw_c,
+                &nb.mean_c,
+                &nb.inv_c,
+                self.id_perm_c.as_ref().unwrap(),
+                self.id_sign_c.as_ref().unwrap(),
+                &mut self.critic.a[0],
+                n as u32,
+                crit_dim as u32,
             )?;
         }
         self.actor
@@ -458,12 +479,28 @@ impl GpuPolicy {
         let n = self.n;
         let (od, cd) = (self.actor.dims[0], self.critic.dims[0]);
         let u = BufferUsages::STORAGE | BufferUsages::COPY_DST;
-        self.raw_obs = Some(Tensor::vector_uninit(backend, (horizon * od * n) as u32, u)?);
-        self.raw_cobs = Some(Tensor::vector_uninit(backend, (horizon * cd * n) as u32, u)?);
+        self.raw_obs = Some(Tensor::vector_uninit(
+            backend,
+            (horizon * od * n) as u32,
+            u,
+        )?);
+        self.raw_cobs = Some(Tensor::vector_uninit(
+            backend,
+            (horizon * cd * n) as u32,
+            u,
+        )?);
         let sb = BufferUsages::STORAGE;
-        self.id_perm_o = Some(Tensor::vector(backend, &(0..od as u32).collect::<Vec<u32>>(), sb)?);
+        self.id_perm_o = Some(Tensor::vector(
+            backend,
+            &(0..od as u32).collect::<Vec<u32>>(),
+            sb,
+        )?);
         self.id_sign_o = Some(Tensor::vector(backend, &vec![1.0f32; od], sb)?);
-        self.id_perm_c = Some(Tensor::vector(backend, &(0..cd as u32).collect::<Vec<u32>>(), sb)?);
+        self.id_perm_c = Some(Tensor::vector(
+            backend,
+            &(0..cd as u32).collect::<Vec<u32>>(),
+            sb,
+        )?);
         self.id_sign_c = Some(Tensor::vector(backend, &vec![1.0f32; cd], sb)?);
         Ok(())
     }
@@ -492,7 +529,11 @@ impl GpuPolicy {
 
     /// … and an encode-only mean forward (no host copies, no sync — caller
     /// owns submission via the cursor).
-    pub fn encode_actor(&mut self, backend: &GpuBackend, cur: &mut EncCursor) -> anyhow::Result<()> {
+    pub fn encode_actor(
+        &mut self,
+        backend: &GpuBackend,
+        cur: &mut EncCursor,
+    ) -> anyhow::Result<()> {
         self.actor
             .encode(backend, &self.ops, &mut self.shapes, cur, self.ct)?;
         Ok(())

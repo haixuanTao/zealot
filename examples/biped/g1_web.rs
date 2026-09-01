@@ -9,10 +9,10 @@
 
 #[path = "../../src/biped/cutile_gemm.rs"]
 mod cutile_gemm;
-#[path = "../../src/biped/gpu_policy.rs"]
-mod gpu_policy;
 #[path = "g1_web_demo.rs"]
 mod g1_web_demo;
+#[path = "../../src/biped/gpu_policy.rs"]
+mod gpu_policy;
 
 /// Robot count: default 10; on the web, override with `?n=` (clamped 1..=200)
 /// — "how many robots can your GPU walk?".
@@ -44,12 +44,16 @@ fn dump_terrain(out: &str, x0: f32, x1: f32) {
         .collect();
     let mut s = String::from("{\"v\":[");
     for (i, p) in v.iter().enumerate() {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         s.push_str(&format!("[{:.4},{:.4},{:.4}]", p[0], p[1], p[2]));
     }
     s.push_str("],\"i\":[");
     for (i, tri) in keep.iter().enumerate() {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         s.push_str(&format!("[{},{},{}]", tri[0], tri[1], tri[2]));
     }
     s.push_str("]}");
@@ -97,4 +101,3 @@ pub async fn main() {
     })
     .await
 }
-

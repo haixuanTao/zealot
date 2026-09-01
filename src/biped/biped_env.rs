@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use roxmltree::Node;
 use zealot_env::obs_history::ObsHistory;
 use zealot_env::rng::Lcg;
-use zealot_env::robots::{RobotSpec, NUM_JOINTS};
+use zealot_env::robots::{NUM_JOINTS, RobotSpec};
 use zealot_env::tasks::velocity_flat::{
     BaseState, CRITIC_OBS_DIM, CommandSampler, FootObs, NUM_FEET, OBS_DIM, RobotState,
     VelocityCommand, VelocityFlatTask,
@@ -136,7 +136,10 @@ pub fn default_mjcf_path() -> String {
     if let Ok(p) = std::env::var("BIPED_MJCF") {
         return p;
     }
-    RobotSpec::from_env().mjcf_path().to_string_lossy().into_owned()
+    RobotSpec::from_env()
+        .mjcf_path()
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -480,10 +483,16 @@ impl BipedEnv {
         // Diff-harness knobs: cap depenetration + more substeps (defaults match
         // the tuned GPU stand config; rapier default max_corrective_velocity=10
         // launches the G1 off ~mm spawn overlaps exactly like the GPU did).
-        if let Some(v) = std::env::var("BIPED_MAX_CORR_VEL").ok().and_then(|v| v.parse::<f32>().ok()) {
+        if let Some(v) = std::env::var("BIPED_MAX_CORR_VEL")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+        {
             ip.normalized_max_corrective_velocity = v;
         }
-        if let Some(n) = std::env::var("BIPED_SOLVER_ITERS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        if let Some(n) = std::env::var("BIPED_SOLVER_ITERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
             ip.num_solver_iterations = n.max(1);
         }
         // Match the nexus GPU env + Isaac/PhysX reference (position iterations =
@@ -502,16 +511,18 @@ impl BipedEnv {
         }
         // BIPED_MOTOR_DELAY=min,max (or max → min=0), physics substeps —
         // same parse as the nexus env; unset/unparseable = off.
-        let motor_delay: Option<(u32, u32)> = std::env::var("BIPED_MOTOR_DELAY").ok().and_then(
-            |s| {
-                let p: Vec<u32> = s.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
+        let motor_delay: Option<(u32, u32)> =
+            std::env::var("BIPED_MOTOR_DELAY").ok().and_then(|s| {
+                let p: Vec<u32> = s
+                    .split(',')
+                    .map(|x| x.trim().parse().ok())
+                    .collect::<Option<_>>()?;
                 match p.as_slice() {
                     [max] => Some((0, *max)),
                     [min, max] => Some((*min, *max)),
                     _ => None,
                 }
-            },
-        );
+            });
         if let Some((min, max)) = motor_delay {
             assert!(
                 min <= max && max <= task.decimation,

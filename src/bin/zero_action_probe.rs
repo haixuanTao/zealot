@@ -58,7 +58,10 @@ fn main() {
                 let zs = env.torso_heights().await;
                 let zmin = zs.iter().cloned().fold(f32::INFINITY, f32::min);
                 let zmean = zs.iter().sum::<f32>() / zs.len() as f32;
-                println!("t={t} torso z env0={:.3} mean={:.3} min={:.3}", zs[0], zmean, zmin);
+                println!(
+                    "t={t} torso z env0={:.3} mean={:.3} min={:.3}",
+                    zs[0], zmean, zmin
+                );
             }
             if (t + 1) % 50 == 0 {
                 let alive_first = first_len.iter().filter(|&&v| v == usize::MAX).count();
@@ -72,7 +75,11 @@ fn main() {
             }
         }
         let survived = first_len.iter().filter(|&&v| v == usize::MAX).count();
-        let ended: Vec<usize> = first_len.iter().copied().filter(|&v| v != usize::MAX).collect();
+        let ended: Vec<usize> = first_len
+            .iter()
+            .copied()
+            .filter(|&v| v != usize::MAX)
+            .collect();
         let mean_first = if ended.is_empty() {
             f32::NAN
         } else {

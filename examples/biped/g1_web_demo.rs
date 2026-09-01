@@ -45,13 +45,13 @@ pub struct DemoCfg {
 }
 
 use biped_env_nexus::{BipedNexusBatchEnv, parse_mjcf};
-use nexus3d::rbd::math::Pose as NexusPose;
 use glamx::{Pose3, Rot3, Vec3};
 use kiss3d::camera::OrbitCamera3d;
 use kiss3d::color::Color;
-use kiss3d::scene::SceneNode3d;
 use kiss3d::event::{Action as KAction, MouseButton as KMouseButton, WindowEvent as KWindowEvent};
+use kiss3d::scene::SceneNode3d;
 use kiss3d::window::Window;
+use nexus3d::rbd::math::Pose as NexusPose;
 use zealot_env::robots::NUM_JOINTS;
 use zealot_env::terrain::{TerrainFamily, TerrainParams, TerrainStrip};
 use zealot_rl::ActorCritic;
@@ -116,7 +116,12 @@ fn load_visuals() -> std::collections::HashMap<String, Vec<([f32; 4], Vec<Vec3>,
         o += 1;
         let name = std::str::from_utf8(&d[o..o + l]).unwrap().to_string();
         o += l;
-        let rgba = [rd_f32(&mut o), rd_f32(&mut o), rd_f32(&mut o), rd_f32(&mut o)];
+        let rgba = [
+            rd_f32(&mut o),
+            rd_f32(&mut o),
+            rd_f32(&mut o),
+            rd_f32(&mut o),
+        ];
         let nv = rd_u32(&mut o) as usize;
         let nf = rd_u32(&mut o) as usize;
         let mut verts = Vec::with_capacity(nv);
@@ -142,8 +147,8 @@ const DT: f32 = 0.02;
 #[cfg(target_arch = "wasm32")]
 mod drive {
     use std::cell::RefCell;
-    use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
+    use wasm_bindgen::prelude::*;
 
     /// Per-press increment, and the range each axis is held within.
     const STEP: f32 = 0.2;
@@ -179,8 +184,8 @@ mod drive {
         let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
             return;
         };
-        let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
-            move |e: web_sys::KeyboardEvent| {
+        let cb =
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
                 // Auto-repeat would ramp the command while a key is merely
                 // held; one press should be one step.
                 if e.repeat() {
@@ -198,8 +203,7 @@ mod drive {
                 }
                 // Arrows/space would otherwise scroll the embedding page.
                 e.prevent_default();
-            },
-        );
+            });
         let _ = doc.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
         cb.forget(); // lives for the page's lifetime
     }
@@ -210,7 +214,10 @@ mod drive {
         // A deflected gamepad stick overrides the latched value; sticks rest
         // near but not exactly at zero, hence the deadzone.
         if let Some(pads) = web_sys::window().and_then(|w| w.navigator().get_gamepads().ok()) {
-            for pad in pads.iter().filter_map(|p| p.dyn_into::<web_sys::Gamepad>().ok()) {
+            for pad in pads
+                .iter()
+                .filter_map(|p| p.dyn_into::<web_sys::Gamepad>().ok())
+            {
                 let axes = pad.axes();
                 let axis = |i: u32| axes.get(i).as_f64().unwrap_or(0.0) as f32;
                 let dead = |v: f32| if v.abs() < 0.15 { 0.0 } else { v };
@@ -250,8 +257,8 @@ mod drive {
 mod vr {
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
+    use wasm_bindgen::prelude::*;
 
     #[derive(Default)]
     struct State {
@@ -296,8 +303,12 @@ mod vr {
         };
         STATE.with(|s| s.borrow_mut().enabled = true);
         let onmessage = Closure::<dyn FnMut(_)>::new(move |ev: web_sys::MessageEvent| {
-            let Some(txt) = ev.data().as_string() else { return };
-            let Ok(v) = js_sys::JSON::parse(&txt) else { return };
+            let Some(txt) = ev.data().as_string() else {
+                return;
+            };
+            let Ok(v) = js_sys::JSON::parse(&txt) else {
+                return;
+            };
             let get = |k: &str| js_sys::Reflect::get(&v, &k.into()).ok();
             STATE.with(|s| {
                 let mut st = s.borrow_mut();
@@ -401,7 +412,11 @@ mod vr {
             if lx == 0.0 && ly == 0.0 {
                 return None;
             }
-            Some([(ly * 0.6).clamp(-0.4, 0.6), 0.0, (-lx * 0.8).clamp(-1.0, 1.0)])
+            Some([
+                (ly * 0.6).clamp(-0.4, 0.6),
+                0.0,
+                (-lx * 0.8).clamp(-1.0, 1.0),
+            ])
         })
     }
 }
@@ -533,26 +548,33 @@ async fn resident_probe() {
     let ws_host: Vec<glamx::Vec4> = {
         let raw: Vec<nexus3d::rbd::glamx::Vec4> =
             backend.slow_read_vec(ws.buffer()).await.expect("ws");
-        raw.iter().map(|v| Vec3::new(v.x, v.y, v.z).extend(v.w)).collect()
+        raw.iter()
+            .map(|v| Vec3::new(v.x, v.y, v.z).extend(v.w))
+            .collect()
     };
     println!("{:>24} {:>10} {:>10}", "joint", "dof_values", "cpu(pose)");
     for j in 0..NUM_JOINTS {
         println!(
             "{:>24} {:>10.4} {:>10.4}",
-            j,
-            dv_host[dofs[j] as usize],
-            q_cpu[j]
+            j, dv_host[dofs[j] as usize], q_cpu[j]
         );
     }
     let bq = ws_host[5]; // link0, quad WS_LTW=5 (n_envs=1)
-    println!("ws LTW quat: [{:.4},{:.4},{:.4},{:.4}]", bq.x, bq.y, bq.z, bq.w);
+    println!(
+        "ws LTW quat: [{:.4},{:.4},{:.4},{:.4}]",
+        bq.x, bq.y, bq.z, bq.w
+    );
     println!("dof_values[0..40]:");
     for (i, v) in dv_host.iter().take(40).enumerate() {
         if v.abs() > 1e-6 {
             println!("  [{i:>2}] {v:+.4}");
         }
     }
-    println!("  (len {}, nonzero {})", dv_host.len(), dv_host.iter().filter(|v| v.abs() > 1e-6).count());
+    println!(
+        "  (len {}, nonzero {})",
+        dv_host.len(),
+        dv_host.iter().filter(|v| v.abs() > 1e-6).count()
+    );
     // Candidate: ws COORDS quad (link·15 + 1) component x per actuated link.
     let links = env.actuated_link_ids();
     println!("{:>8} {:>12} {:>10}", "link", "ws_coords.x", "cpu(pose)");
@@ -560,7 +582,10 @@ async fn resident_probe() {
         let c = ws_host[(l as usize) * 15 + 1];
         let jr = ws_host[(l as usize) * 15]; // WS_JOINT_ROT quad, xyzw
         let ang = 2.0 * jr.z.atan2(jr.w);
-        println!("{:>8} {:>12.4} {:>10.4} jr_angle={:+.4}", l, c.x, q_cpu[j], ang);
+        println!(
+            "{:>8} {:>12.4} {:>10.4} jr_angle={:+.4}",
+            l, c.x, q_cpu[j], ang
+        );
     }
     println!(
         "cpu base quat (xyzw): [{:.4},{:.4},{:.4},{:.4}]",
@@ -572,7 +597,12 @@ async fn resident_probe() {
 /// print torso pos + falls.
 #[cfg(not(target_arch = "wasm32"))]
 async fn headless_check(cfg: &DemoCfg) {
-    configure_env(cfg.terrain, cfg.terrain_level, cfg.terrain_amp_pct, cfg.terrain_slope_deg);
+    configure_env(
+        cfg.terrain,
+        cfg.terrain_level,
+        cfg.terrain_amp_pct,
+        cfg.terrain_slope_deg,
+    );
     let ac = ActorCritic::load_from_bytes(POLICY_BIN).expect("policy checkpoint");
     let mut env = BipedNexusBatchEnv::new(MJCF_XML, 1, 1, 0xC0FFEE).await;
     let (mut obs, _) = env.reset_env(0).await;
@@ -749,9 +779,7 @@ async fn resolve_ckpt(spec: &str) -> Result<String, String> {
         CkptRef::File(url) => Ok(url),
         CkptRef::Repo(repo) => {
             let api = format!("https://huggingface.co/api/models/{repo}");
-            let body = fetch_text(&api)
-                .await
-                .map_err(|e| format!("{repo}: {e}"))?;
+            let body = fetch_text(&api).await.map_err(|e| format!("{repo}: {e}"))?;
             let mut files: Vec<String> = rfilenames(&body)
                 .into_iter()
                 .filter(|f| f.ends_with(".safetensors"))
@@ -806,11 +834,10 @@ async fn fetch_ckpt(url: &str) -> Result<Vec<u8>, String> {
     if !resp.ok() {
         return Err(format!("HTTP {} for {url}", resp.status()));
     }
-    let buf = wasm_bindgen_futures::JsFuture::from(
-        resp.array_buffer().map_err(|e| format!("{e:?}"))?,
-    )
-    .await
-    .map_err(|e| format!("body read failed: {e:?}"))?;
+    let buf =
+        wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?)
+            .await
+            .map_err(|e| format!("body read failed: {e:?}"))?;
     Ok(js_sys::Uint8Array::new(&buf).to_vec())
 }
 
@@ -872,12 +899,21 @@ struct PoseSlot {
     staging: wgpu::Buffer,
     /// `Some` while a copy into this slot is in flight; carries the sim time
     /// its snapshot was taken at.
-    rx: Option<(std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>, f32)>,
+    rx: Option<(
+        std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+        f32,
+    )>,
 }
 
 impl PoseStream {
     fn new(poses: Vec<NexusPose>) -> Self {
-        Self { slots: Vec::new(), poses, stale_frames: 0, fresh: true, captured_at: 0.0 }
+        Self {
+            slots: Vec::new(),
+            poses,
+            stale_frames: 0,
+            fresh: true,
+            captured_at: 0.0,
+        }
     }
 
     /// The wgpu handles, if this backend is WebGPU.
@@ -926,7 +962,9 @@ impl PoseStream {
         // Take every landed copy; keep only the newest snapshot's data.
         let mut best: Option<usize> = None;
         for i in 0..self.slots.len() {
-            let Some((rx, at)) = &self.slots[i].rx else { continue };
+            let Some((rx, at)) = &self.slots[i].rx else {
+                continue;
+            };
             let at = *at;
             match rx.try_recv() {
                 Ok(Ok(())) => {
@@ -984,9 +1022,12 @@ impl PoseStream {
             enc.copy_buffer_to_buffer(src, 0, &self.slots[free].staging, 0, bytes);
             queue.submit([enc.finish()]);
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            self.slots[free].staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.try_send(r);
-            });
+            self.slots[free]
+                .staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.try_send(r);
+                });
             self.slots[free].rx = Some((rx, sim_time));
         }
         true
@@ -1047,7 +1088,11 @@ async fn record(cfg: &DemoCfg, out: &str, seconds: f32) {
     scene.add_directional_light(Vec3::new(1.0, -2.0, -3.0));
 
     // Ground slab + the exact terrain mesh the physics collides with.
-    let (slab_cx, slab_len) = if cfg.terrain { (80.0, 400.0) } else { (0.0, 60.0) };
+    let (slab_cx, slab_len) = if cfg.terrain {
+        (80.0, 400.0)
+    } else {
+        (0.0, 60.0)
+    };
     let slab_drop = if cfg.terrain { 0.02 } else { 0.0 };
     let mut ground = scene.add_cube(slab_len, 60.0, 0.1);
     ground.set_position(Vec3::new(slab_cx, 0.0, -0.05 - slab_drop));
@@ -1112,7 +1157,13 @@ async fn record(cfg: &DemoCfg, out: &str, seconds: f32) {
             }
             let child_origin = Vec3::new(body.local_pos.x, body.local_pos.y, body.local_pos.z);
             let mut parent_node = body_nodes[p].clone();
-            add_segment(&mut parent_node, Vec3::ZERO, child_origin, 0.028, body_color);
+            add_segment(
+                &mut parent_node,
+                Vec3::ZERO,
+                child_origin,
+                0.028,
+                body_color,
+            );
         }
     }
 
@@ -1126,9 +1177,26 @@ async fn record(cfg: &DemoCfg, out: &str, seconds: f32) {
 
     let mut ff = std::process::Command::new("ffmpeg")
         .args([
-            "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", &format!("{w}x{h}"), "-r", "50", "-i", "-",
-            "-vf", "vflip,format=yuv420p", "-c:v", "libx264", "-crf", "21", out,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            &format!("{w}x{h}"),
+            "-r",
+            "50",
+            "-i",
+            "-",
+            "-vf",
+            "vflip,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "21",
+            out,
         ])
         .stdin(std::process::Stdio::piped())
         .spawn()
@@ -1161,10 +1229,7 @@ async fn record(cfg: &DemoCfg, out: &str, seconds: f32) {
         let (base, _) = env.base_pose_for(0, &poses);
         let gz = strip0.as_ref().map_or(0.0, |s| s.height(base[0], base[1]));
         let focus = Vec3::new(base[0], base[1], gz + 0.6);
-        let mut camera = OrbitCamera3d::new(
-            focus + Vec3::new(-1.6, -3.0, 1.6),
-            focus,
-        );
+        let mut camera = OrbitCamera3d::new(focus + Vec3::new(-1.6, -3.0, 1.6), focus);
         camera.set_up_axis(Vec3::Z);
         surface.render_3d(&mut scene, &mut camera).await;
         surface.snap(&mut buf);
@@ -1179,7 +1244,10 @@ async fn record(cfg: &DemoCfg, out: &str, seconds: f32) {
     }
     drop(ff_in);
     let st = ff.wait().expect("ffmpeg wait");
-    println!("record: wrote {out} ({} frames, falls={falls}, ffmpeg {st})", steps);
+    println!(
+        "record: wrote {out} ({} frames, falls={falls}, ffmpeg {st})",
+        steps
+    );
 }
 
 pub async fn run(cfg: DemoCfg) {
@@ -1199,12 +1267,20 @@ pub async fn run(cfg: DemoCfg) {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(i) = std::env::args().position(|a| a == "--record") {
         let args: Vec<String> = std::env::args().collect();
-        let out = args.get(i + 1).cloned().unwrap_or_else(|| "/tmp/g1_record.mp4".into());
+        let out = args
+            .get(i + 1)
+            .cloned()
+            .unwrap_or_else(|| "/tmp/g1_record.mp4".into());
         let seconds: f32 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(15.0);
         record(&cfg, &out, seconds).await;
         return;
     }
-    configure_env(cfg.terrain, cfg.terrain_level, cfg.terrain_amp_pct, cfg.terrain_slope_deg);
+    configure_env(
+        cfg.terrain,
+        cfg.terrain_level,
+        cfg.terrain_amp_pct,
+        cfg.terrain_slope_deg,
+    );
 
     let mut window = Window::new_with_size("zealot G1 — nexus GPU physics", 1200, 900).await;
     window.set_background_color(Color::new(0.051, 0.169, 0.180, 1.0));
@@ -1309,13 +1385,16 @@ pub async fn run(cfg: DemoCfg) {
             amp: cfg.terrain_amp_pct as f32 / 100.0,
             slope: (cfg.terrain_slope_deg.min(45) as f32).to_radians().tan(),
         };
-        let fams = [TerrainFamily::Boxes, TerrainFamily::Rough, TerrainFamily::Wave];
+        let fams = [
+            TerrainFamily::Boxes,
+            TerrainFamily::Rough,
+            TerrainFamily::Wave,
+        ];
         for (f, fam) in fams.into_iter().enumerate() {
             let strip = TerrainStrip::generate_with(fam, ENV_SEED, render_params);
             if f < n_robots {
                 let (v, t) = strip.mesh();
-                let sv: Vec<Vec3> =
-                    v.into_iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
+                let sv: Vec<Vec3> = v.into_iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
                 let mut node = scene.add_trimesh(sv, t, Vec3::ONE, true);
                 node.set_position(offset_of(f));
                 node.set_color(match f {
@@ -1341,8 +1420,7 @@ pub async fn run(cfg: DemoCfg) {
                     Color::new(0.60, 0.63, 0.66, 1.0)
                 };
                 for (_rgba, verts, tris) in groups {
-                    let mut node =
-                        group.add_trimesh(verts.clone(), tris.clone(), Vec3::ONE, false);
+                    let mut node = group.add_trimesh(verts.clone(), tris.clone(), Vec3::ONE, false);
                     node.set_color(color);
                 }
             } else {
@@ -1361,10 +1439,15 @@ pub async fn run(cfg: DemoCfg) {
                 if visuals.contains_key(&body.name) && visuals.contains_key(&mjcf[p].name) {
                     continue;
                 }
-                let child_origin =
-                    Vec3::new(body.local_pos.x, body.local_pos.y, body.local_pos.z);
+                let child_origin = Vec3::new(body.local_pos.x, body.local_pos.y, body.local_pos.z);
                 let mut parent_node = body_nodes[p].clone();
-                add_segment(&mut parent_node, Vec3::ZERO, child_origin, 0.028, body_color);
+                add_segment(
+                    &mut parent_node,
+                    Vec3::ZERO,
+                    child_origin,
+                    0.028,
+                    body_color,
+                );
             }
         }
         robots.push(body_nodes);
@@ -1414,8 +1497,7 @@ pub async fn run(cfg: DemoCfg) {
     // readback — cost ~19 ms of wall time per control step in the browser;
     // this path is encode-only.)
     let backend = env.gpu_backend().clone();
-    let mut gpol =
-        crate::gpu_policy::GpuPolicy::new(&backend, &ac, n_robots).expect("gpu policy");
+    let mut gpol = crate::gpu_policy::GpuPolicy::new(&backend, &ac, n_robots).expect("gpu policy");
     let spec = zealot_env::robots::RobotSpec::from_env();
     let (nmean, nm2, ncount) = ac.obs_norm.state();
     let obs_cfg = zealot_gpu_obs::GpuObsConfig {
@@ -1439,7 +1521,8 @@ pub async fn run(cfg: DemoCfg) {
         // homes (zero velocity); refreshed per control step below.
         if obs_frame >= zealot_gpu_obs::shaders::FRAME {
             let homes = env.held_joint_homes();
-            gobs.set_held(&backend, e, &homes, &[0.0; 13]).expect("held");
+            gobs.set_held(&backend, e, &homes, &[0.0; 13])
+                .expect("held");
         }
     }
     // CPU-side episode counters (timeout + reset bookkeeping only).
@@ -1519,7 +1602,6 @@ pub async fn run(cfg: DemoCfg) {
             .store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
-
     drive::install();
 
     // Live VR upper-body (`?vr=<ws-url>`): connect to the retarget bridge
@@ -1551,7 +1633,13 @@ pub async fn run(cfg: DemoCfg) {
             }
             let s = &strips[fam % strips.len()];
             let mut h = f32::MIN;
-            for (dx, dy) in [(0.0, 0.0), (0.14, 0.0), (-0.14, 0.0), (0.0, 0.14), (0.0, -0.14)] {
+            for (dx, dy) in [
+                (0.0, 0.0),
+                (0.14, 0.0),
+                (-0.14, 0.0),
+                (0.0, 0.14),
+                (0.0, -0.14),
+            ] {
                 h = h.max(s.height(x + dx - off.x, y + dy - off.y));
             }
             h
@@ -1601,8 +1689,7 @@ pub async fn run(cfg: DemoCfg) {
     let mut wander_rng: u32 = {
         #[cfg(target_arch = "wasm32")]
         {
-            (js_sys::Date::now().to_bits() ^ js_sys::Math::random().to_bits()) as u32
-                ^ 0x9E37_79B9
+            (js_sys::Date::now().to_bits() ^ js_sys::Math::random().to_bits()) as u32 ^ 0x9E37_79B9
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1613,7 +1700,9 @@ pub async fn run(cfg: DemoCfg) {
         }
     };
     let mut wander_rand = move || {
-        wander_rng = wander_rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        wander_rng = wander_rng
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
         (wander_rng >> 8) as f32 / (1u32 << 24) as f32
     };
 
@@ -1673,8 +1762,7 @@ pub async fn run(cfg: DemoCfg) {
                                 if terrain {
                                     hit.y = hit.y.clamp(lane.y - 3.6, lane.y + 3.6);
                                 }
-                                hit.z =
-                                    marker_ground(&strips, terrain, fam, lane, hit.x, hit.y);
+                                hit.z = marker_ground(&strips, terrain, fam, lane, hit.x, hit.y);
                                 wander = false;
                                 nav_lane_relative = false;
                                 nav_settle = false;
@@ -1860,8 +1948,8 @@ pub async fn run(cfg: DemoCfg) {
                     .unwrap_or(e);
                 let slot = if peers.len() > 1 && e != center {
                     let j = peers.iter().filter(|&&o| o != center).position(|&o| o == e);
-                    let a = core::f32::consts::TAU * j.unwrap_or(0) as f32
-                        / (peers.len() - 1) as f32;
+                    let a =
+                        core::f32::consts::TAU * j.unwrap_or(0) as f32 / (peers.len() - 1) as f32;
                     let r = (0.35 * (peers.len() as f32).sqrt()).max(0.6);
                     Vec3::new(r * a.cos(), r * a.sin(), 0.0)
                 } else {
@@ -2011,7 +2099,8 @@ pub async fn run(cfg: DemoCfg) {
             let mut cur = crate::cutile_gemm::EncCursor::from_encoder(&backend, enc);
             gpol.encode_actor(&backend, &mut cur).expect("actor");
             let mut enc = cur.into_encoder().expect("encoder");
-            gobs.encode_commit(&mut enc, gpol.actor_output()).expect("commit");
+            gobs.encode_commit(&mut enc, gpol.actor_output())
+                .expect("commit");
             env.encode_scatter_targets(&mut enc, &gobs.targets);
             backend.submit(enc).expect("submit ctrl step");
             // Physics submit granularity, `?phys=`: 0 per-phase (original),
@@ -2068,9 +2157,8 @@ pub async fn run(cfg: DemoCfg) {
                             .collect();
                         rows.sort_by(|a, b| b.1.total_cmp(&a.1));
                         let total: f64 = rows.iter().map(|r| r.1).sum();
-                        let mut out = format!(
-                            "[prof] {prof_steps} steps, GPU {total:.2} ms/ctrl-step\n"
-                        );
+                        let mut out =
+                            format!("[prof] {prof_steps} steps, GPU {total:.2} ms/ctrl-step\n");
                         for (label, ms, n) in rows.iter().take(14) {
                             out.push_str(&format!(
                                 "[prof]  {ms:7.3} ms  x{:<3} {label}\n",
@@ -2115,7 +2203,9 @@ pub async fn run(cfg: DemoCfg) {
             #[cfg(target_arch = "wasm32")]
             if diag {
                 let mabs = |v: &[f32]| {
-                    if v.is_empty() { 0.0 } else {
+                    if v.is_empty() {
+                        0.0
+                    } else {
                         v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32
                     }
                 };
@@ -2129,7 +2219,11 @@ pub async fn run(cfg: DemoCfg) {
                     .unwrap_or_default();
                 dbg_in = mabs(&inp);
                 dbg_out = mabs(&out);
-                dbg_nan = inp.iter().chain(out.iter()).filter(|x| !x.is_finite()).count();
+                dbg_nan = inp
+                    .iter()
+                    .chain(out.iter())
+                    .filter(|x| !x.is_finite())
+                    .count();
             }
             // Mirror the key numbers into the document title: the canvas HUD
             // is unreadable without a screenshot, and the title can be read
@@ -2215,8 +2309,7 @@ pub async fn run(cfg: DemoCfg) {
             for (i, node) in body_nodes.iter_mut().enumerate() {
                 let p = &poses[e * cpb + i];
                 let pos = Vec3::new(p.translation.x, p.translation.y, p.translation.z) + off;
-                let rot =
-                    Rot3::from_xyzw(p.rotation.x, p.rotation.y, p.rotation.z, p.rotation.w);
+                let rot = Rot3::from_xyzw(p.rotation.x, p.rotation.y, p.rotation.z, p.rotation.w);
                 node.set_pose(Pose3::from_parts(pos, rot));
                 // Physics-truth foot clearance across the fleet.
                 for (p1, p2, r) in &mjcf[i].capsules {
@@ -2434,10 +2527,15 @@ mod ckpt_tests {
     fn handles_and_urls_people_actually_paste() {
         let want = "https://huggingface.co/haixuantao/zealot-g1-locomotion/resolve/main/g1_v24.safetensors";
         // The handle off the model page, with the file named.
-        assert_eq!(file("haixuantao/zealot-g1-locomotion/g1_v24.safetensors"), want);
+        assert_eq!(
+            file("haixuantao/zealot-g1-locomotion/g1_v24.safetensors"),
+            want
+        );
         // The page URL for that file ("blob"), and the raw one ("resolve").
         assert_eq!(
-            file("https://huggingface.co/haixuantao/zealot-g1-locomotion/blob/main/g1_v24.safetensors"),
+            file(
+                "https://huggingface.co/haixuantao/zealot-g1-locomotion/blob/main/g1_v24.safetensors"
+            ),
             want
         );
         assert_eq!(file(&format!("{want}?download=true")), want);
@@ -2453,10 +2551,16 @@ mod ckpt_tests {
             assert_eq!(repo(spec), "haixuantao/zealot-g1-locomotion", "{spec}");
         }
         // A non-Hub URL is taken at its word, and a bare word is a local file.
-        assert_eq!(file("https://example.org/p.safetensors"), "https://example.org/p.safetensors");
+        assert_eq!(
+            file("https://example.org/p.safetensors"),
+            "https://example.org/p.safetensors"
+        );
         assert_eq!(file("g1_walk_v24"), "g1_walk_v24.safetensors");
         // Percent-encoded, the way the picker passes it through the query.
-        assert_eq!(repo("haixuantao%2Fzealot-g1-locomotion"), "haixuantao/zealot-g1-locomotion");
+        assert_eq!(
+            repo("haixuantao%2Fzealot-g1-locomotion"),
+            "haixuantao/zealot-g1-locomotion"
+        );
     }
 
     #[test]
@@ -2490,12 +2594,18 @@ mod ckpt_tests {
     fn file_list_comes_out_of_the_hub_response() {
         let body = r#"{"id":"o/r","siblings":[{"rfilename":"README.md"},
             {"rfilename":"g1_v24.safetensors"},{"rfilename":"g1_v24.onnx"}]}"#;
-        assert_eq!(rfilenames(body), ["README.md", "g1_v24.safetensors", "g1_v24.onnx"]);
+        assert_eq!(
+            rfilenames(body),
+            ["README.md", "g1_v24.safetensors", "g1_v24.onnx"]
+        );
     }
 
     #[test]
     fn label_is_the_file_stem() {
-        assert_eq!(ckpt_label("o/r/g1_v24_iter32780.safetensors"), "g1_v24_iter32780");
+        assert_eq!(
+            ckpt_label("o/r/g1_v24_iter32780.safetensors"),
+            "g1_v24_iter32780"
+        );
         assert_eq!(
             ckpt_label("https://huggingface.co/o/r/resolve/main/a/b.safetensors"),
             "b"

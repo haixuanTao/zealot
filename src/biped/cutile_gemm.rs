@@ -546,7 +546,9 @@ mod real {
             let tile_bin = format!("{home}/cuda-13.3-tile/bin");
             if std::env::var("CUTILE_TILEIRAS_PATH").is_err() {
                 // SAFETY: single-threaded init, before any JIT compile.
-                unsafe { std::env::set_var("CUTILE_TILEIRAS_PATH", format!("{tile_bin}/tileiras")) };
+                unsafe {
+                    std::env::set_var("CUTILE_TILEIRAS_PATH", format!("{tile_bin}/tileiras"))
+                };
             }
             let path = std::env::var("PATH").unwrap_or_default();
             if !path.starts_with(&tile_bin) {
@@ -650,7 +652,13 @@ mod real {
             // strided element of the view; the view is cached in the leaked
             // adapter and never dropped.
             unsafe {
-                CtTensor::from_raw_parts(ptr, len_bytes, self.device_id, shape.to_vec(), strides.to_vec())
+                CtTensor::from_raw_parts(
+                    ptr,
+                    len_bytes,
+                    self.device_id,
+                    shape.to_vec(),
+                    strides.to_vec(),
+                )
             }
         }
 
@@ -679,7 +687,14 @@ mod real {
             (256, 128, 64),
         ];
 
-        fn tune_tiles<F>(&self, kind: u8, m: usize, n: usize, k: usize, run: F) -> (usize, usize, usize)
+        fn tune_tiles<F>(
+            &self,
+            kind: u8,
+            m: usize,
+            n: usize,
+            k: usize,
+            run: F,
+        ) -> (usize, usize, usize)
         where
             F: Fn((usize, usize, usize)) -> anyhow::Result<()>,
         {
@@ -1080,11 +1095,10 @@ mod real {
             let yv = self.view(y, m, n, false);
             let g_ptr = buf_ptr(g.buffer());
             let g_key = (g_ptr, [m as i32, n as i32], [n as i32, 1i32]);
-            let g_t = self
-                .outputs
-                .borrow_mut()
-                .remove(&g_key)
-                .unwrap_or_else(|| self.raw_view(g_ptr, [m as i32, n as i32], [n as i32, 1i32]));
+            let g_t =
+                self.outputs.borrow_mut().remove(&g_key).unwrap_or_else(|| {
+                    self.raw_view(g_ptr, [m as i32, n as i32], [n as i32, 1i32])
+                });
             let (g_back, _) = unsafe {
                 elu_backward_ct(g_t.partition([bm, bn]), yv)
                     .generics(vec![bm.to_string(), bn.to_string()])
@@ -1124,15 +1138,10 @@ mod real {
             };
             let tps = nt / splits;
             let (parts_back, _, _, _) = unsafe {
-                row_sum_split_ct(
-                    parts_t.partition([bm]),
-                    xv,
-                    row_tiles as i32,
-                    tps as i32,
-                )
-                .generics(vec![bm.to_string(), bn.to_string()])
-                .async_on(&self.stream)
-                .map_err(anyhow_err)?
+                row_sum_split_ct(parts_t.partition([bm]), xv, row_tiles as i32, tps as i32)
+                    .generics(vec![bm.to_string(), bn.to_string()])
+                    .async_on(&self.stream)
+                    .map_err(anyhow_err)?
             };
             let parts_t = parts_back.unpartition();
             let parts_ptr = parts_t.device_pointer().cu_deviceptr();
@@ -1152,7 +1161,13 @@ mod real {
                 Some(t) => t,
                 // SAFETY: same invariants as raw_view, rank-1.
                 None => unsafe {
-                    CtTensor::from_raw_parts(out_ptr, m * 4, self.device_id, vec![m as i32], vec![1])
+                    CtTensor::from_raw_parts(
+                        out_ptr,
+                        m * 4,
+                        self.device_id,
+                        vec![m as i32],
+                        vec![1],
+                    )
                 },
             };
             let (out_back, _, _) = unsafe {
@@ -1238,7 +1253,13 @@ mod real {
                 Some(t) => t,
                 // SAFETY: same invariants as raw_view, rank-1.
                 None => unsafe {
-                    CtTensor::from_raw_parts(out_ptr, m * 4, self.device_id, vec![m as i32], vec![1])
+                    CtTensor::from_raw_parts(
+                        out_ptr,
+                        m * 4,
+                        self.device_id,
+                        vec![m as i32],
+                        vec![1],
+                    )
                 },
             };
             let (out_back, _, _) = unsafe {
@@ -1262,8 +1283,8 @@ mod real {
             // (m, n, k, lhs_t, rhs_t) — ragged dims + a split-K trigger.
             let cases = [
                 (12usize, 300usize, 45usize, false, false),
-                (45, 300, 256, true, false),  // dgrad-style: Wᵀ · delta
-                (256, 45, 300, false, true),  // wgrad-style: delta · aᵀ
+                (45, 300, 256, true, false), // dgrad-style: Wᵀ · delta
+                (256, 45, 300, false, true), // wgrad-style: delta · aᵀ
                 (64, 96, 4096, false, true), // split-K path
                 // Split-K with ktiles NOT divisible by S (48 tiles / S=32):
                 // exercises the tail-chunk clamp (checked block access traps).
@@ -1287,7 +1308,11 @@ mod real {
                 let rhs_base = if rt { rhs_m.transpose() } else { rhs_m.clone() };
                 let gl = vortx::tensor::Tensor::matrix_from_na(bk, &lhs_base, rw)?;
                 let gr = vortx::tensor::Tensor::matrix_from_na(bk, &rhs_base, rw)?;
-                let go = vortx::tensor::Tensor::matrix_from_na(bk, &DMatrix::<f32>::from_element(m, n, 7.7), rw)?;
+                let go = vortx::tensor::Tensor::matrix_from_na(
+                    bk,
+                    &DMatrix::<f32>::from_element(m, n, 7.7),
+                    rw,
+                )?;
                 self.gemm(&go, &gl, lt, &gr, rt, m, n, k)?;
                 bk.synchronize().map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 let got = bk

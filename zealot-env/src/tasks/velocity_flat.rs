@@ -29,7 +29,7 @@
 
 use crate::math::{quat_rotate, quat_rotate_inv};
 use crate::rng::Lcg;
-use crate::robots::{RobotSpec, NUM_JOINTS};
+use crate::robots::{NUM_JOINTS, RobotSpec};
 
 /// Body axis indices under the Z-up convention (see module docs).
 pub const FWD: usize = 0;
@@ -661,7 +661,7 @@ impl Default for RewardWeights {
             // "swing → settle → swing" cycle without farmable waddle.
             action_rate_rate: 0.0, // off — enable with BIPED_W_ACTION_RATE_RATE
             touchdown_vz: 0.0,     // off — enable with BIPED_W_TOUCHDOWN_VZ
-            touchdown_vz_ok: 0.2, // was 0.3 — landings beyond 0.2 m/s now cost
+            touchdown_vz_ok: 0.2,  // was 0.3 — landings beyond 0.2 m/s now cost
             touchdown_vz_h: 0.10,
             force_rate: 0.0, // off by default — enable with BIPED_W_FORCE_RATE
             force_rate_deadband: 0.15,
@@ -678,11 +678,11 @@ impl Default for RewardWeights {
             foot_clearance_target: 0.03, // (unused at weight 0; kept for the gated compute)
             foot_orientation: -0.01,     // WBC feet_roll_l2 -0.01 (was -0.5)
             feet_yaw_mean: -0.4,         // WBC feet_yaw_mean_vs_base -0.4 (was -2.0)
-            feet_yaw_diff: 0.0, // OFF: keeps the tuned baseline reward unchanged
+            feet_yaw_diff: 0.0,          // OFF: keeps the tuned baseline reward unchanged
             // (runs are compared against a pinned iter-0 reference). WBC has it
             // in every config (G1 -0.1, lerobot -0.02); enable via agile() or a
             // struct update when the next baseline is re-pinned.
-            feet_distance: -0.02,        // WBC feet_distance_from_ref -0.02 (was -0.1)
+            feet_distance: -0.02, // WBC feet_distance_from_ref -0.02 (was -0.1)
             feet_distance_ref: 0.2,
             gait_clock: 3.0, // dense periodic gait reward (the load-bearing
             // stepping signal). Symmetric ±: standing during a
@@ -962,7 +962,10 @@ impl VelocityFlatTask {
                     k += 1;
                 }
             }
-            assert!(k == 2 || k == 0, "expected 0 or 2 ankle_roll joints, found {k}");
+            assert!(
+                k == 2 || k == 0,
+                "expected 0 or 2 ankle_roll joints, found {k}"
+            );
             if k == 0 {
                 // Model without named ankle rolls (lerobot): point at the
                 // hips so the extra terms are duplicates, not garbage.
@@ -1089,8 +1092,7 @@ impl VelocityFlatTask {
             sym_yaw_gate: env_f32("BIPED_SYM_YAW_GATE").unwrap_or(0.0),
             step_relax_dist: env_f32("BIPED_STEP_RELAX_DIST").unwrap_or(0.6),
             step_std_base_h: env_f32("BIPED_STEP_STD_BASE_H").unwrap_or(0.15),
-            step_std_upright: env_f32("BIPED_STEP_STD_UPRIGHT")
-                .unwrap_or(25.0_f32.to_radians()),
+            step_std_upright: env_f32("BIPED_STEP_STD_UPRIGHT").unwrap_or(25.0_f32.to_radians()),
         }
     }
 
@@ -1204,8 +1206,24 @@ impl VelocityFlatTask {
         // still act on.
         let cue = state.step_cue;
         let live = cue.valid > 0.5;
-        put(obs, &mut o, if live { cue.distance.clamp(-0.5, 1.5) } else { 0.0 });
-        put(obs, &mut o, if live { cue.height.clamp(-0.4, 0.4) } else { 0.0 });
+        put(
+            obs,
+            &mut o,
+            if live {
+                cue.distance.clamp(-0.5, 1.5)
+            } else {
+                0.0
+            },
+        );
+        put(
+            obs,
+            &mut o,
+            if live {
+                cue.height.clamp(-0.4, 0.4)
+            } else {
+                0.0
+            },
+        );
         put(obs, &mut o, if live { cue.edge_sin } else { 0.0 });
         put(obs, &mut o, if live { cue.edge_cos } else { 0.0 });
         put(obs, &mut o, if live { 1.0 } else { 0.0 });
@@ -1234,8 +1252,16 @@ impl VelocityFlatTask {
         // fills with the raw oracle BEFORE actor-side noise and dropout.
         let cc = state.step_cue_clean;
         let live = cc.valid > 0.5;
-        obs[OBS_DIM + 6] = if live { cc.distance.clamp(-0.5, 1.5) } else { 0.0 };
-        obs[OBS_DIM + 7] = if live { cc.height.clamp(-0.4, 0.4) } else { 0.0 };
+        obs[OBS_DIM + 6] = if live {
+            cc.distance.clamp(-0.5, 1.5)
+        } else {
+            0.0
+        };
+        obs[OBS_DIM + 7] = if live {
+            cc.height.clamp(-0.4, 0.4)
+        } else {
+            0.0
+        };
         obs[OBS_DIM + 8] = if live { cc.edge_sin } else { 0.0 };
         obs[OBS_DIM + 9] = if live { cc.edge_cos } else { 0.0 };
         obs[OBS_DIM + 10] = if live { 1.0 } else { 0.0 };
@@ -1295,8 +1321,7 @@ impl VelocityFlatTask {
         // motion toward the edge means a loiterer faces the normal kernels and
         // the zone pays nothing unless the manoeuvre is actually happening.
         // Threshold 0.1 m/s matches the standing predicate's scale.
-        let toward_step =
-            v[FWD] * state.step_cue.edge_cos + v[LAT] * state.step_cue.edge_sin;
+        let toward_step = v[FWD] * state.step_cue.edge_cos + v[LAT] * state.step_cue.edge_sin;
         let stepping = state.step_cue.valid > 0.5
             && state.step_cue.distance.abs() < self.step_relax_dist
             && toward_step > 0.1;
@@ -1559,8 +1584,7 @@ impl VelocityFlatTask {
         // term would have none of them.
         const STEP_CLEAR_MARGIN: f32 = 0.05;
         let clear_target = if stepping && state.step_cue.height > 0.0 {
-            (state.step_cue.height + STEP_CLEAR_MARGIN)
-                .max(self.weights.foot_clearance_target)
+            (state.step_cue.height + STEP_CLEAR_MARGIN).max(self.weights.foot_clearance_target)
         } else {
             self.weights.foot_clearance_target
         };
@@ -1980,12 +2004,20 @@ mod tests {
         // The adaptive bar inherits the progress gate: it only raises while
         // actually moving toward the edge.
         st.base.lin_vel_world = [0.4, 0.0, 0.0];
-        let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
+        let cmd = VelocityCommand {
+            vx: 0.4,
+            vy: 0.0,
+            yaw_rate: 0.0,
+        };
 
         let flat = task.reward(&st, &cmd).foot_clearance;
         let mut stepping = st;
         stepping.step_cue = StepCue {
-            distance: 0.3, height: 0.20, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0,
+            distance: 0.3,
+            height: 0.20,
+            edge_sin: 0.0,
+            edge_cos: 1.0,
+            valid: 1.0,
         };
         let on_step = task.reward(&stepping, &cmd).foot_clearance;
         assert!(
@@ -2015,7 +2047,11 @@ mod tests {
         task.stds.base_height = 0.05;
         task.weights.base_height_target = 0.82;
         task.weights.base_height_target_stand = 0.82;
-        let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
+        let cmd = VelocityCommand {
+            vx: 0.4,
+            vy: 0.0,
+            yaw_rate: 0.0,
+        };
 
         // Off the target by 0.20 m -- what crossing a 0.20 m edge looks like.
         let mut st = RobotState::default();
@@ -2025,12 +2061,19 @@ mod tests {
         st.base.lin_vel_world = [0.3, 0.0, 0.0];
         let no_cue = task.reward(&st, &cmd);
         let mut cued = st;
-        cued.step_cue = StepCue { distance: 0.3, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
+        cued.step_cue = StepCue {
+            distance: 0.3,
+            height: 0.2,
+            edge_sin: 0.0,
+            edge_cos: 1.0,
+            valid: 1.0,
+        };
         let with_cue = task.reward(&cued, &cmd);
         assert!(
             with_cue.base_height > no_cue.base_height,
             "relaxation did not fire while approaching a cued step ({} vs {})",
-            with_cue.base_height, no_cue.base_height
+            with_cue.base_height,
+            no_cue.base_height
         );
 
         // LOITERING in the zone (cued, close, but stationary) must get the
@@ -2052,9 +2095,16 @@ mod tests {
         // Cue valid but FAR: no relaxation, so the robot is not given a licence
         // to slouch merely because a step exists somewhere ahead.
         let mut far = st;
-        far.step_cue = StepCue { distance: 1.4, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
+        far.step_cue = StepCue {
+            distance: 1.4,
+            height: 0.2,
+            edge_sin: 0.0,
+            edge_cos: 1.0,
+            valid: 1.0,
+        };
         assert_eq!(
-            task.reward(&far, &cmd).base_height, no_cue.base_height,
+            task.reward(&far, &cmd).base_height,
+            no_cue.base_height,
             "relaxation fired for a step 1.4 m away"
         );
     }
@@ -2070,11 +2120,23 @@ mod tests {
         let cmd = VelocityCommand::default();
         let mut obs = vec![0.0; OBS_DIM];
 
-        st.step_cue = StepCue { distance: 0.42, height: 0.18, edge_sin: 0.5, edge_cos: 0.87, valid: 0.0 };
+        st.step_cue = StepCue {
+            distance: 0.42,
+            height: 0.18,
+            edge_sin: 0.5,
+            edge_cos: 0.87,
+            valid: 0.0,
+        };
         task.observe(&st, &cmd, &mut obs);
         assert_eq!(&obs[48..53], &[0.0; 5], "stale cue leaked through valid=0");
 
-        st.step_cue = StepCue { distance: 0.42, height: 0.18, edge_sin: 0.5, edge_cos: 0.87, valid: 1.0 };
+        st.step_cue = StepCue {
+            distance: 0.42,
+            height: 0.18,
+            edge_sin: 0.5,
+            edge_cos: 0.87,
+            valid: 1.0,
+        };
         task.observe(&st, &cmd, &mut obs);
         assert_eq!(&obs[48..53], &[0.42, 0.18, 0.5, 0.87, 1.0]);
     }
@@ -2087,15 +2149,28 @@ mod tests {
         let task = VelocityFlatTask::for_robot(crate::robots::lerobot_bipedal::lerobot());
         let mut st = RobotState::default();
         st.joint_pos[3] = 0.3;
-        let cmd = VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 };
+        let cmd = VelocityCommand {
+            vx: 0.4,
+            vy: 0.0,
+            yaw_rate: 0.0,
+        };
         let mut with = vec![0.0; OBS_DIM];
         task.observe(&st, &cmd, &mut with);
         let mut cued = vec![0.0; OBS_DIM];
         let mut st2 = st;
-        st2.step_cue = StepCue { distance: 1.0, height: 0.2, edge_sin: 0.0, edge_cos: 1.0, valid: 1.0 };
+        st2.step_cue = StepCue {
+            distance: 1.0,
+            height: 0.2,
+            edge_sin: 0.0,
+            edge_cos: 1.0,
+            valid: 1.0,
+        };
         task.observe(&st2, &cmd, &mut cued);
-        assert_eq!(with[..48], cued[..48],
-                   "setting the step cue changed a pre-existing observation slot");
+        assert_eq!(
+            with[..48],
+            cued[..48],
+            "setting the step cue changed a pre-existing observation slot"
+        );
     }
 
     #[test]
@@ -2127,7 +2202,10 @@ mod tests {
         q[task.robot.mirror[lat]] = 0.2;
         let full = task.symmetry_error(&q, 1.0);
         let released = task.symmetry_error(&q, 0.0);
-        assert!(full > 0.0, "coordinated hip yaw should violate lateral mirror");
+        assert!(
+            full > 0.0,
+            "coordinated hip yaw should violate lateral mirror"
+        );
         assert_eq!(released, 0.0, "gate should fully release the lateral term");
 
         // Sagittal asymmetry must be charged at FULL weight whatever the gate.
@@ -2186,20 +2264,36 @@ mod moving_gate_tests {
         planted.feet[0].contact = true;
         planted.feet[0].air_time = 0.0;
         assert!(
-            task.reward(&planted, &VelocityCommand::default()).single_support > 0.0,
+            task.reward(&planted, &VelocityCommand::default())
+                .single_support
+                > 0.0,
             "single_support should REWARD both feet planted at zero command"
         );
         // ...and stand_planted must actively CHARGE for the airborne foot.
-        assert!(stand.stand_planted < 0.0, "stand_planted did not charge: {}", stand.stand_planted);
+        assert!(
+            stand.stand_planted < 0.0,
+            "stand_planted did not charge: {}",
+            stand.stand_planted
+        );
 
         // Same state under a moving command: the stepping terms come alive, so
         // the assertions above are testing the GATE, not a dead code path.
         let moving = task.reward(
             &st,
-            &VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 },
+            &VelocityCommand {
+                vx: 0.4,
+                vy: 0.0,
+                yaw_rate: 0.0,
+            },
         );
-        assert!(moving.gait_clock != 0.0, "gait_clock never fires even when moving");
-        assert_eq!(moving.stand_planted, 0.0, "stand_planted fired while moving");
+        assert!(
+            moving.gait_clock != 0.0,
+            "gait_clock never fires even when moving"
+        );
+        assert_eq!(
+            moving.stand_planted, 0.0,
+            "stand_planted fired while moving"
+        );
     }
 
     /// The standing height target must apply ONLY at a standing command, and
@@ -2219,7 +2313,14 @@ mod moving_gate_tests {
         st.base.height = 0.835;
         let standing = task.reward(&st, &VelocityCommand::default()).base_height;
         let moving = task
-            .reward(&st, &VelocityCommand { vx: 0.4, vy: 0.0, yaw_rate: 0.0 })
+            .reward(
+                &st,
+                &VelocityCommand {
+                    vx: 0.4,
+                    vy: 0.0,
+                    yaw_rate: 0.0,
+                },
+            )
             .base_height;
         assert!(
             standing > moving,
@@ -2229,16 +2330,25 @@ mod moving_gate_tests {
         // Yaw-only is MOVING (same predicate as the gait clock), so a pure turn
         // must use the walking target, not the standing one.
         let turning = task
-            .reward(&st, &VelocityCommand { vx: 0.0, vy: 0.0, yaw_rate: 0.4 })
+            .reward(
+                &st,
+                &VelocityCommand {
+                    vx: 0.0,
+                    vy: 0.0,
+                    yaw_rate: 0.4,
+                },
+            )
             .base_height;
-        assert_eq!(turning, moving, "a pure yaw command must use the MOVING target");
+        assert_eq!(
+            turning, moving,
+            "a pure yaw command must use the MOVING target"
+        );
 
         // Default: the stand target sits 1 cm above the moving target (the
         // production preference — v24 measured 0.816 standing vs 0.807 walking).
         let plain = launcher_task();
         assert!(
-            (plain.weights.base_height_target_stand
-                - (plain.weights.base_height_target + 0.01))
+            (plain.weights.base_height_target_stand - (plain.weights.base_height_target + 0.01))
                 .abs()
                 < 1e-6,
             "the stand target must default to the moving target + 0.01"
@@ -2255,10 +2365,30 @@ mod moving_gate_tests {
         st.feet[0].contact = false;
         st.feet[0].air_time = 0.1;
         st.feet[1].contact = true;
-        let turn = task.reward(&st, &VelocityCommand { vx: 0.0, vy: 0.0, yaw_rate: 0.4 });
-        assert_eq!(turn.stand_planted, 0.0, "a yaw command was treated as standing");
+        let turn = task.reward(
+            &st,
+            &VelocityCommand {
+                vx: 0.0,
+                vy: 0.0,
+                yaw_rate: 0.4,
+            },
+        );
+        assert_eq!(
+            turn.stand_planted, 0.0,
+            "a yaw command was treated as standing"
+        );
         // And a sub-threshold command IS standing.
-        let tiny = task.reward(&st, &VelocityCommand { vx: 0.05, vy: 0.0, yaw_rate: 0.0 });
-        assert!(tiny.stand_planted < 0.0, "a 0.05 command was treated as moving");
+        let tiny = task.reward(
+            &st,
+            &VelocityCommand {
+                vx: 0.05,
+                vy: 0.0,
+                yaw_rate: 0.0,
+            },
+        );
+        assert!(
+            tiny.stand_planted < 0.0,
+            "a 0.05 command was treated as moving"
+        );
     }
 }

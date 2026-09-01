@@ -39,20 +39,20 @@ use khal::BufferUsages;
 use khal::Shader;
 use khal::backend::{Backend, Encoder, GpuBackend};
 use nalgebra::DMatrix;
+use rayon::prelude::*;
 use std::time::Instant;
 use vortx::linalg::{
     Activation, Adam, AdamParams, Contiguous, Gemm, OpAssign, OpAssignVariant, Ppo, PpoActorParams,
     PpoStageParams, PpoValueParams, Reduce, ReduceVariant,
 };
-use rayon::prelude::*;
 use vortx::shapes::TensorLayoutBuffers;
 use vortx::tensor::Tensor;
-use zealot_env::robots::{RobotSpec, NUM_JOINTS};
+use zealot_env::robots::{NUM_JOINTS, RobotSpec};
 use zealot_rl::ActorCritic;
 use zealot_rl::net::Mlp;
 use zealot_rl::ppo::{Sample, gae};
-use zealot_rl::trainstate::{MomentSet, TrainState, sidecar_path};
 use zealot_rl::rng::Lcg;
+use zealot_rl::trainstate::{MomentSet, TrainState, sidecar_path};
 
 const LOG_SQRT_2PI: f32 = 0.918_938_5;
 const T: usize = 24; // rollout horizon
@@ -237,11 +237,19 @@ const HSIGN: [f32; 13] = [
     -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0,
 ];
 const HELD_NAMES: [&str; 13] = [
-    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
-    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
-    "left_elbow_joint", "left_wrist_roll_joint",
-    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
-    "right_elbow_joint", "right_wrist_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
 ];
 
 // With BIPED_OBS_HISTORY the actor obs is H stacked 45-frames — the mirror is
@@ -295,7 +303,10 @@ fn mirror_table(dim: usize, f: impl Fn(&[f32]) -> Vec<f32>) -> (Vec<u32>, Vec<f3
                 *v == 1.0 || *v == -1.0,
                 "mirror entry ({r},{j}) = {v}, expected ±1 (not a signed permutation)"
             );
-            assert!(perm[r] == u32::MAX, "mirror maps two inputs onto output {r}");
+            assert!(
+                perm[r] == u32::MAX,
+                "mirror maps two inputs onto output {r}"
+            );
             perm[r] = j as u32;
             sign[r] = *v;
         }
@@ -311,7 +322,11 @@ fn mirror_sample(s: &Sample) -> Sample {
         // Empty unless a consumer still needs host obs — see `keep_obs`. The
         // batch (both halves) and the mirror-loss target are built on device
         // from the raw observations, so nothing reads these by default.
-        obs: if s.obs.is_empty() { Vec::new() } else { mirror_obs(&s.obs) },
+        obs: if s.obs.is_empty() {
+            Vec::new()
+        } else {
+            mirror_obs(&s.obs)
+        },
         critic_obs: if s.critic_obs.is_empty() {
             Vec::new()
         } else {
@@ -680,7 +695,13 @@ impl GpuMlp {
             mb.push(bk.slow_read_vec(self.mb[i].buffer()).await.unwrap()[..out].to_vec());
             vb.push(bk.slow_read_vec(self.vb[i].buffer()).await.unwrap()[..out].to_vec());
         }
-        MomentSet { dims: self.dims.clone(), mw, vw, mb, vb }
+        MomentSet {
+            dims: self.dims.clone(),
+            mw,
+            vw,
+            mb,
+            vb,
+        }
     }
 
     /// Restore moments saved by [`read_moments`](Self::read_moments).
@@ -870,7 +891,9 @@ fn main() {
             - 1;
         let mut dev_obs_ready = false;
         if gpu_obs_dev {
-            eprintln!("[launch] BIPED_GPU_OBS: device obs -> policy (host keeps 1/16 stats subsample)");
+            eprintln!(
+                "[launch] BIPED_GPU_OBS: device obs -> policy (host keeps 1/16 stats subsample)"
+            );
         }
         // Mirror as an explicit signed permutation, cross-checked against the
         // real mirror functions before anything depends on it.
@@ -883,9 +906,19 @@ fn main() {
         let t_sc = Tensor::vector(&bk, &mirror_sign_cobs, BufferUsages::STORAGE).unwrap();
         // Identity tables for the un-mirrored halves (the stage kernel always
         // applies `perm`/`sign`).
-        let t_po_id = Tensor::vector(&bk, &(0..od as u32).collect::<Vec<u32>>(), BufferUsages::STORAGE).unwrap();
+        let t_po_id = Tensor::vector(
+            &bk,
+            &(0..od as u32).collect::<Vec<u32>>(),
+            BufferUsages::STORAGE,
+        )
+        .unwrap();
         let t_so_id = Tensor::vector(&bk, &vec![1.0f32; od], BufferUsages::STORAGE).unwrap();
-        let t_pc_id = Tensor::vector(&bk, &(0..cd as u32).collect::<Vec<u32>>(), BufferUsages::STORAGE).unwrap();
+        let t_pc_id = Tensor::vector(
+            &bk,
+            &(0..cd as u32).collect::<Vec<u32>>(),
+            BufferUsages::STORAGE,
+        )
+        .unwrap();
         let t_sc_id = Tensor::vector(&bk, &vec![1.0f32; cd], BufferUsages::STORAGE).unwrap();
         // The HMIRROR/HSIGN tables above assume the G1 29-DOF held-joint
         // staging order; a robot with a different held set must fail here, not
@@ -911,7 +944,10 @@ fn main() {
             let mc = (0..cd)
                 .map(|i| (mirror_sign_cobs[i] * xc[mirror_perm_cobs[i] as usize] - rc[i]).abs())
                 .fold(0.0f32, f32::max);
-            assert!(mo == 0.0 && mc == 0.0, "mirror table mismatch: obs {mo}, critic {mc}");
+            assert!(
+                mo == 0.0 && mc == 0.0,
+                "mirror table mismatch: obs {mo}, critic {mc}"
+            );
             println!(
                 "device batch staging ENABLED: mirror table verified (obs {od}, critic {cd}, exact)"
             );
@@ -1111,7 +1147,9 @@ fn main() {
         }
         let norm_freeze = std::env::var("BIPED_NORM_FREEZE").map_or(true, |v| v != "0");
         if norm_freeze {
-            println!("obs-normalizer FREEZE enabled: per-iteration stats snapshot (exact PPO ratios)");
+            println!(
+                "obs-normalizer FREEZE enabled: per-iteration stats snapshot (exact PPO ratios)"
+            );
         }
         // Persistent device-side PPO batch tensors (obs, critic).
         let mut stage_out: Option<(Tensor<f32>, Tensor<f32>, Option<Tensor<f32>>)> = None;
@@ -1200,9 +1238,13 @@ fn main() {
             // Linear 0.9 -> 0.1 over the first 30% of the run, then the
             // deploy-level 0.1 (matching BIPED_STEP_CUE_DROPOUT's default).
             let cue_hi: f32 = std::env::var("BIPED_STEP_CUE_DROPOUT_INIT")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.9);
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.9);
             let cue_lo: f32 = std::env::var("BIPED_STEP_CUE_DROPOUT")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.10);
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.10);
             let cue_frac = (frac / 0.3).clamp(0.0, 1.0);
             env.set_step_cue_dropout(cue_hi + (cue_lo - cue_hi) * cue_frac);
 
@@ -1533,22 +1575,130 @@ fn main() {
                     // Batch layout is [mirrored; originals]: mirror tables for
                     // the first half, identity for the second.
                     if mirror_aug {
-                        ppo.stage_batch(&mut pass, &po0, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po, &t_so, &mut *f_obs, half as u32, od as u32).unwrap();
-                        ppo.stage_batch(&mut pass, &po1, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po_id, &t_so_id, &mut *f_obs, half as u32, od as u32).unwrap();
-                        ppo.stage_batch(&mut pass, &pc0, gpu.raw_cobs(), &nb.mean_c, &nb.inv_c, &t_pc, &t_sc, &mut *f_cobs, half as u32, cd as u32).unwrap();
-                        ppo.stage_batch(&mut pass, &pc1, gpu.raw_cobs(), &nb.mean_c, &nb.inv_c, &t_pc_id, &t_sc_id, &mut *f_cobs, half as u32, cd as u32).unwrap();
+                        ppo.stage_batch(
+                            &mut pass,
+                            &po0,
+                            gpu.raw_obs(),
+                            &nb.mean_o,
+                            &nb.inv_o,
+                            &t_po,
+                            &t_so,
+                            &mut *f_obs,
+                            half as u32,
+                            od as u32,
+                        )
+                        .unwrap();
+                        ppo.stage_batch(
+                            &mut pass,
+                            &po1,
+                            gpu.raw_obs(),
+                            &nb.mean_o,
+                            &nb.inv_o,
+                            &t_po_id,
+                            &t_so_id,
+                            &mut *f_obs,
+                            half as u32,
+                            od as u32,
+                        )
+                        .unwrap();
+                        ppo.stage_batch(
+                            &mut pass,
+                            &pc0,
+                            gpu.raw_cobs(),
+                            &nb.mean_c,
+                            &nb.inv_c,
+                            &t_pc,
+                            &t_sc,
+                            &mut *f_cobs,
+                            half as u32,
+                            cd as u32,
+                        )
+                        .unwrap();
+                        ppo.stage_batch(
+                            &mut pass,
+                            &pc1,
+                            gpu.raw_cobs(),
+                            &nb.mean_c,
+                            &nb.inv_c,
+                            &t_pc_id,
+                            &t_sc_id,
+                            &mut *f_cobs,
+                            half as u32,
+                            cd as u32,
+                        )
+                        .unwrap();
                     } else {
-                        ppo.stage_batch(&mut pass, &po0, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po_id, &t_so_id, &mut *f_obs, total as u32, od as u32).unwrap();
-                        ppo.stage_batch(&mut pass, &pc0, gpu.raw_cobs(), &nb.mean_c, &nb.inv_c, &t_pc_id, &t_sc_id, &mut *f_cobs, total as u32, cd as u32).unwrap();
+                        ppo.stage_batch(
+                            &mut pass,
+                            &po0,
+                            gpu.raw_obs(),
+                            &nb.mean_o,
+                            &nb.inv_o,
+                            &t_po_id,
+                            &t_so_id,
+                            &mut *f_obs,
+                            total as u32,
+                            od as u32,
+                        )
+                        .unwrap();
+                        ppo.stage_batch(
+                            &mut pass,
+                            &pc0,
+                            gpu.raw_cobs(),
+                            &nb.mean_c,
+                            &nb.inv_c,
+                            &t_pc_id,
+                            &t_sc_id,
+                            &mut *f_cobs,
+                            total as u32,
+                            cd as u32,
+                        )
+                        .unwrap();
                     }
                     // Mirror-loss target: the same staging with each half using
                     // the other tables (mirror of mirror = identity).
                     if let Some(mir) = f_obs_mir_buf.as_mut() {
                         if mirror_aug {
-                            ppo.stage_batch(&mut pass, &po0, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po_id, &t_so_id, &mut *mir, half as u32, od as u32).unwrap();
-                            ppo.stage_batch(&mut pass, &po1, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po, &t_so, &mut *mir, half as u32, od as u32).unwrap();
+                            ppo.stage_batch(
+                                &mut pass,
+                                &po0,
+                                gpu.raw_obs(),
+                                &nb.mean_o,
+                                &nb.inv_o,
+                                &t_po_id,
+                                &t_so_id,
+                                &mut *mir,
+                                half as u32,
+                                od as u32,
+                            )
+                            .unwrap();
+                            ppo.stage_batch(
+                                &mut pass,
+                                &po1,
+                                gpu.raw_obs(),
+                                &nb.mean_o,
+                                &nb.inv_o,
+                                &t_po,
+                                &t_so,
+                                &mut *mir,
+                                half as u32,
+                                od as u32,
+                            )
+                            .unwrap();
                         } else {
-                            ppo.stage_batch(&mut pass, &po0, gpu.raw_obs(), &nb.mean_o, &nb.inv_o, &t_po, &t_so, &mut *mir, total as u32, od as u32).unwrap();
+                            ppo.stage_batch(
+                                &mut pass,
+                                &po0,
+                                gpu.raw_obs(),
+                                &nb.mean_o,
+                                &nb.inv_o,
+                                &t_po,
+                                &t_so,
+                                &mut *mir,
+                                total as u32,
+                                od as u32,
+                            )
+                            .unwrap();
                         }
                     }
                 }
@@ -1584,7 +1734,11 @@ fn main() {
                     worst
                 };
                 let wo = chk(od, &dev, &aff_o, &|c| {
-                    if c < half { mirror_obs(&batch[c + half].obs) } else { batch[c].obs.clone() }
+                    if c < half {
+                        mirror_obs(&batch[c + half].obs)
+                    } else {
+                        batch[c].obs.clone()
+                    }
                 });
                 let wc = chk(cd, &devc, &aff_c, &|c| {
                     if c < half {
@@ -1621,8 +1775,9 @@ fn main() {
                 ac.obs_norm.commit(&mut pn_obs);
                 ac.critic_norm.commit(&mut pn_cobs);
             }
-            let f_act =
-                stage_rows(&bk, ad_, total, None, st, |c| &act_arena[c * ad_..(c + 1) * ad_]);
+            let f_act = stage_rows(&bk, ad_, total, None, st, |c| {
+                &act_arena[c * ad_..(c + 1) * ad_]
+            });
             let f_adv = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].adv), st);
             let f_lpo = mk(
                 &bk,
@@ -1636,7 +1791,10 @@ fn main() {
             );
             let f_ret = mk(&bk, &DMatrix::from_fn(1, total, |_, c| batch[c].ret), st);
             if std::env::var("BIPED_UPD_PROF2").is_ok() {
-                eprintln!("[prof-upd2] stage_dev={stg_dev_s:.3}s stage_h2d={:.3}s", t_stg_h2d.elapsed().as_secs_f64());
+                eprintln!(
+                    "[prof-upd2] stage_dev={stg_dev_s:.3}s stage_h2d={:.3}s",
+                    t_stg_h2d.elapsed().as_secs_f64()
+                );
             }
             let ap = Tensor::scalar(
                 &bk,
@@ -1724,9 +1882,8 @@ fn main() {
                         let sig_old2 = (2.0 * ls_old).exp();
                         let inv_sig_new2 = (-2.0 * ls_new).exp();
                         let dmu = mn[k * mb + c] - mean_old_last[c][k];
-                        kl0 += (ls_new - ls_old)
-                            + 0.5 * (sig_old2 + dmu * dmu) * inv_sig_new2
-                            - 0.5;
+                        kl0 +=
+                            (ls_new - ls_old) + 0.5 * (sig_old2 + dmu * dmu) * inv_sig_new2 - 0.5;
                     }
                 }
                 kl0 /= mb as f32;
@@ -2054,9 +2211,7 @@ fn main() {
                         let sig_old2 = (2.0 * ls_old).exp();
                         let inv_sig_new2 = (-2.0 * ls_new).exp();
                         let dmu = mn[k * mb + c] - mean_old_last[c][k];
-                        kl += (ls_new - ls_old)
-                            + 0.5 * (sig_old2 + dmu * dmu) * inv_sig_new2
-                            - 0.5;
+                        kl += (ls_new - ls_old) + 0.5 * (sig_old2 + dmu * dmu) * inv_sig_new2 - 0.5;
                     }
                 }
                 kl /= mb as f32;
@@ -2267,7 +2422,9 @@ fn main() {
             let sc = sidecar_path(&ckpt);
             match ts.save(&sc) {
                 Ok(()) => println!("saved → {ckpt} (latest) + {sc} (optimizer state, resumable)"),
-                Err(e) => println!("saved → {ckpt} (latest); WARNING {sc} failed ({e}) — a resume will cold-start Adam"),
+                Err(e) => println!(
+                    "saved → {ckpt} (latest); WARNING {sc} failed ({e}) — a resume will cold-start Adam"
+                ),
             }
             println!("best policy at {ckpt}.best (reward-EMA {best_ema:.4})");
         }

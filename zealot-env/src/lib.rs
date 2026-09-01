@@ -51,9 +51,9 @@
 //!               driving nexus's batched pipeline across all parallel environments.
 
 pub mod config;
+pub mod knobs;
 pub mod math;
 pub mod motion;
-pub mod knobs;
 pub mod obs_history;
 pub mod rng;
 pub mod robots;
@@ -62,7 +62,7 @@ pub mod terrain;
 
 pub use config::{BodyState, EnvConfig};
 pub use obs_history::ObsHistory;
-pub use robots::{JointSpec, LeRobotBipedal, RobotSpec, NUM_JOINTS};
+pub use robots::{JointSpec, LeRobotBipedal, NUM_JOINTS, RobotSpec};
 pub use tasks::VelocityFlatTask;
 
 /// Crate version — used to sanity-check that the workspace links.

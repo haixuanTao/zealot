@@ -415,26 +415,42 @@ fn main() {
         // as biped_train_gpu, so the bench measures the current fast path.
         let ct: Option<&'static CutileGemm> = CutileGemm::init(env.backend()).await;
         gpu.set_cutile(ct);
-        gpu.init_raw_batch(env.backend(), t_steps).expect("raw batch buffers");
+        gpu.init_raw_batch(env.backend(), t_steps)
+            .expect("raw batch buffers");
         {
             let bk = env.backend();
             let aff_o = ac2.obs_norm.affine();
             let aff_c = ac2.critic_norm.affine();
             let up = |v: &[f32]| Tensor::vector(bk, v, BufferUsages::STORAGE).unwrap();
-            let idp = |d: usize| Tensor::vector(bk, &(0..d as u32).collect::<Vec<u32>>(), BufferUsages::STORAGE).unwrap();
-            let ones = |d: usize| Tensor::vector(bk, &vec![1.0f32; d], BufferUsages::STORAGE).unwrap();
+            let idp = |d: usize| {
+                Tensor::vector(
+                    bk,
+                    &(0..d as u32).collect::<Vec<u32>>(),
+                    BufferUsages::STORAGE,
+                )
+                .unwrap()
+            };
+            let ones =
+                |d: usize| Tensor::vector(bk, &vec![1.0f32; d], BufferUsages::STORAGE).unwrap();
             gpu.set_norm(gpu_policy::NormBufs {
-                mean_o: up(&aff_o.0), inv_o: up(&aff_o.1),
-                mean_c: up(&aff_c.0), inv_c: up(&aff_c.1),
-                perm_o: idp(od), sign_o: ones(od),
-                perm_c: idp(cd), sign_c: ones(cd),
+                mean_o: up(&aff_o.0),
+                inv_o: up(&aff_o.1),
+                mean_c: up(&aff_c.0),
+                inv_c: up(&aff_c.1),
+                perm_o: idp(od),
+                sign_o: ones(od),
+                perm_c: idp(cd),
+                sign_c: ones(cd),
             });
         }
         let (mut gc, mut gcc) = env.initial_obs().await;
         // Warm the policy forward once, untimed: cuTile JITs per-shape kernels
         // on first use (~2 s); a training run pays that once per process, so the
         // steady-state iteration shouldn't carry it.
-        let _ = gpu.forward(env.backend(), &ac2, &gc, &gcc, 0).await.unwrap();
+        let _ = gpu
+            .forward(env.backend(), &ac2, &gc, &gcc, 0)
+            .await
+            .unwrap();
         let mut samp: Vec<Vec<Sample>> = (0..n).map(|_| Vec::with_capacity(t_steps)).collect();
         let (mut rs, mut vs, mut ds): (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<bool>>) = (
             (0..n).map(|_| vec![]).collect(),
@@ -454,7 +470,10 @@ fn main() {
             }
             t_rec += t.elapsed().as_nanos();
             let t = Instant::now();
-            let (means, values) = gpu.forward(env.backend(), &ac2, &gc, &gcc, step_i).await.unwrap();
+            let (means, values) = gpu
+                .forward(env.backend(), &ac2, &gc, &gcc, step_i)
+                .await
+                .unwrap();
             t_fwd += t.elapsed().as_nanos();
             let t = Instant::now();
             let mut acts = Vec::with_capacity(n);

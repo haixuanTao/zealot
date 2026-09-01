@@ -43,7 +43,12 @@ fn full_body_agile_legs_match() {
     let full = unitree_g1_29dof_agile();
     for (a, b) in legs.joints.iter().zip(full.joints.iter()) {
         assert_eq!(a.name, b.name);
-        assert_eq!((a.kp, a.kd, a.effort_limit, a.armature), (b.kp, b.kd, b.effort_limit, b.armature), "{}", a.name);
+        assert_eq!(
+            (a.kp, a.kd, a.effort_limit, a.armature),
+            (b.kp, b.kd, b.effort_limit, b.armature),
+            "{}",
+            a.name
+        );
         assert_eq!(a.action_scale, b.action_scale, "{}", a.name);
     }
 }

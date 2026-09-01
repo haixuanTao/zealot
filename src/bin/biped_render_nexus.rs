@@ -19,7 +19,7 @@ mod gpu_policy;
 use biped_env_nexus::{BipedNexusBatchEnv, StepOut, default_mjcf_path};
 use gpu_policy::GpuPolicy;
 use std::fmt::Write as _;
-use zealot_env::robots::{RobotSpec, NUM_JOINTS};
+use zealot_env::robots::{NUM_JOINTS, RobotSpec};
 use zealot_rl::ppo::{Sample, gae};
 use zealot_rl::rng::Lcg;
 use zealot_rl::{ActorCritic, PpoConfig};
@@ -356,10 +356,14 @@ fn main() {
                 let (jacs, cols, (cpb, dpb, spb)) = env.dbg_mb_jac_columns().await;
                 let (_, cons) = env.dbg_mb_contacts().await;
                 let mut out = String::from("{\n");
-                out.push_str(&format!("  \"cpb\": {cpb}, \"dpb\": {dpb}, \"spb\": {spb},\n"));
+                out.push_str(&format!(
+                    "  \"cpb\": {cpb}, \"dpb\": {dpb}, \"spb\": {spb},\n"
+                ));
                 out.push_str("  \"slots\": [\n");
                 for (i, c) in cons.iter().take(192).enumerate() {
-                    if c.kind == 0 { continue; }
+                    if c.kind == 0 {
+                        continue;
+                    }
                     let row: Vec<String> = (0..dpb as usize)
                         .map(|d| format!("{:.6}", jacs[i * dpb as usize + d]))
                         .collect();
@@ -379,7 +383,11 @@ fn main() {
                 let nb = 64usize;
                 for i in 0..13 {
                     let l = &ls[i * nb];
-                    println!("[dbgl] link {i} mass {:.4} com {:?}", 1.0/l.local_mprops.inv_mass.x.max(1e-9), l.local_mprops.com);
+                    println!(
+                        "[dbgl] link {i} mass {:.4} com {:?}",
+                        1.0 / l.local_mprops.inv_mass.x.max(1e-9),
+                        l.local_mprops.com
+                    );
                 }
                 let bj = env.dbg_body_jacobians().await;
                 let bjs: Vec<String> = bj.iter().map(|v| format!("{v:.6}")).collect();
@@ -397,25 +405,39 @@ fn main() {
                 // ang_jac=(pt-com)x(-z) so ang_jac.y = pt_x - com_x, com_x=0).
                 // Fz = last-substep accumulated impulse / substep dt.
                 let decim: f32 = std::env::var("BIPED_DECIMATION")
-                    .ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(4.0);
                 let sub_dt = 0.02 / decim / 8.0;
                 let mut line = format!("[gpuc] step {step}:");
                 for foot_link in [6u32, 12u32] {
                     let mut fz = 0.0f32;
                     let mut pts = String::new();
                     for c in cons.iter().take(192) {
-                        if c.kind == 0 || c.link_id != foot_link { continue; }
+                        if c.kind == 0 || c.link_id != foot_link {
+                            continue;
+                        }
                         if c.kind == 1 {
                             fz += c.impulse;
-                            pts.push_str(&format!(" (x{:+.3} N{:.3} rhs{:+.2})", c.ang_jac.y, c.impulse, c.rhs));
+                            pts.push_str(&format!(
+                                " (x{:+.3} N{:.3} rhs{:+.2})",
+                                c.ang_jac.y, c.impulse, c.rhs
+                            ));
                         } else if c.kind == 2 {
                             // tangent row: lin_jac = tangent dir; print its x-component,
                             // impulse and mu (clamp = mu * paired normal impulse).
-                            pts.push_str(&format!(" [T{:+.3} tx{:+.2} slip{:+.4}]", c.impulse, c.lin_jac.x, c._unused_cfm));
+                            pts.push_str(&format!(
+                                " [T{:+.3} tx{:+.2} slip{:+.4}]",
+                                c.impulse, c.lin_jac.x, c._unused_cfm
+                            ));
                         }
                     }
-                    line.push_str(&format!(" foot{}: Fz~{:7.1}N pts[{} ]",
-                        if foot_link == 6 { 0 } else { 1 }, fz / sub_dt, pts));
+                    line.push_str(&format!(
+                        " foot{}: Fz~{:7.1}N pts[{} ]",
+                        if foot_link == 6 { 0 } else { 1 },
+                        fz / sub_dt,
+                        pts
+                    ));
                 }
                 println!("{line}");
             }
@@ -452,7 +474,11 @@ fn main() {
         let _ = write!(s, "  \"feet\": [{}],\n", feet_json.join(", "));
         let resets_json: Vec<String> = resets.iter().map(|i| i.to_string()).collect();
         let _ = write!(s, "  \"resets\": [{}],\n", resets_json.join(", "));
-        let jn: Vec<String> = RobotSpec::from_env().joints.iter().map(|j| format!("\"{}\"", j.name)).collect();
+        let jn: Vec<String> = RobotSpec::from_env()
+            .joints
+            .iter()
+            .map(|j| format!("\"{}\"", j.name))
+            .collect();
         let _ = write!(s, "  \"joint_names\": [{}],\n", jn.join(", "));
         let base_json: Vec<String> = bases
             .iter()
@@ -520,7 +546,11 @@ fn main() {
             let _ = write!(
                 s,
                 "  \"terrain\": {{\"cx\": {:.3}, \"cy\": {:.3}, \"half\": {:.3}, \"hs\": {:.3}, \"heights\": [{}]}},\n",
-                mcx, mcy, half, hs, vals.join(",")
+                mcx,
+                mcy,
+                half,
+                hs,
+                vals.join(",")
             );
         }
         s.push_str("  \"frame_quats\": [\n");
