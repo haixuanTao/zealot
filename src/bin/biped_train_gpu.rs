@@ -24,6 +24,9 @@
 mod biped_env;
 #[path = "../biped/biped_env_nexus.rs"]
 mod biped_env_nexus;
+#[cfg(feature = "cutile")]
+#[path = "../biped/cublas.rs"]
+mod cublas;
 #[path = "../biped/cutile_gemm.rs"]
 mod cutile_gemm;
 #[path = "../biped/gpu_policy.rs"]
@@ -2166,6 +2169,16 @@ fn main() {
                     exec_s,
                     kl_s,
                 );
+                // Per-kernel GPU profile for the CURRENT logging window
+                // (BIPED_PROF_KERNELS=1 + KHAL_CUDA_PROFILE=1). The dump clears
+                // the accumulator, so each line is that window's mix — how the
+                // rollout/update split moves as the policy trains. Needs
+                // BIPED_GRAPH=0 (per-launch sync is illegal mid-capture).
+                #[cfg(feature = "cuda_backend")]
+                if std::env::var_os("BIPED_PROF_KERNELS").is_some() {
+                    eprintln!("[prof-kernels] iter {it}");
+                    khal::backend::cuda::dump_kernel_profile();
+                }
                 // Structured per-component reward + termination-cause line for the
                 // W&B sidecar (`wandb_logger.py` parses the `[rb]` prefix). Mean of
                 // each reward term over the window since the last drain, plus

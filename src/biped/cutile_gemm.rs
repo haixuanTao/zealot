@@ -172,7 +172,17 @@ mod real {
         /// Tiled GEMM `z = x·y`, tf32 tensor cores, f32 accumulate. Checked
         /// accesses (OOB loads zero-pad, stores mask) + ceil-div K loop, so no
         /// dimension needs to be a tile multiple. Overwrites `z`.
-        #[cutile::entry()]
+        /// Codegen hints. These are keyed BY ARCHITECTURE — the compiler selects
+        /// the matching set and other targets fall back to defaults, so this is
+        /// not an sm_120 lock-in. (This module is the CUDA fast path already;
+        /// the portable SPIR-V/Metal shaders are separate source and untouched.)
+        /// `occupancy` and `num_cta_in_cga` are scheduling hints; both are pure
+        /// codegen and cannot change results. Re-tune per GPU like TUNED_TILES.
+        #[cutile::entry(optimization_hints = (
+            sm_120 = (occupancy = 2, num_cta_in_cga = 2,),
+            sm_100 = (occupancy = 2, num_cta_in_cga = 2,),
+            sm_90 = (num_cta_in_cga = 1,),
+        ))]
         unsafe fn gemm_tf32<const BM: i32, const BN: i32, const BK: i32>(
             z: &mut Tensor<f32, { [BM, BN] }>,
             x: &Tensor<f32, { [-1, -1] }>,
@@ -199,7 +209,17 @@ mod real {
         /// partition access TRAPS on an out-of-range BLOCK index (only
         /// within-tile ragged edges zero-pad), so the tail chunk's k-tile
         /// range is clamped to `ktiles_total` explicitly.
-        #[cutile::entry()]
+        /// Codegen hints. These are keyed BY ARCHITECTURE — the compiler selects
+        /// the matching set and other targets fall back to defaults, so this is
+        /// not an sm_120 lock-in. (This module is the CUDA fast path already;
+        /// the portable SPIR-V/Metal shaders are separate source and untouched.)
+        /// `occupancy` and `num_cta_in_cga` are scheduling hints; both are pure
+        /// codegen and cannot change results. Re-tune per GPU like TUNED_TILES.
+        #[cutile::entry(optimization_hints = (
+            sm_120 = (occupancy = 2, num_cta_in_cga = 2,),
+            sm_100 = (occupancy = 2, num_cta_in_cga = 2,),
+            sm_90 = (num_cta_in_cga = 1,),
+        ))]
         unsafe fn gemm_splitk_tf32<const BM: i32, const BN: i32, const BK: i32>(
             z_parts: &mut Tensor<f32, { [BM, BN] }>,
             x: &Tensor<f32, { [-1, -1] }>,
@@ -233,7 +253,17 @@ mod real {
         /// vector broadcast over N), optionally followed by ELU (alpha = 1:
         /// `v > 0 ? v : exp(v) − 1`, matching vortx `gpu_elu`). Replaces the
         /// forward pass's gemm + bias-broadcast-GEMV + add + ELU pass chain.
-        #[cutile::entry()]
+        /// Codegen hints. These are keyed BY ARCHITECTURE — the compiler selects
+        /// the matching set and other targets fall back to defaults, so this is
+        /// not an sm_120 lock-in. (This module is the CUDA fast path already;
+        /// the portable SPIR-V/Metal shaders are separate source and untouched.)
+        /// `occupancy` and `num_cta_in_cga` are scheduling hints; both are pure
+        /// codegen and cannot change results. Re-tune per GPU like TUNED_TILES.
+        #[cutile::entry(optimization_hints = (
+            sm_120 = (occupancy = 2, num_cta_in_cga = 2,),
+            sm_100 = (occupancy = 2, num_cta_in_cga = 2,),
+            sm_90 = (num_cta_in_cga = 1,),
+        ))]
         unsafe fn gemm_bias_act_tf32<const BM: i32, const BN: i32, const BK: i32>(
             z: &mut Tensor<f32, { [BM, BN] }>,
             x: &Tensor<f32, { [-1, -1] }>,
@@ -310,6 +340,34 @@ mod real {
             out.store(acc);
         }
 
+        /// Bias + optional ELU as a SEPARATE pass, for the cuBLAS path.
+        ///
+        /// Fusing this into our own GEMM epilogue saves an elementwise pass but
+        /// costs far more in matmul throughput: measured, the fused kernel runs
+        /// the forward GEMMs in 23.3 ms where cuBLAS does them in ~10, against
+        /// only ~4 ms saved on elementwise. So when cuBLAS is driving, take the
+        /// unfused route.
+        #[cutile::entry()]
+        unsafe fn bias_act_ct<const BM: i32, const BN: i32>(
+            z: &mut Tensor<f32, { [BM, BN] }>,
+            bias: &Tensor<f32, { [-1, -1] }>,
+            apply_elu: i32,
+        ) {
+            let part_b = bias.partition(const_shape![BM, 1]);
+            let pid: (i32, i32, i32) = get_tile_block_id();
+            let mut acc: Tile<f32, { [BM, BN] }> = z.load();
+            let bt: Tile<f32, { [BM, 1] }> = part_b.load([pid.0, 0]);
+            acc = acc + bt.broadcast(const_shape![BM, BN]);
+            if apply_elu != 0 {
+                let zero: Tile<f32, { [BM, BN] }> = 0.0f32.broadcast(const_shape![BM, BN]);
+                let one: Tile<f32, { [BM, BN] }> = 1.0f32.broadcast(const_shape![BM, BN]);
+                let mask = cmpf(acc, zero, predicate::GreaterThan, cmp_ordering::Ordered);
+                let em1 = exp(acc) - one;
+                acc = select(mask, acc, em1);
+            }
+            z.store(acc);
+        }
+
         /// Split row-sums — pass 1. Block `p` handles row-tile `p % row_tiles`
         /// and column-chunk `p / row_tiles`, summing `tps` column-tiles into
         /// `parts[chunk·row_tiles + row_tile]`. The 1-D grid is
@@ -362,6 +420,15 @@ mod real {
         }
     }
     use kernels::*;
+
+    /// Split-K only kicks in below this many CTAs from the tile grid alone.
+    const SPLITK_MIN_CTAS: usize = 96;
+    /// ...and then splits only far enough to reach this many CTAs (2 per SM on
+    /// an RTX 5090). `BIPED_CUTILE_SPLITK_LOG=1` prints the decision per shape.
+    const SPLITK_TARGET_CTAS: usize = 340;
+    /// Never leave a split with fewer K-tiles than this — a split that does
+    /// almost no work still pays a full prologue and another merge input.
+    const SPLITK_MIN_KTILES_PER_SPLIT: usize = 8;
 
     /// Offline-tuned GEMM tiles: `(kind, m, n, k, bm, bn, bk)`.
     ///
@@ -454,6 +521,9 @@ mod real {
         outputs: RefCell<HashMap<ViewKey, CtTensor<f32>>>,
         /// cuTile-owned split-K partial buffers, keyed by (padded rows, cols).
         parts: RefCell<HashMap<(usize, usize), CtTensor<f32>>>,
+        /// BIPED_CUBLAS_GEMM=1: reference cuBLAS path for the plain GEMMs, to
+        /// measure the cuTile kernels against inside the real trainer.
+        cublas: Option<crate::cublas::Cublas>,
         /// BIPED_CUTILE_TUNE only: (kind, m, n, k) -> measured winner.
         tuned: RefCell<HashMap<(u8, usize, usize, usize), (usize, usize, usize)>>,
     }
@@ -498,6 +568,7 @@ mod real {
                     &device,
                 )
             };
+            let cu_stream_raw = stream.cu_stream() as *mut std::ffi::c_void;
             let me: &'static CutileGemm = Box::leak(Box::new(CutileGemm {
                 stream,
                 device_id: ctx.ordinal(),
@@ -505,6 +576,22 @@ mod real {
                 inputs: RefCell::new(HashMap::new()),
                 outputs: RefCell::new(HashMap::new()),
                 parts: RefCell::new(HashMap::new()),
+                cublas: if std::env::var("BIPED_CUBLAS_GEMM").is_ok_and(|v| v != "0") {
+                    // `stream` is moved into the struct below; take the raw
+                    // handle first so cuBLAS shares the same in-order stream.
+                    match crate::cublas::Cublas::new(cu_stream_raw) {
+                        Ok(c) => {
+                            eprintln!("[cublas] reference GEMM path ENABLED (plain gemm only)");
+                            Some(c)
+                        }
+                        Err(e) => {
+                            eprintln!("[cublas] unavailable ({e}); using cuTile GEMM");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                },
                 tuned: RefCell::new(HashMap::new()),
             }));
             match me.self_test(bk).await {
@@ -737,6 +824,19 @@ mod real {
             n: usize,
             k: usize,
         ) -> anyhow::Result<()> {
+            if let Some(cb) = &self.cublas {
+                // Same stream, so ordering against the cuTile launches holds.
+                return cb.gemm(
+                    buf_ptr(out.buffer()),
+                    buf_ptr(lhs.buffer()),
+                    lhs_t,
+                    buf_ptr(rhs.buffer()),
+                    rhs_t,
+                    m,
+                    n,
+                    k,
+                );
+            }
             let tiles = if std::env::var("BIPED_CUTILE_TUNE").is_ok() {
                 self.tune_tiles(0, m, n, k, |t| {
                     self.gemm_inner(out, lhs, lhs_t, rhs, rhs_t, m, n, k, t)
@@ -760,6 +860,19 @@ mod real {
             bias_row_stride: usize,
             elu: bool,
         ) -> anyhow::Result<()> {
+            if let Some(cb) = &self.cublas {
+                cb.gemm(
+                    buf_ptr(out.buffer()),
+                    buf_ptr(lhs.buffer()),
+                    false,
+                    buf_ptr(rhs.buffer()),
+                    false,
+                    m,
+                    n,
+                    k,
+                )?;
+                return self.bias_act(out, m, n, bias, bias_row_stride, elu);
+            }
             let tiles = if std::env::var("BIPED_CUTILE_TUNE").is_ok() {
                 self.tune_tiles(1, m, n, k, |t| {
                     self.gemm_bias_act_inner(out, lhs, rhs, m, n, k, bias, bias_row_stride, elu, t)
@@ -799,14 +912,47 @@ mod real {
             let ktiles = k.div_ceil(bk);
             // Split-K for deep-K, small-output shapes (the wgrads): without it
             // they run on blocks_m·blocks_n CTAs and leave the GPU idle.
-            let s_count = if k >= 1024 && blocks_m * blocks_n < 96 {
-                [32usize, 16, 8, 4, 2, 1]
-                    .into_iter()
-                    .find(|&s| ktiles >= s)
-                    .unwrap_or(1)
+            //
+            // The split count is sized to the deficit, not taken from a fixed
+            // list. The old code picked the largest s <= ktiles — always 32,
+            // since ktiles is 384 at batch 24576 — regardless of how many CTAs
+            // the tile already produced. With the tuned 64x64 tile the base
+            // grid is ~28 CTAs, so s=32 launched ~900 CTAs on 170 SMs (5x
+            // oversubscribed) AND made `reduce_splitk` sum 32 partials per
+            // output element. Both halves of that are wasted: the merge is
+            // linear in s, and its 7.4 ms plus the split GEMM's 29.6 ms were
+            // 43% of the whole update.
+            //
+            // So: split only as far as it takes to fill the machine, keeping
+            // enough K per split that each CTA still amortises its prologue.
+            let s_count = if k >= 1024 && blocks_m * blocks_n < SPLITK_MIN_CTAS {
+                let base = (blocks_m * blocks_n).max(1);
+                let want = SPLITK_TARGET_CTAS.div_ceil(base);
+                // Round down to a power of two: the merge indexes partials as
+                // `s * blocks_m + mb`, and uneven splits leave a ragged tail.
+                let mut s = 1usize;
+                while s * 2 <= want.min(ktiles / SPLITK_MIN_KTILES_PER_SPLIT.max(1)) {
+                    s *= 2;
+                }
+                // BIPED_CUTILE_SPLITS=n forces the count, for sweeping the
+                // GEMM-parallelism vs merge-cost trade directly.
+                match std::env::var("BIPED_CUTILE_SPLITS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    Some(forced) => forced.clamp(1, ktiles.max(1)),
+                    None => s.clamp(1, ktiles.max(1)),
+                }
             } else {
                 1
             };
+            if std::env::var("BIPED_CUTILE_SPLITK_LOG").is_ok() && s_count > 1 {
+                eprintln!(
+                    "[cutile] splitk {m}x{n}x{k} tile {bm}x{bn}x{bk} base={} splits={s_count} -> {} ctas",
+                    blocks_m * blocks_n,
+                    blocks_m * blocks_n * s_count
+                );
+            }
 
             let g = vec![bm.to_string(), bn.to_string(), bk.to_string()];
             let stored = if s_count > 1 {
@@ -1012,6 +1158,41 @@ mod real {
             let (out_back, _, _) = unsafe {
                 row_sum_ct(out_t.partition([bm]), pv, splits as i32)
                     .generics(vec![bm.to_string(), bn2.to_string()])
+                    .async_on(&self.stream)
+                    .map_err(anyhow_err)?
+            };
+            self.outputs
+                .borrow_mut()
+                .insert(out_key, out_back.unpartition());
+            Ok(())
+        }
+
+        /// Apply bias (+ ELU) in place — the cuBLAS path's epilogue.
+        fn bias_act(
+            &self,
+            out: &vortx::tensor::Tensor<f32>,
+            m: usize,
+            n: usize,
+            bias: &vortx::tensor::Tensor<f32>,
+            bias_row_stride: usize,
+            elu: bool,
+        ) -> anyhow::Result<()> {
+            let (bm, bn) = (tile_for(m, 128), tile_for(n, 128));
+            let b = self.view_strided(
+                buf_ptr(bias.buffer()),
+                [m as i32, 1],
+                [bias_row_stride as i32, 1],
+            );
+            let out_ptr = buf_ptr(out.buffer());
+            let out_key = (out_ptr, [m as i32, n as i32], [n as i32, 1i32]);
+            let out_t = self
+                .outputs
+                .borrow_mut()
+                .remove(&out_key)
+                .unwrap_or_else(|| self.raw_view(out_ptr, [m as i32, n as i32], [n as i32, 1i32]));
+            let (out_back, _, _) = unsafe {
+                bias_act_ct(out_t.partition([bm, bn]), b, i32::from(elu))
+                    .generics(vec![bm.to_string(), bn.to_string()])
                     .async_on(&self.stream)
                     .map_err(anyhow_err)?
             };
