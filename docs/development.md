@@ -41,7 +41,8 @@ CUTILE_TILEIRAS_PATH = "/path/to/cuda-13.3/bin/tileiras"  # cuTile runtime JIT
 ```
 
 Prerequisites: sibling checkouts `../nexus`, `../vortx-unified`,
-`../khal-unified` (see the `[patch.crates-io]` table), a CUDA >= 12.8 `ptxas`,
+`../khal-unified`, `../parry`, `../naga-fixed` (see the `[patch.crates-io]`
+table), a CUDA >= 12.8 `ptxas`,
 and libdevice. The backend builds from stock
 [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-oxide) `main` (>= `6247276`;
 our two blocking fixes, [#518](https://github.com/NVlabs/cuda-oxide/pull/518)
@@ -49,6 +50,31 @@ and [#520](https://github.com/NVlabs/cuda-oxide/pull/520), merged 2026-07-28). C
 `CUDA_OXIDE_SHADERS_PTX_NEXUS_RBD_SHADERS3D` / `..._VORTX_SHADERS` — rebuild
 the trainer after rebuilding cubins.
 
+
+### Sibling checkouts: which revision
+
+`[patch.crates-io]` points at paths, not revisions, so a checkout on the wrong
+branch does not fail the build — **cargo silently drops the patch** and builds
+against crates.io instead, leaving only:
+
+```
+warning: patch `parry3d v0.26.1 (/…/parry/crates/parry3d)` was not used in the crate graph
+```
+
+`parry` is the one that bites: its `master` is **0.26.1** while nexus 0.4 needs
+**0.29**, so the default clone always misses. Use the branch that matches:
+
+```sh
+git -C ../parry checkout rebase/nexus-0.4     # 0.29.0 — what nexus 0.4 wants
+```
+
+Verify the patches actually took, rather than trusting the clone:
+
+```sh
+cargo tree -p zealot --features "gpu biped_gpu" -i parry3d
+#   parry3d v0.29.0 (/…/parry/crates/parry3d)   <- path = patched
+#   parry3d v0.29.0                             <- no path = crates.io, patch DROPPED
+```
 
 ## Configuration: one source of truth
 
