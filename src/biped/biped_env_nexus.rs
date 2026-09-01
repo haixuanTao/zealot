@@ -1854,8 +1854,11 @@ pub struct BipedNexusBatchEnv {
     /// `BIPED_VERIFY_REWARD`, which needs the host values to compare against.
     use_gpu_reward: bool,
     /// Env-index stride of the host obs subsample kept for normalizer stats
-    /// under device obs (`BIPED_OBS_STATS_STRIDE`, default 16 = the original
-    /// hard-coded 1/16). 1 = every env (host-obs-parity statistics; costs the
+    /// under device obs (`BIPED_OBS_STATS_STRIDE`). NOTE: the default below is
+    /// `1`, not the 16 this comment used to claim — at 1 every env still does
+    /// full host assembly, so the "1/16 subsample" saving does not happen
+    /// unless you set it.
+    /// 1 = every env (host-obs-parity statistics; costs the
     /// full host assembly the subsample was avoiding). Must be a power of two
     /// (the gate is a mask).
     obs_stats_stride: usize,
@@ -2876,18 +2879,34 @@ impl BipedNexusBatchEnv {
                 // backends fall back at the first step (guard in `step`).
                 let on = std::env::var("BIPED_GPU_OBS").map_or(true, |v| v != "0")
                     && std::env::var("BIPED_VERIFY_REWARD").is_err();
-                // The device obs kernel predates the upper-body block (obs 79):
-                // it still writes the 53-dim layout. Force HOST assembly until
-                // the kernel grows the two new inputs; measured cost at
-                // stats-stride 1 is ~1% (host2 0.813 vs devfix1 0.803 s/iter).
-                let on = on && {
-                    if on {
-                        eprintln!(
-                            "[env] BIPED_GPU_OBS requested but the device kernel predates the upper-body obs block — forcing HOST assembly"
-                        );
-                    }
-                    false
-                };
+                // The kernel DOES write the 79-dim frame (zealot-obs-shaders
+                // `FRAME = 79`, upper-body block at o[53..79) read from cmd
+                // slots [4..30)). What was missing was the trainer side: only
+                // the web demo ever called `set_held`, so those cmd slots were
+                // zero here and device obs would have silently dropped the
+                // held-joint block. `fill_held_cmd` now streams it with the
+                // command upload, so the device path is correct — and it takes
+                // the per-sample host obs upload (~490 MB/iteration, 24 ms of
+                // H2D at n=4096) out of the loop.
+                //
+                // `BIPED_GPU_OBS=0` still forces the host path, and a robot
+                // with no held joints keeps it too (nothing to stream, and the
+                // narrow-frame policies never read those slots anyway).
+                //
+                // Correct and at speed parity (measured, n=4096: rollout 0.81 s
+                // device vs 0.80 s host; iteration 0 reproduces the host path's
+                // mean reward, -0.2222 either way). The H2D it removes is real
+                // but hidden — the rollout is `gpuwait`-bound at ~24 ms/step,
+                // so the ~24 ms/iteration of obs upload overlaps physics rather
+                // than adding to the total.
+                //
+                // OPT-IN nonetheless: the device path draws the observation
+                // noise on the GPU, a different stream from the host RNG, so
+                // flipping the default would silently change every training
+                // trajectory (visible above as 1440 falls vs 1455 at iteration
+                // 0 — same reward, different rollout). That is a deliberate
+                // decision, not a performance one.
+                let on = on && std::env::var("BIPED_GPU_OBS").is_ok_and(|v| v == "1");
                 eprintln!(
                     "[env] obs assembly: {}",
                     if on {
@@ -5482,7 +5501,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     .expect("gpu observe"),
                 );
             }
-            let mut cmd_b = vec![0.0f32; 4 * n];
+            let mut cmd_b = vec![0.0f32; 30 * n];
             let mut ph_b = vec![0.0f32; n];
             let mut cue_b = vec![0.0f32; 10 * n];
             for e in 0..n {
@@ -5494,6 +5513,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     cue_b[k * n + e] = computed[e].cue_obs[k];
                 }
             }
+            self.fill_held_cmd(&mut cmd_b);
             let (qt, qdt) = {
                 let j = self.gpu_joints.as_ref().unwrap();
                 (j.q_tensor(), j.qd_tensor())
@@ -6131,7 +6151,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 fellv[e] = computed[e].fell as u32;
             }
 
-            let mut cmd_b = vec![0.0f32; 4 * n];
+            let mut cmd_b = vec![0.0f32; 30 * n];
             let mut ph_b = vec![0.0f32; n];
             let mut cue_b = vec![0.0f32; 10 * n];
             if go {
@@ -6144,6 +6164,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                         cue_b[k * n + e] = computed[e].cue_obs[k];
                     }
                 }
+                self.fill_held_cmd(&mut cmd_b);
                 self.cached_cue_b = cue_b.clone();
             }
 
@@ -6625,6 +6646,34 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
         self.use_gpu_obs
     }
 
+    /// Fill the obs `cmd` buffer's upper-body block — slots [4..17) held-joint
+    /// PD targets, [17..30) their finite-diff velocities — the source of the
+    /// 79-dim frame's [53..79). The device obs kernel has supported this since
+    /// v29; only the *trainer* never streamed it (`set_held` is called by the
+    /// web demo alone), which is why device obs assembly stayed switched off
+    /// and every observation went host→device instead.
+    ///
+    /// Bulk-filled into the caller's `cmd_b` (already `30 * n`), so this costs
+    /// one upload of 26·n floats per control step — ~426 KB at n=4096, against
+    /// the ~490 MB/iteration of host obs it replaces.
+    fn fill_held_cmd(&self, cmd_b: &mut [f32]) {
+        let n = self.n;
+        let n_held = self.idx.held.len();
+        if n_held == 0 || cmd_b.len() < 30 * n {
+            return;
+        }
+        let dt = self.task.control_dt();
+        let nh = n_held.min(13);
+        for e in 0..n {
+            for j in 0..nh {
+                let cur = self.arm_staged[e * n_held + j];
+                let prev = self.prev_arm_staged[e * n_held + j];
+                cmd_b[(4 + j) * n + e] = cur;
+                cmd_b[(17 + j) * n + e] = (cur - prev) / dt;
+            }
+        }
+    }
+
     pub fn take_step_timings(&mut self) -> StepTimings {
         std::mem::take(&mut self.timings)
     }
@@ -6767,7 +6816,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                     la[k * n + e] = self.last_action[e][k];
                 }
             }
-            let mut cmd_b = vec![0.0f32; 4 * n];
+            let mut cmd_b = vec![0.0f32; 30 * n];
             let mut ph_b = vec![0.0f32; n];
             for e in 0..n {
                 cmd_b[e] = self.cmd[e].vx;
@@ -6775,6 +6824,7 @@ let w_knee_torques: f32 = self.knobs.w_knee_torques;
                 cmd_b[2 * n + e] = self.cmd[e].yaw_rate;
                 ph_b[e] = self.gait_phase[e];
             }
+            self.fill_held_cmd(&mut cmd_b);
             let cue_b = if self.cached_cue_b.len() == 10 * n {
                 self.cached_cue_b.clone()
             } else {
