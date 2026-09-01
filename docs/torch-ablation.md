@@ -67,3 +67,58 @@ GPU-busy time, and `gpu_mb_compute_dynamics_without_coriolis_pre` alone is
 173 ms across 96 launches (1.8 ms each). Halving the update saves ~90 ms;
 halving that one physics kernel saves ~86 ms — and the solver's dense-LU cost is
 the documented O(n³) wall the repo already flags for full-body robots.
+
+## Follow-up: closing the gap in the Rust update
+
+The torch comparison localised *where* the cuTile update lost time (nsys, same
+iteration, same tool on both sides):
+
+| | cuTile (before) | torch |
+| --- | ---: | ---: |
+| GEMM | 78.9 ms | 32.0 ms |
+| **Reduction** | **60.1 ms** | **7.5 ms** |
+| elementwise | 7.0 | 10.7 |
+| optimizer | 1.3 | 3.9 |
+| index/copy | 3.7 | 3.9 |
+| total | 150.6 | 58.1 |
+
+Two fixes followed, both in `src/biped/cutile_gemm.rs`:
+
+**1. Split the bias-gradient row-sum.** `row_sum_ct` was the single largest
+kernel in the update (43.9 ms, 29%): it parallelised over `m` only, and `m` is a
+bias width (<=512), so a 25 MB reduction ran on 2-4 CTAs at ~12% of memory
+bandwidth. `row_sum_split_ct` now splits the column tiles across chunks (a
+divisor of the tile count, so no tail check) and a second tiny pass merges them.
+
+**2. Per-shape tile selection.** `tile_for` returned the smallest covering tile
+from {16,32,64,128}, which collapses to 128x128x64 for nearly every call — one
+tile shape for ~30 different GEMMs. Forcing a single *wider* tile is worse, not
+better (128x256 globally: update 0.11 -> 0.23 s), because the update mixes
+wide-N shapes with degenerate ones (m=12 actor output, m=1 critic head) where a
+128-row tile discards 116 of 128 rows. `TUNED_TILES` is an offline-measured
+table (33 shapes, `BIPED_CUTILE_TUNE=1`), with an analytical rule as the
+fallback for shapes not in it.
+
+| build | update encode | iteration |
+| --- | ---: | ---: |
+| baseline (fixed 128x128x64) | 0.15 s | 1.0 s |
+| + split row-sum | 0.11 s | 1.0 s |
+| + analytical tiles | 0.12 s | 1.0 s |
+| **+ tuned table** | **0.09 s** | **0.9 s** |
+
+**40% off the update**, and the iteration-0 rollout still reproduces the
+baseline exactly (-0.2222 reward, 1455 falls); the cuTile self-test is unchanged
+at 1.13e-3.
+
+A note on "analytical": a shape-only rule gets the *structural* decision right
+(never make a tile wider than the dimension it covers) but only reproduced 3/11
+of the measured winners — every miss one step too wide in BN. That last factor
+of two depends on K-depth interacting with occupancy (256x24576x**395** wants
+128x64 while 256x24576x**256** wants 128x128) and is not derivable from shape
+alone. This is what cuBLAS actually ships: a fitted table, not a formula. Hence
+the table, with the rule as fallback. Re-tune per GPU with
+`BIPED_CUTILE_TUNE=1`; `BIPED_CUTILE_TUNED=0` and `BIPED_CUTILE_ANALYTIC=0`
+select the fallbacks for A/B.
+
+The torch gap that remains is now mostly the GEMMs themselves — cuBLAS ships a
+tuned kernel per shape, not just a tuned tile.

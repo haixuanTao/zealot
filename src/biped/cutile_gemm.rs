@@ -310,6 +310,38 @@ mod real {
             out.store(acc);
         }
 
+        /// Split row-sums — pass 1. Block `p` handles row-tile `p % row_tiles`
+        /// and column-chunk `p / row_tiles`, summing `tps` column-tiles into
+        /// `parts[chunk·row_tiles + row_tile]`. The 1-D grid is
+        /// `row_tiles · splits`, so `parts` is a rank-1 `[splits·m]` buffer laid
+        /// out chunk-major; pass 2 views it as `[m, splits]` (strides `[1, m]`)
+        /// and re-uses `row_sum_ct`.
+        ///
+        /// Why: the single-pass kernel parallelises over `m` only — and `m` here
+        /// is a bias dimension (<=512), so a 25 MB reduction ran on 2-4 CTAs at
+        /// ~12% of memory bandwidth. `splits` must divide the column-tile count
+        /// exactly (the launcher picks a divisor), so no bounds check is needed.
+        #[cutile::entry()]
+        unsafe fn row_sum_split_ct<const BM: i32, const BN: i32>(
+            parts: &mut Tensor<f32, { [BM] }>,
+            x: &Tensor<f32, { [-1, -1] }>,
+            row_tiles: i32,
+            tps: i32,
+        ) {
+            let part = x.partition(const_shape![BM, BN]);
+            let pid: (i32, i32, i32) = get_tile_block_id();
+            let rt = pid.0 % row_tiles;
+            let j0 = (pid.0 / row_tiles) * tps;
+            let t0: Tile<f32, { [BM, BN] }> = part.load([rt, j0]);
+            let mut acc: Tile<f32, { [BM] }> = reduce_sum(t0, 1i32);
+            for j in 1i32..tps {
+                let t: Tile<f32, { [BM, BN] }> = part.load([rt, j0 + j]);
+                let s: Tile<f32, { [BM] }> = reduce_sum(t, 1i32);
+                acc = acc + s;
+            }
+            parts.store(acc);
+        }
+
         /// Sum the split-K partials: `out[mb, nb] = Σ_s parts[s·blocks_m + mb, nb]`.
         /// Overwrites `out`.
         #[cutile::entry()]
@@ -331,15 +363,78 @@ mod real {
     }
     use kernels::*;
 
+    /// Offline-tuned GEMM tiles: `(kind, m, n, k, bm, bn, bk)`.
+    ///
+    /// Measured on an RTX 5090 (sm_120) with `BIPED_CUTILE_TUNE=1`; `kind` 0 is
+    /// `gemm`, 1 is `gemm_bias_act`. Shapes not listed fall back to the
+    /// analytical rule. Re-tune per GPU — these are hardware-specific.
+    /// `BIPED_CUTILE_TUNED=0` ignores the table.
+    #[rustfmt::skip]
+    const TUNED_TILES: [(u8, usize, usize, usize, usize, usize, usize); 33] = [
+        (0, 1, 128, 24576, 16, 64, 64), // 0.034 ms
+        (0, 12, 128, 24576, 16, 64, 64), // 0.034 ms
+        (0, 12, 300, 45, 16, 128, 64), // 0.008 ms
+        (0, 128, 24576, 1, 128, 64, 16), // 0.011 ms
+        (0, 128, 24576, 12, 128, 64, 16), // 0.012 ms
+        (0, 128, 256, 24576, 64, 64, 64), // 0.082 ms
+        (0, 256, 24576, 128, 64, 128, 64), // 0.048 ms
+        (0, 256, 24576, 256, 64, 128, 64), // 0.078 ms
+        (0, 256, 256, 24576, 128, 128, 64), // 0.125 ms
+        (0, 256, 395, 24576, 64, 64, 64), // 0.224 ms
+        (0, 256, 45, 300, 16, 64, 64), // 0.012 ms
+        (0, 256, 512, 24576, 128, 128, 64), // 0.202 ms
+        (0, 45, 300, 256, 16, 128, 64), // 0.011 ms
+        (0, 512, 12288, 51, 64, 128, 64), // 0.031 ms
+        (0, 512, 24576, 256, 128, 128, 64), // 0.137 ms
+        (0, 512, 90, 24576, 64, 64, 64), // 0.139 ms
+        (0, 64, 96, 3072, 16, 128, 64), // 0.022 ms
+        (0, 64, 96, 4096, 16, 128, 64), // 0.024 ms
+        (1, 1, 24576, 128, 16, 256, 64), // 0.010 ms
+        (1, 1, 4096, 128, 16, 128, 64), // 0.009 ms
+        (1, 100, 300, 45, 64, 64, 64), // 0.009 ms
+        (1, 12, 24576, 128, 16, 256, 64), // 0.012 ms
+        (1, 12, 4096, 128, 16, 64, 64), // 0.009 ms
+        (1, 128, 24576, 256, 64, 64, 64), // 0.039 ms
+        (1, 128, 4096, 256, 64, 64, 64), // 0.010 ms
+        (1, 256, 24576, 256, 64, 64, 64), // 0.068 ms
+        (1, 256, 24576, 395, 64, 64, 64), // 0.132 ms
+        (1, 256, 24576, 512, 64, 64, 64), // 0.109 ms
+        (1, 256, 4096, 256, 64, 64, 64), // 0.019 ms
+        (1, 256, 4096, 395, 64, 64, 64), // 0.033 ms
+        (1, 256, 4096, 512, 64, 64, 64), // 0.027 ms
+        (1, 512, 24576, 90, 64, 64, 64), // 0.087 ms
+        (1, 512, 4096, 90, 64, 64, 64), // 0.022 ms
+    ];
+
     /// Smallest tile size in {16, 32, 64, 128} covering `dim` (checked kernels
     /// handle the ceil-grid remainder).
     fn tile_for(dim: usize, max: usize) -> usize {
-        for c in [16usize, 32, 64, 128] {
+        for c in [16usize, 32, 64, 128, 256] {
             if c >= dim || c == max {
                 return c.min(max);
             }
         }
         max
+    }
+
+    /// `BIPED_CUTILE_TILE=bm,bn,bk` overrides the GEMM tile shape (each capped
+    /// by the dimension it covers). The default heuristic picks the smallest
+    /// covering tile, which pins every large GEMM to 128x128x64; cuBLAS chooses
+    /// per shape from a tuned set (128x256, 256x128, ...), which is most of its
+    /// edge on these skinny shapes. Set to sweep candidates without a rebuild.
+    fn tile_override() -> Option<(usize, usize, usize)> {
+        static OVERRIDE: std::sync::OnceLock<Option<(usize, usize, usize)>> =
+            std::sync::OnceLock::new();
+        *OVERRIDE.get_or_init(|| {
+            let v = std::env::var("BIPED_CUTILE_TILE").ok()?;
+            let mut it = v.split(',').map(|x| x.trim().parse::<usize>());
+            match (it.next()?.ok()?, it.next()?.ok()?, it.next()?.ok()?) {
+                (bm, bn, bk) => {
+                    eprintln!("[cutile] tile override {bm}x{bn}x{bk}");
+                    Some((bm, bn, bk))
+                }
+            }
+        })
     }
 
     /// (device_ptr, shape[2], strides[2]) — element strides.
@@ -359,6 +454,8 @@ mod real {
         outputs: RefCell<HashMap<ViewKey, CtTensor<f32>>>,
         /// cuTile-owned split-K partial buffers, keyed by (padded rows, cols).
         parts: RefCell<HashMap<(usize, usize), CtTensor<f32>>>,
+        /// BIPED_CUTILE_TUNE only: (kind, m, n, k) -> measured winner.
+        tuned: RefCell<HashMap<(u8, usize, usize, usize), (usize, usize, usize)>>,
     }
 
     impl CutileGemm {
@@ -408,6 +505,7 @@ mod real {
                 inputs: RefCell::new(HashMap::new()),
                 outputs: RefCell::new(HashMap::new()),
                 parts: RefCell::new(HashMap::new()),
+                tuned: RefCell::new(HashMap::new()),
             }));
             match me.self_test(bk).await {
                 Ok(worst) => {
@@ -474,6 +572,160 @@ mod real {
         /// transposed base (e.g. wgrad's `aᵀ`), viewed via strides. The caller
         /// must have SUBMITTED all pending khal work touching these buffers
         /// (same stream ⇒ ordering by issue).
+        /// Offline tile tuning — `BIPED_CUTILE_TUNE=1`.
+        ///
+        /// Times every candidate on the real buffers and prints a table row per
+        /// shape, ready to paste into `TUNED_TILES`. NOT for production runs:
+        /// it measures inside iteration 0 (cold caches, JIT firing mid-timing,
+        /// physics queued on the same in-order stream) and it re-runs each GEMM
+        /// several times — safe only because `gemm_splitk` STORES its partials
+        /// rather than accumulating them. Re-run per GPU; the winners are
+        /// hardware-specific.
+        const TUNE_CANDIDATES: [(usize, usize, usize); 8] = [
+            (128, 128, 64),
+            (128, 64, 64),
+            (64, 128, 64),
+            (64, 64, 64),
+            (16, 128, 64),
+            (16, 256, 64),
+            (128, 256, 64),
+            (256, 128, 64),
+        ];
+
+        fn tune_tiles<F>(&self, kind: u8, m: usize, n: usize, k: usize, run: F) -> (usize, usize, usize)
+        where
+            F: Fn((usize, usize, usize)) -> anyhow::Result<()>,
+        {
+            let key = (kind, m, n, k);
+            if let Some(t) = self.tuned.borrow().get(&key) {
+                return *t;
+            }
+            let mut cands: Vec<(usize, usize, usize)> = Self::TUNE_CANDIDATES
+                .iter()
+                .map(|&(a, b, c)| (tile_for(m, a), tile_for(n, b), tile_for(k, c)))
+                .collect();
+            cands.sort_unstable();
+            cands.dedup();
+            let sync = || api::zeros::<f32>(&[1]).sync_on(&self.stream).is_ok();
+            let mut best = (self.analytic_tiles(m, n, k), f64::INFINITY);
+            for t in cands {
+                if run(t).is_err() || !sync() {
+                    continue;
+                }
+                let t0 = std::time::Instant::now();
+                for _ in 0..5 {
+                    let _ = run(t);
+                }
+                if !sync() {
+                    continue;
+                }
+                let dt = t0.elapsed().as_secs_f64() / 5.0;
+                if dt < best.1 {
+                    best = (t, dt);
+                }
+            }
+            let (bm, bn, bk) = best.0;
+            eprintln!(
+                "[cutile-tune]     ({kind}, {m}, {n}, {k}, {bm}, {bn}, {bk}), // {:.3} ms",
+                best.1 * 1e3
+            );
+            self.tuned.borrow_mut().insert(key, best.0);
+            best.0
+        }
+
+        /// Analytical tile choice for one GEMM shape.
+        ///
+        /// The old heuristic took the smallest covering tile from
+        /// {16,32,64,128}, which collapses to 128x128x64 for nearly every call
+        /// — one tile shape for ~10 very different GEMMs. Forcing a single
+        /// wider tile is worse, not better (128x256 globally: update 0.11 ->
+        /// 0.23 s), because the update mixes wide-N shapes (n=256/512, the
+        /// hidden layers) with degenerate ones (n=12 actor output, n=1 critic
+        /// head) — a 256-wide tile wastes 95% of its columns on the latter.
+        ///
+        /// So pick per shape, from the shape alone. Two constraints decide it:
+        ///
+        /// 1. **Fill the GPU.** A `BM x BN` tile emits `ceil(m/BM)*ceil(n/BN)`
+        ///    CTAs; below ~2 per SM the tail dominates. Shrink the tile until
+        ///    the grid covers `2 * SM_COUNT`, preferring to shrink whichever
+        ///    dimension still has slack.
+        /// 2. **Do not pay for padding.** Never choose a tile wider than the
+        ///    dimension it covers, rounded up to the next power of two — that
+        ///    is what makes 128x256 catastrophic at n=12.
+        ///
+        /// `BK` trades pipeline depth against register pressure: deep-K shapes
+        /// (the weight grads, k = batch) want the larger step, shallow ones the
+        /// smaller. No timing, no JIT fan-out, deterministic across runs.
+        fn analytic_tiles(&self, m: usize, n: usize, k: usize) -> (usize, usize, usize) {
+            if let Some((tm, tn, tk)) = tile_override() {
+                return (
+                    tile_for(m, tm.min(256)),
+                    tile_for(n, tn.min(256)),
+                    tile_for(k, tk.min(128)),
+                );
+            }
+            if std::env::var("BIPED_CUTILE_ANALYTIC").is_ok_and(|v| v == "0") {
+                return (tile_for(m, 128), tile_for(n, 128), tile_for(k, 64));
+            }
+            // Deep-K shapes (the weight grads, k = batch) get their occupancy
+            // from the split-K path below, which only triggers while
+            // `blocks_m * blocks_n < 96`. Shrinking their tiles to "fill the
+            // GPU" would push the grid past that and silently turn split-K OFF
+            // — slower, not faster. Leave that regime exactly as tuned.
+            if k >= 1024 {
+                return (tile_for(m, 128), tile_for(n, 128), tile_for(k, 64));
+            }
+            // Constraint 2: cap each tile side at the next power of two >= dim
+            // (and at the kernel's supported maximum).
+            let cap = |d: usize, hi: usize| -> usize {
+                let mut c = 16usize;
+                while c < d && c < hi {
+                    c *= 2;
+                }
+                c.min(hi)
+            };
+            let mut bm = cap(m, 256);
+            let mut bn = cap(n, 256);
+            // Constraint 1: shrink the larger side until the grid fills the GPU.
+            const SM: usize = 170; // RTX 5090 (sm_120)
+            let target = 2 * SM;
+            while bm.max(bn) > 16 && m.div_ceil(bm) * n.div_ceil(bn) < target {
+                if bm >= bn && bm > 16 {
+                    bm /= 2;
+                } else if bn > 16 {
+                    bn /= 2;
+                } else {
+                    break;
+                }
+            }
+            // K step: deep reductions amortise a larger step; shallow ones do
+            // not, and an oversized BK just pads.
+            let bk = if k >= 1024 { cap(k, 128) } else { cap(k, 64) };
+            (bm, bn, bk)
+        }
+
+        /// Tile for one GEMM shape: the offline-tuned table when the shape is in
+        /// it, else the analytical rule. The table is what cuBLAS effectively
+        /// ships — fitted per architecture, not derived — and it recovers the
+        /// last factor of two in BN that shape alone does not determine (the
+        /// choice depends on K-depth interacting with occupancy: 256x24576x395
+        /// wants 128x64 while 256x24576x256 wants 128x128).
+        fn pick_tiles(&self, kind: u8, m: usize, n: usize, k: usize) -> (usize, usize, usize) {
+            if tile_override().is_some() {
+                return self.analytic_tiles(m, n, k);
+            }
+            if !std::env::var("BIPED_CUTILE_TUNED").is_ok_and(|v| v == "0") {
+                if let Some(&(_, _, _, _, bm, bn, bk)) = TUNED_TILES
+                    .iter()
+                    .find(|&&(kd, tm, tn, tk, _, _, _)| kd == kind && tm == m && tn == n && tk == k)
+                {
+                    return (bm, bn, bk);
+                }
+            }
+            self.analytic_tiles(m, n, k)
+        }
+
+        #[allow(clippy::too_many_arguments)]
         pub fn gemm(
             &self,
             out: &vortx::tensor::Tensor<f32>,
@@ -485,9 +737,53 @@ mod real {
             n: usize,
             k: usize,
         ) -> anyhow::Result<()> {
-            let bm = tile_for(m, 128);
-            let bn = tile_for(n, 128);
-            let bk = tile_for(k, 64);
+            let tiles = if std::env::var("BIPED_CUTILE_TUNE").is_ok() {
+                self.tune_tiles(0, m, n, k, |t| {
+                    self.gemm_inner(out, lhs, lhs_t, rhs, rhs_t, m, n, k, t)
+                })
+            } else {
+                self.pick_tiles(0, m, n, k)
+            };
+            self.gemm_inner(out, lhs, lhs_t, rhs, rhs_t, m, n, k, tiles)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn gemm_bias_act(
+            &self,
+            out: &vortx::tensor::Tensor<f32>,
+            lhs: &vortx::tensor::Tensor<f32>,
+            rhs: &vortx::tensor::Tensor<f32>,
+            m: usize,
+            n: usize,
+            k: usize,
+            bias: &vortx::tensor::Tensor<f32>,
+            bias_row_stride: usize,
+            elu: bool,
+        ) -> anyhow::Result<()> {
+            let tiles = if std::env::var("BIPED_CUTILE_TUNE").is_ok() {
+                self.tune_tiles(1, m, n, k, |t| {
+                    self.gemm_bias_act_inner(out, lhs, rhs, m, n, k, bias, bias_row_stride, elu, t)
+                })
+            } else {
+                self.pick_tiles(1, m, n, k)
+            };
+            self.gemm_bias_act_inner(out, lhs, rhs, m, n, k, bias, bias_row_stride, elu, tiles)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn gemm_inner(
+            &self,
+            out: &vortx::tensor::Tensor<f32>,
+            lhs: &vortx::tensor::Tensor<f32>,
+            lhs_t: bool,
+            rhs: &vortx::tensor::Tensor<f32>,
+            rhs_t: bool,
+            m: usize,
+            n: usize,
+            k: usize,
+            tiles: (usize, usize, usize),
+        ) -> anyhow::Result<()> {
+            let (bm, bn, bk) = tiles;
             let x = self.view(lhs, m, k, lhs_t);
             let y = self.view(rhs, k, n, rhs_t);
             let out_ptr = buf_ptr(out.buffer());
@@ -575,7 +871,8 @@ mod real {
         /// `act` is ELU when `elu` (hidden layers) else identity. Replaces the
         /// vortx gemm + bias-GEMV + add + ELU pass chain in one launch.
         #[allow(clippy::too_many_arguments)]
-        pub fn gemm_bias_act(
+        #[allow(clippy::too_many_arguments)]
+        fn gemm_bias_act_inner(
             &self,
             out: &vortx::tensor::Tensor<f32>,
             lhs: &vortx::tensor::Tensor<f32>,
@@ -586,10 +883,9 @@ mod real {
             bias: &vortx::tensor::Tensor<f32>,
             bias_row_stride: usize,
             elu: bool,
+            tiles: (usize, usize, usize),
         ) -> anyhow::Result<()> {
-            let bm = tile_for(m, 128);
-            let bn = tile_for(n, 128);
-            let bk = tile_for(k, 64);
+            let (bm, bn, bk) = tiles;
             let x = self.view(lhs, m, k, false);
             let y = self.view(rhs, k, n, false);
             let b = self.view_strided(
@@ -655,6 +951,76 @@ mod real {
             Ok(())
         }
 
+        /// Two-pass row-sum: `splits` chunks of column-tiles reduced in
+        /// parallel, then merged. Same result as the single-pass kernel up to
+        /// summation order (fp32 addition is not associative).
+        #[allow(clippy::too_many_arguments)]
+        fn row_sum_split(
+            &self,
+            out: &vortx::tensor::Tensor<f32>,
+            x: &vortx::tensor::Tensor<f32>,
+            m: usize,
+            n: usize,
+            bm: usize,
+            bn: usize,
+            row_tiles: usize,
+            nt: usize,
+            splits: usize,
+        ) -> anyhow::Result<()> {
+            let xv = self.view(x, m, n, false);
+            // Pass 1 -> parts[splits * m], chunk-major.
+            let pkey = (splits * row_tiles * bm, 1usize);
+            let parts_t = match self.parts.borrow_mut().remove(&pkey) {
+                Some(p) => p,
+                None => api::zeros::<f32>(&[pkey.0])
+                    .sync_on(&self.stream)
+                    .map_err(anyhow_err)?,
+            };
+            let tps = nt / splits;
+            let (parts_back, _, _, _) = unsafe {
+                row_sum_split_ct(
+                    parts_t.partition([bm]),
+                    xv,
+                    row_tiles as i32,
+                    tps as i32,
+                )
+                .generics(vec![bm.to_string(), bn.to_string()])
+                .async_on(&self.stream)
+                .map_err(anyhow_err)?
+            };
+            let parts_t = parts_back.unpartition();
+            let parts_ptr = parts_t.device_pointer().cu_deviceptr();
+            self.parts.borrow_mut().insert(pkey, parts_t);
+
+            // Pass 2: view the chunk-major partials as [m, splits] (strides
+            // [1, m']) and re-use the single-pass kernel over `splits` columns.
+            let mp = row_tiles * bm;
+            // MUST go through the cache: a bare `raw_view` is dropped at the end
+            // of this call and its Tensor frees the pointer it does not own
+            // ("Free async failed: invalid argument"). Cached views are leaked.
+            let pv = self.view_strided(parts_ptr, [m as i32, splits as i32], [1i32, mp as i32]);
+            let bn2 = tile_for(splits, 128);
+            let out_ptr = buf_ptr(out.buffer());
+            let out_key = (out_ptr, [m as i32, 0], [1i32, 0]);
+            let out_t = match self.outputs.borrow_mut().remove(&out_key) {
+                Some(t) => t,
+                // SAFETY: same invariants as raw_view, rank-1.
+                None => unsafe {
+                    CtTensor::from_raw_parts(out_ptr, m * 4, self.device_id, vec![m as i32], vec![1])
+                },
+            };
+            let (out_back, _, _) = unsafe {
+                row_sum_ct(out_t.partition([bm]), pv, splits as i32)
+                    .generics(vec![bm.to_string(), bn2.to_string()])
+                    .async_on(&self.stream)
+                    .map_err(anyhow_err)?
+            };
+            self.outputs
+                .borrow_mut()
+                .insert(out_key, out_back.unpartition());
+            Ok(())
+        }
+
         /// Bias gradient: `out(m×1) = row_sums(x(m×n))` in one launch.
         pub fn row_sum(
             &self,
@@ -665,6 +1031,23 @@ mod real {
         ) -> anyhow::Result<()> {
             let bm = tile_for(m, 128);
             let bn = tile_for(n, 128);
+            // Parallelise over the REDUCED dimension too. `m` is a bias width
+            // (<=512) so the single-pass grid is 2-4 CTAs; split the column
+            // tiles across `splits` chunks (a divisor of the tile count, so the
+            // kernel needs no tail check) and merge with a second, tiny pass.
+            let nt = n.div_ceil(bn);
+            let row_tiles = m.div_ceil(bm);
+            let splits = if std::env::var("BIPED_CUTILE_ROWSUM_SPLIT").is_ok_and(|v| v == "0") {
+                1
+            } else {
+                (2..=64)
+                    .rev()
+                    .find(|s| nt % s == 0 && row_tiles * s <= 512 && nt / s >= 2)
+                    .unwrap_or(1)
+            };
+            if splits > 1 {
+                return self.row_sum_split(out, x, m, n, bm, bn, row_tiles, nt, splits);
+            }
             let xv = self.view(x, m, n, false);
             let out_ptr = buf_ptr(out.buffer());
             // Rank-1 view; keyed with zeroed second slots to stay distinct
