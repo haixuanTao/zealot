@@ -40,6 +40,9 @@ fn main() {
         }
         let actions = vec![[0.0f32; NUM_JOINTS]; n];
 
+        // PROF=N: after the normal loop, run N GPU-timestamped physics steps
+        // and print the per-pass breakdown (which pass dominates & scales).
+        let prof_steps: usize = std::env::var("PROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         for t in 0..steps {
             let _ = env.step(&actions).await;
             let (lens, contacts) = env.dbg_contacts().await;
@@ -129,6 +132,40 @@ fn main() {
                 for r in rows {
                     println!("[c0] {r}");
                 }
+            }
+        }
+
+        if prof_steps > 0 {
+            let backend = env.backend().clone();
+            let mut ts = khal::backend::GpuTimestamps::new(&backend, 512);
+            let mut acc: std::collections::HashMap<String, (f64, u32)> = Default::default();
+            let mut done = 0usize;
+            while done < prof_steps {
+                ts.reset();
+                env.step_physics_profiled(&mut ts);
+                ts.request_read(&backend);
+                loop {
+                    if let Some(rows) = ts.try_take(&backend) {
+                        for r in rows {
+                            let e = acc.entry(r.label).or_insert((0.0, 0));
+                            e.0 += r.duration_ms;
+                            e.1 += 1;
+                        }
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                done += 1;
+            }
+            let mut rows: Vec<(String, f64, u32)> = acc
+                .iter()
+                .map(|(k, (ms, cnt))| (k.clone(), ms / prof_steps as f64, cnt / prof_steps as u32))
+                .collect();
+            rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let total: f64 = rows.iter().map(|r| r.1).sum();
+            println!("[gpuprof] {} envs, GPU {total:.2} ms/ctrl-step", n);
+            for (label, ms, cnt) in rows.iter().take(16) {
+                println!("[gpuprof] {ms:8.3} ms  x{cnt:<4} {label}");
             }
         }
     });
